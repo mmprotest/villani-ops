@@ -1,6 +1,6 @@
 from __future__ import annotations
 from pathlib import Path
-import typer, json, subprocess, shutil, os
+import typer, json, subprocess, shutil, os, sys
 from rich.console import Console
 from rich.table import Table
 from villani_ops import VillaniOps
@@ -21,6 +21,10 @@ def init(workspace: str='.villani-ops'):
 
 @backend_app.command('add')
 def backend_add(name: str, provider: str=typer.Option(...), base_url: str|None=None, model: str=typer.Option(...), api_key: str|None=None, api_key_env: str|None=None, input_cost: float=0.0, output_cost: float=0.0, roles: str='coding', capability_score: int=0, max_tokens: int|None=None, timeout_seconds: int|None=None, workspace: str='.villani-ops'):
+    if api_key and api_key_env:
+        raise typer.BadParameter('Choose only one of --api-key or --api-key-env')
+    if provider=='local' and not api_key and not api_key_env:
+        api_key='dummy'
     s=storage(workspace); s.init_workspace(); b=s.load_backends(); b[name]=Backend(name=name,provider=provider,base_url=base_url,model=model,api_key=api_key,api_key_env=api_key_env,input_cost_per_million=input_cost,output_cost_per_million=output_cost,roles=[r.strip() for r in roles.split(',') if r.strip()],capability_score=capability_score,max_tokens=max_tokens,timeout_seconds=timeout_seconds); s.save_backends(b); console.print(f'Added backend {name}')
 
 @backend_app.command('list')
@@ -89,7 +93,7 @@ def run(repo: str|None=None, task: str|None=typer.Option(None,'--task'), task_id
             raise typer.BadParameter('YAML policy files use legacy smoke-test mode. Re-run with --legacy-yaml-policy if you intentionally want that path. It does not provide LLM task validation.')
         result=_legacy_run(repo, t, policy, workspace)
     else:
-        result=VillaniOps.from_workspace(workspace).run(repo=repo, task=t, policy=policy, isolation=isolation, human_approval=human_approval, non_interactive=non_interactive)
+        result=VillaniOps.from_workspace(workspace).run(repo=repo, task=t, policy=policy, isolation=isolation, human_approval=human_approval, non_interactive=(non_interactive or not sys.stdin.isatty()))
     d=result.decision; console.print(f"Result: {'ACCEPTED' if d.accepted else 'REJECTED' if (policy.endswith('.yaml') or '/' in policy) else 'FAILED'}"); console.print(f'Task: {t.objective}'); c=d.classification or {}; console.print(f"Classification: {c.get('difficulty')} {c.get('category')} {c.get('risk')}"); console.print(f"Strategy: {policy}, {len((d.execution_strategy or {}).get('attempts',[]))} planned attempts"); console.print(f"Winner: {d.winning_attempt_id or 'none'}"); console.print(f"Review: {d.reviewer_decision}, score {d.reviewer_score}"); console.print(f"Cost: total ${d.total_cost:.6f}"); console.print('Evidence:'); [console.print(f'  - {e}') for e in d.reviewer_evidence]; console.print(f"Apply:\n  villani-ops apply {d.run_id}"); console.print(f'Report: {result.report_path}')
 
 
@@ -133,49 +137,56 @@ def _legacy_run(repo, t, policy_path, workspace):
     return SimpleNamespace(run_id=run_id,run_dir=str(run_dir),decision=d,report_path=str(report),attempts=attempts)
 
 @app.command()
-def apply(run_id: str, branch: str|None=None, commit: bool=False, force: bool=False, workspace: str='.villani-ops'):
-    s=storage(workspace); run_dir=_run_dir_for(s, run_id); run_id=run_dir.name; d=json.loads((run_dir/'decision.json').read_text())
-    if not d.get('accepted'): raise typer.BadParameter('No accepted attempt exists')
-    repo=Path(json.loads((run_dir/'task.json').read_text())['repo_path'])
-    if subprocess.run(['git','status','--porcelain'],cwd=repo,text=True,capture_output=True).stdout.strip() and not force: raise typer.BadParameter('Source repo is dirty; use --force')
-    if branch: subprocess.run(['git','checkout','-b',branch],cwd=repo,check=True)
-    subprocess.run(['git','apply',d['winning_patch_path']],cwd=repo,check=True)
-    if commit: subprocess.run(['git','add','.'],cwd=repo,check=True); subprocess.run(['git','commit','-m',f'Apply Villani Ops run {run_id}'],cwd=repo,check=True)
+def apply(run_id: str, branch: str|None=None, commit: bool=False, message: str|None=None, force: bool=False, force_branch: bool=False, workspace: str='.villani-ops'):
+    from villani_ops.git_ops import safe_apply
+    s=storage(workspace); run_dir=_run_dir_for(s, run_id)
+    try:
+        safe_apply(run_dir, branch=branch, commit=commit, message=message, force=force, force_branch=force_branch, artifact_name='apply.json')
+    except Exception as e:
+        raise typer.BadParameter(str(e))
     console.print('Applied patch')
 
 @app.command()
-def branch(run_id: str, name: str=typer.Option(...), commit: bool=False, workspace: str='.villani-ops'):
-    apply(run_id, branch=name, commit=commit, workspace=workspace)
+def branch(run_id: str, name: str=typer.Option(...), commit: bool=False, force: bool=False, force_branch: bool=False, workspace: str='.villani-ops'):
+    from villani_ops.git_ops import safe_apply
+    s=storage(workspace); run_dir=_run_dir_for(s, run_id)
+    try:
+        safe_apply(run_dir, branch=name, commit=commit, force=force, force_branch=force_branch, artifact_name='branch.json')
+    except Exception as e:
+        raise typer.BadParameter(str(e))
+    console.print(f'Created branch {name}')
 
 @app.command()
-def pr(run_id: str, title: str, body: str='', no_push: bool=False, workspace: str='.villani-ops'):
+def pr(run_id: str, title: str=typer.Option(...), body: str=typer.Option(''), branch: str|None=None, no_push: bool=False, force: bool=False, force_branch: bool=False, workspace: str='.villani-ops'):
+    from datetime import datetime, timezone
+    from villani_ops.git_ops import safe_apply, resolve_accepted, manual_pr_commands
     s=storage(workspace); run_dir=_run_dir_for(s, run_id); run_id=run_dir.name
-    d=json.loads((run_dir/'decision.json').read_text())
-    if not d.get('accepted'):
-        raise typer.BadParameter('No accepted attempt exists')
-    task_data=json.loads((run_dir/'task.json').read_text()); repo=Path(task_data['repo_path'])
-    branch_name=d.get('winning_branch') or f'villani-ops/{run_id}'
-    manual=f"villani-ops branch {run_id} --name {branch_name} --commit\ngit push -u origin {branch_name}\ngh pr create --title {title!r} --body {body!r}"
+    try:
+        d, repo, patch=resolve_accepted(run_dir)
+    except Exception as e:
+        raise typer.BadParameter(str(e))
+    branch_name=branch or d.get('winning_branch') or f'villani-ops/{run_id}'
+    manual=manual_pr_commands(branch_name,title,body)
     gh=shutil.which('gh')
-    if not gh:
-        result={'attempted':True,'gh_available':False,'branch':branch_name,'title':title,'body':body,'exit_code':127,'stdout':'','stderr':'gh CLI is unavailable','url':None,'manual_commands':manual}
-        (run_dir/'pr.json').write_text(json.dumps(result, indent=2))
-        console.print('gh not available. Run manually:\n'+manual)
-        raise typer.Exit(1)
-    # Ensure a branch with the accepted patch exists in the source repo.
-    subprocess.run(['git','checkout','-B',branch_name],cwd=repo,check=True,capture_output=True,text=True)
-    patch=d.get('winning_patch_path')
-    if patch:
-        subprocess.run(['git','apply',patch],cwd=repo,check=False,capture_output=True,text=True)
-    subprocess.run(['git','add','.'],cwd=repo,check=True,capture_output=True,text=True)
-    if subprocess.run(['git','diff','--cached','--quiet'],cwd=repo).returncode!=0:
-        subprocess.run(['git','commit','-m',title],cwd=repo,check=True,capture_output=True,text=True)
-    if not no_push:
-        subprocess.run(['git','push','-u','origin',branch_name],cwd=repo,check=False,capture_output=True,text=True)
+    if not gh and not no_push:
+        art={'attempted':True,'gh_available':False,'branch':branch_name,'title':title,'body':body,'push_skipped':False,'exit_code':127,'stdout':'','stderr':'gh CLI is unavailable','url':None,'manual_commands':manual,'created_at':datetime.now(timezone.utc).isoformat()}
+        (run_dir/'pr.json').write_text(json.dumps(art, indent=2)); console.print('gh not available. Run manually:\n'+'\n'.join(manual)); raise typer.Exit(1)
+    try:
+        safe_apply(run_dir, branch=branch_name, commit=True, message=title, force=force, force_branch=force_branch, artifact_name='pr_apply.json')
+    except Exception as e:
+        art={'attempted':True,'gh_available':bool(gh),'branch':branch_name,'title':title,'body':body,'push_skipped':no_push,'exit_code':1,'stdout':'','stderr':str(e),'url':None,'manual_commands':manual,'created_at':datetime.now(timezone.utc).isoformat()}
+        (run_dir/'pr.json').write_text(json.dumps(art, indent=2)); raise typer.BadParameter(str(e))
+    if no_push:
+        art={'attempted':False,'gh_available':bool(gh),'branch':branch_name,'title':title,'body':body,'push_skipped':True,'exit_code':0,'stdout':'','stderr':'','url':None,'manual_commands':manual,'created_at':datetime.now(timezone.utc).isoformat()}
+        (run_dir/'pr.json').write_text(json.dumps(art, indent=2)); console.print('\n'.join(manual)); return
+    push=subprocess.run(['git','push','-u','origin',branch_name],cwd=repo,text=True,capture_output=True)
+    if push.returncode!=0:
+        art={'attempted':True,'gh_available':True,'branch':branch_name,'title':title,'body':body,'push_skipped':False,'exit_code':push.returncode,'stdout':push.stdout,'stderr':push.stderr,'url':None,'manual_commands':manual,'created_at':datetime.now(timezone.utc).isoformat()}
+        (run_dir/'pr.json').write_text(json.dumps(art, indent=2)); raise typer.Exit(push.returncode)
     proc=subprocess.run([gh,'pr','create','--title',title,'--body',body],cwd=repo,text=True,capture_output=True)
-    out=_redact(proc.stdout); err=_redact(proc.stderr); url=out.strip().splitlines()[-1] if out.strip().startswith('http') or 'http' in out else None
-    result={'attempted':True,'gh_available':True,'branch':branch_name,'title':title,'body':body,'exit_code':proc.returncode,'stdout':out,'stderr':err,'url':url}
-    (run_dir/'pr.json').write_text(json.dumps(result, indent=2))
+    out=_redact(proc.stdout); err=_redact(proc.stderr); url=next((l for l in out.splitlines() if l.startswith('http')), None)
+    art={'attempted':True,'gh_available':True,'branch':branch_name,'title':title,'body':body,'push_skipped':False,'exit_code':proc.returncode,'stdout':out,'stderr':err,'url':url,'manual_commands':manual,'created_at':datetime.now(timezone.utc).isoformat()}
+    (run_dir/'pr.json').write_text(json.dumps(art, indent=2))
     if proc.returncode!=0: raise typer.Exit(proc.returncode)
     console.print(out or 'PR created')
 
@@ -184,36 +195,47 @@ def report(run_id_or_latest: str, workspace: str='.villani-ops'):
     s=storage(workspace); run_dir=s.resolve_latest_run() if run_id_or_latest in {'latest','runs/latest'} else s.workspace/'runs'/run_id_or_latest; console.print((Path(run_dir)/'report.md').read_text())
 
 @app.command()
-def compare(repo: str=typer.Option(...), tasks: str=typer.Option(...), policies: list[str]=typer.Option(['cheap','balanced','quality']), out: str='.villani-ops/reports/comparison.md', workspace: str='.villani-ops', non_interactive: bool=True):
+def compare(repo: str=typer.Option(...), tasks: str=typer.Option(...), policies: list[str]=typer.Option(['cheap','balanced','quality']), out: str='.villani-ops/reports/comparison.md', workspace: str='.villani-ops', non_interactive: bool=True, resume: bool=False, max_tasks: int|None=None, repeat: int=1):
     import csv, statistics
     s=storage(workspace); s.init_workspace(); out_path=Path(out).expanduser().resolve(); out_path.parent.mkdir(parents=True, exist_ok=True)
-    task_rows=[]
-    for line in Path(tasks).read_text().splitlines():
-        if line.strip(): task_rows.append(json.loads(line))
-    results=[]
-    for td in task_rows:
-        for pol in policies:
-            t=Task(task_id=td.get('id') or None, repo_path=str(Path(repo).resolve()), objective=td.get('objective'), success_criteria=td.get('success_criteria'))
-            start=__import__('time').time()
-            try:
-                rr=VillaniOps.from_workspace(s.workspace).run(repo=repo, task=t, policy=pol, non_interactive=non_interactive)
-                d=rr.decision; accepted=d.accepted; winner=d.winning_attempt_id; score=d.reviewer_score
-                err=''
-            except Exception as e:
-                d=None; accepted=False; winner=None; score=None; err=str(e)
-            results.append({'task_id':td.get('id'), 'policy':pol, 'accepted':accepted, 'total_cost':getattr(d,'total_cost',0) if d else 0, 'coding_cost':getattr(d,'coding_cost',0) if d else 0, 'classification_cost':getattr(d,'classification_cost',0) if d else 0, 'policy_cost':getattr(d,'policy_cost',0) if d else 0, 'review_cost':getattr(d,'review_cost',0) if d else 0, 'input_tokens':getattr(d,'total_input_tokens',0) if d else 0, 'output_tokens':getattr(d,'total_output_tokens',0) if d else 0, 'attempts_used':getattr(d,'total_attempts',0) if d else 0, 'winning_backend': next((a.get('backend_name') for a in (getattr(d,'attempts',[]) if d else []) if a.get('attempt_id')==winner), None), 'difficulty': ((getattr(d,'classification',{}) or {}).get('difficulty') if d else None), 'category': ((getattr(d,'classification',{}) or {}).get('category') if d else None), 'reviewer_score': score, 'wall_time': __import__('time').time()-start, 'error': err})
+    task_rows=[json.loads(line) for line in Path(tasks).read_text().splitlines() if line.strip()]
+    if max_tasks is not None: task_rows=task_rows[:max_tasks]
     json_path=out_path.with_suffix('.json'); csv_path=out_path.with_suffix('.csv')
+    results=[]
+    done=set()
+    if resume and json_path.exists():
+        results=json.loads(json_path.read_text()); done={(r.get('policy'),r.get('task_id'),r.get('trial_index')) for r in results}
+    before=subprocess.run(['git','rev-parse','HEAD'],cwd=Path(repo),text=True,capture_output=True).stdout.strip()
+    for trial in range(repeat):
+        for td in task_rows:
+            for pol in policies:
+                key=(pol,td.get('id'),trial)
+                if key in done: continue
+                t=Task(task_id=td.get('id') or None, repo_path=str(Path(repo).resolve()), objective=td.get('objective'), success_criteria=td.get('success_criteria'))
+                start_t=__import__('time').time(); d=None; err=''
+                try:
+                    rr=VillaniOps.from_workspace(s.workspace).run(repo=repo, task=t, policy=pol, non_interactive=non_interactive)
+                    d=rr.decision
+                except Exception as e:
+                    err=str(e)
+                winner=getattr(d,'winning_attempt_id',None) if d else None
+                cls=(getattr(d,'classification',{}) or {}) if d else {}
+                results.append({'policy':pol,'task_id':td.get('id'),'run_id':getattr(d,'run_id','') if d else '','trial_index':trial,'accepted':getattr(d,'accepted',False) if d else False,'total_cost':getattr(d,'total_cost',0) if d else 0,'classification_cost':getattr(d,'classification_cost',0) if d else 0,'policy_cost':getattr(d,'policy_cost',0) if d else 0,'coding_cost':getattr(d,'coding_cost',0) if d else 0,'review_cost':getattr(d,'review_cost',0) if d else 0,'total_input_tokens':getattr(d,'total_input_tokens',0) if d else 0,'total_output_tokens':getattr(d,'total_output_tokens',0) if d else 0,'attempts_used':getattr(d,'total_attempts',0) if d else 0,'winning_backend': next((a.get('backend_name') for a in (getattr(d,'attempts',[]) if d else []) if a.get('attempt_id')==winner), None),'difficulty':cls.get('difficulty'),'category':cls.get('category'),'risk':cls.get('risk'),'reviewer_score':getattr(d,'reviewer_score',None) if d else None,'wall_time_seconds':__import__('time').time()-start_t,'failure_reason':err or ('' if getattr(d,'accepted',False) else getattr(d,'reason',''))})
+    after=subprocess.run(['git','rev-parse','HEAD'],cwd=Path(repo),text=True,capture_output=True).stdout.strip()
+    if before and after and before!=after: raise typer.BadParameter('compare mutated source repo HEAD')
     json_path.write_text(json.dumps(results, indent=2))
+    fields=['policy','task_id','run_id','trial_index','accepted','total_cost','classification_cost','policy_cost','coding_cost','review_cost','total_input_tokens','total_output_tokens','attempts_used','winning_backend','difficulty','category','risk','reviewer_score','wall_time_seconds','failure_reason']
     with csv_path.open('w', newline='') as f:
-        w=csv.DictWriter(f, fieldnames=list(results[0].keys()) if results else ['policy']); w.writeheader(); w.writerows(results)
+        w=csv.DictWriter(f, fieldnames=fields); w.writeheader(); w.writerows(results)
     lines=['# Villani Ops Comparison','','| Policy | Tasks run | Accepted solves | Solve rate | Total cost | Cost per accepted solve | Tokens per accepted solve | Attempts per accepted solve | Median wall time | Average reviewer score |','| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |']
     for pol in policies:
         rs=[r for r in results if r['policy']==pol]; n=len(rs); acc=[r for r in rs if r['accepted']]
-        total=sum(r['total_cost'] for r in rs); toks=sum(r['input_tokens']+r['output_tokens'] for r in rs); attempts=sum(r['attempts_used'] for r in rs)
+        total=sum(r['total_cost'] for r in rs); toks=sum(r['total_input_tokens']+r['total_output_tokens'] for r in rs); attempts=sum(r['attempts_used'] for r in rs)
         cpa='N/A' if not acc else f"${total/len(acc):.6f}"; tpa='N/A' if not acc else f"{toks/len(acc):.1f}"; apa='N/A' if not acc else f"{attempts/len(acc):.1f}"
-        med=statistics.median([r['wall_time'] for r in rs]) if rs else 0; scores=[r['reviewer_score'] for r in rs if r['reviewer_score'] is not None]; avg=sum(scores)/len(scores) if scores else 0
+        med=statistics.median([r['wall_time_seconds'] for r in rs]) if rs else 0; scores=[r['reviewer_score'] for r in rs if r['reviewer_score'] is not None]; avg=sum(scores)/len(scores) if scores else 0
         lines.append(f"| {pol} | {n} | {len(acc)} | {(len(acc)/n*100 if n else 0):.1f}% | ${total:.6f} | {cpa} | {tpa} | {apa} | {med:.2f}s | {avg:.2f} |")
     out_path.write_text('\n'.join(lines)+'\n')
     console.print(f'Wrote {out_path}, {csv_path}, {json_path}')
+
 
 if __name__=='__main__': app()

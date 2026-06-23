@@ -24,7 +24,7 @@ villani-ops backend add local-qwen \
   --provider openai-compatible \
   --base-url http://localhost:1234/v1 \
   --model qwen3.6-27b \
-  --api-key-env VILLANI_API_KEY \
+  --api-key dummy \
   --input-cost 0.60 \
   --output-cost 3.60 \
   --roles coding,classification,review,policy \
@@ -48,6 +48,25 @@ villani-ops compare \
   --tasks tasks.jsonl \
   --policies cheap balanced quality
 ```
+
+
+### Backend API keys
+
+`--api-key` is the backend LLM API key. Villani Ops stores it in local `.villani-ops/backends.yaml`, passes it to OpenAI-compatible classification, policy, and review calls, and passes the same resolved key to `villani-code --api-key` when that backend is used for coding. Direct keys are masked in backend output, reports, and saved runner command artifacts. For local LM Studio-style OpenAI-compatible servers, `dummy` is often acceptable.
+
+Use `--api-key-env ENV_NAME` as the optional advanced path if you do not want to store a direct key locally. Do not provide both `--api-key` and `--api-key-env`; the CLI fails clearly and asks you to choose one.
+
+### Human approval and controller decisions
+
+Human approval can be requested with `--human-approval`, by strategy stop conditions such as `ask_human_on_uncertain_review`, or by reviewer output (`requires_human_approval` / `ask_human`). In non-interactive mode, or when stdin is not a TTY, Villani Ops does not hang: it writes `human_approval.json` with `decision: skipped` and continues with safe retry/escalate/fail behavior. Every attempt writes `controller_decision.json`, and final `decision.json` includes all decision steps.
+
+### Safe git commands
+
+`apply`, `branch`, and `pr` refuse dirty source repos unless `--force`, refuse missing or unaccepted patches, run `git apply --check` before mutating the repository, and do not ignore subprocess failures. Branch creation refuses existing branch names unless `--force-branch`. PR creation refuses missing `gh` unless `--no-push`, and records manual commands in `pr.json`.
+
+### Compare
+
+`compare` writes Markdown/CSV/JSON rows with policy, task id, run id, trial index, cost/token breakdown, attempts, reviewer score, wall time, and failure reason. Use `--repeat N` for repeated trials, `--max-tasks N` for smoke tests, and `--resume` to skip completed policy/task/trial rows.
 
 ## Task creation with classification
 

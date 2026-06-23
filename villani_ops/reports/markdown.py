@@ -7,7 +7,7 @@ def write_markdown_report(run_dir, task, policy_or_strategy, attempts, decision,
     cls=decision.classification or {}
     rows=[]
     for a in attempts:
-        r=a.get('review') or {}; rows.append(f"| {a.get('attempt_id')} | {a.get('backend_name')} | {a.get('model','')} | {a.get('status')} | {a.get('exit_code','')} | {r.get('decision','')} | {r.get('score','')} | {r.get('recommended_action','')} | {(a.get('human_approval') or {}).get('decision','')} | {a.get('acceptance_eligible','')} | {'; '.join(a.get('acceptance_blockers') or [])} | {a.get('patch_path','')} |")
+        r=a.get('review') or {}; rows.append(f"| {a.get('attempt_id')} | {a.get('backend_name')} | {a.get('model','')} | {a.get('status')} | {a.get('exit_code','')} | {r.get('decision','')} | {r.get('score','')} | {r.get('recommended_action','')} | {(a.get('human_approval') or {}).get('decision','')} | {a.get('acceptance_eligible','')} | {'; '.join(a.get('acceptance_blockers') or [])} | {a.get('controller_action','')} | {a.get('patch_path','')} |")
     evidence='\n'.join(f"- {e}" for e in decision.reviewer_evidence) or '- none'
     warnings='\n'.join(f"- {w}" for w in decision.warnings) or '- none'
     changed='\n'.join(f"- {f}" for a in attempts for f in a.get('changed_files',[])) or '- none'
@@ -42,8 +42,8 @@ Strategy warnings: {', '.join(strategy.get('warnings') or []) or 'none'}
 
 ## Attempts
 
-| Attempt | Backend | Model | Status | Exit | Review | Score | Recommended | Human | Acceptance eligible | Blockers | Patch |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Attempt | Backend | Model | Status | Exit | Review | Score | Recommended | Human | Acceptance eligible | Blockers | Controller action | Patch |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 {chr(10).join(rows)}
 
 ## Changed Files
@@ -54,9 +54,17 @@ Strategy warnings: {', '.join(strategy.get('warnings') or []) or 'none'}
 
 {evidence}
 
+## Controller Decision Steps
+
+```json
+{json.dumps(decision.decision_steps, indent=2)}
+```
+
 ## Final Controller Decision
 
 Result: {'ACCEPTED' if decision.accepted else 'FAILED'}
+
+Final action: {decision.final_action}
 
 Reason: {decision.reason}
 
