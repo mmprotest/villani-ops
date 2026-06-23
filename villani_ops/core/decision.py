@@ -25,6 +25,7 @@ class Decision(BaseModel):
     attempts: list[dict[str, Any]] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     apply_options: dict[str, Any] = Field(default_factory=dict)
+    decision_steps: list[dict[str, Any]] = Field(default_factory=list)
     reason: str = ''
     total_attempts: int = 0
     discarded_attempts: list[dict] = Field(default_factory=list)

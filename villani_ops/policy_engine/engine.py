@@ -42,9 +42,21 @@ class PolicyEngine:
         cheapest=sorted(coding, key=lambda b:(b.estimate_cost(1000,1000), b.output_cost_per_million, b.input_cost_per_million, -b.capability_score))[0]
         highest=sorted(coding, key=lambda b:(-b.capability_score, b.output_cost_per_million, b.name))[0]
         hard = classification.difficulty in {'hard','very_hard'} or classification.risk in {'high','critical'}
+        easy = classification.difficulty in {'easy'} and classification.risk in {'low'}
+        if profile=='cheap' and easy:
+            kept=[StrategyAttempt(backend=cheapest.name, max_attempts=1, reason='Normalized cheap easy/low-risk profile to cheapest backend only.')]
+            warnings.append('LLM strategy was normalized to enforce cheap easy/low-risk constraints.')
+        elif profile=='cheap' and hard:
+            # cheapest first plus at most one escalation
+            esc=next((a for a in kept if a.backend!=cheapest.name), None)
+            kept=[StrategyAttempt(backend=cheapest.name, max_attempts=1, reason='Normalized cheap hard/high-risk profile to start cheapest.')] + ([StrategyAttempt(backend=esc.backend, max_attempts=1, reason=esc.reason or 'One allowed escalation.')] if esc else [])
+            warnings.append('LLM strategy was normalized to one cheap escalation path.')
         if profile=='cheap' and kept and kept[0].backend != cheapest.name:
             kept.insert(0, StrategyAttempt(backend=cheapest.name, max_attempts=1, reason='Normalized cheap profile to start with cheapest eligible backend.'))
             warnings.append('LLM strategy was normalized to enforce cheap policy constraints.')
+        if profile=='balanced' and kept and easy and kept[0].backend != cheapest.name:
+            kept.insert(0, StrategyAttempt(backend=cheapest.name, max_attempts=1, reason='Normalized balanced easy/low-risk profile to start cheaper.'))
+            warnings.append('LLM strategy was normalized to enforce balanced easy start constraints.')
         if profile=='quality' and hard and kept and kept[0].backend != highest.name:
             kept.insert(0, StrategyAttempt(backend=highest.name, max_attempts=1, reason='Normalized quality hard/high-risk profile to start with highest-capability backend.'))
             warnings.append('LLM strategy was normalized to enforce quality policy constraints.')
