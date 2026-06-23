@@ -1,46 +1,86 @@
 from pathlib import Path
+import json
 
-def write_markdown_report(run_dir, task, policy, attempts, decision, wall_time: float):
-    p=Path(run_dir)/"report.md"
+def write_markdown_report(run_dir, task, policy_or_strategy, attempts, decision, wall_time: float):
+    p=Path(run_dir)/'report.md'
+    strategy=decision.execution_strategy or (policy_or_strategy.model_dump(mode='json') if hasattr(policy_or_strategy,'model_dump') else {})
+    cls=decision.classification or {}
     rows=[]
     for a in attempts:
-        v=a.validation
-        rows.append(f"| {a.attempt_id} | {a.backend_name} | {a.runner_name} | {a.status} | {bool(v and v.passed)} | {v.score if v else ''} | {a.estimated_cost:.6f} | {a.input_tokens}/{a.output_tokens} | {a.diff_path or ''} |")
-    warnings="\n".join(f"- {w}" for w in decision.warnings) or "- none"
+        r=a.get('review') or {}; rows.append(f"| {a.get('attempt_id')} | {a.get('backend_name')} | {a.get('model','')} | {a.get('status')} | {a.get('exit_code','')} | {r.get('decision','')} | {r.get('score','')} | {a.get('patch_path','')} |")
+    evidence='\n'.join(f"- {e}" for e in decision.reviewer_evidence) or '- none'
+    warnings='\n'.join(f"- {w}" for w in decision.warnings) or '- none'
+    changed='\n'.join(f"- {f}" for a in attempts for f in a.get('changed_files',[])) or '- none'
+    apply=decision.apply_options or {}
     p.write_text(f"""# Villani Ops Run Report
 
-Task: {task.instruction}
+## Task
 
-Result: {'ACCEPTED' if decision.accepted else 'REJECTED'}
-Winner: {decision.winning_attempt_id or 'none'}
+Objective: {task.objective or task.instruction}
 
-## Summary
+Success criteria: {task.success_criteria or 'Not provided'}
 
-| Metric | Value |
-| --- | --- |
-| Policy | {policy.name} |
-| Total attempts | {decision.total_attempts} |
-| Total cost | {decision.total_cost:.6f} |
-| Total input tokens | {decision.total_input_tokens} |
-| Total output tokens | {decision.total_output_tokens} |
-| Total wall time | {wall_time:.2f}s |
+## Classification
+
+`{cls.get('difficulty','?')} {cls.get('category','?')} {cls.get('risk','?')}`
+
+```json
+{json.dumps(cls, indent=2)}
+```
+
+## Policy Strategy
+
+Profile: {strategy.get('profile','')}
+
+{strategy.get('strategy_summary','')}
+
+```json
+{json.dumps(strategy, indent=2)}
+```
 
 ## Attempts
 
-| Attempt | Backend | Runner | Status | Valid | Score | Cost | Tokens | Diff |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Attempt | Backend | Model | Status | Exit | Review | Score | Patch |
+| --- | --- | --- | --- | --- | --- | --- | --- |
 {chr(10).join(rows)}
 
-## Decision
+## Changed Files
 
-{decision.reason}
+{changed}
+
+## Reviewer Evidence
+
+{evidence}
+
+## Final Controller Decision
+
+Result: {'ACCEPTED' if decision.accepted else 'FAILED'}
+
+Reason: {decision.reason}
+
+Winner: {decision.winning_attempt_id or 'none'}
+
+Cost: ${decision.total_cost:.6f} (classification ${decision.classification_cost:.6f}, policy ${decision.policy_cost:.6f}, coding ${decision.coding_cost:.6f}, review ${decision.review_cost:.6f})
+
+## Accepted Result / Next Commands
+
+Apply:
+  {apply.get('apply_command', f'villani-ops apply {decision.run_id}')}
+
+Branch:
+  {apply.get('branch_command', f'villani-ops branch {decision.run_id} --name villani-ops/{decision.run_id}')}
+
+PR:
+  {apply.get('pr_command', f'villani-ops pr {decision.run_id} --title "..."')}
+
+Worktree: {decision.winning_worktree_path or 'none'}
+Patch: {decision.winning_patch_path or 'none'}
 
 ## Warnings
 
 {warnings}
 
-## Artifact Paths
-
 Run directory: {Path(run_dir)}
+Wall time: {wall_time:.2f}s
 """)
     return p

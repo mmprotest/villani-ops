@@ -1,96 +1,153 @@
-# Villani Ops
+# Villani Ops v0.2
 
-Villani Ops is the control plane for cost-aware AI coding operations. It turns coding agents from expensive one-shot guesses into auditable, cost-optimised local operations.
+Villani Ops is a local-file-first control plane for cost-aware AI coding operations. It coordinates LLM classification, LLM policy planning, isolated Villani Code coding attempts, LLM review, artifact capture, and apply/branch/PR handoff. There is no UI and no web API in v0.2.
 
-Villani Ops v0.1 is intentionally boring: a Python package with a clean internal API and a thin CLI. It runs isolated attempts, captures stdout/stderr/diffs, validates attempts with honest deterministic validators, selects a winner, and writes inspectable artifacts to disk.
+## What it does
 
-## What it is not
+For a real git repository and objective, Villani Ops can:
 
-Villani Ops is **not** a web app, dashboard, hosted job system, HTTP API, auth system, or React UI. Those are intentionally excluded until the local controller proves the core thesis.
+1. classify the task with an enabled backend that has the `classification` role;
+2. generate a cost-aware execution strategy with a backend that has the `policy` role;
+3. run Villani Code in an isolated git worktree using a backend that has the `coding` role;
+4. capture stdout, stderr, terminal output, patch, changed files, git status, branch, worktree path, and command metadata;
+5. review the attempt with a backend that has the `review` role;
+6. decide whether to accept, retry, escalate, ask for human approval, or fail;
+7. expose apply, branch, and PR commands for accepted work.
 
-## Install editable
+A failed runner attempt that produces a diff is reviewable but is not automatically accepted. Acceptance requires a zero runner exit code, a passing LLM reviewer result, a validated attempt status, and no unhandled runner error unless an explicit human approval path is implemented and recorded.
+
+## Requirements
+
+* Python 3.11+
+* A git repository for worktree isolation
+* Villani Code CLI available as `villani-code` for real coding attempts
+* At least one configured LLM backend for each required role: `coding`, `classification`, `review`, `policy`
+
+Install locally:
 
 ```bash
 pip install -e .
-```
-
-This installs the `villani-ops` console script and exposes the `villani_ops` Python package.
-
-## v0.1 CLI flow
-
-Initialize local file storage:
-
-```bash
 villani-ops init
 ```
 
-Add a local backend configuration. Backend config is local YAML; Villani Ops does not create or host model backends.
+## Configure model backends
+
+Backends are stored in `.villani-ops/backends.yaml`. Prefer `--api-key-env` over raw API keys; CLI output and reports redact raw secrets.
 
 ```bash
-villani-ops backend add local \
-  --provider local \
-  --model local-test \
-  --input-cost 0 \
-  --output-cost 0
+villani-ops backend add local-qwen \
+  --provider openai-compatible \
+  --base-url http://localhost:1234/v1 \
+  --model qwen3.6-27b \
+  --api-key-env VILLANI_API_KEY \
+  --input-cost 0.60 \
+  --output-cost 3.60 \
+  --roles coding,classification,review,policy \
+  --capability-score 80 \
+  --max-tokens 50000
 ```
 
-Configure a runner command template. Villani Ops does not hardcode any coding-agent binary. The runner runs inside an isolated copy of the target repository.
+Backend roles:
+
+* `coding` - used by Villani Code attempts
+* `classification` - used to classify task difficulty/category/risk
+* `policy` - used to generate the execution strategy
+* `review` - used to review completed attempts
+
+Useful commands:
 
 ```bash
-villani-ops runner set shell \
-  --command "python -m my_agent --repo {repo} --task-file {task_file}"
+villani-ops backend list
+villani-ops backend show local-qwen
+villani-ops backend disable local-qwen
+villani-ops backend enable local-qwen
 ```
 
-Create a default policy from configured backends:
+## Configure Villani Code runner
+
+The default command name is `villani-code`. The runner invokes:
 
 ```bash
-villani-ops policy create-default --name villani-escalation-v1
+villani-code run "<prompt>" \
+  --base-url <base_url> \
+  --model <model> \
+  --repo <isolated_worktree_path> \
+  --provider <provider> \
+  --api-key <api_key> \
+  --auto-approve \
+  --no-stream \
+  --max-tokens 50000
 ```
 
-Run a task against a local repository:
+The saved command artifact redacts the API key.
+
+## Create and run a task
+
+Create a task record:
+
+```bash
+villani-ops task create \
+  --repo ./some-git-repo \
+  --objective "Fix the failing auth tests" \
+  --success-criteria "Tests pass and diff is minimal"
+```
+
+Run directly:
 
 ```bash
 villani-ops run \
-  --repo ./some-repo \
+  --repo ./some-git-repo \
   --task "Fix the failing auth tests" \
-  --policy .villani-ops/policies/villani-escalation-v1.yaml
+  --success-criteria "Tests pass and diff is minimal" \
+  --policy balanced \
+  --isolation worktree
 ```
 
-View the latest report:
+Or run an existing task:
+
+```bash
+villani-ops run --task-id <task_id> --policy cheap
+```
+
+Default policy profiles are `cheap`, `balanced`, and `quality`:
+
+```bash
+villani-ops policy list-defaults
+villani-ops policy show balanced
+```
+
+## Review report and artifacts
+
+Each run writes local artifacts under `.villani-ops/runs/<run_id>/`, including:
+
+* `task.json`
+* `classification.json`
+* `strategy.json`
+* `decision.json`
+* `report.md`
+* per-attempt `stdout.log`, `stderr.log`, `diff.patch`, `changed_files.json`, `git_status.txt`, `review.json`, and `attempt.json`
+
+Read the report:
 
 ```bash
 villani-ops report latest
 ```
 
-You can also invoke the CLI module directly:
+## Apply accepted work
+
+Villani Ops does not mutate the source repository during `run`. After an accepted run:
 
 ```bash
-python -m villani_ops.cli.main --help
+villani-ops apply <run_id>
+villani-ops branch <run_id> --name my-branch
+villani-ops pr <run_id> --title "Fix auth tests" --body "Generated by Villani Ops"
 ```
 
-## Python API
+`apply` refuses a dirty source working tree unless `--force` is provided. `branch` creates a branch and applies the accepted patch. `pr` uses the GitHub `gh` CLI if available; otherwise it prints manual commands.
 
-```python
-from villani_ops import VillaniOps, Task, Policy
+## Known limitations
 
-ops = VillaniOps.from_workspace(".villani-ops")
-policy = Policy.load(".villani-ops/policies/villani-escalation-v1.yaml")
-result = ops.run(
-    repo="./repo",
-    task=Task(
-        repo_path="./repo",
-        instruction="Fix the failing auth tests",
-        success_criteria="Tests pass and diff is minimal",
-    ),
-    policy=policy,
-)
-print(result.decision.accepted, result.report_path)
-```
-
-## Artifacts
-
-Runs are stored under `.villani-ops/runs/<run_id>/` with task and policy snapshots, per-attempt repositories, stdout/stderr logs, `diff.patch`, validation JSON, decision JSON, CSV, and a Markdown report.
-
-## Validation honesty
-
-`diff_review` is the functional v0.1 validator. It checks that an attempt produced a non-empty diff and records exactly that. `llm_review` exists as a clean extension point but returns a clear error unless a real reviewer backend client is implemented in the future.
+* Human approval is represented in the decision vocabulary but does not yet include an interactive approval workflow.
+* Copy isolation remains only for legacy compatibility; v0.2 defaults to git worktrees.
+* GitHub PR creation is intentionally optional and depends on the local `gh` CLI.
+* Villani Ops does not fake classification, policy, or review results. Missing LLM backends fail clearly.
