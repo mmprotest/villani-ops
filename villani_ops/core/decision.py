@@ -1,35 +1,43 @@
 from __future__ import annotations
+from typing import Any
 from pydantic import BaseModel, Field
-from .attempt import Attempt
-from .policy import SelectionConfig
 
 class Decision(BaseModel):
     run_id: str
-    winning_attempt_id: str | None = None
     accepted: bool = False
-    reason: str
-    total_attempts: int
-    total_cost: float
-    total_input_tokens: int
-    total_output_tokens: int
-    discarded_attempts: list[dict] = Field(default_factory=list)
+    final_action: str = 'fail'
+    winning_attempt_id: str | None = None
+    winning_branch: str | None = None
+    winning_worktree_path: str | None = None
+    winning_patch_path: str | None = None
+    reviewer_decision: str | None = None
+    reviewer_score: float | None = None
+    reviewer_evidence: list[str] = Field(default_factory=list)
+    classification: dict[str, Any] | None = None
+    execution_strategy: dict[str, Any] | None = None
+    total_cost: float = 0
+    coding_cost: float = 0
+    classification_cost: float = 0
+    policy_cost: float = 0
+    review_cost: float = 0
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    attempts: list[dict[str, Any]] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
+    apply_options: dict[str, Any] = Field(default_factory=dict)
+    reason: str = ''
+    total_attempts: int = 0
+    discarded_attempts: list[dict] = Field(default_factory=list)
 
-def select_attempt(run_id: str, attempts: list[Attempt], selection: SelectionConfig, warnings: list[str] | None = None) -> Decision:
-    warnings = warnings or []
-    valid = [a for a in attempts if a.validation and a.validation.passed]
-    winner = None
-    if valid:
-        if selection.choose_lowest_cost_valid_attempt:
-            winner = min(valid, key=lambda a: (a.estimated_cost, -(a.validation.score if a.validation else 0)))
-            reason = "Selected lowest-cost valid attempt."
-        else:
-            winner = max(valid, key=lambda a: ((a.validation.score if a.validation else 0), -a.estimated_cost))
-            reason = "Selected highest-scoring valid attempt, tie-broken by lower cost."
+# Backward-compatible helper with the P0 acceptance guard.
+def select_attempt(run_id, attempts, selection=None, warnings=None):
+    warnings=warnings or []
+    valid=[a for a in attempts if getattr(a,'validation',None) and a.validation.passed and (getattr(a,'status',None) in {'validated','human_approved'} or getattr(a,'status',None)=='pending') and getattr(a,'error',None) is None]
+
+    if valid and selection and getattr(selection, 'choose_lowest_cost_valid_attempt', False):
+        winner=min(valid, key=lambda a: (a.estimated_cost, -a.validation.score))
+    elif valid:
+        winner=max(valid, key=lambda a: (a.validation.score, -a.estimated_cost))
     else:
-        reason = "No valid attempt was found."
-    return Decision(
-        run_id=run_id, winning_attempt_id=winner.attempt_id if winner else None, accepted=winner is not None, reason=reason,
-        total_attempts=len(attempts), total_cost=sum(a.estimated_cost for a in attempts), total_input_tokens=sum(a.input_tokens for a in attempts),
-        total_output_tokens=sum(a.output_tokens for a in attempts),
-        discarded_attempts=[{"attempt_id": a.attempt_id, "status": a.status, "reason": a.error or (a.validation.summary if a.validation else "not selected")} for a in attempts if not winner or a.attempt_id != winner.attempt_id], warnings=warnings)
+        winner=None
+    return Decision(run_id=run_id, accepted=winner is not None, final_action='accept' if winner else 'fail', winning_attempt_id=winner.attempt_id if winner else None, total_attempts=len(attempts), total_cost=sum(a.estimated_cost for a in attempts), total_input_tokens=sum(a.input_tokens for a in attempts), total_output_tokens=sum(a.output_tokens for a in attempts), warnings=warnings, reason='Selected valid successful attempt.' if winner else 'No valid successful attempt found.')
