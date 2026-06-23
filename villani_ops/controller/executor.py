@@ -13,6 +13,7 @@ from villani_ops.runners.base import RunnerContext
 from villani_ops.runners.villani_code import VillaniCodeRunner
 from villani_ops.review import LLMReviewer, ReviewResult
 from villani_ops.reports.markdown import write_markdown_report
+from villani_ops.core.acceptance import is_attempt_acceptance_eligible
 
 class RunResult(BaseModel):
     run_id: str; run_dir: str; decision: Decision; report_path: str; attempts: list[dict]
@@ -20,9 +21,9 @@ class RunResult(BaseModel):
 class VillaniOps:
     def __init__(self, storage: FileStorage): self.storage=storage
     @classmethod
-    def from_workspace(cls, path: str | Path = '.villani-ops') -> 'VillaniOps': return cls(FileStorage(path))
+    def from_workspace(cls, path: str | Path = '.villani-ops') -> 'VillaniOps': return cls(FileStorage(Path(path).expanduser().resolve()))
 
-    def run(self, repo: str|Path, task: Task, policy: str='balanced', isolation: str='worktree') -> RunResult:
+    def run(self, repo: str|Path, task: Task, policy: str='balanced', isolation: str='worktree', human_approval: bool=False, non_interactive: bool=False) -> RunResult:
         self.storage.init_workspace(); start=time.time(); repo=Path(repo).resolve(); task.repo_path=str(repo)
         run_id=datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')+'-'+secrets.token_hex(3)
         run_dir=self.storage.create_run_dir(run_id); self.storage.save_task(run_dir, task)
@@ -52,17 +53,49 @@ class VillaniOps:
                     review, rev_call=LLMReviewer().review(task, cls, backend, review_input, backends, adir/'review.json')
                     costs['review']+=rev_call.estimated_cost; tin+=rev_call.input_tokens; tout+=rev_call.output_tokens
                     meta['review']=review.model_dump(mode='json'); meta['review_path']=str(adir/'review.json')
-                    # P0 guard: nonzero exit / unhandled error can never be auto-accepted without human override.
-                    can_accept=(result.exit_code==0 and review.passed and review.decision=='pass' and review.recommended_action=='accept')
-                    meta['status']='validated' if can_accept else ('rejected' if result.exit_code==0 else 'failed')
-                    if result.exit_code!=0: meta['error']=result.stderr.strip() or f"Runner exited with {result.exit_code}"
-                    if can_accept:
+                    meta['status']='candidate'
+                    if result.exit_code!=0:
+                        meta['status']='failed'; meta['error']=result.stderr.strip() or f"Runner exited with {result.exit_code}"
+                    # Human approval path for uncertain/ask_human reviews when enabled.
+                    if human_approval and (review.recommended_action=='ask_human' or review.decision=='uncertain' or review.requires_human_approval):
+                        decision = 'reject'
+                        reason = 'non-interactive default reject'
+                        if not non_interactive:
+                            print(f"Human approval requested for {attempt_id} ({backend.name}/{backend.model})")
+                            print(f"Summary: {review.summary}")
+                            print('Evidence: ' + '; '.join(review.evidence))
+                            print('Issues: ' + '; '.join(review.issues))
+                            print(f"Patch: {meta.get('patch_path')}")
+                            print('Changed files: ' + ', '.join(meta.get('changed_files') or []))
+                            print(f"Cost so far: ${sum(costs.values()):.6f}")
+                            decision = input('Decision [accept/reject/retry/escalate/fail]: ').strip().lower() or 'reject'
+                            reason = input('Reason: ').strip() or 'local user decision'
+                        if decision not in {'accept','reject','retry','escalate','fail'}:
+                            decision='reject'; reason='invalid human decision defaulted to reject'
+                        approval={'requested':True,'decision':decision,'reason':reason,'approved_by':'local_user','created_at':datetime.now(timezone.utc).isoformat()}
+                        meta['human_approval']=approval; (adir/'human_approval.json').write_text(json.dumps(approval, indent=2))
+                        if decision=='accept':
+                            meta['status']='human_approved'
+                        elif decision=='retry':
+                            meta['status']='rejected'
+                        elif decision=='escalate':
+                            meta['status']='rejected'; meta['escalate_requested']=True
+                        elif decision=='fail':
+                            meta['status']='rejected'; meta['fail_requested']=True
+                        else:
+                            meta['status']='rejected'
+                    elif result.exit_code==0 and review.passed and review.decision=='pass' and review.recommended_action=='accept':
+                        meta['status']='validated'
+                    eligible, blockers = is_attempt_acceptance_eligible(meta)
+                    meta['acceptance_eligible']=eligible; meta['acceptance_blockers']=blockers
+                    if eligible:
                         accepted=meta; attempts.append(meta); (adir/'attempt.json').write_text(json.dumps(meta, indent=2)); break
                 except Exception as e:
                     meta['status']='failed'; meta['error']=str(e); warnings.append(str(e))
                 meta['ended_at']=datetime.now(timezone.utc).isoformat(); attempts.append(meta); (adir/'attempt.json').write_text(json.dumps(meta, indent=2))
                 rec=((meta.get('review') or {}).get('recommended_action'))
-                if rec in {'retry_same_backend'}: continue
+                if meta.get('fail_requested'): break
+                if rec in {'retry_same_backend'} or (meta.get('human_approval') or {}).get('decision')=='retry': continue
                 break
             if accepted: break
         apply_opts={}

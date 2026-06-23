@@ -12,7 +12,7 @@ from villani_ops.isolation.base import EXCLUDED_DIRS
 
 class FileStorage:
     def __init__(self, workspace: str | Path = ".villani-ops"):
-        self.workspace = Path(workspace)
+        self.workspace = Path(workspace).expanduser().resolve()
     def init_workspace(self):
         self.workspace.mkdir(exist_ok=True); (self.workspace/"policies").mkdir(exist_ok=True); (self.workspace/"runs").mkdir(exist_ok=True)
         if not (self.workspace/"config.yaml").exists(): self.save_config({"runners":{"shell":{"command":None},"villani_code":{"command":None}}})
