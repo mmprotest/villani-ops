@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "villani-ops"
+version = "0.1.0"
+description = "Control plane for cost-aware AI coding operations"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["typer>=0.12", "pydantic>=2", "PyYAML>=6", "rich>=13"]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.scripts]
+villani-ops = "villani_ops.cli.main:app"
+
+[tool.pytest.ini_options]
+testpaths = ["villani_ops/tests"]
