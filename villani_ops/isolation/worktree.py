@@ -15,7 +15,7 @@ class GitWorktreeIsolation:
         if Path(top).resolve()!=repo: repo=Path(top).resolve()
         base=_run(['git','rev-parse','HEAD'], repo, log)
         _run(['git','status'], repo, log)
-        wt=Path(workspace)/'worktrees'/run_id/attempt_id; wt.parent.mkdir(parents=True, exist_ok=True)
+        wt=Path(workspace).expanduser().resolve()/'worktrees'/run_id/attempt_id; wt.parent.mkdir(parents=True, exist_ok=True)
         branch=f"villani-ops/{run_id}/{attempt_id}"
         _run(['git','worktree','add','-b',branch,str(wt),'HEAD'], repo, log)
         return {"repo_path":str(repo),"worktree_path":str(wt.resolve()),"branch_name":branch,"base_commit":base,"commands":log}
