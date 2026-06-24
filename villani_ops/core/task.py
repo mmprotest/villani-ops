@@ -14,6 +14,11 @@ class TaskClassification(BaseModel):
     required_capabilities: list[str] = Field(default_factory=list)
     reasoning_summary: str = ""
     confidence: float = 0.0
+    adjustment_notes: list[str] = Field(default_factory=list)
+    relevant_file_paths: list[str] = Field(default_factory=list)
+    task_shape_signals: dict[str, Any] = Field(default_factory=dict)
+    original_difficulty: str | None = None
+    original_risk: str | None = None
 
 class Task(BaseModel):
     task_id: str = Field(default_factory=lambda: datetime.now(timezone.utc).strftime("task_%Y%m%dT%H%M%SZ_")+secrets.token_hex(3))
