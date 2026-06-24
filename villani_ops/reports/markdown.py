@@ -8,6 +8,9 @@ def write_markdown_report(run_dir, task, policy_or_strategy, attempts, decision,
     rows=[]
     for a in attempts:
         r=a.get('review') or {}; rows.append(f"| {a.get('attempt_id')} | {a.get('backend_name')} | {a.get('model','')} | {a.get('status')} | {a.get('exit_code','')} | {r.get('decision','')} | {r.get('score','')} | {r.get('recommended_action','')} | {(a.get('human_approval') or {}).get('decision','')} | {a.get('acceptance_eligible','')} | {'; '.join(a.get('acceptance_blockers') or [])} | {a.get('controller_action','')} | {a.get('patch_path','')} |")
+    timeline='\n'.join(f"- {st.get('step_id')}: {st.get('state_before')} --{st.get('action')}--> {st.get('state_after')} ({st.get('reason')})" for st in (decision.controller_steps or [])) or '- none'
+    rankings='\n'.join(f"- {r.get('expected_cost_rank')}. {r.get('backend')}: capability {r.get('capability_score')}, estimated ${r.get('estimated_attempt_cost')} — {r.get('rank_reason')}" for r in (strategy.get('backend_rankings') or [])) or '- none'
+    blockers='\n'.join(f"- {b}" for b in (decision.acceptance_blockers or [])) or '- none'
     evidence='\n'.join(f"- {e}" for e in decision.reviewer_evidence) or '- none'
     warnings='\n'.join(f"- {w}" for w in decision.warnings) or '- none'
     changed='\n'.join(f"- {f}" for a in attempts for f in a.get('changed_files',[])) or '- none'
@@ -27,6 +30,10 @@ Success criteria: {task.success_criteria or 'Not provided'}
 ```json
 {json.dumps(cls, indent=2)}
 ```
+
+## Backend Rankings
+
+{rankings}
 
 ## Policy Strategy
 
@@ -54,6 +61,10 @@ Strategy warnings: {', '.join(strategy.get('warnings') or []) or 'none'}
 
 {evidence}
 
+## Controller Timeline
+
+{timeline}
+
 ## Controller Decision Steps
 
 ```json
@@ -67,6 +78,15 @@ Result: {'ACCEPTED' if decision.accepted else 'FAILED'}
 Final action: {decision.final_action}
 
 Reason: {decision.reason}
+
+Failure reason: {decision.failure_reason or 'none'}
+
+Acceptance blockers:
+{blockers}
+
+Retries used: {decision.retries_used}
+
+Escalations used: {decision.escalations_used}
 
 Winner: {decision.winning_attempt_id or 'none'}
 
