@@ -26,6 +26,11 @@ class LLMReviewer:
         backend=select_backend(backends,'review')
         ctx={"task":task.model_dump(mode='json'),"classification":classification.model_dump(mode='json') if classification else None,"coding_backend":coding_backend.redacted_dict(),"attempt":attempt}
         result=self.client.complete_json(backend, SYSTEM, USER.format(context=json.dumps(ctx, indent=2)[:60000]), 'ReviewResult')
-        review=ReviewResult.model_validate(result.parsed_json); review.reviewer_backend=backend.name
+        try:
+            review=ReviewResult.model_validate(result.parsed_json)
+        except Exception as e:
+            setattr(e, 'llm_result', result); setattr(e, 'schema_name', 'ReviewResult'); setattr(e, 'backend', backend)
+            raise
+        review.reviewer_backend=backend.name
         if out_path: Path(out_path).write_text(review.model_dump_json(indent=2))
         return review, result

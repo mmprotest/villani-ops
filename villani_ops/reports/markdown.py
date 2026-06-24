@@ -15,6 +15,8 @@ def write_markdown_report(run_dir, task, policy_or_strategy, attempts, decision,
     human_override_blockers='\n'.join(f"- {b}" for b in (getattr(decision, 'human_override_blockers', []) or [])) or '- none'
     evidence='\n'.join(f"- {e}" for e in decision.reviewer_evidence) or '- none'
     warnings='\n'.join(f"- {w}" for w in decision.warnings) or '- none'
+    fallback_used=any('deterministic fallback policy' in str(w) for w in (strategy.get('warnings') or []))
+    fallback_reason=next((str(w) for w in (strategy.get('warnings') or []) if 'deterministic fallback policy' in str(w)), '')
     changed='\n'.join(f"- {f}" for a in attempts for f in a.get('changed_files',[])) or '- none'
     telemetry='\n\n'.join(
         f"Attempt: {a.get('attempt_id')}\nBackend: {a.get('backend_name')}\nModel: {a.get('model')}\nDebug dir: {a.get('debug_artifact_dir')}\nTelemetry: {a.get('telemetry_path')}\nInput tokens: {a.get('input_tokens',0)}\nOutput tokens: {a.get('output_tokens',0)}\nCoding cost: {a.get('coding_cost',0)}\nDuration ms: {a.get('duration_ms')}\nModel requests: {a.get('model_requests',0)}\nTool calls: {a.get('total_tool_calls',0)}\nTool calls by name: {json.dumps(a.get('tool_calls_by_name') or {}, sort_keys=True)}\nFile reads: {a.get('total_file_reads',0)}\nFile writes: {a.get('total_file_writes',0)}\nCommands executed: {a.get('commands_executed',0)}\nCommands failed: {a.get('commands_failed',0)}\nFirst substantive file read tool index: {a.get('first_substantive_file_read_tool_index')}\nFirst file mutation tool index: {a.get('first_file_mutation_tool_index')}\nToken accounting status: {a.get('token_accounting_status','missing')}\nToken accounting warnings: {'; '.join(a.get('token_accounting_warnings') or []) or 'none'}"
@@ -44,6 +46,10 @@ Success criteria: {task.success_criteria or 'Not provided'}
 ## Policy Strategy
 
 Profile: {strategy.get('profile','')}
+
+Fallback used: {str(fallback_used).lower()}
+
+Fallback reason: {fallback_reason or 'none'}
 
 {strategy.get('strategy_summary','')}
 
