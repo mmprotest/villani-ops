@@ -9,6 +9,7 @@ from villani_ops.core.decision import Decision
 from villani_ops.storage.files import FileStorage
 from villani_ops.classification import TaskClassifier
 from villani_ops.policy_engine import PolicyEngine, ExecutionStrategy
+from villani_ops.policy_engine.engine import _write_controller_error
 from villani_ops.isolation.worktree import GitWorktreeIsolation, capture_worktree
 from villani_ops.runners.base import RunnerContext
 from villani_ops.runners.villani_code import VillaniCodeRunner
@@ -33,6 +34,15 @@ class VillaniOps:
         backends=self.storage.load_backends(); warnings=[]; attempts=[]; costs={'classification':0.0,'policy':0.0,'review':0.0,'coding':0.0}; tin=tout=0
         recorder=ControllerStateRecorder(run_id, run_dir)
         strategy=None; cls=None
+        def record_failed_controller_call(phase, schema, exc):
+            nonlocal tin, tout
+            result=getattr(exc, "result", None) or getattr(exc, "llm_result", None)
+            backend=getattr(exc, "backend", None)
+            if result:
+                costs[phase]+=getattr(result, "estimated_cost", 0) or 0
+                tin+=getattr(result, "input_tokens", 0) or 0
+                tout+=getattr(result, "output_tokens", 0) or 0
+            _write_controller_error(run_dir, phase, backend, schema, result, parse_error=getattr(exc, "parse_error", None), validation_error=str(exc) if result else None)
         def finalize(accepted=None, final_action='fail', failure_reason=''):
             apply_opts={}
             if accepted:
@@ -45,6 +55,7 @@ class VillaniOps:
         try:
             cls, cls_call = TaskClassifier().classify(task, backends, run_dir/'classification.json'); task.classification=cls; self.storage.save_task(run_dir, task)
         except Exception as e:
+            record_failed_controller_call('classification', getattr(e, 'schema_name', 'TaskClassification'), e)
             warnings.append(str(e)); recorder.transition(ControllerAction.fail, ControllerState.failed, f'Classification failed: {e}')
             decision_steps=[]; retries_used=escalations_used=0
             return finalize(None, 'fail', f'Classification failed: {e}')
@@ -90,6 +101,7 @@ class VillaniOps:
                         review, rev_call=LLMReviewer().review(task, cls, backend, review_input, backends, adir/'review.json')
                         costs['review']+=rev_call.estimated_cost; tin+=rev_call.input_tokens; tout+=rev_call.output_tokens
                     except Exception as e:
+                        record_failed_controller_call('review', getattr(e, 'schema_name', 'ReviewResult'), e)
                         review=ReviewResult(passed=False, decision='fail', summary=f'Reviewer failed: {e}', issues=[str(e)], recommended_action='retry_same_backend' if plan.max_attempts - (_ + 1) > 0 else ('escalate' if current_plan_index < len(strategy.attempts)-1 else 'fail'))
                         (adir/'review.json').write_text(review.model_dump_json(indent=2))
                         warnings.append(f'Review failed for {attempt_id}: {e}')

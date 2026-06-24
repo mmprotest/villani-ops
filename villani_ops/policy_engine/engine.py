@@ -1,17 +1,74 @@
 from __future__ import annotations
 from typing import Any
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 import json
 from pathlib import Path
 from villani_ops.core.backend import Backend, select_backend, coding_backends
 from villani_ops.core.task import TaskClassification
-from villani_ops.llm.client import LLMClient, LLMCallResult
+from villani_ops.llm.client import LLMClient, LLMCallResult, LLMCallError
 from .defaults import DEFAULT_PROFILES
 from .prompts import SYSTEM, USER
+
+
+
+def normalize_execution_strategy_payload(raw: dict, requested_profile: str) -> dict:
+    payload=dict(raw or {})
+    hint=payload.get("profile") or payload.get("strategy_name") or payload.get("policy") or payload.get("selected_profile") or payload.get("profile_name")
+    if hint is not None:
+        payload["_model_profile_hint"]=hint
+    for alias in ("strategy_name", "policy", "selected_profile", "profile_name"):
+        payload.pop(alias, None)
+    payload["profile"]=requested_profile
+    if "planned_attempts" in payload and "attempts" not in payload:
+        payload["attempts"]=payload["planned_attempts"]
+    if "planned_attempts" not in payload and "attempts" in payload:
+        payload["planned_attempts"]=payload["attempts"]
+    if "attempts" not in payload and payload.get("backend_order"):
+        payload["attempts"]=[{"backend": b, "max_attempts": 1, "reason": "Created from backend_order."} for b in payload["backend_order"]]
+    if "stop_conditions" not in payload:
+        payload["stop_conditions"]={}
+    if "stop_condition" not in payload:
+        payload["stop_condition"]="first_accepted"
+    payload.setdefault("warnings", [])
+    if "strategy_summary" not in payload:
+        payload["strategy_summary"]=payload.get("rationale") or payload.get("reasoning_summary") or ""
+    return payload
+
+def _write_controller_error(run_dir: Path|None, phase: str, backend: Backend|None, schema: str, result: LLMCallResult|None, parse_error=None, validation_error=None, normalized_payload=None):
+    if not run_dir: return
+    d=Path(run_dir)/"controller_calls"; d.mkdir(parents=True, exist_ok=True)
+    data={"phase":phase,"backend":getattr(backend,"name",None),"schema":schema,"url":getattr(result,"url",None),"model":getattr(result,"model",getattr(backend,"model",None)),"max_tokens":getattr(result,"max_tokens",getattr(backend,"max_tokens",None)),"http_status":getattr(result,"http_status",None),"finish_reason":getattr(result,"finish_reason",None),"usage":getattr(result,"usage",{}) if result else {},"message_content":getattr(result,"raw_text",None),"reasoning_content":getattr(result,"reasoning_content",None),"raw_response":getattr(result,"raw_response",{}) if result else {},"parse_error":parse_error,"validation_error":validation_error,"normalized_payload":normalized_payload or {}}
+    (d/f"{phase}_error.json").write_text(json.dumps(data, indent=2, default=str))
+
+def build_deterministic_fallback_strategy(classification: TaskClassification, backends: dict[str, Backend], profile: str, reason: str) -> ExecutionStrategy:
+    coding=coding_backends(backends)
+    max_total=DEFAULT_PROFILES[profile]["max_total_attempts"]
+    def cost(b): return b.estimate_cost(1000,1000)
+    cheapest=sorted(coding, key=lambda b:(cost(b), b.output_cost_per_million, b.input_cost_per_million, -b.capability_score, b.name))[0]
+    strongest=sorted(coding, key=lambda b:(-b.capability_score, cost(b), b.name))[0]
+    attempts=[]
+    if profile=="cheap":
+        attempts=[StrategyAttempt(backend=cheapest.name, max_attempts=1, reason="Deterministic fallback: cheapest coding backend.")]
+    elif profile=="balanced":
+        if cheapest.name==strongest.name:
+            attempts=[StrategyAttempt(backend=cheapest.name, max_attempts=min(2,max_total), reason="Deterministic fallback: only coding backend.")]
+        else:
+            attempts=[StrategyAttempt(backend=cheapest.name, max_attempts=1, reason="Deterministic fallback: cheapest viable backend first."), StrategyAttempt(backend=strongest.name, max_attempts=1, reason="Deterministic fallback: escalate to strongest backend.")]
+    else:
+        ordered=[]
+        for b in [strongest]+sorted(coding, key=lambda b:(-b.capability_score, cost(b), b.name)):
+            if b.name not in [x.name for x in ordered]: ordered.append(b)
+        remaining=min(3,max_total)
+        for b in ordered:
+            if remaining<=0: break
+            attempts.append(StrategyAttempt(backend=b.name, max_attempts=1, reason="Deterministic fallback: quality profile escalation path.")); remaining-=1
+        if remaining and attempts: attempts[0].max_attempts+=remaining
+    return ExecutionStrategy(profile=profile, strategy_summary="Policy generation failed validation, so Villani Ops used deterministic fallback policy.", attempts=attempts, warnings=[f"Policy generation failed validation, so Villani Ops used deterministic fallback policy. {reason}"], stop_conditions={"mode":"first_accepted"})
 
 class StrategyAttempt(BaseModel):
     backend: str; runner: str='villani_code'; max_attempts:int=1; timeout_seconds:int=1200; reason:str=''
 class ExecutionStrategy(BaseModel):
+    model_config = ConfigDict(extra="ignore")
     profile: str; strategy_summary: str=''; attempts: list[StrategyAttempt]=Field(default_factory=list); stop_conditions: dict[str, Any]=Field(default_factory=dict); escalation_rules:list[dict[str,Any]]=Field(default_factory=list); cost_risk_summary:str=''; warnings: list[str]=Field(default_factory=list); backend_rankings: list[dict[str, Any]]=Field(default_factory=list)
 
 class PolicyEngine:
@@ -22,8 +79,22 @@ class PolicyEngine:
         if not coding: raise ValueError("No enabled coding backends configured.")
         allowed={b.name for b in coding}; max_total=DEFAULT_PROFILES[profile]['max_total_attempts']
         ctx={"classification":classification.model_dump(),"profile":profile,"profile_rules":DEFAULT_PROFILES[profile],"coding_backends":[b.redacted_dict() for b in coding]}
-        result=self.client.complete_json(policy_backend, SYSTEM, USER.format(context=json.dumps(ctx, indent=2)), 'ExecutionStrategy')
-        strat=ExecutionStrategy.model_validate(result.parsed_json)
+        try:
+            result=self.client.complete_json(policy_backend, SYSTEM, USER.format(context=json.dumps(ctx, indent=2)), 'ExecutionStrategy')
+        except LLMCallError as e:
+            _write_controller_error(Path(out_path).parent if out_path else None, 'policy', policy_backend, 'ExecutionStrategy', e.result, parse_error=e.parse_error)
+            strat=build_deterministic_fallback_strategy(classification, backends, profile, str(e))
+            if out_path: Path(out_path).write_text(strat.model_dump_json(indent=2))
+            return strat, e.result or LLMCallResult(parsed_json={}, raw_text='', backend_name=policy_backend.name, model=policy_backend.model)
+        normalized=normalize_execution_strategy_payload(result.parsed_json, profile)
+        try:
+            strat=ExecutionStrategy.model_validate(normalized)
+        except Exception as e:
+            run_dir=Path(out_path).parent if out_path else None
+            _write_controller_error(run_dir, "policy", policy_backend, "ExecutionStrategy", result, validation_error=str(e), normalized_payload=normalized)
+            strat=build_deterministic_fallback_strategy(classification, backends, profile, str(e))
+            if out_path: Path(out_path).write_text(strat.model_dump_json(indent=2))
+            return strat, result
         warnings=[]
         valid_by_name={b.name:b for b in coding}
         original=[a.backend for a in strat.attempts]
@@ -83,6 +154,9 @@ class PolicyEngine:
         strat.attempts=final; strat.profile=profile; strat.backend_rankings=rankings; strat.warnings.extend(warnings)
         if original != [a.backend for a in strat.attempts] and not warnings:
             strat.warnings.append('LLM strategy was normalized to enforce policy constraints.')
-        if not strat.attempts: raise ValueError("Policy engine produced no valid attempts")
+        if not strat.attempts:
+            reason="Policy engine produced no valid attempts"
+            _write_controller_error(Path(out_path).parent if out_path else None, "policy", policy_backend, "ExecutionStrategy", result, validation_error=reason, normalized_payload=normalized)
+            strat=build_deterministic_fallback_strategy(classification, backends, profile, reason)
         if out_path: Path(out_path).write_text(strat.model_dump_json(indent=2))
         return strat, result

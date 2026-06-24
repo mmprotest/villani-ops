@@ -25,6 +25,10 @@ class TaskClassifier:
         backend=self.select_backend(backends); repo=Path(task.repo_path).resolve()
         context={"objective":task.objective,"success_criteria":task.success_criteria,"constraints":task.constraints,"repo":_repo_context(repo)}
         result=self.client.complete_json(backend, SYSTEM, USER.format(context=json.dumps(context, indent=2)), 'TaskClassification')
-        cls=TaskClassification.model_validate(result.parsed_json)
+        try:
+            cls=TaskClassification.model_validate(result.parsed_json)
+        except Exception as e:
+            setattr(e, 'llm_result', result); setattr(e, 'schema_name', 'TaskClassification'); setattr(e, 'backend', backend)
+            raise
         if out_path: Path(out_path).write_text(cls.model_dump_json(indent=2))
         return cls, result
