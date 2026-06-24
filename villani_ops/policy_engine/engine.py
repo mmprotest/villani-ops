@@ -34,10 +34,10 @@ def normalize_execution_strategy_payload(raw: dict, requested_profile: str) -> d
         payload["strategy_summary"]=payload.get("rationale") or payload.get("reasoning_summary") or ""
     return payload
 
-def _write_controller_error(run_dir: Path|None, phase: str, backend: Backend|None, schema: str, result: LLMCallResult|None, parse_error=None, validation_error=None, normalized_payload=None):
+def _write_controller_error(run_dir: Path|None, phase: str, backend: Backend|None, schema: str, result: LLMCallResult|None, parse_error=None, validation_error=None, normalized_payload=None, raw_payload=None, fallback_used=False, fallback_payload=None):
     if not run_dir: return
     d=Path(run_dir)/"controller_calls"; d.mkdir(parents=True, exist_ok=True)
-    data={"phase":phase,"backend":getattr(backend,"name",None),"schema":schema,"url":getattr(result,"url",None),"model":getattr(result,"model",getattr(backend,"model",None)),"max_tokens":getattr(result,"max_tokens",getattr(backend,"max_tokens",None)),"http_status":getattr(result,"http_status",None),"finish_reason":getattr(result,"finish_reason",None),"usage":getattr(result,"usage",{}) if result else {},"message_content":getattr(result,"raw_text",None),"reasoning_content":getattr(result,"reasoning_content",None),"raw_response":getattr(result,"raw_response",{}) if result else {},"parse_error":parse_error,"validation_error":validation_error,"normalized_payload":normalized_payload or {}}
+    data={"phase":phase,"backend":getattr(backend,"name",None),"schema":schema,"url":getattr(result,"url",None),"model":getattr(result,"model",getattr(backend,"model",None)),"max_tokens":getattr(result,"max_tokens",getattr(backend,"max_tokens",None)),"http_status":getattr(result,"http_status",None),"finish_reason":getattr(result,"finish_reason",None),"usage":getattr(result,"usage",{}) if result else {},"message_content":getattr(result,"raw_text",None),"reasoning_content":getattr(result,"reasoning_content",None),"raw_response":getattr(result,"raw_response",{}) if result else {},"parse_error":parse_error,"validation_error":validation_error,"raw_payload":raw_payload if raw_payload is not None else (getattr(result,"parsed_json",{}) if result else {}),"normalized_payload":normalized_payload or {},"fallback_used":fallback_used,"fallback_payload":fallback_payload or {}}
     (d/f"{phase}_error.json").write_text(json.dumps(data, indent=2, default=str))
 
 def build_deterministic_fallback_strategy(classification: TaskClassification, backends: dict[str, Backend], profile: str, reason: str) -> ExecutionStrategy:
@@ -112,7 +112,7 @@ class PolicyEngine:
 
         def est(b):
             budget=b.max_tokens or 8000
-            mult={'easy':0.5,'medium':1.0,'hard':1.5,'very_hard':2.0}.get(classification.difficulty,1.0)
+            mult={'easy':0.5,'medium':1.0,'hard':1.5}.get(classification.difficulty,1.0)
             return b.estimate_cost(int(budget*mult), int(budget*0.35*mult))
         rankings=[]
         for b in coding:
@@ -126,7 +126,7 @@ class PolicyEngine:
         # deterministic profile guardrails
         cheapest=sorted(coding, key=lambda b:(b.estimate_cost(1000,1000), b.output_cost_per_million, b.input_cost_per_million, -b.capability_score))[0]
         highest=sorted(coding, key=lambda b:(-b.capability_score, b.output_cost_per_million, b.name))[0]
-        hard = classification.difficulty in {'hard','very_hard'} or classification.risk in {'high','critical'}
+        hard = classification.difficulty == 'hard' or classification.risk == 'high'
         easy = classification.difficulty in {'easy'} and classification.risk in {'low'}
         if profile=='cheap' and easy:
             kept=[StrategyAttempt(backend=cheapest.name, max_attempts=1, reason='Normalized cheap easy/low-risk profile to cheapest backend only.')]
