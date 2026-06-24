@@ -12,7 +12,7 @@ from .prompts import SYSTEM, USER
 class StrategyAttempt(BaseModel):
     backend: str; runner: str='villani_code'; max_attempts:int=1; timeout_seconds:int=1200; reason:str=''
 class ExecutionStrategy(BaseModel):
-    profile: str; strategy_summary: str=''; attempts: list[StrategyAttempt]=Field(default_factory=list); stop_conditions: dict[str, Any]=Field(default_factory=dict); escalation_rules:list[dict[str,Any]]=Field(default_factory=list); cost_risk_summary:str=''; warnings: list[str]=Field(default_factory=list)
+    profile: str; strategy_summary: str=''; attempts: list[StrategyAttempt]=Field(default_factory=list); stop_conditions: dict[str, Any]=Field(default_factory=dict); escalation_rules:list[dict[str,Any]]=Field(default_factory=list); cost_risk_summary:str=''; warnings: list[str]=Field(default_factory=list); backend_rankings: list[dict[str, Any]]=Field(default_factory=list)
 
 class PolicyEngine:
     def __init__(self, client: LLMClient|None=None): self.client=client or LLMClient()
@@ -38,6 +38,20 @@ class PolicyEngine:
                 warnings.append(f'LLM strategy was truncated to max {max_total} total attempts for {profile}.')
                 break
             a.max_attempts=max(1, min(a.max_attempts, max_total-total)); total += a.max_attempts; kept.append(a)
+
+        def est(b):
+            budget=b.max_tokens or 8000
+            mult={'easy':0.5,'medium':1.0,'hard':1.5,'very_hard':2.0}.get(classification.difficulty,1.0)
+            return b.estimate_cost(int(budget*mult), int(budget*0.35*mult))
+        rankings=[]
+        for b in coding:
+            c=max(est(b), 0.000001); cap=max(b.capability_score,1)
+            if profile=='cheap': key=(c, -cap)
+            elif profile=='quality': key=(-cap, c)
+            else: key=(-(cap/c), c)
+            rankings.append((key, {'backend':b.name,'capability_score':b.capability_score,'estimated_attempt_cost':round(c,6),'expected_cost_rank':0,'rank_reason':f'{profile} policy ranking using capability {b.capability_score} and estimated attempt cost ${c:.6f}'}))
+        rankings=[r for _,r in sorted(rankings, key=lambda x:x[0])]
+        for i,r in enumerate(rankings,1): r['expected_cost_rank']=i
         # deterministic profile guardrails
         cheapest=sorted(coding, key=lambda b:(b.estimate_cost(1000,1000), b.output_cost_per_million, b.input_cost_per_million, -b.capability_score))[0]
         highest=sorted(coding, key=lambda b:(-b.capability_score, b.output_cost_per_million, b.name))[0]
@@ -66,7 +80,7 @@ class PolicyEngine:
             if a.backend not in valid_by_name: continue
             if total>=max_total: break
             a.max_attempts=max(1, min(a.max_attempts, max_total-total)); total+=a.max_attempts; final.append(a)
-        strat.attempts=final; strat.profile=profile; strat.warnings.extend(warnings)
+        strat.attempts=final; strat.profile=profile; strat.backend_rankings=rankings; strat.warnings.extend(warnings)
         if original != [a.backend for a in strat.attempts] and not warnings:
             strat.warnings.append('LLM strategy was normalized to enforce policy constraints.')
         if not strat.attempts: raise ValueError("Policy engine produced no valid attempts")

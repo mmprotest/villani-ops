@@ -26,6 +26,13 @@ class Decision(BaseModel):
     warnings: list[str] = Field(default_factory=list)
     apply_options: dict[str, Any] = Field(default_factory=dict)
     decision_steps: list[dict[str, Any]] = Field(default_factory=list)
+    controller_steps: list[dict[str, Any]] = Field(default_factory=list)
+    failure_reason: str = ''
+    acceptance_blockers: list[str] = Field(default_factory=list)
+    retries_used: int = 0
+    escalations_used: int = 0
+    attempts_used: int = 0
+    all_attempted_backends: list[str | None] = Field(default_factory=list)
     reason: str = ''
     total_attempts: int = 0
     discarded_attempts: list[dict] = Field(default_factory=list)

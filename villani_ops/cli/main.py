@@ -157,7 +157,7 @@ def branch(run_id: str, name: str=typer.Option(...), commit: bool=False, force: 
     console.print(f'Created branch {name}')
 
 @app.command()
-def pr(run_id: str, title: str=typer.Option(...), body: str=typer.Option(''), branch: str|None=None, no_push: bool=False, force: bool=False, force_branch: bool=False, workspace: str='.villani-ops'):
+def pr(run_id: str, title: str=typer.Option(...), body: str=typer.Option(''), branch: str|None=None, no_push: bool=False, prepare_branch: bool=typer.Option(False, '--prepare-branch'), force: bool=False, force_branch: bool=False, workspace: str='.villani-ops'):
     from datetime import datetime, timezone
     from villani_ops.git_ops import safe_apply, resolve_accepted, manual_pr_commands
     s=storage(workspace); run_dir=_run_dir_for(s, run_id); run_id=run_dir.name
@@ -168,24 +168,24 @@ def pr(run_id: str, title: str=typer.Option(...), body: str=typer.Option(''), br
     branch_name=branch or d.get('winning_branch') or f'villani-ops/{run_id}'
     manual=manual_pr_commands(branch_name,title,body)
     gh=shutil.which('gh')
-    if not gh and not no_push:
-        art={'attempted':True,'gh_available':False,'branch':branch_name,'title':title,'body':body,'push_skipped':False,'exit_code':127,'stdout':'','stderr':'gh CLI is unavailable','url':None,'manual_commands':manual,'created_at':datetime.now(timezone.utc).isoformat()}
-        (run_dir/'pr.json').write_text(json.dumps(art, indent=2)); console.print('gh not available. Run manually:\n'+'\n'.join(manual)); raise typer.Exit(1)
+    if not gh and not no_push and not prepare_branch:
+        art={'attempted':False,'gh_available':False,'branch':branch_name,'title':title,'body':body,'push_skipped':False,'exit_code':127,'stdout':'','stderr':'gh CLI is unavailable; no mutation performed without --prepare-branch','url':None,'manual_commands':manual,'created_at':datetime.now(timezone.utc).isoformat()}
+        (run_dir/'pr.json').write_text(json.dumps(art, indent=2)); console.print('gh not available; no mutation performed. Re-run with --prepare-branch or run manually:\n'+'\n'.join(manual)); raise typer.Exit(1)
     try:
         safe_apply(run_dir, branch=branch_name, commit=True, message=title, force=force, force_branch=force_branch, artifact_name='pr_apply.json')
     except Exception as e:
         art={'attempted':True,'gh_available':bool(gh),'branch':branch_name,'title':title,'body':body,'push_skipped':no_push,'exit_code':1,'stdout':'','stderr':str(e),'url':None,'manual_commands':manual,'created_at':datetime.now(timezone.utc).isoformat()}
         (run_dir/'pr.json').write_text(json.dumps(art, indent=2)); raise typer.BadParameter(str(e))
-    if no_push:
+    if no_push or (prepare_branch and not gh):
         art={'attempted':False,'gh_available':bool(gh),'branch':branch_name,'title':title,'body':body,'push_skipped':True,'exit_code':0,'stdout':'','stderr':'','url':None,'manual_commands':manual,'created_at':datetime.now(timezone.utc).isoformat()}
         (run_dir/'pr.json').write_text(json.dumps(art, indent=2)); console.print('\n'.join(manual)); return
     push=subprocess.run(['git','push','-u','origin',branch_name],cwd=repo,text=True,capture_output=True)
     if push.returncode!=0:
-        art={'attempted':True,'gh_available':True,'branch':branch_name,'title':title,'body':body,'push_skipped':False,'exit_code':push.returncode,'stdout':push.stdout,'stderr':push.stderr,'url':None,'manual_commands':manual,'created_at':datetime.now(timezone.utc).isoformat()}
+        art={'attempted':True,'gh_available':True,'branch':branch_name,'title':title,'body':body,'push_skipped':False,'commit_sha':subprocess.run(['git','rev-parse','HEAD'],cwd=repo,text=True,capture_output=True).stdout.strip(),'exit_code':push.returncode,'stdout':push.stdout,'stderr':push.stderr,'url':None,'manual_commands':manual,'created_at':datetime.now(timezone.utc).isoformat()}
         (run_dir/'pr.json').write_text(json.dumps(art, indent=2)); raise typer.Exit(push.returncode)
     proc=subprocess.run([gh,'pr','create','--title',title,'--body',body],cwd=repo,text=True,capture_output=True)
     out=_redact(proc.stdout); err=_redact(proc.stderr); url=next((l for l in out.splitlines() if l.startswith('http')), None)
-    art={'attempted':True,'gh_available':True,'branch':branch_name,'title':title,'body':body,'push_skipped':False,'exit_code':proc.returncode,'stdout':out,'stderr':err,'url':url,'manual_commands':manual,'created_at':datetime.now(timezone.utc).isoformat()}
+    art={'attempted':True,'gh_available':True,'branch':branch_name,'title':title,'body':body,'push_skipped':False,'commit_sha':subprocess.run(['git','rev-parse','HEAD'],cwd=repo,text=True,capture_output=True).stdout.strip(),'exit_code':proc.returncode,'stdout':out,'stderr':err,'url':url,'manual_commands':manual,'created_at':datetime.now(timezone.utc).isoformat()}
     (run_dir/'pr.json').write_text(json.dumps(art, indent=2))
     if proc.returncode!=0: raise typer.Exit(proc.returncode)
     console.print(out or 'PR created')
@@ -220,20 +220,31 @@ def compare(repo: str=typer.Option(...), tasks: str=typer.Option(...), policies:
                     err=str(e)
                 winner=getattr(d,'winning_attempt_id',None) if d else None
                 cls=(getattr(d,'classification',{}) or {}) if d else {}
-                results.append({'policy':pol,'task_id':td.get('id'),'run_id':getattr(d,'run_id','') if d else '','trial_index':trial,'accepted':getattr(d,'accepted',False) if d else False,'total_cost':getattr(d,'total_cost',0) if d else 0,'classification_cost':getattr(d,'classification_cost',0) if d else 0,'policy_cost':getattr(d,'policy_cost',0) if d else 0,'coding_cost':getattr(d,'coding_cost',0) if d else 0,'review_cost':getattr(d,'review_cost',0) if d else 0,'total_input_tokens':getattr(d,'total_input_tokens',0) if d else 0,'total_output_tokens':getattr(d,'total_output_tokens',0) if d else 0,'attempts_used':getattr(d,'total_attempts',0) if d else 0,'winning_backend': next((a.get('backend_name') for a in (getattr(d,'attempts',[]) if d else []) if a.get('attempt_id')==winner), None),'difficulty':cls.get('difficulty'),'category':cls.get('category'),'risk':cls.get('risk'),'reviewer_score':getattr(d,'reviewer_score',None) if d else None,'wall_time_seconds':__import__('time').time()-start_t,'failure_reason':err or ('' if getattr(d,'accepted',False) else getattr(d,'reason',''))})
+                results.append({'comparison_id':out_path.stem,'policy':pol,'task_id':td.get('id'),'run_id':getattr(d,'run_id','') if d else '','trial_index':trial,'accepted':getattr(d,'accepted',False) if d else False,'final_action':getattr(d,'final_action','fail') if d else 'fail','total_cost':getattr(d,'total_cost',0) if d else 0,'classification_cost':getattr(d,'classification_cost',0) if d else 0,'policy_cost':getattr(d,'policy_cost',0) if d else 0,'coding_cost':getattr(d,'coding_cost',0) if d else 0,'review_cost':getattr(d,'review_cost',0) if d else 0,'total_input_tokens':getattr(d,'total_input_tokens',0) if d else 0,'total_output_tokens':getattr(d,'total_output_tokens',0) if d else 0,'attempts_used':getattr(d,'attempts_used',getattr(d,'total_attempts',0)) if d else 0,'retries_used':getattr(d,'retries_used',0) if d else 0,'escalations_used':getattr(d,'escalations_used',0) if d else 0,'strategy_summary':((getattr(d,'execution_strategy',{}) or {}).get('strategy_summary','') if d else ''),'winning_backend': next((a.get('backend_name') for a in (getattr(d,'attempts',[]) if d else []) if a.get('attempt_id')==winner), None),'winning_model': next((a.get('model') for a in (getattr(d,'attempts',[]) if d else []) if a.get('attempt_id')==winner), None),'difficulty':cls.get('difficulty'),'category':cls.get('category'),'risk':cls.get('risk'),'reviewer_score':getattr(d,'reviewer_score',None) if d else None,'wall_time_seconds':__import__('time').time()-start_t,'report_path':(str(Path(s.workspace)/'runs'/getattr(d,'run_id','')/'report.md') if d else ''),'failure_reason':err or ('' if getattr(d,'accepted',False) else (getattr(d,'failure_reason','') or getattr(d,'reason','')))})
     after=subprocess.run(['git','rev-parse','HEAD'],cwd=Path(repo),text=True,capture_output=True).stdout.strip()
     if before and after and before!=after: raise typer.BadParameter('compare mutated source repo HEAD')
     json_path.write_text(json.dumps(results, indent=2))
-    fields=['policy','task_id','run_id','trial_index','accepted','total_cost','classification_cost','policy_cost','coding_cost','review_cost','total_input_tokens','total_output_tokens','attempts_used','winning_backend','difficulty','category','risk','reviewer_score','wall_time_seconds','failure_reason']
+    fields=['comparison_id','task_id','trial_index','policy','run_id','accepted','final_action','failure_reason','difficulty','category','risk','strategy_summary','attempts_used','retries_used','escalations_used','winning_backend','winning_model','reviewer_score','total_cost','classification_cost','policy_cost','coding_cost','review_cost','total_input_tokens','total_output_tokens','wall_time_seconds','report_path']
     with csv_path.open('w', newline='') as f:
         w=csv.DictWriter(f, fieldnames=fields); w.writeheader(); w.writerows(results)
-    lines=['# Villani Ops Comparison','','| Policy | Tasks run | Accepted solves | Solve rate | Total cost | Cost per accepted solve | Tokens per accepted solve | Attempts per accepted solve | Median wall time | Average reviewer score |','| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |']
+    lines=['# Villani Ops Comparison','','| Policy | Tasks run | Accepted solves | Solve rate | Total cost | Cost per accepted solve | Tokens per accepted solve | Attempts per accepted solve | Retries per accepted solve | Escalations per accepted solve | Median wall time | Average reviewer score |','| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |']
     for pol in policies:
         rs=[r for r in results if r['policy']==pol]; n=len(rs); acc=[r for r in rs if r['accepted']]
-        total=sum(r['total_cost'] for r in rs); toks=sum(r['total_input_tokens']+r['total_output_tokens'] for r in rs); attempts=sum(r['attempts_used'] for r in rs)
-        cpa='N/A' if not acc else f"${total/len(acc):.6f}"; tpa='N/A' if not acc else f"{toks/len(acc):.1f}"; apa='N/A' if not acc else f"{attempts/len(acc):.1f}"
+        total=sum(r['total_cost'] for r in rs); toks=sum(r['total_input_tokens']+r['total_output_tokens'] for r in rs); attempts=sum(r['attempts_used'] for r in rs); retries=sum(r.get('retries_used',0) for r in rs); escalations=sum(r.get('escalations_used',0) for r in rs)
+        cpa='N/A' if not acc else f"${total/len(acc):.6f}"; tpa='N/A' if not acc else f"{toks/len(acc):.1f}"; apa='N/A' if not acc else f"{attempts/len(acc):.1f}"; rpa='N/A' if not acc else f"{retries/len(acc):.1f}"; epa='N/A' if not acc else f"{escalations/len(acc):.1f}"
         med=statistics.median([r['wall_time_seconds'] for r in rs]) if rs else 0; scores=[r['reviewer_score'] for r in rs if r['reviewer_score'] is not None]; avg=sum(scores)/len(scores) if scores else 0
-        lines.append(f"| {pol} | {n} | {len(acc)} | {(len(acc)/n*100 if n else 0):.1f}% | ${total:.6f} | {cpa} | {tpa} | {apa} | {med:.2f}s | {avg:.2f} |")
+        lines.append(f"| {pol} | {n} | {len(acc)} | {(len(acc)/n*100 if n else 0):.1f}% | ${total:.6f} | {cpa} | {tpa} | {apa} | {rpa} | {epa} | {med:.2f}s | {avg:.2f} |")
+    from collections import Counter
+    fail=Counter(r.get('failure_reason') or 'none' for r in results if not r.get('accepted'))
+    cat=Counter((r.get('category') or 'unknown') for r in results)
+    lines += ['', '## Failure reason breakdown'] + [f'- {k}: {v}' for k,v in fail.items()]
+    lines += ['', '## Category/difficulty breakdown'] + [f'- {k}: {v}' for k,v in cat.items()]
+    def pol_stats(name):
+        rs=[r for r in results if r['policy']==name]; acc=[r for r in rs if r['accepted']]; total=sum(r['total_cost'] for r in rs); return len(acc), len(rs), (total/len(acc) if acc else None)
+    cheap=pol_stats('cheap'); bal=pol_stats('balanced'); qual=pol_stats('quality')
+    bal_cost='N/A' if bal[2] is None else '${:.6f}'.format(bal[2])
+    qual_cost='N/A' if qual[2] is None else '${:.6f}'.format(qual[2])
+    lines += ['', '## Thesis signal', f'- Cheapest policy solve rate: {cheap[0]}/{cheap[1]}', f'- Quality policy solve rate: {qual[0]}/{qual[1]}', f'- Balanced policy cost per accepted solve: {bal_cost}', f'- Quality policy cost per accepted solve: {qual_cost}', f'Balanced solved {bal[0]}/{bal[1]} at {bal_cost} per accepted solve versus Quality solving {qual[0]}/{qual[1]} at {qual_cost} per accepted solve.']
     out_path.write_text('\n'.join(lines)+'\n')
     console.print(f'Wrote {out_path}, {csv_path}, {json_path}')
 
