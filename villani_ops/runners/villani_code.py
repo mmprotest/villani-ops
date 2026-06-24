@@ -4,6 +4,17 @@ from pathlib import Path
 from .base import RunnerContext, RunnerResult
 from .villani_code_debug import write_runner_telemetry
 
+def provider_for_villani_code_cli(provider: str) -> str:
+    normalized = (provider or "").strip().lower()
+    mapping = {
+        "openai-compatible": "openai",
+        "openai_compatible": "openai",
+        "openai compatible": "openai",
+        "openai": "openai",
+        "anthropic": "anthropic",
+    }
+    return mapping.get(normalized, provider)
+
 class VillaniCodeRunner:
     name='villani_code'
     def build_prompt(self, c: RunnerContext) -> str:
@@ -19,15 +30,24 @@ class VillaniCodeRunner:
             else:
                 return RunnerResult(exit_code=2, stderr=f"Backend '{context.backend.name}' has no resolved API key.")
         prompt=self.build_prompt(context); max_tokens=str(context.backend.max_tokens or 50000)
+        cli_provider=provider_for_villani_code_cli(context.backend.provider)
+        provider_warning=None
+        if (context.backend.provider or "").strip().lower() and cli_provider == context.backend.provider and cli_provider not in {"openai", "anthropic"}:
+            provider_warning=f"Unknown Villani Code CLI provider mapping for '{context.backend.provider}'; passing through unchanged."
         debug_dir = Path(context.run_dir) / 'villani_code_debug'
         debug_dir.mkdir(parents=True, exist_ok=True)
         telemetry_path = Path(context.run_dir) / 'runner_telemetry.json'
-        cmd=[command_name,'run',prompt,'--base-url',context.backend.base_url or '', '--model',context.backend.model,'--repo',context.repo_path,'--provider',context.backend.provider,'--api-key',api_key,'--auto-approve','--no-stream','--max-tokens',max_tokens,'--debug','trace','--debug-dir',str(debug_dir)]
+        cmd=[command_name,'run',prompt,'--base-url',context.backend.base_url or '', '--model',context.backend.model,'--repo',context.repo_path,'--provider',cli_provider,'--api-key',api_key,'--auto-approve','--no-stream','--max-tokens',max_tokens,'--debug','trace','--debug-dir',str(debug_dir)]
         red=[('***REDACTED***' if x==api_key else x) for x in cmd]
         Path(context.run_dir,'villani_code_command.json').write_text(json.dumps(red, indent=2))
         def _result(exit_code:int, stdout='', stderr=''):
             tel=write_runner_telemetry(debug_dir, telemetry_path, context.backend)
-            return RunnerResult(exit_code=exit_code, stdout=stdout or '', stderr=stderr or '', input_tokens=tel.input_tokens, output_tokens=tel.output_tokens, debug_artifact_dir=str(debug_dir), telemetry_path=str(telemetry_path), duration_ms=tel.duration_ms, model_requests=tel.model_requests, model_failures=tel.model_failures, total_tool_calls=tel.total_tool_calls, tool_calls_by_name=tel.tool_calls_by_name, total_file_reads=tel.total_file_reads, total_file_writes=tel.total_file_writes, commands_executed=tel.commands_executed, commands_failed=tel.commands_failed, first_substantive_file_read_tool_index=tel.first_substantive_file_read_tool_index, first_substantive_file_read_seconds=tel.first_substantive_file_read_seconds, first_file_mutation_tool_index=tel.first_file_mutation_tool_index, first_file_mutation_seconds=tel.first_file_mutation_seconds, first_command_tool_index=tel.first_command_tool_index, first_command_seconds=tel.first_command_seconds, token_accounting_status=tel.token_accounting_status, token_accounting_warnings=tel.token_accounting_warnings, telemetry=tel.model_dump(mode='json'))
+            warnings=list(tel.token_accounting_warnings)
+            telemetry=tel.model_dump(mode='json')
+            if provider_warning:
+                warnings.append(provider_warning)
+                telemetry.setdefault('token_accounting_warnings', []).append(provider_warning)
+            return RunnerResult(exit_code=exit_code, stdout=stdout or '', stderr=stderr or '', input_tokens=tel.input_tokens, output_tokens=tel.output_tokens, debug_artifact_dir=str(debug_dir), telemetry_path=str(telemetry_path), duration_ms=tel.duration_ms, model_requests=tel.model_requests, model_failures=tel.model_failures, total_tool_calls=tel.total_tool_calls, tool_calls_by_name=tel.tool_calls_by_name, total_file_reads=tel.total_file_reads, total_file_writes=tel.total_file_writes, commands_executed=tel.commands_executed, commands_failed=tel.commands_failed, first_substantive_file_read_tool_index=tel.first_substantive_file_read_tool_index, first_substantive_file_read_seconds=tel.first_substantive_file_read_seconds, first_file_mutation_tool_index=tel.first_file_mutation_tool_index, first_file_mutation_seconds=tel.first_file_mutation_seconds, first_command_tool_index=tel.first_command_tool_index, first_command_seconds=tel.first_command_seconds, token_accounting_status=tel.token_accounting_status, token_accounting_warnings=warnings, telemetry=telemetry)
         def _norm(x):
             if x is None: return ''
             if isinstance(x, bytes): return x.decode(errors='replace')

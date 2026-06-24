@@ -3,7 +3,7 @@ import os
 from typing import Any, Literal
 from pydantic import BaseModel, Field
 
-Provider = Literal["openai-compatible", "villani-code", "local", "custom"]
+Provider = Literal["openai-compatible", "openai", "anthropic", "villani-code", "local", "custom"]
 Role = Literal["coding", "classification", "review", "policy"]
 
 class Backend(BaseModel):
