@@ -113,9 +113,14 @@ class VillaniOps:
                     progress.info(f'Villani Code exited {result.exit_code} in {((result.duration_ms or 0)/1000):.1f}s')
                     coding_cost=backend.estimate_cost(result.input_tokens,result.output_tokens)
                     meta.update({'exit_code':result.exit_code,'stdout_path':str(adir/'stdout.log'),'stderr_path':str(adir/'stderr.log'),'debug_artifact_dir':result.debug_artifact_dir,'resolved_trace_dir':result.resolved_trace_dir,'telemetry_path':result.telemetry_path,'duration_ms':result.duration_ms,'input_tokens':result.input_tokens,'output_tokens':result.output_tokens,'total_tokens':result.input_tokens+result.output_tokens,'coding_cost':coding_cost,'model_requests':result.model_requests,'model_failures':result.model_failures,'total_tool_calls':result.total_tool_calls,'tool_calls_by_name':result.tool_calls_by_name,'total_file_reads':result.total_file_reads,'total_file_writes':result.total_file_writes,'commands_executed':result.commands_executed,'commands_failed':result.commands_failed,'first_substantive_file_read_tool_index':result.first_substantive_file_read_tool_index,'first_substantive_file_read_seconds':result.first_substantive_file_read_seconds,'first_file_mutation_tool_index':result.first_file_mutation_tool_index,'first_file_mutation_seconds':result.first_file_mutation_seconds,'first_command_tool_index':result.first_command_tool_index,'first_command_seconds':result.first_command_seconds,'token_accounting_status':result.token_accounting_status,'token_accounting_warnings':result.token_accounting_warnings,'runner_telemetry':result.telemetry})
-                    if result.token_accounting_status in {'missing','mismatch'}:
+                    if result.token_accounting_status == 'missing':
                         warnings.append(f'Attempt {attempt_id} has token_accounting_status={result.token_accounting_status}. Coding cost may be unreliable.')
                         progress.warning(f'token accounting missing for {attempt_id}')
+                    elif result.token_accounting_status == 'mismatch':
+                        warnings.append(f'Attempt {attempt_id} has token_accounting_status={result.token_accounting_status}. Coding cost may be unreliable.')
+                        progress.warning(f'token accounting mismatch for {attempt_id}; coding cost may be unreliable')
+                    elif result.token_accounting_status == 'summary_only':
+                        progress.warning(f'token accounting summary-only for {attempt_id}; model response usage was not available for verification')
                     else:
                         progress.info(f'Telemetry: {result.token_accounting_status}, input {result.input_tokens}, output {result.output_tokens}, cost ${coding_cost:.6f}')
                     cap=capture_worktree(wt['worktree_path'], adir); meta.update(cap)
