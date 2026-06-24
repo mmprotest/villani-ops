@@ -11,33 +11,164 @@ from .prompts import SYSTEM, USER
 
 
 
+
+def _first_string(mapping: dict, keys: tuple[str, ...]) -> str | None:
+    for key in keys:
+        value=mapping.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _coerce_int(value: Any, default: int) -> int:
+    try:
+        if isinstance(value, bool):
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _clamp(value: int, low: int, high: int) -> int:
+    return max(low, min(value, high))
+
+
+_BACKEND_ALIASES=("backend", "assigned_backend", "backend_name", "model_backend", "model", "model_name", "backend_id", "name")
+_RUNNER_ALIASES=("runner", "runner_name", "runner_type", "agent", "tool", "executor")
+_MAX_ATTEMPT_ALIASES=("max_attempts", "attempts", "num_attempts", "n_attempts", "retries", "max_retries", "tries")
+_TIMEOUT_ALIASES=("timeout_seconds", "timeout", "max_seconds", "time_limit_seconds", "agent_time_limit_seconds")
+_REASON_ALIASES=("reason", "rationale", "instructions", "description", "summary", "why", "phase", "name")
+_ATTEMPT_SOURCES=("attempts", "planned_attempts", "plan", "steps", "execution_steps", "execution_plan", "phases", "execution_phases", "backend_order", "backend_sequence", "model_sequence", "backend_plan")
+_SEQUENCE_SOURCES=("backend_order", "backend_sequence", "model_sequence", "backend_plan")
+_PLANNING_FIELDS=("backend_sequence", "backend_order", "execution_phases", "phases", "steps", "execution_plan", "planned_attempts", "plan", "execution_steps", "model_sequence", "backend_plan")
+
+
+def normalize_attempt_payload(raw_attempt: dict | str, default_reason: str = "") -> dict:
+    """Normalize one local-model attempt/phase/sequence item into StrategyAttempt shape."""
+    if isinstance(raw_attempt, str):
+        backend=raw_attempt.strip()
+        return {"backend": backend, "runner": "villani_code", "max_attempts": 1, "timeout_seconds": 1200, "reason": default_reason} if backend else {}
+    if not isinstance(raw_attempt, dict):
+        return {}
+    backend=_first_string(raw_attempt, _BACKEND_ALIASES)
+    if not backend:
+        return {}
+    runner=_first_string(raw_attempt, _RUNNER_ALIASES) or "villani_code"
+    max_attempts=1
+    for key in _MAX_ATTEMPT_ALIASES:
+        if key in raw_attempt:
+            max_attempts=_coerce_int(raw_attempt.get(key), 1)
+            break
+    timeout=1200
+    for key in _TIMEOUT_ALIASES:
+        if key in raw_attempt:
+            timeout=_coerce_int(raw_attempt.get(key), 1200)
+            break
+    reason=_first_string(raw_attempt, _REASON_ALIASES) or default_reason or "Normalized local-model policy attempt."
+    return {"backend": backend.strip(), "runner": runner.strip() or "villani_code", "max_attempts": _clamp(max_attempts, 1, 3), "timeout_seconds": max(1, timeout), "reason": reason}
+
+
+def _normalize_attempt_list(value: Any, default_reason: str) -> list[dict]:
+    if isinstance(value, list):
+        return [a for item in value if (a:=normalize_attempt_payload(item, default_reason))]
+    if isinstance(value, dict):
+        if isinstance(value.get("attempts"), list):
+            return _normalize_attempt_list(value.get("attempts"), default_reason)
+        return [a for a in [normalize_attempt_payload(value, default_reason)] if a]
+    if isinstance(value, str):
+        return [a for a in [normalize_attempt_payload(value, default_reason)] if a]
+    return []
+
+
+def _trim_attempt_budget(attempts: list[dict], requested_profile: str) -> list[dict]:
+    max_total=DEFAULT_PROFILES.get(requested_profile, {}).get("max_total_attempts", 3)
+    trimmed=[]; total=0
+    for attempt in attempts:
+        backend=str(attempt.get("backend", "")).strip()
+        if not backend or total >= max_total:
+            continue
+        attempt=dict(attempt); attempt["backend"]=backend
+        allowed=max_total-total
+        attempt["max_attempts"]=_clamp(_coerce_int(attempt.get("max_attempts"), 1), 1, min(3, allowed))
+        total += attempt["max_attempts"]
+        trimmed.append(attempt)
+    return trimmed
+
+
 def normalize_execution_strategy_payload(raw: dict, requested_profile: str) -> dict:
     payload=dict(raw or {})
-    hint=payload.get("profile") or payload.get("strategy_name") or payload.get("policy") or payload.get("selected_profile") or payload.get("profile_name")
-    if hint is not None:
-        payload["_model_profile_hint"]=hint
-    for alias in ("strategy_name", "policy", "selected_profile", "profile_name"):
+    hint=payload.get("profile") or payload.get("strategy_name") or payload.get("strategy_id") or payload.get("policy") or payload.get("selected_profile") or payload.get("profile_name") or payload.get("mode")
+    for alias in ("strategy_name", "strategy_id", "policy", "selected_profile", "profile_name", "mode"):
         payload.pop(alias, None)
     payload["profile"]=requested_profile
-    if "planned_attempts" in payload and "attempts" not in payload:
-        payload["attempts"]=payload["planned_attempts"]
-    if "planned_attempts" not in payload and "attempts" in payload:
-        payload["planned_attempts"]=payload["attempts"]
-    if "attempts" not in payload and payload.get("backend_order"):
-        payload["attempts"]=[{"backend": b, "max_attempts": 1, "reason": "Created from backend_order."} for b in payload["backend_order"]]
-    if "stop_conditions" not in payload:
-        payload["stop_conditions"]={}
-    if "stop_condition" not in payload:
-        payload["stop_condition"]="first_accepted"
-    payload.setdefault("warnings", [])
-    if "strategy_summary" not in payload:
-        payload["strategy_summary"]=payload.get("rationale") or payload.get("reasoning_summary") or ""
+
+    attempts=[]
+    canonical_field="attempts"
+    # Prefer the schema-native field when present, then planned_attempts, then rich phases, then sequences.
+    if isinstance(payload.get("attempts"), list):
+        attempts=_normalize_attempt_list(payload.get("attempts"), "Created from attempts.")
+    elif isinstance(payload.get("planned_attempts"), list):
+        attempts=_normalize_attempt_list(payload.get("planned_attempts"), "Created from planned_attempts.")
+    if not attempts:
+        for source in ("execution_phases", "phases", "steps", "execution_steps", "execution_plan", "plan"):
+            if source in payload:
+                attempts=_normalize_attempt_list(payload.get(source), f"Created from {source}.")
+                if attempts:
+                    break
+    if not attempts:
+        for source in _SEQUENCE_SOURCES:
+            if source in payload:
+                attempts=_normalize_attempt_list(payload.get(source), f"Created from {source}.")
+                if attempts:
+                    break
+    attempts=_trim_attempt_budget(attempts, requested_profile)
+    payload[canonical_field]=attempts
+    payload.pop("planned_attempts", None)
+
+    if any(field in (raw or {}) for field in _PLANNING_FIELDS) and not attempts:
+        payload["_normalization_error"]="Policy response contained planning fields but no attempts could be normalized."
+
+    stop=None
+    for key in ("stop_conditions", "stop_condition", "termination_conditions", "termination", "exit_conditions", "success_criteria"):
+        if key in payload:
+            stop=payload.get(key); break
+    if isinstance(stop, dict):
+        mode=stop.get("mode") or ("first_accepted" if stop.get("stop_on_success", True) else None) or "first_accepted"
+        payload["stop_conditions"]={"mode": mode}
+    elif isinstance(stop, str) and stop.strip():
+        payload["stop_conditions"]={"mode": stop.strip()}
+    else:
+        payload["stop_conditions"]={"mode":"first_accepted"}
+    for key in ("stop_condition", "termination_conditions", "termination", "exit_conditions", "success_criteria"):
+        payload.pop(key, None)
+
+    warnings=payload.get("warnings", [])
+    if isinstance(warnings, str): warnings=[warnings]
+    if not isinstance(warnings, list): warnings=[]
+    for key in ("risks", "caveats", "notes", "concerns"):
+        val=payload.get(key)
+        if isinstance(val, str) and val.strip(): warnings.append(val.strip())
+        elif isinstance(val, list): warnings.extend(str(x).strip() for x in val if str(x).strip())
+    payload["warnings"]=warnings
+
+    if not payload.get("strategy_summary"):
+        for key in ("summary", "reasoning_summary", "rationale"):
+            if isinstance(payload.get(key), str) and payload[key].strip():
+                payload["strategy_summary"]=payload[key].strip(); break
+        else:
+            payload["strategy_summary"]=str(hint).strip() if hint else "Normalized local-model policy strategy."
+
+    if "backend_rankings" not in payload:
+        for key in ("ranked_backends", "backend_scores", "ranking", "rankings"):
+            if key in payload:
+                payload["backend_rankings"]=payload.get(key); break
+    payload.setdefault("backend_rankings", [])
     return payload
 
-def _write_controller_error(run_dir: Path|None, phase: str, backend: Backend|None, schema: str, result: LLMCallResult|None, parse_error=None, validation_error=None, normalized_payload=None, raw_payload=None, fallback_used=False, fallback_payload=None):
+def _write_controller_error(run_dir: Path|None, phase: str, backend: Backend|None, schema: str, result: LLMCallResult|None, parse_error=None, validation_error=None, normalized_payload=None, raw_payload=None, fallback_used=False, fallback_payload=None, fallback_reason=None):
     if not run_dir: return
     d=Path(run_dir)/"controller_calls"; d.mkdir(parents=True, exist_ok=True)
-    data={"phase":phase,"backend":getattr(backend,"name",None),"schema":schema,"url":getattr(result,"url",None),"model":getattr(result,"model",getattr(backend,"model",None)),"max_tokens":getattr(result,"max_tokens",getattr(backend,"max_tokens",None)),"http_status":getattr(result,"http_status",None),"finish_reason":getattr(result,"finish_reason",None),"usage":getattr(result,"usage",{}) if result else {},"message_content":getattr(result,"raw_text",None),"reasoning_content":getattr(result,"reasoning_content",None),"raw_response":getattr(result,"raw_response",{}) if result else {},"parse_error":parse_error,"validation_error":validation_error,"raw_payload":raw_payload if raw_payload is not None else (getattr(result,"parsed_json",{}) if result else {}),"normalized_payload":normalized_payload or {},"fallback_used":fallback_used,"fallback_payload":fallback_payload or {}}
+    data={"phase":phase,"backend":getattr(backend,"name",None),"schema":schema,"url":getattr(result,"url",None),"model":getattr(result,"model",getattr(backend,"model",None)),"max_tokens":getattr(result,"max_tokens",getattr(backend,"max_tokens",None)),"http_status":getattr(result,"http_status",None),"finish_reason":getattr(result,"finish_reason",None),"usage":getattr(result,"usage",{}) if result else {},"message_content":getattr(result,"raw_text",None),"reasoning_content":getattr(result,"reasoning_content",None),"raw_response":getattr(result,"raw_response",{}) if result else {},"parse_error":parse_error,"validation_error":validation_error,"raw_payload":raw_payload if raw_payload is not None else (getattr(result,"parsed_json",{}) if result else {}),"normalized_payload":normalized_payload or {},"fallback_used":fallback_used,"fallback_reason":fallback_reason or (validation_error or parse_error if fallback_used else None),"fallback_payload":fallback_payload or {}}
     (d/f"{phase}_error.json").write_text(json.dumps(data, indent=2, default=str))
 
 def build_deterministic_fallback_strategy(classification: TaskClassification, backends: dict[str, Backend], profile: str, reason: str) -> ExecutionStrategy:
@@ -82,17 +213,23 @@ class PolicyEngine:
         try:
             result=self.client.complete_json(policy_backend, SYSTEM, USER.format(context=json.dumps(ctx, indent=2)), 'ExecutionStrategy')
         except LLMCallError as e:
-            _write_controller_error(Path(out_path).parent if out_path else None, 'policy', policy_backend, 'ExecutionStrategy', e.result, parse_error=e.parse_error)
             strat=build_deterministic_fallback_strategy(classification, backends, profile, str(e))
+            _write_controller_error(Path(out_path).parent if out_path else None, 'policy', policy_backend, 'ExecutionStrategy', e.result, parse_error=e.parse_error, fallback_used=True, fallback_payload=strat.model_dump())
             if out_path: Path(out_path).write_text(strat.model_dump_json(indent=2))
             return strat, e.result or LLMCallResult(parsed_json={}, raw_text='', backend_name=policy_backend.name, model=policy_backend.model)
         normalized=normalize_execution_strategy_payload(result.parsed_json, profile)
+        if normalized.get("_normalization_error"):
+            reason=normalized["_normalization_error"]
+            strat=build_deterministic_fallback_strategy(classification, backends, profile, reason)
+            _write_controller_error(Path(out_path).parent if out_path else None, "policy", policy_backend, "ExecutionStrategy", result, validation_error=reason, normalized_payload=normalized, fallback_used=True, fallback_payload=strat.model_dump())
+            if out_path: Path(out_path).write_text(strat.model_dump_json(indent=2))
+            return strat, result
         try:
             strat=ExecutionStrategy.model_validate(normalized)
         except Exception as e:
             run_dir=Path(out_path).parent if out_path else None
-            _write_controller_error(run_dir, "policy", policy_backend, "ExecutionStrategy", result, validation_error=str(e), normalized_payload=normalized)
             strat=build_deterministic_fallback_strategy(classification, backends, profile, str(e))
+            _write_controller_error(run_dir, "policy", policy_backend, "ExecutionStrategy", result, validation_error=str(e), normalized_payload=normalized, fallback_used=True, fallback_payload=strat.model_dump())
             if out_path: Path(out_path).write_text(strat.model_dump_json(indent=2))
             return strat, result
         warnings=[]
@@ -156,7 +293,7 @@ class PolicyEngine:
             strat.warnings.append('LLM strategy was normalized to enforce policy constraints.')
         if not strat.attempts:
             reason="Policy engine produced no valid attempts"
-            _write_controller_error(Path(out_path).parent if out_path else None, "policy", policy_backend, "ExecutionStrategy", result, validation_error=reason, normalized_payload=normalized)
             strat=build_deterministic_fallback_strategy(classification, backends, profile, reason)
+            _write_controller_error(Path(out_path).parent if out_path else None, "policy", policy_backend, "ExecutionStrategy", result, validation_error=reason, normalized_payload=normalized, fallback_used=True, fallback_payload=strat.model_dump())
         if out_path: Path(out_path).write_text(strat.model_dump_json(indent=2))
         return strat, result
