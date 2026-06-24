@@ -3,14 +3,14 @@ from pathlib import Path
 import typer, json, subprocess, shutil, os, sys
 from rich.console import Console
 from rich.table import Table
-from villani_ops import VillaniOps
+from villani_ops import VillaniOps, CostPolicyVillaniOps
 from villani_ops.core.task import Task
 from villani_ops.core.backend import Backend
 from villani_ops.storage.files import FileStorage
 from villani_ops.policy_engine.defaults import DEFAULT_PROFILES
 from villani_ops.controller.progress import RunProgressReporter
 
-app=typer.Typer(help='Villani Ops: cost-aware AI coding operations.')
+app=typer.Typer(help='Villani Ops: CLI-only multi-agent performance orchestrator for coding tasks.')
 backend_app=typer.Typer(); task_app=typer.Typer(); policy_app=typer.Typer(); runner_app=typer.Typer()
 app.add_typer(backend_app,name='backend'); app.add_typer(task_app,name='task'); app.add_typer(policy_app,name='policy'); app.add_typer(runner_app,name='runner')
 console=Console()
@@ -79,22 +79,46 @@ def policy_create_default(name: str=typer.Option('balanced'), workspace: str='.v
     s=storage(workspace); s.init_workspace(); backends=s.load_backends(); attempts=[AttemptPlan(backend=b.name, max_attempts=1, timeout_seconds=900, runner='shell') for b in backends.values()]
     pol=Policy(name=name, attempts=attempts); path=s.workspace/'policies'/f'{name}.yaml'; pol.save(path); console.print(f'Created policy at {path}')
 
-@app.command()
-def run(repo: str|None=None, task: str|None=typer.Option(None,'--task'), task_id: str|None=None, policy: str='balanced', max_attempts: int|None=typer.Option(None, '--max-attempts', min=1, max=10), success_criteria: str|None=None, isolation: str='worktree', workspace: str='.villani-ops', legacy_yaml_policy: bool=False, human_approval: bool=typer.Option(False, '--human-approval/--no-human-approval'), non_interactive: bool=False):
+@app.command(context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
+def run(ctx: typer.Context, repo: str|None=None, task: str|None=typer.Option(None,'--task'), task_id: str|None=None, success_criteria: str|None=None, candidate_attempts: int=typer.Option(3, '--candidate-attempts', min=1, max=8), backend: list[str]|None=typer.Option(None, '--backend'), timeout_seconds: int|None=None, classify: bool=typer.Option(True, '--classify/--no-classify'), human_approval: bool=typer.Option(False, '--human-approval/--no-human-approval'), non_interactive: bool=False, workspace: str='.villani-ops'):
+    if '--policy' in ctx.args or any(a.startswith('--policy=') for a in ctx.args):
+        raise typer.BadParameter('Cost policies moved to villani-ops cost-run')
     s=storage(workspace)
     if task_id:
         data=json.loads((s.workspace/'tasks'/task_id/'task.json').read_text()); t=Task.model_validate(data); repo=t.repo_path
     else:
         if not repo or not task: raise typer.BadParameter('Provide --task-id or both --repo and --task')
         t=Task(repo_path=str(Path(repo).resolve()), objective=task, success_criteria=success_criteria)
+    result=VillaniOps(storage(workspace), progress_reporter=RunProgressReporter(True)).run(repo=repo, task=t, candidate_attempts=candidate_attempts, backend=backend, timeout_seconds=timeout_seconds, classify=classify, human_approval=human_approval, non_interactive=(non_interactive or not sys.stdin.isatty()))
+    d=result.decision
+    console.print(f"Result: {'ACCEPTED' if d.accepted else 'FAILED'}")
+    console.print('Mode: performance_orchestration')
+    console.print(f'Task: {t.objective}')
+    console.print(f"Candidate attempts requested/completed: {d.candidate_attempts_requested}/{d.candidate_attempts_completed}")
+    console.print(f"Winner: {d.winning_attempt_id or 'none'}")
+    console.print(f"Controller reason: {d.reason}")
+    console.print(f"Cost telemetry: total ${d.total_cost:.6f}")
+    if d.accepted:
+        console.print(f"Apply:\n  villani-ops apply {d.run_id}"); console.print(f"Branch:\n  villani-ops branch {d.run_id} --name villani-ops/{d.run_id}"); console.print(f"PR:\n  villani-ops pr {d.run_id} --title \"{(t.objective or 'Villani Ops changes')[:60]}\"")
+    else:
+        console.print(f"Failure reason: {d.failure_reason}")
+    console.print(f'Report: {result.report_path}')
 
+@app.command('cost-run')
+def cost_run(repo: str|None=None, task: str|None=typer.Option(None,'--task'), task_id: str|None=None, policy: str='balanced', max_attempts: int|None=typer.Option(None, '--max-attempts', min=1, max=10), success_criteria: str|None=None, isolation: str='worktree', workspace: str='.villani-ops', legacy_yaml_policy: bool=False, human_approval: bool=typer.Option(False, '--human-approval/--no-human-approval'), non_interactive: bool=False):
+    s=storage(workspace)
+    if task_id:
+        data=json.loads((s.workspace/'tasks'/task_id/'task.json').read_text()); t=Task.model_validate(data); repo=t.repo_path
+    else:
+        if not repo or not task: raise typer.BadParameter('Provide --task-id or both --repo and --task')
+        t=Task(repo_path=str(Path(repo).resolve()), objective=task, success_criteria=success_criteria)
     is_yaml = policy.endswith(('.yaml','.yml')) or Path(policy).suffix in {'.yaml','.yml'}
     if is_yaml:
         if not legacy_yaml_policy:
             raise typer.BadParameter('YAML policy files use legacy smoke-test mode. Re-run with --legacy-yaml-policy if you intentionally want that path. It does not provide LLM task validation.')
         result=_legacy_run(repo, t, policy, workspace)
     else:
-        result=VillaniOps(storage(workspace), progress_reporter=RunProgressReporter(True)).run(repo=repo, task=t, policy=policy, isolation=isolation, human_approval=human_approval, non_interactive=(non_interactive or not sys.stdin.isatty()), max_attempts=max_attempts)
+        result=CostPolicyVillaniOps(storage(workspace), progress_reporter=RunProgressReporter(True)).run(repo=repo, task=t, policy=policy, isolation=isolation, human_approval=human_approval, non_interactive=(non_interactive or not sys.stdin.isatty()), max_attempts=max_attempts)
     d=result.decision; strat=d.execution_strategy or {}; console.print(f"Result: {'ACCEPTED' if d.accepted else 'REJECTED' if (policy.endswith('.yaml') or '/' in policy) else 'FAILED'}"); console.print(f"Final state: {d.final_state}"); console.print(f"Final action: {d.final_action}"); console.print(f'Task: {t.objective}'); c=d.classification or {}; console.print(f"Classification: {c.get('difficulty')} {c.get('category')} {c.get('risk')}"); console.print(f"Policy: {policy}"); console.print(f"Max attempts: {strat.get('max_attempts') or len(strat.get('attempts',[]))}"); console.print(f"Planned attempts: {len(strat.get('attempts',[]))}"); console.print(f"Attempts used: {d.attempts_used}"); console.print(f"Retries used: {d.retries_used}"); console.print(f"Escalations used: {d.escalations_used}"); console.print(f"Human reviews requested/skipped: {d.human_reviews_requested}/{d.human_reviews_skipped}"); console.print(f"Winner: {d.winning_attempt_id or 'none'}"); console.print(f"Review: {d.reviewer_decision}, score {d.reviewer_score}"); console.print(f"Human override used: {d.human_override_used}"); console.print(f"Controller reason: {d.reason}"); console.print(f"Cost: total ${d.total_cost:.6f}"); console.print('Evidence:'); [console.print(f'  - {e}') for e in d.reviewer_evidence]
     if d.accepted:
         console.print(f"Apply:\n  villani-ops apply {d.run_id}"); console.print(f"Branch:\n  villani-ops branch {d.run_id} --name villani-ops/{d.run_id}"); console.print(f"PR:\n  villani-ops pr {d.run_id} --title \"{(t.objective or 'Villani Ops changes')[:60]}\"")
@@ -102,7 +126,6 @@ def run(repo: str|None=None, task: str|None=typer.Option(None,'--task'), task_id
         console.print(f"Failure reason: {d.failure_reason}")
         console.print(f"Best failed attempt: {(d.attempts[-1] or {}).get('attempt_id') if d.attempts else 'none'}")
     console.print(f'Report: {result.report_path}')
-
 
 
 
@@ -222,7 +245,7 @@ def compare(repo: str=typer.Option(...), tasks: str=typer.Option(...), policies:
                 t=Task(task_id=td.get('id') or None, repo_path=str(Path(repo).resolve()), objective=td.get('objective'), success_criteria=td.get('success_criteria'))
                 start_t=__import__('time').time(); d=None; err=''
                 try:
-                    rr=VillaniOps.from_workspace(s.workspace).run(repo=repo, task=t, policy=pol, non_interactive=non_interactive, max_attempts=max_attempts)
+                    rr=CostPolicyVillaniOps.from_workspace(s.workspace).run(repo=repo, task=t, policy=pol, non_interactive=non_interactive, max_attempts=max_attempts)
                     d=rr.decision
                 except Exception as e:
                     err=str(e)

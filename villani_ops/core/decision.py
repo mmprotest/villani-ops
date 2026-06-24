@@ -4,6 +4,15 @@ from pydantic import BaseModel, Field
 
 class Decision(BaseModel):
     run_id: str
+
+    mode: str = "performance"
+    investigation: dict[str, Any] | None = None
+    selection: dict[str, Any] | None = None
+    selected_attempt_id: str | None = None
+    candidate_attempts_requested: int = 0
+    candidate_attempts_completed: int = 0
+    eligible_candidate_attempts: list[str] = Field(default_factory=list)
+    orchestration_summary: str = ""
     accepted: bool = False
     lifecycle_completed: bool = False
     final_state: str = ''

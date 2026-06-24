@@ -4,7 +4,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 Provider = Literal["openai-compatible", "openai", "anthropic", "villani-code", "local", "custom"]
-Role = Literal["coding", "classification", "review", "policy"]
+Role = Literal["coding", "classification", "review", "policy", "investigation", "selection"]
 
 class Backend(BaseModel):
     name: str

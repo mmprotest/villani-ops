@@ -103,8 +103,8 @@ def test_cli_accepts_max_attempts_with_mocked_run(monkeypatch, tmp_path):
     def fake_run(self, **kwargs):
         assert kwargs['max_attempts'] == 4
         return type('R', (), {'decision':D(), 'report_path':'/tmp/report.md'})()
-    monkeypatch.setattr('villani_ops.controller.executor.VillaniOps.run', fake_run)
+    monkeypatch.setattr('villani_ops.cost_policy.executor.CostPolicyVillaniOps.run', fake_run)
     repo=tmp_path/'repo'; repo.mkdir(); (repo/'.git').mkdir()
-    res=CliRunner().invoke(app, ['run','--repo',str(repo),'--task','x','--policy','balanced','--max-attempts','4','--non-interactive'])
+    res=CliRunner().invoke(app, ['cost-run','--repo',str(repo),'--task','x','--policy','balanced','--max-attempts','4','--non-interactive'])
     assert res.exit_code == 0
     assert 'Max attempts: 4' in res.output

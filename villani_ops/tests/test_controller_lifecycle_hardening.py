@@ -1,7 +1,7 @@
 import json, os, stat, subprocess
 from pathlib import Path
 
-from villani_ops.controller.executor import VillaniOps
+from villani_ops.cost_policy.executor import CostPolicyVillaniOps as VillaniOps
 from villani_ops.controller.human_approval import TestHumanApprovalProvider, NonInteractiveHumanApprovalProvider
 from villani_ops.core.backend import Backend
 from villani_ops.core.task import Task, TaskClassification
