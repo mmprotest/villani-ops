@@ -5,6 +5,8 @@ from pydantic import BaseModel, Field
 class Decision(BaseModel):
     run_id: str
     accepted: bool = False
+    lifecycle_completed: bool = False
+    final_state: str = ''
     final_action: str = 'fail'
     winning_attempt_id: str | None = None
     winning_branch: str | None = None
@@ -32,6 +34,13 @@ class Decision(BaseModel):
     retries_used: int = 0
     escalations_used: int = 0
     attempts_used: int = 0
+    human_reviews_requested: int = 0
+    human_reviews_completed: int = 0
+    human_reviews_skipped: int = 0
+    human_override_used: bool = False
+    human_override_reasons: list[str] = Field(default_factory=list)
+    acceptance_blockers_before_override: list[str] = Field(default_factory=list)
+    acceptance_blockers_after_override: list[str] = Field(default_factory=list)
     all_attempted_backends: list[str | None] = Field(default_factory=list)
     reason: str = ''
     total_attempts: int = 0
