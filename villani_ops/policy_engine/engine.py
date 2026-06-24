@@ -198,13 +198,29 @@ def build_deterministic_fallback_strategy(classification: TaskClassification, ba
 
 class StrategyAttempt(BaseModel):
     backend: str; runner: str='villani_code'; max_attempts:int=1; timeout_seconds:int=1200; reason:str=''
+    estimated_solve_probability: float | None = None
+    estimated_attempt_cost: float | None = None
+    estimated_input_tokens: int | None = None
+    estimated_output_tokens: int | None = None
+    required_capability: int | None = None
+    capability_score: int | None = None
+    capability_gap: int | None = None
 class ExecutionStrategy(BaseModel):
     model_config = ConfigDict(extra="ignore")
     profile: str; strategy_summary: str=''; attempts: list[StrategyAttempt]=Field(default_factory=list); stop_conditions: dict[str, Any]=Field(default_factory=dict); escalation_rules:list[dict[str,Any]]=Field(default_factory=list); cost_risk_summary:str=''; warnings: list[str]=Field(default_factory=list); backend_rankings: list[dict[str, Any]]=Field(default_factory=list)
+    max_attempts: int | None = None
+    required_capability: int | None = None
+    planning_objective: str | None = None
+    deterministic_planner: bool = False
 
 class PolicyEngine:
     def __init__(self, client: LLMClient|None=None): self.client=client or LLMClient()
-    def generate(self, classification: TaskClassification, backends: dict[str, Backend], profile: str, out_path: str|Path|None=None) -> tuple[ExecutionStrategy, LLMCallResult]:
+    def generate(self, classification: TaskClassification, backends: dict[str, Backend], profile: str, out_path: str|Path|None=None, max_attempts: int|None=None) -> tuple[ExecutionStrategy, LLMCallResult]:
+        from villani_ops.policy_engine.planner import plan_execution_strategy, deterministic_policy_call
+        if type(self.client) is LLMClient:
+            strat=plan_execution_strategy(backends, classification, profile, max_attempts=max_attempts)
+            if out_path: Path(out_path).write_text(strat.model_dump_json(indent=2))
+            return strat, deterministic_policy_call()
         if profile not in DEFAULT_PROFILES: raise ValueError(f"Unknown policy profile '{profile}'")
         policy_backend=select_backend(backends,'policy'); coding=coding_backends(backends)
         if not coding: raise ValueError("No enabled coding backends configured.")
