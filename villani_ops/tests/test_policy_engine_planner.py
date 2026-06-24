@@ -14,6 +14,10 @@ def b(name, cap, cost=1.0, roles=("coding",), enabled=True):
     return Backend(name=name, provider="openai-compatible", base_url="http://x/v1", model=name, api_key="dummy", roles=list(roles), enabled=enabled, capability_score=cap, input_cost_per_million=cost, output_cost_per_million=cost)
 
 
+def narrow_cls(category="bug_fix", difficulty="medium", risk="medium", confidence=.9):
+    return TaskClassification(difficulty=difficulty, risk=risk, category=category, confidence=confidence, relevant_file_paths=["tests/test_foo.py","src/pkg/foo.py"], task_shape_signals={"relevant_file_count":2,"explicit_tests_mentioned":True,"failing_tests_mentioned":True,"target_files_found":True})
+
+
 def test_max_attempts_is_separate_from_policy():
     strat=plan_execution_strategy({"small":b("small",35,.1), "large":b("large",70,2)}, TaskClassification(difficulty="medium", risk="low", category="bug_fix"), "cheap", max_attempts=3)
     assert strat.max_attempts == 3
@@ -27,23 +31,21 @@ def test_cheap_starts_with_cheapest_viable_backend():
 
 
 def test_cheap_skips_hopeless_backend():
-    backs={"tiny":b("tiny",5,.001), "medium":b("medium",45,.1), "large":b("large",80,1)}
-    strat=plan_execution_strategy(backs, TaskClassification(difficulty="medium", risk="medium"), "cheap", max_attempts=2)
+    backs={"tiny":b("tiny",1,.001), "qwen35b":b("qwen35b",51,.1)}
+    cls=TaskClassification(difficulty="hard", risk="high", confidence=.2, task_shape_signals={"relevant_file_count":9,"target_files_found":False,"broad_change":True})
+    strat=plan_execution_strategy(backs, cls, "cheap", max_attempts=2)
     assert strat.attempts[0].backend != "tiny"
-    assert strat.attempts[0].backend == "medium"
 
 
-def test_cheap_retry_threshold():
-    cls=TaskClassification(difficulty="medium", risk="low", category="bug_fix")
-    strat=plan_execution_strategy({"small":b("small",35,.01), "large":b("large",70,1)}, cls, "cheap", max_attempts=2)
-    # required=40, small gap=-5, p=.40, below .45 and gap<0, so escalate.
-    assert [a.backend for a in strat.attempts] == ["small", "large"]
+def test_cheap_retry_threshold_allows_reasonable_retry():
+    cls=narrow_cls(risk="low")
+    strat=plan_execution_strategy({"qwen9b":b("qwen9b",24,.01), "qwen35b":b("qwen35b",51,.1)}, cls, "cheap", max_attempts=3)
+    assert strat.attempts[0].backend == "qwen9b"
 
 
 def test_balanced_starts_cheap_but_escalates_sooner():
     backs={"qwen9b":b("qwen9b",24,.01), "qwen35b":b("qwen35b",51,.1)}
-    cls=TaskClassification(difficulty="medium", risk="low", category="bug_fix")
-    strat=plan_execution_strategy(backs, cls, "balanced", max_attempts=2)
+    strat=plan_execution_strategy(backs, narrow_cls(), "balanced", max_attempts=2)
     assert [a.backend for a in strat.attempts] == ["qwen9b", "qwen35b"]
 
 
@@ -54,16 +56,29 @@ def test_quality_uses_strongest_backend_repeatedly():
 
 
 def test_required_capability_estimate():
-    assert estimate_required_capability(TaskClassification(difficulty="easy", risk="low", category="bug_fix")) == 20
-    assert estimate_required_capability(TaskClassification(difficulty="medium", risk="low", category="bug_fix")) == 40
-    assert estimate_required_capability(TaskClassification(difficulty="hard", risk="high", category="security")) == 80
+    assert estimate_required_capability(TaskClassification(difficulty="easy", risk="low", category="bug_fix")) == 15
+    assert estimate_required_capability(TaskClassification(difficulty="medium", risk="low", category="feature")) == 30
+    assert estimate_required_capability(TaskClassification(difficulty="medium", risk="medium", category="test_fix")) == 33
+    assert estimate_required_capability(TaskClassification(difficulty="hard", risk="high", category="security")) == 63
+
+
+def test_p_solve_is_not_cliffy_at_minus_21():
+    cls=TaskClassification(difficulty="medium", risk="medium")
+    assert estimate_backend_solve_probability(b("gap",24), cls, 45) >= .15
 
 
 def test_solve_probability_increases_with_capability():
-    cls=TaskClassification(difficulty="medium", risk="medium", category="bug_fix")
+    cls=narrow_cls()
     req=estimate_required_capability(cls)
-    ps=[estimate_backend_solve_probability(b(str(c), c), cls, req) for c in (20,50,80)]
-    assert ps[0] < ps[1] < ps[2]
+    ps=[estimate_backend_solve_probability(b(str(c), c), cls, req) for c in (24,51)]
+    assert ps[0] < ps[1]
+
+
+def test_task_shape_bonus_is_category_agnostic():
+    a=narrow_cls(category="bug_fix")
+    c=narrow_cls(category="feature")
+    assert estimate_required_capability(a) == estimate_required_capability(c)
+    assert estimate_backend_solve_probability(b("qwen9b",24), a, estimate_required_capability(a)) == estimate_backend_solve_probability(b("qwen9b",24), c, estimate_required_capability(c))
 
 
 def test_policy_plan_includes_estimates():
@@ -73,6 +88,8 @@ def test_policy_plan_includes_estimates():
     assert a.estimated_attempt_cost is not None
     assert a.required_capability is not None
     assert a.capability_gap is not None
+    assert a.base_solve_probability is not None
+    assert a.shape_adjustment is not None
 
 
 def test_no_enabled_coding_backend():

@@ -11,6 +11,7 @@ required_capabilities must be an array of strings
 reasoning_summary must be a concise summary, not chain of thought
 confidence must be a number from 0 to 1
 Use medium, not moderate.
+Use repo.relevant_files content excerpts, when provided, to ground difficulty, risk, likely files, and confidence. Do not overestimate broadness when the relevant file context is narrow and explicit tests or validation paths are present.
 
 Schema keys: difficulty, category, risk, estimated_attempts_needed, needs_tests, likely_files, required_capabilities, reasoning_summary, confidence.
 

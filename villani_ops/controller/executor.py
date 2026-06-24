@@ -76,6 +76,10 @@ class VillaniOps:
         progress.info(f"Classification: {cls.difficulty} {cls.category} {cls.risk}, confidence {cls.confidence:.2f}")
         from villani_ops.policy_engine.planner import estimate_required_capability
         progress.info(f"Required capability estimate: {estimate_required_capability(cls)}")
+        if cls.adjustment_notes:
+            [progress.info(f"  {note}") for note in cls.adjustment_notes]
+        sig=cls.task_shape_signals or {}
+        progress.info(f"Task shape: relevant files {sig.get('relevant_file_count', len(cls.relevant_file_paths))}, explicit tests {'yes' if sig.get('explicit_tests_mentioned') else 'no'}, target files found {'yes' if sig.get('target_files_found') else 'no'}")
         progress.step("[2/6] Generating policy...")
         # policy
         recorder.transition(ControllerAction.generate_strategy, ControllerState.planning, 'Classification complete; generating strategy.')
@@ -95,9 +99,9 @@ class VillaniOps:
             progress.info(f"Planning objective: {strategy.planning_objective or strategy.strategy_summary}")
             progress.info('Backend rankings:')
             for r in strategy.backend_rankings:
-                progress.info(f"  {r.get('backend')}: capability {r.get('capability_score')}, estimated p_solve {r.get('estimated_solve_probability')}, estimated cost ${float(r.get('estimated_attempt_cost') or 0):.6f}, viable {'yes' if r.get('viable') else 'no'}")
+                progress.info(f"  {r.get('backend')}: capability {r.get('capability_score')}, capability gap {r.get('capability_gap')}, base p_solve {r.get('base_solve_probability')}, shape adjustment {r.get('shape_adjustment')}, final p_solve {r.get('final_solve_probability')}, estimated cost ${float(r.get('estimated_attempt_cost') or 0):.6f}, viable {'yes' if r.get('viable') else 'no'}")
             progress.info('Planned attempts:')
-            [progress.info(f'  attempt_{i+1:03d}: {a.backend}, p_solve {a.estimated_solve_probability}, estimated cost ${float(a.estimated_attempt_cost or 0):.6f}') for i,a in enumerate(strategy.attempts)]
+            [progress.info(f'  attempt_{i+1:03d}: {a.backend}, p_solve {a.estimated_solve_probability}, estimated cost ${float(a.estimated_attempt_cost or 0):.6f}, reason: {a.reason}') for i,a in enumerate(strategy.attempts)]
         except Exception as e:
             warnings.append(str(e)); recorder.transition(ControllerAction.fail, ControllerState.failed, f'Policy generation failed: {e}')
             decision_steps=[]; retries_used=escalations_used=0

@@ -199,6 +199,8 @@ def build_deterministic_fallback_strategy(classification: TaskClassification, ba
 class StrategyAttempt(BaseModel):
     backend: str; runner: str='villani_code'; max_attempts:int=1; timeout_seconds:int=1200; reason:str=''
     estimated_solve_probability: float | None = None
+    base_solve_probability: float | None = None
+    shape_adjustment: float | None = None
     estimated_attempt_cost: float | None = None
     estimated_input_tokens: int | None = None
     estimated_output_tokens: int | None = None
