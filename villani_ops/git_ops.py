@@ -42,14 +42,14 @@ def safe_apply(run_dir: Path, *, branch: str|None=None, commit: bool=False, mess
         d, repo, patch=resolve_accepted(run_dir)
         pre=_snapshot(repo, patch, d.get('winning_attempt_id'), branch)
         if dirty(repo) and not force: raise ValueError('Source repo is dirty; use --force')
+        chk=run_git(repo,['apply','--check',str(patch)])
+        stdout.append(chk.stdout); stderr.append(chk.stderr)
+        if chk.returncode!=0: raise RuntimeError('git apply --check failed; repository was not mutated: '+(chk.stderr.strip() or chk.stdout.strip()))
         if branch:
             if branch_exists(repo, branch):
                 if not force_branch: raise ValueError(f"Branch '{branch}' already exists; use --force-branch")
                 run_git(repo,['branch','-D',branch],check=True)
             p=run_git(repo,['checkout','-b',branch],check=True); stdout.append(p.stdout); stderr.append(p.stderr); created_branch=True; mutated=True
-        chk=run_git(repo,['apply','--check',str(patch)])
-        stdout.append(chk.stdout); stderr.append(chk.stderr)
-        if chk.returncode!=0: raise RuntimeError('git apply --check failed; repository was not mutated: '+(chk.stderr.strip() or chk.stdout.strip()))
         ap=run_git(repo,['apply',str(patch)],check=True); stdout.append(ap.stdout); stderr.append(ap.stderr); mutated=True
         if commit:
             run_git(repo,['add','.'],check=True)

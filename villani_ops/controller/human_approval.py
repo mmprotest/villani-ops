@@ -59,7 +59,7 @@ class TestHumanApprovalProvider:
         return HumanApprovalResult(requested=True, request_reasons=context.request_reasons, prompted=True, decision=self.decision, reason=self.reason, approved_by='test', valid_override=_valid(self.decision, context), shown_evidence=_shown(context))
 
 def _shown(c: HumanApprovalPromptContext) -> dict[str, Any]:
-    return {'patch_path':c.patch_path,'changed_files':c.changed_files,'reviewer_summary':c.review_summary,'reviewer_issues':c.review_issues,'acceptance_blockers':c.acceptance_blockers}
+    return {'patch_path':c.patch_path,'changed_files':c.changed_files,'reviewer_summary':c.review_summary,'reviewer_decision':c.review_decision,'reviewer_issues':c.review_issues,'acceptance_blockers':c.acceptance_blockers}
 
 def _valid(decision: str, c: HumanApprovalPromptContext) -> bool:
     return decision == 'accept' and bool(c.request_reasons) and bool(c.patch_path) and bool(c.changed_files)
