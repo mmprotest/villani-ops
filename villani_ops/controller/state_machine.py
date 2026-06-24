@@ -93,7 +93,7 @@ def decide_next_action(context: ControllerDecisionContext) -> ControllerActionDe
     eligible, blockers = is_attempt_acceptance_eligible(a, h)
     if h and h.decision != 'skipped':
         if h.decision == 'accept':
-            if h.valid_override or context.human_override_allowed:
+            if context.human_override_allowed:
                 return ControllerActionDecision(action=ControllerAction.accept, reason='Human accepted after legitimate approval request.', acceptance_eligible=True, acceptance_blockers=[], should_stop=True)
             return _retry_or_escalate_or_fail(context, 'Human accepted but override is not enabled; continuing safely.')
         if h.decision == 'reject':

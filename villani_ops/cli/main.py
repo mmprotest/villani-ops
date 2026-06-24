@@ -171,27 +171,28 @@ def pr(run_id: str, title: str=typer.Option(...), body: str=typer.Option(''), br
         d, repo, patch=resolve_accepted(run_dir)
     except Exception as e:
         raise typer.BadParameter(str(e))
-    branch_name=branch or d.get('winning_branch') or f'villani-ops/{run_id}'
+    branch_name=branch or f'villani-ops-pr/{run_id}'
     manual=manual_pr_commands(branch_name,title,body)
+    recovery=['Run git status before continuing.', f'Use manual commands for branch {branch_name} if needed.']
     gh=shutil.which('gh')
     if not gh and not no_push and not prepare_branch:
-        art={'attempted':False,'gh_available':False,'branch':branch_name,'title':title,'body':body,'push_skipped':False,'exit_code':127,'stdout':'','stderr':'gh CLI is unavailable; no mutation performed without --prepare-branch','url':None,'manual_commands':manual,'created_at':datetime.now(timezone.utc).isoformat()}
+        art={'attempted':False,'gh_available':False,'branch':branch_name,'title':title,'body':body,'push_skipped':False,'exit_code':127,'stdout':'','stderr':'gh CLI is unavailable; no mutation performed without --prepare-branch','url':None,'manual_commands':manual,'recovery_instructions':recovery,'created_at':datetime.now(timezone.utc).isoformat()}
         (run_dir/'pr.json').write_text(json.dumps(art, indent=2)); console.print('gh not available; no mutation performed. Re-run with --prepare-branch or run manually:\n'+'\n'.join(manual)); raise typer.Exit(1)
     try:
         safe_apply(run_dir, branch=branch_name, commit=True, message=title, force=force, force_branch=force_branch, artifact_name='pr_apply.json')
     except Exception as e:
-        art={'attempted':True,'gh_available':bool(gh),'branch':branch_name,'title':title,'body':body,'push_skipped':no_push,'exit_code':1,'stdout':'','stderr':str(e),'url':None,'manual_commands':manual,'created_at':datetime.now(timezone.utc).isoformat()}
+        art={'attempted':True,'gh_available':bool(gh),'branch':branch_name,'title':title,'body':body,'push_skipped':no_push,'exit_code':1,'stdout':'','stderr':str(e),'url':None,'manual_commands':manual,'recovery_instructions':recovery,'created_at':datetime.now(timezone.utc).isoformat()}
         (run_dir/'pr.json').write_text(json.dumps(art, indent=2)); raise typer.BadParameter(str(e))
     if no_push or (prepare_branch and not gh):
-        art={'attempted':False,'gh_available':bool(gh),'branch':branch_name,'title':title,'body':body,'push_skipped':True,'exit_code':0,'stdout':'','stderr':'','url':None,'manual_commands':manual,'created_at':datetime.now(timezone.utc).isoformat()}
+        art={'attempted':False,'gh_available':bool(gh),'branch':branch_name,'title':title,'body':body,'push_skipped':True,'commit_sha':subprocess.run(['git','rev-parse','HEAD'],cwd=repo,text=True,capture_output=True).stdout.strip(),'exit_code':0,'stdout':'','stderr':'','url':None,'manual_commands':manual,'recovery_instructions':recovery,'created_at':datetime.now(timezone.utc).isoformat()}
         (run_dir/'pr.json').write_text(json.dumps(art, indent=2)); console.print('\n'.join(manual)); return
     push=subprocess.run(['git','push','-u','origin',branch_name],cwd=repo,text=True,capture_output=True)
     if push.returncode!=0:
-        art={'attempted':True,'gh_available':True,'branch':branch_name,'title':title,'body':body,'push_skipped':False,'commit_sha':subprocess.run(['git','rev-parse','HEAD'],cwd=repo,text=True,capture_output=True).stdout.strip(),'exit_code':push.returncode,'stdout':push.stdout,'stderr':push.stderr,'url':None,'manual_commands':manual,'created_at':datetime.now(timezone.utc).isoformat()}
+        art={'attempted':True,'gh_available':True,'branch':branch_name,'title':title,'body':body,'push_skipped':False,'commit_sha':subprocess.run(['git','rev-parse','HEAD'],cwd=repo,text=True,capture_output=True).stdout.strip(),'exit_code':push.returncode,'stdout':push.stdout,'stderr':push.stderr,'url':None,'manual_commands':manual,'recovery_instructions':recovery,'created_at':datetime.now(timezone.utc).isoformat()}
         (run_dir/'pr.json').write_text(json.dumps(art, indent=2)); raise typer.Exit(push.returncode)
     proc=subprocess.run([gh,'pr','create','--title',title,'--body',body],cwd=repo,text=True,capture_output=True)
     out=_redact(proc.stdout); err=_redact(proc.stderr); url=next((l for l in out.splitlines() if l.startswith('http')), None)
-    art={'attempted':True,'gh_available':True,'branch':branch_name,'title':title,'body':body,'push_skipped':False,'commit_sha':subprocess.run(['git','rev-parse','HEAD'],cwd=repo,text=True,capture_output=True).stdout.strip(),'exit_code':proc.returncode,'stdout':out,'stderr':err,'url':url,'manual_commands':manual,'created_at':datetime.now(timezone.utc).isoformat()}
+    art={'attempted':True,'gh_available':True,'branch':branch_name,'title':title,'body':body,'push_skipped':False,'commit_sha':subprocess.run(['git','rev-parse','HEAD'],cwd=repo,text=True,capture_output=True).stdout.strip(),'exit_code':proc.returncode,'stdout':out,'stderr':err,'url':url,'manual_commands':manual,'recovery_instructions':recovery,'created_at':datetime.now(timezone.utc).isoformat()}
     (run_dir/'pr.json').write_text(json.dumps(art, indent=2))
     if proc.returncode!=0: raise typer.Exit(proc.returncode)
     console.print(out or 'PR created')
@@ -243,14 +244,15 @@ def compare(repo: str=typer.Option(...), tasks: str=typer.Option(...), policies:
     from collections import Counter
     fail=Counter(r.get('failure_reason') or 'none' for r in results if not r.get('accepted'))
     cat=Counter((r.get('category') or 'unknown') for r in results)
+    diff=Counter((r.get('difficulty') or 'unknown') for r in results)
     lines += ['', '## Failure reason breakdown'] + [f'- {k}: {v}' for k,v in fail.items()]
-    lines += ['', '## Category/difficulty breakdown'] + [f'- {k}: {v}' for k,v in cat.items()]
+    lines += ['', '## Category/difficulty breakdown'] + [f'- category {k}: {v}' for k,v in cat.items()] + [f'- difficulty {k}: {v}' for k,v in diff.items()]
     def pol_stats(name):
         rs=[r for r in results if r['policy']==name]; acc=[r for r in rs if r['accepted']]; total=sum(r['total_cost'] for r in rs); return len(acc), len(rs), (total/len(acc) if acc else None)
     cheap=pol_stats('cheap'); bal=pol_stats('balanced'); qual=pol_stats('quality')
     bal_cost='N/A' if bal[2] is None else '${:.6f}'.format(bal[2])
     qual_cost='N/A' if qual[2] is None else '${:.6f}'.format(qual[2])
-    lines += ['', '## Thesis signal', f'- Cheapest policy solve rate: {cheap[0]}/{cheap[1]}', f'- Quality policy solve rate: {qual[0]}/{qual[1]}', f'- Balanced policy cost per accepted solve: {bal_cost}', f'- Quality policy cost per accepted solve: {qual_cost}', f'Balanced solved {bal[0]}/{bal[1]} at {bal_cost} per accepted solve versus Quality solving {qual[0]}/{qual[1]} at {qual_cost} per accepted solve.']
+    lines += ['', '## Thesis Signal', f'- Cheapest policy solve rate: {cheap[0]}/{cheap[1]}', f'- Quality policy solve rate: {qual[0]}/{qual[1]}', f'- Balanced policy cost per accepted solve: {bal_cost}', f'- Quality policy cost per accepted solve: {qual_cost}', f'Balanced solved {bal[0]}/{bal[1]} at {bal_cost} per accepted solve versus Quality solving {qual[0]}/{qual[1]} at {qual_cost} per accepted solve.']
     out_path.write_text('\n'.join(lines)+'\n')
     console.print(f'Wrote {out_path}, {csv_path}, {json_path}')
 

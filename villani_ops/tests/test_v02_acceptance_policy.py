@@ -21,8 +21,10 @@ def test_acceptance_requires_successful_runner_and_passing_review():
     assert not is_attempt_acceptance_eligible(bad)[0]
     bad={**base,'review':{'passed':False,'decision':'uncertain','recommended_action':'ask_human'}}
     assert not is_attempt_acceptance_eligible(bad)[0]
-    human={**bad,'status':'human_approved','human_approval':{'decision':'accept'}}
-    assert is_attempt_acceptance_eligible(human)[0]
+    human={**bad,'status':'human_approved','patch_path':'diff.patch','changed_files':['hello.txt'],'human_approval':{'decision':'accept'}}
+    assert not is_attempt_acceptance_eligible(human)[0]
+    valid={**human,'human_approval':{'decision':'accept','valid_override':True,'requested':True,'prompted':True,'skipped_reason':None,'request_reasons':['reviewer_recommended_ask_human'],'shown_evidence':{'patch_path':'diff.patch','changed_files':['hello.txt'],'reviewer_decision':'uncertain','acceptance_blockers':['review decision is uncertain']}}}
+    assert is_attempt_acceptance_eligible(valid)[0]
 
 def _backend(name, roles=('coding',), cap=10, in_cost=1, out_cost=1, enabled=True):
     return Backend(name=name, provider='local', model=name, roles=list(roles), capability_score=cap, input_cost_per_million=in_cost, output_cost_per_million=out_cost, enabled=enabled)

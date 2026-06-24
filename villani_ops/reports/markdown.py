@@ -12,6 +12,7 @@ def write_markdown_report(run_dir, task, policy_or_strategy, attempts, decision,
     timeline="| Step | Attempt | From | Action | To | Reason |\\n| --- | --- | --- | --- | --- | --- |\\n" + (timeline_rows or "| none | | | | | |")
     rankings='\n'.join(f"- {r.get('expected_cost_rank')}. {r.get('backend')}: capability {r.get('capability_score')}, estimated ${r.get('estimated_attempt_cost')} — {r.get('rank_reason')}" for r in (strategy.get('backend_rankings') or [])) or '- none'
     blockers='\n'.join(f"- {b}" for b in (decision.acceptance_blockers or [])) or '- none'
+    human_override_blockers='\n'.join(f"- {b}" for b in (getattr(decision, 'human_override_blockers', []) or [])) or '- none'
     evidence='\n'.join(f"- {e}" for e in decision.reviewer_evidence) or '- none'
     warnings='\n'.join(f"- {w}" for w in decision.warnings) or '- none'
     changed='\n'.join(f"- {f}" for a in attempts for f in a.get('changed_files',[])) or '- none'
@@ -94,6 +95,11 @@ Escalations used: {decision.escalations_used}
 Human reviews requested/skipped: {decision.human_reviews_requested}/{decision.human_reviews_skipped}
 
 Human override used: {decision.human_override_used}
+
+human_override_used: {str(decision.human_override_used).lower()}
+
+Human override blockers:
+{human_override_blockers}
 
 Winner: {decision.winning_attempt_id or 'none'}
 

@@ -39,6 +39,7 @@ class Decision(BaseModel):
     human_reviews_skipped: int = 0
     human_override_used: bool = False
     human_override_reasons: list[str] = Field(default_factory=list)
+    human_override_blockers: list[str] = Field(default_factory=list)
     acceptance_blockers_before_override: list[str] = Field(default_factory=list)
     acceptance_blockers_after_override: list[str] = Field(default_factory=list)
     all_attempted_backends: list[str | None] = Field(default_factory=list)
