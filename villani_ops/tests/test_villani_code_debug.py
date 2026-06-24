@@ -59,3 +59,37 @@ def test_malformed_jsonl_does_not_crash(tmp_path):
     t=parse_villani_code_debug_artifact(tmp_path)
     assert t.input_tokens == 1
     assert t.token_accounting_warnings
+
+
+def test_parser_sorts_mixed_timezone_and_missing_timestamps_safely(tmp_path):
+    (tmp_path/'final_summary.json').write_text(json.dumps(summary(total_tool_calls=5, total_file_reads=1, total_file_writes=1)))
+    write_jsonl(tmp_path/'model_responses.jsonl',[{"usage":{"prompt_tokens":11532,"completion_tokens":7390,"total_tokens":18922}}])
+    write_jsonl(tmp_path/'tool_calls.jsonl',[
+        {"tool_name":"Ls","turn_index":3},
+        {"tool_name":"Read","started_at":"2026-06-22T19:19:13.100000+00:00","normalized_args_summary":{"file_path":"x.py"}},
+        {"tool_name":"Write","tool_category":"file_mutation","started_at":"2026-06-22T19:19:14.100000"},
+        {"tool_name":"Bash","tool_category":"command","turn_index":1,"args":{"command":"echo hi"}},
+        {"tool_name":"Shell","tool_category":"command","turn_index":1,"args":{"command":"echo bye"}},
+    ])
+    t=parse_villani_code_debug_artifact(tmp_path)
+    assert t.first_tool_call_index is not None
+    assert t.first_file_mutation_tool_index is not None
+    assert t.first_substantive_file_read_tool_index is not None
+    assert t.first_substantive_file_read_tool_index == 1
+    assert t.first_file_mutation_tool_index == 2
+    assert t.first_command_tool_index == 3
+
+
+def test_parser_treats_malformed_timestamps_like_missing_timestamps(tmp_path):
+    (tmp_path/'final_summary.json').write_text(json.dumps(summary(total_tool_calls=3, total_file_reads=1, total_file_writes=1)))
+    write_jsonl(tmp_path/'model_responses.jsonl',[{"usage":{"prompt_tokens":11532,"completion_tokens":7390,"total_tokens":18922}}])
+    write_jsonl(tmp_path/'tool_calls.jsonl',[
+        {"tool_name":"Read","started_at":"not-a-timestamp","turn_index":2,"normalized_args_summary":{"file_path":"x.py"}},
+        {"tool_name":"Write","tool_category":"file_mutation","started_at":"2026-06-22T19:19:13.100000+00:00"},
+        {"tool_name":"Bash","tool_category":"command","turn_index":1,"args":{"command":"echo hi"}},
+    ])
+    t=parse_villani_code_debug_artifact(tmp_path)
+    assert t.first_file_mutation_tool_index == 1
+    assert t.first_command_tool_index == 2
+    assert t.first_substantive_file_read_tool_index == 3
+    assert any('Malformed tool call timestamp' in w for w in t.token_accounting_warnings)
