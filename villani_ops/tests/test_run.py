@@ -36,3 +36,27 @@ def test_yaml_policy_without_legacy_flag_fails(tmp_path, monkeypatch):
     res=runner.invoke(app,["run","--repo",str(repo),"--task","edit","--policy",".villani-ops/policies/p.yaml"])
     assert res.exit_code != 0
     assert "YAML policy files use legacy smoke-test mode" in res.output
+
+
+def test_cli_run_emits_progress_markers(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path); setup_workspace(tmp_path)
+    repo=tmp_path/"repo"; repo.mkdir(); (repo/"hello.txt").write_text("hello\n")
+    import villani_ops.cli.main as main
+    class FakeDecision:
+        accepted=True; final_state='accepted'; final_action='accept'; classification={'difficulty':'medium','category':'bug_fix','risk':'low'}; execution_strategy={'attempts':[{}]}; attempts_used=1; retries_used=0; escalations_used=0; human_reviews_requested=0; human_reviews_skipped=0; winning_attempt_id='attempt_001'; reviewer_decision='pass'; reviewer_score=1.0; human_override_used=False; reason='ok'; total_cost=0.0; reviewer_evidence=[]; run_id='run123'; failure_reason=''; attempts=[]
+    class FakeOps:
+        def __init__(self, *args, **kwargs): pass
+        def run(self, **kwargs):
+            print('Starting Villani Ops run')
+            print('Classifying task')
+            print('Generating policy')
+            print('Running attempt_001')
+            print('Reviewing attempt_001')
+            print('Finalizing decision')
+            print('Report: /tmp/report.md')
+            return type('R', (), {'decision': FakeDecision(), 'report_path':'/tmp/report.md'})()
+    monkeypatch.setattr(main, 'VillaniOps', FakeOps)
+    res=runner.invoke(app,["run","--repo",str(repo),"--task","edit","--policy","balanced"], catch_exceptions=False)
+    assert res.exit_code == 0
+    for text in ['Starting Villani Ops run','Classifying task','Generating policy','Running attempt_001','Reviewing attempt_001','Finalizing decision','Report:']:
+        assert text in res.output

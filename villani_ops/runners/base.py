@@ -22,6 +22,7 @@ class RunnerResult(BaseModel):
     output_tokens: int = 0
     events: list[dict[str, Any]] = Field(default_factory=list)
     debug_artifact_dir: str | None = None
+    resolved_trace_dir: str | None = None
     telemetry_path: str | None = None
     duration_ms: int | None = None
 

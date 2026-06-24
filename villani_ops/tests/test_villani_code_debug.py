@@ -93,3 +93,30 @@ def test_parser_treats_malformed_timestamps_like_missing_timestamps(tmp_path):
     assert t.first_command_tool_index == 2
     assert t.first_substantive_file_read_tool_index == 3
     assert any('Malformed tool call timestamp' in w for w in t.token_accounting_warnings)
+
+
+def test_parser_resolves_nested_trace_dir(tmp_path):
+    trace=tmp_path/'villani_code_debug'/'20260624T034357_216114Z'
+    trace.mkdir(parents=True)
+    (trace/'final_summary.json').write_text(json.dumps(summary(tokens_input=7,tokens_output=3)))
+    write_jsonl(trace/'model_responses.jsonl',[{"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}}])
+    write_jsonl(trace/'tool_calls.jsonl',[{"tool_name":"Read","normalized_args_summary":{"file_path":"x.py"}}])
+    t=parse_villani_code_debug_artifact(tmp_path/'villani_code_debug')
+    assert t.input_tokens > 0
+    assert t.output_tokens > 0
+    assert t.token_accounting_status == 'verified'
+    assert t.resolved_trace_dir.endswith('20260624T034357_216114Z')
+
+
+def test_parser_chooses_newest_nested_trace_dir(tmp_path):
+    parent=tmp_path/'villani_code_debug'
+    old=parent/'old'; new=parent/'new'
+    old.mkdir(parents=True); new.mkdir()
+    (old/'final_summary.json').write_text(json.dumps(summary(tokens_input=1,tokens_output=1)))
+    (new/'final_summary.json').write_text(json.dumps(summary(tokens_input=9,tokens_output=2)))
+    import os, time
+    os.utime(old/'final_summary.json',(1,1)); os.utime(new/'final_summary.json',(2,2))
+    write_jsonl(new/'model_responses.jsonl',[{"usage":{"prompt_tokens":9,"completion_tokens":2,"total_tokens":11}}])
+    t=parse_villani_code_debug_artifact(parent)
+    assert t.resolved_trace_dir.endswith('new')
+    assert t.input_tokens == 9
