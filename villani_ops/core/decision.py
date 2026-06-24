@@ -24,6 +24,9 @@ class Decision(BaseModel):
     review_cost: float = 0
     total_input_tokens: int = 0
     total_output_tokens: int = 0
+    total_coding_input_tokens: int = 0
+    total_coding_output_tokens: int = 0
+    token_accounting_statuses: dict[str, int] = Field(default_factory=dict)
     attempts: list[dict[str, Any]] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     apply_options: dict[str, Any] = Field(default_factory=dict)

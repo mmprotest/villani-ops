@@ -2,6 +2,7 @@ from __future__ import annotations
 import os, subprocess, shutil, json
 from pathlib import Path
 from .base import RunnerContext, RunnerResult
+from .villani_code_debug import write_runner_telemetry
 
 class VillaniCodeRunner:
     name='villani_code'
@@ -18,11 +19,25 @@ class VillaniCodeRunner:
             else:
                 return RunnerResult(exit_code=2, stderr=f"Backend '{context.backend.name}' has no resolved API key.")
         prompt=self.build_prompt(context); max_tokens=str(context.backend.max_tokens or 50000)
-        cmd=[command_name,'run',prompt,'--base-url',context.backend.base_url or '', '--model',context.backend.model,'--repo',context.repo_path,'--provider',context.backend.provider,'--api-key',api_key,'--auto-approve','--no-stream','--max-tokens',max_tokens]
+        debug_dir = Path(context.run_dir) / 'villani_code_debug'
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        telemetry_path = Path(context.run_dir) / 'runner_telemetry.json'
+        cmd=[command_name,'run',prompt,'--base-url',context.backend.base_url or '', '--model',context.backend.model,'--repo',context.repo_path,'--provider',context.backend.provider,'--api-key',api_key,'--auto-approve','--no-stream','--max-tokens',max_tokens,'--debug','trace','--debug-dir',str(debug_dir)]
         red=[('***REDACTED***' if x==api_key else x) for x in cmd]
         Path(context.run_dir,'villani_code_command.json').write_text(json.dumps(red, indent=2))
+        def _result(exit_code:int, stdout='', stderr=''):
+            tel=write_runner_telemetry(debug_dir, telemetry_path, context.backend)
+            return RunnerResult(exit_code=exit_code, stdout=stdout or '', stderr=stderr or '', input_tokens=tel.input_tokens, output_tokens=tel.output_tokens, debug_artifact_dir=str(debug_dir), telemetry_path=str(telemetry_path), duration_ms=tel.duration_ms, model_requests=tel.model_requests, model_failures=tel.model_failures, total_tool_calls=tel.total_tool_calls, tool_calls_by_name=tel.tool_calls_by_name, total_file_reads=tel.total_file_reads, total_file_writes=tel.total_file_writes, commands_executed=tel.commands_executed, commands_failed=tel.commands_failed, first_substantive_file_read_tool_index=tel.first_substantive_file_read_tool_index, first_substantive_file_read_seconds=tel.first_substantive_file_read_seconds, first_file_mutation_tool_index=tel.first_file_mutation_tool_index, first_file_mutation_seconds=tel.first_file_mutation_seconds, first_command_tool_index=tel.first_command_tool_index, first_command_seconds=tel.first_command_seconds, token_accounting_status=tel.token_accounting_status, token_accounting_warnings=tel.token_accounting_warnings, telemetry=tel.model_dump(mode='json'))
+        def _norm(x):
+            if x is None: return ''
+            if isinstance(x, bytes): return x.decode(errors='replace')
+            return str(x)
         try:
             p=subprocess.run(cmd, cwd=context.repo_path, text=True, capture_output=True, timeout=context.timeout_seconds, env={**os.environ, **context.env})
-            return RunnerResult(exit_code=p.returncode, stdout=p.stdout, stderr=p.stderr)
+            return _result(p.returncode, p.stdout, p.stderr)
         except subprocess.TimeoutExpired as e:
-            return RunnerResult(exit_code=124, stdout=e.stdout or '', stderr=(e.stderr or '')+f"\nCommand timed out after {context.timeout_seconds}s")
+            r=_result(124, _norm(e.stdout), _norm(e.stderr)+f"\nCommand timed out after {context.timeout_seconds}s")
+            r.token_accounting_warnings.append('Runner timed out; telemetry may be partial.')
+            r.telemetry.setdefault('token_accounting_warnings', []).append('Runner timed out; telemetry may be partial.')
+            Path(telemetry_path).write_text(json.dumps(r.telemetry, indent=2))
+            return r
