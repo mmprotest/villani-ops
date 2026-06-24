@@ -30,9 +30,18 @@ class Backend(BaseModel):
         return self.api_key
 
     def api_key_configured(self) -> bool:
+        if self.api_key is not None and self.api_key != "":
+            return True
         if self.api_key_env:
-            return bool(os.environ.get(self.api_key_env)) or True
-        return bool(self.api_key)
+            return bool(os.environ.get(self.api_key_env))
+        return False
+
+    def api_key_status(self) -> str:
+        if self.api_key is not None and self.api_key != "":
+            return "direct_key_configured"
+        if self.api_key_env:
+            return "env_var_present" if os.environ.get(self.api_key_env) else "env_var_missing"
+        return "missing"
 
     def redacted_dict(self) -> dict[str, Any]:
         data = self.model_dump(mode="json")
