@@ -55,7 +55,11 @@ def test_happy_path_full_lifecycle_and_report(tmp_path, monkeypatch):
     t=transitions(Path(res.run_dir))
     assert [('planned','classify','classifying'),('classifying','generate_strategy','planning'),('planning','run_attempt','attempting'),('attempting','review_attempt','reviewing'),('reviewing','decide','deciding'),('deciding','accept','accepted')]==t[:6]
     d=json.loads((Path(res.run_dir)/'decision.json').read_text()); assert d['final_state']=='accepted' and d['controller_steps']
-    assert '| Step | Attempt | From | Action | To | Reason |' in (Path(res.run_dir)/'report.md').read_text()
+    report = (Path(res.run_dir)/'report.md').read_text()
+    assert '| Step | Attempt | From | Action | To | Reason |' in report
+    timeline = report.split('## Controller Timeline', 1)[1].split('## Controller Decision Steps', 1)[0]
+    assert '\\n' not in timeline
+    assert '| Step | Attempt | From | Action | To | Reason |\n| --- | --- | --- | --- | --- | --- |' in timeline
     assert (repo/'hello.txt').read_text()=='hello\n'
 
 

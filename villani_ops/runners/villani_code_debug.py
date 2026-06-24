@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 from typing import Any
@@ -90,6 +90,26 @@ def _parse_ts(s: Any) -> datetime | None:
         return None
 
 
+def _normalized_ts(value: Any) -> datetime | None:
+    ts = _parse_ts(value)
+    if ts is None:
+        return None
+    if ts.tzinfo is None:
+        return ts.replace(tzinfo=timezone.utc)
+    return ts.astimezone(timezone.utc)
+
+
+def _sort_timestamp(value: Any, warnings: list[str] | None = None) -> float:
+    ts = _normalized_ts(value)
+    if ts is None:
+        if isinstance(value, str) and value:
+            msg = f"Malformed tool call timestamp: {value}"
+            if warnings is not None and msg not in warnings:
+                warnings.append(msg)
+        return float('inf')
+    return ts.timestamp()
+
+
 def _tool_name(t: dict[str, Any]) -> str:
     return str(t.get('tool_name') or t.get('name') or t.get('tool') or '')
 
@@ -142,12 +162,12 @@ def parse_villani_code_debug_artifact(debug_dir: Path) -> VillaniCodeTelemetry:
 
     tools=_jsonl(debug_dir/'tool_calls.jsonl', warnings) if (debug_dir/'tool_calls.jsonl').exists() else []
     if tools:
-        sorted_tools=sorted(enumerate(tools), key=lambda it: (_parse_ts(it[1].get('started_at')) or datetime.max, it[1].get('turn_index') if it[1].get('turn_index') is not None else 10**9, it[0]))
+        sorted_tools=sorted(enumerate(tools), key=lambda it: (_sort_timestamp(it[1].get('started_at'), warnings), it[1].get('turn_index') if it[1].get('turn_index') is not None else 10**9, it[0]))
         tel.total_tool_calls=len(sorted_tools)
         tel.tool_calls_by_name=dict(Counter(_tool_name(t) for _,t in sorted_tools if _tool_name(t))) or tel.tool_calls_by_name
-        start=_parse_ts(tel.started_at)
+        start=_normalized_ts(tel.started_at)
         for idx,(_,t) in enumerate(sorted_tools,1):
-            ts=_parse_ts(t.get('started_at'))
+            ts=_normalized_ts(t.get('started_at'))
             sec=(ts-start).total_seconds() if ts and start else None
             name=_tool_name(t); cat=t.get('tool_category'); args=_args(t)
             if tel.first_tool_call_index is None:
