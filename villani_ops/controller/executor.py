@@ -28,7 +28,7 @@ class VillaniOps:
     @classmethod
     def from_workspace(cls, path: str | Path = '.villani-ops') -> 'VillaniOps': return cls(FileStorage(Path(path).expanduser().resolve()))
 
-    def run(self, repo: str|Path, task: Task, policy: str='balanced', isolation: str='worktree', human_approval: bool=False, non_interactive: bool=False) -> RunResult:
+    def run(self, repo: str|Path, task: Task, policy: str='balanced', isolation: str='worktree', human_approval: bool=False, non_interactive: bool=False, max_attempts: int|None=None) -> RunResult:
         self.storage.init_workspace(); start=time.time(); repo=Path(repo).resolve(); task.repo_path=str(repo)
         run_id=datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')+'-'+secrets.token_hex(3)
         run_dir=self.storage.create_run_dir(run_id); self.storage.save_task(run_dir, task)
@@ -74,17 +74,30 @@ class VillaniOps:
         if cls_call.error:
             warnings.append(cls_call.error)
         progress.info(f"Classification: {cls.difficulty} {cls.category} {cls.risk}, confidence {cls.confidence:.2f}")
+        from villani_ops.policy_engine.planner import estimate_required_capability
+        progress.info(f"Required capability estimate: {estimate_required_capability(cls)}")
         progress.step("[2/6] Generating policy...")
         # policy
         recorder.transition(ControllerAction.generate_strategy, ControllerState.planning, 'Classification complete; generating strategy.')
         try:
-            strategy, pol_call = PolicyEngine().generate(cls, backends, policy, run_dir/'execution_strategy.json')
+            try:
+                strategy, pol_call = PolicyEngine().generate(cls, backends, policy, run_dir/'execution_strategy.json', max_attempts=max_attempts)
+            except TypeError as e:
+                if "max_attempts" not in str(e):
+                    raise
+                strategy, pol_call = PolicyEngine().generate(cls, backends, policy, run_dir/'execution_strategy.json')
             (run_dir/'strategy.json').write_text(strategy.model_dump_json(indent=2))
             if strategy.warnings:
                 for w in strategy.warnings:
                     if 'fallback' in str(w).lower(): progress.warning(str(w))
+            progress.info(f"Policy: {policy}")
+            progress.info(f"Max attempts: {strategy.max_attempts or len(strategy.attempts)}")
+            progress.info(f"Planning objective: {strategy.planning_objective or strategy.strategy_summary}")
+            progress.info('Backend rankings:')
+            for r in strategy.backend_rankings:
+                progress.info(f"  {r.get('backend')}: capability {r.get('capability_score')}, estimated p_solve {r.get('estimated_solve_probability')}, estimated cost ${float(r.get('estimated_attempt_cost') or 0):.6f}, viable {'yes' if r.get('viable') else 'no'}")
             progress.info('Planned attempts:')
-            [progress.info(f'  attempt_{i+1:03d}: {a.backend}') for i,a in enumerate(strategy.attempts)]
+            [progress.info(f'  attempt_{i+1:03d}: {a.backend}, p_solve {a.estimated_solve_probability}, estimated cost ${float(a.estimated_attempt_cost or 0):.6f}') for i,a in enumerate(strategy.attempts)]
         except Exception as e:
             warnings.append(str(e)); recorder.transition(ControllerAction.fail, ControllerState.failed, f'Policy generation failed: {e}')
             decision_steps=[]; retries_used=escalations_used=0

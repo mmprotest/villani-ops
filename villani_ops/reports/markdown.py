@@ -11,6 +11,10 @@ def write_markdown_report(run_dir, task, policy_or_strategy, attempts, decision,
     timeline_rows='\n'.join(f"| {st.get('step_id')} | {st.get('attempt_id') or ''} | {st.get('state_before')} | {st.get('action')} | {st.get('state_after')} | {st.get('reason')} |" for st in (decision.controller_steps or []))
     timeline="| Step | Attempt | From | Action | To | Reason |\n| --- | --- | --- | --- | --- | --- |\n" + (timeline_rows or "| none | | | | | |")
     rankings='\n'.join(f"- {r.get('expected_cost_rank')}. {r.get('backend')}: capability {r.get('capability_score')}, estimated ${r.get('estimated_attempt_cost')} — {r.get('rank_reason')}" for r in (strategy.get('backend_rankings') or [])) or '- none'
+    planned_attempts='\n'.join(
+        f"- attempt_{i+1:03d}: {a.get('backend')} — p_solve {a.get('estimated_solve_probability')}, estimated cost ${float(a.get('estimated_attempt_cost') or 0):.6f}, required capability {a.get('required_capability')}, capability gap {a.get('capability_gap')}"
+        for i,a in enumerate(strategy.get('attempts') or [])
+    ) or '- none'
     blockers='\n'.join(f"- {b}" for b in (decision.acceptance_blockers or [])) or '- none'
     human_override_blockers='\n'.join(f"- {b}" for b in (getattr(decision, 'human_override_blockers', []) or [])) or '- none'
     evidence='\n'.join(f"- {e}" for e in decision.reviewer_evidence) or '- none'
@@ -39,21 +43,31 @@ Success criteria: {task.success_criteria or 'Not provided'}
 {json.dumps(cls, indent=2)}
 ```
 
-## Backend Rankings
+## Policy Planning
 
+Policy profile: {strategy.get('profile','')}
+
+Max attempts: {strategy.get('max_attempts') or len(strategy.get('attempts') or [])}
+
+Required capability estimate: {strategy.get('required_capability')}
+
+Planning objective: {strategy.get('planning_objective') or strategy.get('strategy_summary','')}
+
+Deterministic policy planner used: {str(bool(strategy.get('deterministic_planner'))).lower()}
+
+Backend rankings:
 {rankings}
+
+Planned attempts:
+{planned_attempts}
+
+Policy warnings: {', '.join(strategy.get('warnings') or []) or 'none'}
 
 ## Policy Strategy
 
 Profile: {strategy.get('profile','')}
 
-Fallback used: {str(fallback_used).lower()}
-
-Fallback reason: {fallback_reason or 'none'}
-
 {strategy.get('strategy_summary','')}
-
-Strategy warnings: {', '.join(strategy.get('warnings') or []) or 'none'}
 
 ```json
 {json.dumps(strategy, indent=2)}
