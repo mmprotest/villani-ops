@@ -60,6 +60,8 @@ class VillaniOps:
             decision_steps=[]; retries_used=escalations_used=0
             return finalize(None, 'fail', f'Classification failed: {e}')
         costs['classification']+=cls_call.estimated_cost; tin+=cls_call.input_tokens; tout+=cls_call.output_tokens
+        if cls_call.error:
+            warnings.append(cls_call.error)
         # policy
         recorder.transition(ControllerAction.generate_strategy, ControllerState.planning, 'Classification complete; generating strategy.')
         try:
