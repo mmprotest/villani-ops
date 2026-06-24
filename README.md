@@ -1,76 +1,100 @@
-# Villani Ops v0.2
+# Villani Ops
 
-Villani Ops is the control plane for cost-aware AI coding operations. It is a Python package plus CLI: **no UI** and **no web API**. It classifies real repository tasks, asks an LLM policy engine for a cost-aware strategy, ranks backends with deterministic policy economics, runs Villani Code in isolated git worktrees, reviews attempts with an LLM, drives retry/escalation/human/fail decisions through an explicit controller state machine, and exposes safe apply/branch/PR paths.
+Villani Ops is a CLI-only multi-agent performance orchestrator for coding tasks. It uses investigation, independent candidate attempts, LLM review, and selector-based final decisioning to test whether small/local models can solve more tasks than naive single-agent runs.
 
-## Architecture
+Phase 1 is about **solve-rate lift**, not cost reduction. Cost and token telemetry are still captured in artifacts and reports, but the main `villani-ops run` path does not optimize for cost and does not use the old `cheap`, `balanced`, or `quality` profiles.
 
-- **Backend roles**: model backends declare roles (`coding`, `classification`, `review`, `policy`) plus capability and cost metadata. Disabled and non-role backends are excluded.
-- **LLM classification**: task creation and runs can classify difficulty, category, risk, and context.
-- **LLM policy engine**: profiles (`cheap`, `balanced`, `quality`) produce execution strategies; Villani Ops then enforces profile semantics, computes backend rankings from capability/cost/difficulty/risk, and records normalization warnings.
-- **Villani Code runner**: coding attempts run through `villani-code run` with isolated repo path, auto-approval, no streaming, and max token settings.
-- **Worktree isolation**: attempts happen in git worktrees under the absolute workspace path so the source repo is not mutated during runs.
-- **LLM review**: patches are not accepted unless the runner succeeded and the reviewer passes/recommends accept, except explicit human approval.
-- **Controller state machine and human approval**: explicit states/actions persist a controller timeline. Human decisions (`accept`, `reject`, `retry`, `escalate`, `fail`, `skipped`) are reflected in artifacts and reports.
-- **Safe apply / branch / PR**: accepted attempts can be applied, branched, or submitted with the `gh` CLI. Commands snapshot pre-mutation state, record rollback outcomes, and write recovery instructions on failure.
-- **Compare**: run multiple tasks across policies and write Markdown/CSV/JSON cost and solve-rate reports.
-- **Legacy YAML mode warning**: YAML policy files are quarantined behind `--legacy-yaml-policy`; they are smoke checks, not LLM task validation.
+There is **no UI** and **no web API**.
 
-## Examples
+## Main performance path
 
 ```bash
-villani-ops init
+villani-ops run \
+  --repo ./some-git-repo \
+  --task "Fix the failing auth tests" \
+  --success-criteria "Tests pass and diff is minimal" \
+  --candidate-attempts 3 \
+  --backend local-qwen \
+  --non-interactive
+```
 
+The performance run lifecycle is:
+
+1. Save the task in a new run directory.
+2. Optionally classify the task.
+3. Run an investigator LLM call.
+4. Run multiple independent Villani Code candidates in isolated git worktrees.
+5. Capture patches, changed files, stdout, stderr, diffs, and runner telemetry.
+6. Review every candidate with the LLM reviewer.
+7. Run a selector LLM call over reviewed candidates.
+8. Accept only a selected candidate that passes strict acceptance gates.
+9. Write `decision.json`, `report.md`, `controller_steps.jsonl`, and per-attempt artifacts.
+10. Print apply/branch/PR commands only when there is an accepted winner.
+
+`--candidate-attempts` accepts 1 through 8. If one `--backend` is supplied, every candidate uses it. If multiple `--backend` values are supplied, candidates cycle through them. If no backend is supplied, Villani Ops uses the highest-capability enabled coding backend.
+
+## Legacy cost-policy path
+
+The previous cost-aware product path is preserved as a secondary command:
+
+```bash
+villani-ops cost-run \
+  --repo ./some-git-repo \
+  --task "Fix the failing auth tests" \
+  --success-criteria "Tests pass and diff is minimal" \
+  --policy balanced \
+  --max-attempts 3 \
+  --non-interactive
+```
+
+Use `cost-run` for the old `cheap`, `balanced`, and `quality` policy profiles, `--max-attempts`, `--legacy-yaml-policy`, controller timeline, reports, human approval, apply, branch, PR, and cost-policy comparison workflows.
+
+Passing `--policy` to `villani-ops run` fails clearly because cost policies moved to `villani-ops cost-run`.
+
+## Backend roles
+
+Backends can declare roles such as `coding`, `classification`, `review`, `policy`, `investigation`, and `selection`:
+
+```bash
 villani-ops backend add local-qwen \
   --provider openai-compatible \
   --base-url http://localhost:1234/v1 \
   --model qwen3.6-27b \
   --api-key dummy \
-  --input-cost 0.60 \
-  --output-cost 3.60 \
-  --roles coding,classification,review,policy \
+  --roles coding,classification,review,investigation,selection \
   --capability-score 80 \
   --max-tokens 50000
+```
 
-villani-ops run \
-  --repo ./some-git-repo \
-  --task "Fix the failing auth tests" \
-  --success-criteria "Tests pass and diff is minimal" \
-  --policy balanced
+Existing backend configs remain valid. The old `policy` role is still used by `villani-ops cost-run`.
 
+## Safe git commands
+
+Accepted runs can be applied, branched, or prepared for PR:
+
+```bash
 villani-ops apply latest
-
-villani-ops branch latest --name villani-ops/fix-auth-tests
-
+villani-ops branch latest --name villani-ops/latest
 villani-ops pr latest --title "Fix auth tests" --body "Generated by Villani Ops"
-# If gh is unavailable but you intentionally want a local branch/commit:
-villani-ops pr latest --prepare-branch --title "Fix auth tests" --body "Generated by Villani Ops"
+villani-ops report latest
+```
 
+These commands continue to use the accepted attempt recorded in `decision.json`. They refuse unsafe mutations such as dirty source repos unless explicitly forced.
+
+## Cost-policy comparison
+
+`compare` is explicitly a cost-policy comparison command:
+
+```bash
 villani-ops compare \
   --repo ./some-git-repo \
   --tasks tasks.jsonl \
   --policies cheap balanced quality
 ```
 
+It runs the legacy cost-policy runner internally and writes Markdown/CSV/JSON reports with policy, task id, run id, final action, strategy, winner backend/model, costs, tokens, reviewer score, wall time, and failure reason.
 
-### Backend API keys
-
-`--api-key` is the backend LLM API key. Villani Ops stores it in local `.villani-ops/backends.yaml`, passes it to OpenAI-compatible classification, policy, and review calls, and passes the same resolved key to `villani-code --api-key` when that backend is used for coding. Direct keys are masked in backend output, reports, and saved runner command artifacts. For local LM Studio-style OpenAI-compatible servers, `dummy` is often acceptable.
-
-Use `--api-key-env ENV_NAME` as the optional advanced path if you do not want to store a direct key locally. Do not provide both `--api-key` and `--api-key-env`; the CLI fails clearly and asks you to choose one.
-
-### Human approval and controller decisions
-
-Human approval can be requested with `--human-approval`, by strategy stop conditions such as `ask_human_on_uncertain_review`, or by reviewer output (`requires_human_approval` / `ask_human`). In non-interactive mode, or when stdin is not a TTY, Villani Ops does not hang: it writes `human_approval.json` with `decision: skipped` and continues with safe retry/escalate/fail behavior. Every attempt writes `controller_decision.json`; the run writes `controller_steps.jsonl`; final `decision.json` includes controller steps, retries used, escalations used, acceptance blockers, final action, and failure reason.
-
-### Safe git commands
-
-`apply`, `branch`, and `pr` refuse dirty source repos unless `--force`, refuse missing or unaccepted patches, run `git apply --check` before mutating the repository, and do not ignore subprocess failures. Branch creation refuses existing branch names unless `--force-branch`. PR creation refuses missing `gh` without mutating unless `--prepare-branch` is passed; with `--prepare-branch`, it creates the local branch/commit and records manual push/PR commands. Push and `gh pr create` failures persist branch/commit details and recovery commands in `pr.json`.
-
-### Compare
-
-`compare` writes Markdown/CSV/JSON rows with policy, task id, run id, trial index, final action, classification, strategy summary, retry/escalation counts, winner backend/model, cost/token breakdown, reviewer score, wall time, report path, and failure reason. The Markdown report includes failure/category breakdowns and a deterministic thesis signal section. Use `--repeat N` for repeated trials, `--max-tasks N` for smoke tests, and `--resume` to skip completed policy/task/trial rows.
-
-## Task creation with classification
+## Task creation
 
 ```bash
 villani-ops task create \
@@ -80,16 +104,20 @@ villani-ops task create \
   --classify
 ```
 
-## Legacy policy files
+## Legacy YAML policies
 
-YAML policies use legacy smoke-test mode. Run them only when intentional:
+YAML policy files are quarantined behind the cost command and require explicit opt-in:
 
 ```bash
-villani-ops run --legacy-yaml-policy --policy path/to/policy.yaml --repo ./repo --task "..."
+villani-ops cost-run --legacy-yaml-policy --policy path/to/policy.yaml --repo ./repo --task "..."
 ```
 
 Legacy reports include: `LEGACY MODE: This run used diff_review smoke validation, not LLM task validation.`
 
-## Mocked/local testing notes
+## Testing
 
-The test suite uses mocked LLM responses, fake Villani Code behavior, temporary git repositories, and mocked GitHub/`gh` interactions. Tests must not call real external LLMs, real Villani Code, or real GitHub. Run `pytest` after `pip install -e .[test]`.
+The test suite uses mocked LLM responses, fake Villani Code behavior, temporary git repositories, and mocked GitHub/`gh` interactions. Tests must not call real external LLMs, real Villani Code, or real GitHub.
+
+```bash
+pytest
+```
