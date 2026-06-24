@@ -1,7 +1,7 @@
 from __future__ import annotations
 from pathlib import Path
 from datetime import datetime, timezone
-import time, secrets, json, subprocess, sys
+import time, secrets, json, sys
 from pydantic import BaseModel
 from villani_ops.core.task import Task
 from villani_ops.core.decision import Decision
@@ -14,13 +14,14 @@ from villani_ops.runners.villani_code import VillaniCodeRunner
 from villani_ops.review import LLMReviewer, ReviewResult
 from villani_ops.reports.markdown import write_markdown_report
 from villani_ops.core.acceptance import is_attempt_acceptance_eligible
-from villani_ops.controller.state_machine import ControllerDecisionContext, ControllerStep, HumanApprovalResult, ControllerAction, decide_next_action, next_state
+from villani_ops.controller.state_machine import ControllerDecisionContext, HumanApprovalResult, ControllerAction, ControllerState, ControllerStateRecorder, decide_next_action, next_state
+from villani_ops.controller.human_approval import TerminalHumanApprovalProvider, NonInteractiveHumanApprovalProvider, HumanApprovalPromptContext
 
 class RunResult(BaseModel):
     run_id: str; run_dir: str; decision: Decision; report_path: str; attempts: list[dict]
 
 class VillaniOps:
-    def __init__(self, storage: FileStorage): self.storage=storage
+    def __init__(self, storage: FileStorage, human_approval_provider=None): self.storage=storage; self.human_approval_provider=human_approval_provider
     @classmethod
     def from_workspace(cls, path: str | Path = '.villani-ops') -> 'VillaniOps': return cls(FileStorage(Path(path).expanduser().resolve()))
 
@@ -29,25 +30,42 @@ class VillaniOps:
         run_id=datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')+'-'+secrets.token_hex(3)
         run_dir=self.storage.create_run_dir(run_id); self.storage.save_task(run_dir, task)
         backends=self.storage.load_backends(); warnings=[]; attempts=[]; costs={'classification':0.0,'policy':0.0,'review':0.0,'coding':0.0}; tin=tout=0
+        recorder=ControllerStateRecorder(run_id, run_dir)
+        strategy=None; cls=None
+        def finalize(accepted=None, final_action='fail', failure_reason=''):
+            apply_opts={}
+            if accepted:
+                apply_opts={'apply_command':f'villani-ops apply {run_id}','branch_command':f'villani-ops branch {run_id} --name villani-ops/{run_id}','pr_command':f'villani-ops pr {run_id} --title "{(task.objective or "Villani Ops changes")[:60]}"'}
+            decision=Decision(run_id=run_id, accepted=bool(accepted), final_action=final_action, final_state=recorder.current_state.value if hasattr(recorder.current_state,'value') else str(recorder.current_state), lifecycle_completed=bool(accepted) or final_action=='fail', winning_attempt_id=accepted.get('attempt_id') if accepted else None, winning_branch=accepted.get('branch_name') if accepted else None, winning_worktree_path=accepted.get('worktree_path') if accepted else None, winning_patch_path=accepted.get('patch_path') if accepted else None, reviewer_decision=(accepted.get('review') or {}).get('decision') if accepted else ((attempts[-1].get('review') or {}).get('decision') if attempts else None), reviewer_score=(accepted.get('review') or {}).get('score') if accepted else ((attempts[-1].get('review') or {}).get('score') if attempts else None), reviewer_evidence=(accepted.get('review') or {}).get('evidence',[]) if accepted else [], classification=cls.model_dump(mode='json') if cls else None, execution_strategy=strategy.model_dump(mode='json') if strategy else None, total_cost=sum(costs.values()), coding_cost=costs['coding'], classification_cost=costs['classification'], policy_cost=costs['policy'], review_cost=costs['review'], total_input_tokens=tin, total_output_tokens=tout, attempts=attempts, warnings=warnings, apply_options=apply_opts, decision_steps=decision_steps, controller_steps=recorder.steps, acceptance_blockers=([] if accepted else (decision_steps[-1].get('acceptance_blockers',[]) if decision_steps else [])), retries_used=retries_used, escalations_used=escalations_used, attempts_used=len(attempts), all_attempted_backends=[a.get('backend_name') for a in attempts], failure_reason=('' if accepted else (failure_reason or (decision_steps[-1].get('reason','No attempt satisfied acceptance gates.') if decision_steps else 'No attempt satisfied acceptance gates.'))), reason='Accepted reviewer-passed successful runner attempt.' if accepted else (failure_reason or 'No attempt satisfied acceptance gates.'), total_attempts=len(attempts), human_reviews_requested=sum(1 for a in attempts if (a.get('human_approval') or {}).get('requested')), human_reviews_completed=sum(1 for a in attempts if (a.get('human_approval') or {}).get('prompted')), human_reviews_skipped=sum(1 for a in attempts if (a.get('human_approval') or {}).get('skipped_reason')), human_override_used=bool(accepted and (accepted.get('human_approval') or {}).get('valid_override')), human_override_reasons=(((accepted.get('human_approval') or {}).get('request_reasons') or []) if accepted else []))
+            self.storage.save_decision(run_dir, decision); report=write_markdown_report(run_dir, task, strategy, attempts, decision, time.time()-start)
+            return RunResult(run_id=run_id, run_dir=str(run_dir), decision=decision, report_path=str(report), attempts=attempts)
         # classify
-        cls, cls_call = TaskClassifier().classify(task, backends, run_dir/'classification.json'); task.classification=cls; self.storage.save_task(run_dir, task)
+        recorder.transition(ControllerAction.classify, ControllerState.classifying, 'Starting task classification.')
+        try:
+            cls, cls_call = TaskClassifier().classify(task, backends, run_dir/'classification.json'); task.classification=cls; self.storage.save_task(run_dir, task)
+        except Exception as e:
+            warnings.append(str(e)); recorder.transition(ControllerAction.fail, ControllerState.failed, f'Classification failed: {e}')
+            decision_steps=[]; retries_used=escalations_used=0
+            return finalize(None, 'fail', f'Classification failed: {e}')
         costs['classification']+=cls_call.estimated_cost; tin+=cls_call.input_tokens; tout+=cls_call.output_tokens
         # policy
-        strategy, pol_call = PolicyEngine().generate(cls, backends, policy, run_dir/'execution_strategy.json')
-        (run_dir/'strategy.json').write_text(strategy.model_dump_json(indent=2))
+        recorder.transition(ControllerAction.generate_strategy, ControllerState.planning, 'Classification complete; generating strategy.')
+        try:
+            strategy, pol_call = PolicyEngine().generate(cls, backends, policy, run_dir/'execution_strategy.json')
+            (run_dir/'strategy.json').write_text(strategy.model_dump_json(indent=2))
+        except Exception as e:
+            warnings.append(str(e)); recorder.transition(ControllerAction.fail, ControllerState.failed, f'Policy generation failed: {e}')
+            decision_steps=[]; retries_used=escalations_used=0
+            return finalize(None, 'fail', f'Policy generation failed: {e}')
         costs['policy']+=pol_call.estimated_cost; tin+=pol_call.input_tokens; tout+=pol_call.output_tokens
-        accepted=None; runner=VillaniCodeRunner(); decision_steps=[]; controller_steps=[]; retries_used=0; escalations_used=0
-        def record_step(attempt_id, state_before, action, state_after, reason, data=None):
-            step=ControllerStep(step_id=f"step_{len(controller_steps)+1:03d}", run_id=run_id, attempt_id=attempt_id, state_before=str(state_before), action=str(action), state_after=str(state_after), reason=reason, data=data or {})
-            row=step.model_dump(mode='json'); controller_steps.append(row)
-            with (run_dir/'controller_steps.jsonl').open('a') as f: f.write(json.dumps(row)+"\n")
-            return row
+        accepted=None; runner=VillaniCodeRunner(); decision_steps=[]; retries_used=0; escalations_used=0
         for current_plan_index, plan in enumerate(strategy.attempts):
             backend=backends[plan.backend]
             for _ in range(plan.max_attempts):
                 attempt_id=f"attempt_{len(attempts)+1:03d}"; adir=run_dir/'attempts'/attempt_id; adir.mkdir(parents=True, exist_ok=True)
                 meta={'attempt_id':attempt_id,'backend_name':backend.name,'model':backend.model,'runner_name':'villani_code','status':'running','started_at':datetime.now(timezone.utc).isoformat(),'policy_reason':plan.reason}
                 try:
+                    recorder.transition(ControllerAction.run_attempt, ControllerState.attempting, 'Starting coding attempt.', attempt_id, {'backend':backend.name,'model':backend.model})
                     if isolation!='worktree': raise ValueError('Only worktree isolation is supported by the v0.2 controller loop')
                     wt=GitWorktreeIsolation().create(repo, run_id, attempt_id, self.storage.workspace); meta.update(wt)
                     result=runner.run(RunnerContext(attempt_id=attempt_id, repo_path=wt['worktree_path'], task_instruction=task.objective or task.instruction or '', success_criteria=task.success_criteria, backend=backend, timeout_seconds=plan.timeout_seconds or backend.timeout_seconds or 1200, run_dir=str(adir)))
@@ -55,47 +73,51 @@ class VillaniOps:
                     meta.update({'exit_code':result.exit_code,'stdout_path':str(adir/'stdout.log'),'stderr_path':str(adir/'stderr.log'),'input_tokens':result.input_tokens,'output_tokens':result.output_tokens})
                     cap=capture_worktree(wt['worktree_path'], adir); meta.update(cap)
                     costs['coding']+=backend.estimate_cost(result.input_tokens,result.output_tokens); tin+=result.input_tokens; tout+=result.output_tokens
+                    recorder.transition(ControllerAction.review_attempt, ControllerState.reviewing, 'Runner completed; starting review.', attempt_id, {'exit_code':result.exit_code,'changed_files':meta.get('changed_files')})
                     review_input={k:meta.get(k) for k in ['attempt_id','exit_code','stdout_path','stderr_path','changed_files','git_status']}
                     review_input['stdout_summary']=result.stdout[-4000:]; review_input['stderr_summary']=result.stderr[-4000:]; review_input['patch']=(Path(cap['patch_path']).read_text(errors='replace')[:50000])
-                    review, rev_call=LLMReviewer().review(task, cls, backend, review_input, backends, adir/'review.json')
-                    costs['review']+=rev_call.estimated_cost; tin+=rev_call.input_tokens; tout+=rev_call.output_tokens
+                    try:
+                        review, rev_call=LLMReviewer().review(task, cls, backend, review_input, backends, adir/'review.json')
+                        costs['review']+=rev_call.estimated_cost; tin+=rev_call.input_tokens; tout+=rev_call.output_tokens
+                    except Exception as e:
+                        review=ReviewResult(passed=False, decision='fail', summary=f'Reviewer failed: {e}', issues=[str(e)], recommended_action='retry_same_backend' if plan.max_attempts - (_ + 1) > 0 else ('escalate' if current_plan_index < len(strategy.attempts)-1 else 'fail'))
+                        (adir/'review.json').write_text(review.model_dump_json(indent=2))
+                        warnings.append(f'Review failed for {attempt_id}: {e}')
                     meta['review']=review.model_dump(mode='json'); meta['review_path']=str(adir/'review.json')
                     meta['status']='candidate'
                     if result.exit_code!=0:
                         meta['status']='failed'; meta['error']=result.stderr.strip() or f"Runner exited with {result.exit_code}"
-                    human_needed = bool(human_approval or strategy.stop_conditions.get('ask_human_on_uncertain_review') and review.decision=='uncertain' or review.requires_human_approval or review.recommended_action=='ask_human')
+                    eligible_before, blockers_before = is_attempt_acceptance_eligible(meta)
+                    request_reasons=[]
+                    if human_approval: request_reasons.append('cli_human_approval')
+                    if strategy.stop_conditions.get('human_approval_enabled'): request_reasons.append('strategy_human_approval_enabled')
+                    if strategy.stop_conditions.get('ask_human_on_uncertain_review') and review.decision=='uncertain': request_reasons.append('strategy_ask_human_on_uncertain_review')
+                    if review.requires_human_approval: request_reasons.append('reviewer_requires_human_approval')
+                    if review.recommended_action=='ask_human': request_reasons.append('reviewer_recommended_ask_human')
+                    human_needed = bool(request_reasons)
                     if human_needed:
-                        decision = 'skipped'; reason = 'non_interactive'; prompted = False
-                        can_prompt = (not non_interactive) and sys.stdin.isatty()
-                        if can_prompt:
-                            prompted=True
-                            print(f"Human approval requested for {attempt_id} ({backend.name}/{backend.model})")
-                            print(f"Reviewer: {review.decision}, score {review.score}")
-                            print(f"Summary: {review.summary}")
-                            print('Evidence: ' + '; '.join(review.evidence))
-                            print('Issues: ' + '; '.join(review.issues))
-                            print(f"Patch: {meta.get('patch_path')}")
-                            print('Changed files: ' + ', '.join(meta.get('changed_files') or []))
-                            print(f"Cost so far: ${sum(costs.values()):.6f}")
-                            decision = input('Decision [accept/reject/retry/escalate/fail]: ').strip().lower() or 'reject'
-                            reason = input('Reason: ').strip() or 'local user decision'
-                        if decision not in {'accept','reject','retry','escalate','fail','skipped'}:
-                            decision='reject'; reason='invalid human decision defaulted to reject'
-                        approval={'requested':True,'prompted':prompted,'skipped_reason':None if prompted else 'non_interactive','decision':decision,'reason':reason,'approved_by':'local_user' if prompted else None,'created_at':datetime.now(timezone.utc).isoformat()}
+                        recorder.transition(ControllerAction.ask_human, ControllerState.human_review, 'Human approval requested.', attempt_id, {'request_reasons':request_reasons})
+                        provider=self.human_approval_provider or (NonInteractiveHumanApprovalProvider() if (non_interactive or not sys.stdin.isatty()) else TerminalHumanApprovalProvider())
+                        approval_model=provider.request_approval(HumanApprovalPromptContext(run_id=run_id, attempt_id=attempt_id, backend_name=backend.name, backend_model=backend.model, runner_exit_code=result.exit_code, review_decision=review.decision, review_score=review.score, review_summary=review.summary, review_evidence=review.evidence, review_issues=review.issues, acceptance_blockers=blockers_before, patch_path=meta.get('patch_path'), changed_files=meta.get('changed_files') or [], cost_so_far=sum(costs.values()), request_reasons=request_reasons))
+                        approval=approval_model.model_dump(mode='json')
                         meta['human_approval']=approval; (adir/'human_approval.json').write_text(json.dumps(approval, indent=2))
-                        if decision=='accept': meta['status']='human_approved'
-                        elif decision=='retry': meta['status']='rejected'
-                        elif decision=='escalate': meta['status']='rejected'; meta['escalate_requested']=True
-                        elif decision=='fail': meta['status']='rejected'; meta['fail_requested']=True
+                        if approval_model.decision=='accept': meta['status']='human_approved'
+                        elif approval_model.decision=='retry': meta['status']='rejected'
+                        elif approval_model.decision=='escalate': meta['status']='rejected'; meta['escalate_requested']=True
+                        elif approval_model.decision=='fail': meta['status']='rejected'; meta['fail_requested']=True
                         else: meta['status']='rejected'
+                        recorder.transition(ControllerAction.decide, ControllerState.deciding, 'Human approval completed or skipped.', attempt_id, {'decision':approval_model.decision,'valid_override':approval_model.valid_override})
                     elif result.exit_code==0 and review.passed and review.decision=='pass' and review.recommended_action=='accept':
                         meta['status']='validated'
+                        recorder.transition(ControllerAction.decide, ControllerState.deciding, 'Review completed; deciding next action.', attempt_id)
+                    else:
+                        recorder.transition(ControllerAction.decide, ControllerState.deciding, 'Review completed; deciding next action.', attempt_id)
                     # deterministic controller state-machine decision
                     human_model=HumanApprovalResult.model_validate(meta['human_approval']) if meta.get('human_approval') else None
                     review_model=ReviewResult.model_validate(meta['review'])
                     remaining_for_backend = plan.max_attempts - (_ + 1)
                     escalation_available = current_plan_index < len(strategy.attempts)-1
-                    ctx=ControllerDecisionContext(run_id=run_id, attempt=meta, review=review_model, human_approval=human_model, strategy=strategy, current_plan_index=current_plan_index, current_attempt_number=len(attempts)+1, attempts_remaining_for_backend=remaining_for_backend, escalation_available=escalation_available, non_interactive=non_interactive, human_override_allowed=human_approval or bool(strategy.stop_conditions.get('human_approval_enabled')))
+                    ctx=ControllerDecisionContext(run_id=run_id, attempt=meta, review=review_model, human_approval=human_model, strategy=strategy, current_plan_index=current_plan_index, current_attempt_number=len(attempts)+1, attempts_remaining_for_backend=remaining_for_backend, escalation_available=escalation_available, non_interactive=non_interactive, human_override_allowed=bool(human_model and human_model.valid_override))
                     action_decision=decide_next_action(ctx)
                     eligible=action_decision.acceptance_eligible; blockers=action_decision.acceptance_blockers
                     if action_decision.action == ControllerAction.accept and human_model and human_model.decision=='accept':
@@ -104,15 +126,22 @@ class VillaniOps:
                         meta['status']='validated'
                     meta['acceptance_eligible']=eligible; meta['acceptance_blockers']=blockers
                     action=action_decision.action.value; reason=action_decision.reason
-                    step={'attempt_id':attempt_id,'runner_exit_code':meta.get('exit_code'),'review_decision':review_model.decision,'review_recommended_action':review_model.recommended_action,'human_approval_decision':(human_model.decision if human_model else None),'acceptance_eligible':eligible,'acceptance_blockers':blockers,'controller_action':action,'reason':reason,'created_at':datetime.now(timezone.utc).isoformat()}
+                    step={'attempt_id':attempt_id,'runner_exit_code':meta.get('exit_code'),'review_decision':review_model.decision,'review_recommended_action':review_model.recommended_action,'human_approval_decision':(human_model.decision if human_model else None),'human_override_used':bool(human_model and human_model.valid_override and action=='accept'),'human_override_reasons':(human_model.request_reasons if human_model else []),'acceptance_eligible':eligible,'acceptance_blockers':blockers,'acceptance_blockers_before_override':blockers_before,'acceptance_blockers_after_override':blockers,'controller_action':action,'reason':reason,'created_at':datetime.now(timezone.utc).isoformat()}
                     meta['controller_action']=action; meta['controller_decision']=step; decision_steps.append(step); (adir/'controller_decision.json').write_text(json.dumps(step, indent=2))
-                    record_step(attempt_id, 'deciding', action, next_state(action_decision.action).value, reason, step)
+                    recorder.transition(action_decision.action, next_state(action_decision.action), reason, attempt_id, step)
                     if action_decision.action == ControllerAction.retry_same_backend: retries_used += 1
                     if action_decision.action == ControllerAction.escalate: escalations_used += 1
                     if action_decision.action == ControllerAction.accept:
                         accepted=meta; attempts.append(meta); (adir/'attempt.json').write_text(json.dumps(meta, indent=2)); break
+                    if action_decision.action == ControllerAction.retry_same_backend:
+                        recorder.transition(ControllerAction.run_attempt, ControllerState.attempting, 'Retrying same backend; starting next attempt.', attempt_id)
+                    if action_decision.action == ControllerAction.escalate:
+                        recorder.transition(ControllerAction.run_attempt, ControllerState.attempting, 'Escalating to next backend; starting next attempt.', attempt_id)
                 except Exception as e:
                     meta['status']='failed'; meta['error']=str(e); warnings.append(str(e))
+                    recorder.transition(ControllerAction.review_attempt, ControllerState.reviewing, 'Attempt failed before or during review; preserving lifecycle.', attempt_id, {'error':str(e)})
+                    recorder.transition(ControllerAction.decide, ControllerState.deciding, 'Attempt error; deciding failure.', attempt_id)
+                    recorder.transition(ControllerAction.fail, ControllerState.failed, f'Attempt failed: {e}', attempt_id)
                 meta['ended_at']=datetime.now(timezone.utc).isoformat(); attempts.append(meta); (adir/'attempt.json').write_text(json.dumps(meta, indent=2))
                 rec=((meta.get('review') or {}).get('recommended_action'))
                 if meta.get('fail_requested'): break
@@ -120,9 +149,4 @@ class VillaniOps:
                 if meta.get('controller_action')=='escalate' or (meta.get('human_approval') or {}).get('decision')=='escalate': break
                 break
             if accepted: break
-        apply_opts={}
-        if accepted:
-            apply_opts={'apply_command':f'villani-ops apply {run_id}','branch_command':f'villani-ops branch {run_id} --name villani-ops/{run_id}','pr_command':f'villani-ops pr {run_id} --title "{(task.objective or "Villani Ops changes")[:60]}"'}
-        decision=Decision(run_id=run_id, accepted=bool(accepted), final_action='accept' if accepted else (decision_steps[-1]['controller_action'] if decision_steps else 'fail'), winning_attempt_id=accepted.get('attempt_id') if accepted else None, winning_branch=accepted.get('branch_name') if accepted else None, winning_worktree_path=accepted.get('worktree_path') if accepted else None, winning_patch_path=accepted.get('patch_path') if accepted else None, reviewer_decision=(accepted.get('review') or {}).get('decision') if accepted else None, reviewer_score=(accepted.get('review') or {}).get('score') if accepted else None, reviewer_evidence=(accepted.get('review') or {}).get('evidence',[]) if accepted else [], classification=cls.model_dump(mode='json'), execution_strategy=strategy.model_dump(mode='json'), total_cost=sum(costs.values()), coding_cost=costs['coding'], classification_cost=costs['classification'], policy_cost=costs['policy'], review_cost=costs['review'], total_input_tokens=tin, total_output_tokens=tout, attempts=attempts, warnings=warnings, apply_options=apply_opts, decision_steps=decision_steps, controller_steps=controller_steps, acceptance_blockers=([] if accepted else (decision_steps[-1].get('acceptance_blockers',[]) if decision_steps else [])), retries_used=retries_used, escalations_used=escalations_used, attempts_used=len(attempts), all_attempted_backends=[a.get('backend_name') for a in attempts], failure_reason=('' if accepted else (decision_steps[-1].get('reason','No attempt satisfied acceptance gates.') if decision_steps else 'No attempt satisfied acceptance gates.')), reason='Accepted reviewer-passed successful runner attempt.' if accepted else 'No attempt satisfied acceptance gates.', total_attempts=len(attempts))
-        self.storage.save_decision(run_dir, decision); report=write_markdown_report(run_dir, task, strategy, attempts, decision, time.time()-start)
-        return RunResult(run_id=run_id, run_dir=str(run_dir), decision=decision, report_path=str(report), attempts=attempts)
+        return finalize(accepted, 'accept' if accepted else (decision_steps[-1]['controller_action'] if decision_steps else 'fail'))

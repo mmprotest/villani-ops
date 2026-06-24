@@ -8,7 +8,8 @@ def write_markdown_report(run_dir, task, policy_or_strategy, attempts, decision,
     rows=[]
     for a in attempts:
         r=a.get('review') or {}; rows.append(f"| {a.get('attempt_id')} | {a.get('backend_name')} | {a.get('model','')} | {a.get('status')} | {a.get('exit_code','')} | {r.get('decision','')} | {r.get('score','')} | {r.get('recommended_action','')} | {(a.get('human_approval') or {}).get('decision','')} | {a.get('acceptance_eligible','')} | {'; '.join(a.get('acceptance_blockers') or [])} | {a.get('controller_action','')} | {a.get('patch_path','')} |")
-    timeline='\n'.join(f"- {st.get('step_id')}: {st.get('state_before')} --{st.get('action')}--> {st.get('state_after')} ({st.get('reason')})" for st in (decision.controller_steps or [])) or '- none'
+    timeline_rows='\n'.join(f"| {st.get('step_id')} | {st.get('attempt_id') or ''} | {st.get('state_before')} | {st.get('action')} | {st.get('state_after')} | {st.get('reason')} |" for st in (decision.controller_steps or []))
+    timeline="| Step | Attempt | From | Action | To | Reason |\\n| --- | --- | --- | --- | --- | --- |\\n" + (timeline_rows or "| none | | | | | |")
     rankings='\n'.join(f"- {r.get('expected_cost_rank')}. {r.get('backend')}: capability {r.get('capability_score')}, estimated ${r.get('estimated_attempt_cost')} — {r.get('rank_reason')}" for r in (strategy.get('backend_rankings') or [])) or '- none'
     blockers='\n'.join(f"- {b}" for b in (decision.acceptance_blockers or [])) or '- none'
     evidence='\n'.join(f"- {e}" for e in decision.reviewer_evidence) or '- none'
@@ -75,6 +76,8 @@ Strategy warnings: {', '.join(strategy.get('warnings') or []) or 'none'}
 
 Result: {'ACCEPTED' if decision.accepted else 'FAILED'}
 
+Final state: {decision.final_state}
+
 Final action: {decision.final_action}
 
 Reason: {decision.reason}
@@ -87,6 +90,10 @@ Acceptance blockers:
 Retries used: {decision.retries_used}
 
 Escalations used: {decision.escalations_used}
+
+Human reviews requested/skipped: {decision.human_reviews_requested}/{decision.human_reviews_skipped}
+
+Human override used: {decision.human_override_used}
 
 Winner: {decision.winning_attempt_id or 'none'}
 

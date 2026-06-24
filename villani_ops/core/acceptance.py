@@ -8,17 +8,25 @@ def _get(attempt: Any, key: str, default=None):
     return getattr(attempt, key, default)
 
 
-def is_attempt_acceptance_eligible(attempt: Any) -> tuple[bool, list[str]]:
+def is_attempt_acceptance_eligible(attempt: Any, human_approval: Any | None = None) -> tuple[bool, list[str]]:
     """Return whether an attempt may be accepted by the controller.
 
     Human approval is the only override for runner failures / uncertain reviews.
     """
     blockers: list[str] = []
     status = _get(attempt, "status")
-    human = _get(attempt, "human_approval") or {}
-    human_accept = isinstance(human, dict) and human.get("decision") == "accept"
+    human = human_approval or _get(attempt, "human_approval") or {}
+    if not isinstance(human, dict) and human is not None:
+        human = getattr(human, "model_dump", lambda **_: {})()
+    human_accept = isinstance(human, dict) and human.get("decision") == "accept" and (human.get("valid_override") is True or "valid_override" not in human)
 
     if human_accept and status == "human_approved":
+        patch_path = _get(attempt, "patch_path")
+        changed = _get(attempt, "changed_files") or []
+        if "valid_override" in human and not patch_path:
+            return False, ["human override requires a patch"]
+        if "valid_override" in human and not changed:
+            return False, ["human override requires changed-file evidence"]
         return True, []
 
     exit_code = _get(attempt, "exit_code")

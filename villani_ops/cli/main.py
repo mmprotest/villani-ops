@@ -94,7 +94,13 @@ def run(repo: str|None=None, task: str|None=typer.Option(None,'--task'), task_id
         result=_legacy_run(repo, t, policy, workspace)
     else:
         result=VillaniOps.from_workspace(workspace).run(repo=repo, task=t, policy=policy, isolation=isolation, human_approval=human_approval, non_interactive=(non_interactive or not sys.stdin.isatty()))
-    d=result.decision; console.print(f"Result: {'ACCEPTED' if d.accepted else 'REJECTED' if (policy.endswith('.yaml') or '/' in policy) else 'FAILED'}"); console.print(f'Task: {t.objective}'); c=d.classification or {}; console.print(f"Classification: {c.get('difficulty')} {c.get('category')} {c.get('risk')}"); console.print(f"Strategy: {policy}, {len((d.execution_strategy or {}).get('attempts',[]))} planned attempts"); console.print(f"Winner: {d.winning_attempt_id or 'none'}"); console.print(f"Review: {d.reviewer_decision}, score {d.reviewer_score}"); console.print(f"Cost: total ${d.total_cost:.6f}"); console.print('Evidence:'); [console.print(f'  - {e}') for e in d.reviewer_evidence]; console.print(f"Apply:\n  villani-ops apply {d.run_id}"); console.print(f'Report: {result.report_path}')
+    d=result.decision; console.print(f"Result: {'ACCEPTED' if d.accepted else 'REJECTED' if (policy.endswith('.yaml') or '/' in policy) else 'FAILED'}"); console.print(f"Final state: {d.final_state}"); console.print(f"Final action: {d.final_action}"); console.print(f'Task: {t.objective}'); c=d.classification or {}; console.print(f"Classification: {c.get('difficulty')} {c.get('category')} {c.get('risk')}"); console.print(f"Policy: {policy}, {len((d.execution_strategy or {}).get('attempts',[]))} planned attempts"); console.print(f"Attempts used: {d.attempts_used}"); console.print(f"Retries used: {d.retries_used}"); console.print(f"Escalations used: {d.escalations_used}"); console.print(f"Human reviews requested/skipped: {d.human_reviews_requested}/{d.human_reviews_skipped}"); console.print(f"Winner: {d.winning_attempt_id or 'none'}"); console.print(f"Review: {d.reviewer_decision}, score {d.reviewer_score}"); console.print(f"Human override used: {d.human_override_used}"); console.print(f"Controller reason: {d.reason}"); console.print(f"Cost: total ${d.total_cost:.6f}"); console.print('Evidence:'); [console.print(f'  - {e}') for e in d.reviewer_evidence]
+    if d.accepted:
+        console.print(f"Apply:\n  villani-ops apply {d.run_id}"); console.print(f"Branch:\n  villani-ops branch {d.run_id} --name villani-ops/{d.run_id}"); console.print(f"PR:\n  villani-ops pr {d.run_id} --title \"{(t.objective or 'Villani Ops changes')[:60]}\"")
+    else:
+        console.print(f"Failure reason: {d.failure_reason}")
+        console.print(f"Best failed attempt: {(d.attempts[-1] or {}).get('attempt_id') if d.attempts else 'none'}")
+    console.print(f'Report: {result.report_path}')
 
 
 
