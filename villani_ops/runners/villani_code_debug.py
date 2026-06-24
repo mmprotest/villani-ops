@@ -13,6 +13,7 @@ from villani_ops.core.backend import Backend
 
 class VillaniCodeTelemetry(BaseModel):
     debug_dir: str
+    resolved_trace_dir: str | None = None
     summary_path: str | None = None
     final_summary_path: str | None = None
     run_id: str | None = None
@@ -124,12 +125,30 @@ def _is_command(t: dict[str, Any]) -> bool:
     return bool(args.get('command')) or t.get('tool_category')=='command' or name in {'bash','shell','exec','runcommand','terminal','exec_command'} or 'shell' in name
 
 
+def resolve_villani_code_trace_dir(debug_dir: Path) -> Path:
+    debug_dir=Path(debug_dir)
+    if (debug_dir/'final_summary.json').exists() or (debug_dir/'summary.json').exists():
+        return debug_dir
+    candidates=[]
+    if debug_dir.exists():
+        for child in debug_dir.iterdir():
+            if child.is_dir() and ((child/'final_summary.json').exists() or (child/'summary.json').exists()):
+                candidates.append(child)
+    if not candidates:
+        return debug_dir
+    def key(child: Path) -> float:
+        for name in ('final_summary.json','summary.json'):
+            p=child/name
+            if p.exists(): return p.stat().st_mtime
+        return child.stat().st_mtime
+    return max(candidates, key=key)
+
 def parse_villani_code_debug_artifact(debug_dir: Path) -> VillaniCodeTelemetry:
-    warnings: list[str]=[]; debug_dir=Path(debug_dir)
-    final=debug_dir/'final_summary.json'; summ=debug_dir/'summary.json'
+    warnings: list[str]=[]; debug_dir=Path(debug_dir); trace_dir=resolve_villani_code_trace_dir(debug_dir)
+    final=trace_dir/'final_summary.json'; summ=trace_dir/'summary.json'
     summary_path = final if final.exists() else (summ if summ.exists() else None)
     summary = _read_json(summary_path, warnings) if summary_path else None
-    tel=VillaniCodeTelemetry(debug_dir=str(debug_dir), token_accounting_warnings=warnings)
+    tel=VillaniCodeTelemetry(debug_dir=str(debug_dir), resolved_trace_dir=str(trace_dir), token_accounting_warnings=warnings)
     if final.exists(): tel.final_summary_path=str(final)
     if summ.exists(): tel.summary_path=str(summ)
     if not summary:
@@ -147,7 +166,7 @@ def parse_villani_code_debug_artifact(debug_dir: Path) -> VillaniCodeTelemetry:
     tel.tool_failures_by_name=dict(summary.get('tool_failures_by_name') or {})
     tel.changed_files_from_debug=list(summary.get('changed_files_from_debug') or summary.get('changed_files') or [])
 
-    responses_path=debug_dir/'model_responses.jsonl'
+    responses_path=trace_dir/'model_responses.jsonl'
     if responses_path.exists():
         rin=rout=rtot=0; count=0
         for r in _jsonl(responses_path, warnings):
@@ -160,7 +179,7 @@ def parse_villani_code_debug_artifact(debug_dir: Path) -> VillaniCodeTelemetry:
     else:
         tel.token_accounting_status='summary_only'; warnings.append('Missing optional artifact: model_responses.jsonl')
 
-    tools=_jsonl(debug_dir/'tool_calls.jsonl', warnings) if (debug_dir/'tool_calls.jsonl').exists() else []
+    tools=_jsonl(trace_dir/'tool_calls.jsonl', warnings) if (trace_dir/'tool_calls.jsonl').exists() else []
     if tools:
         sorted_tools=sorted(enumerate(tools), key=lambda it: (_sort_timestamp(it[1].get('started_at'), warnings), it[1].get('turn_index') if it[1].get('turn_index') is not None else 10**9, it[0]))
         tel.total_tool_calls=len(sorted_tools)
