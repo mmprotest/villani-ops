@@ -120,3 +120,80 @@ def test_parser_chooses_newest_nested_trace_dir(tmp_path):
     t=parse_villani_code_debug_artifact(parent)
     assert t.resolved_trace_dir.endswith('new')
     assert t.input_tokens == 9
+
+
+def test_parser_reads_real_villani_code_payload_usage_shape(tmp_path):
+    trace = tmp_path / 'villani_code_debug' / '20260624T034357_216114Z'
+    trace.mkdir(parents=True)
+    (trace / 'final_summary.json').write_text(json.dumps({
+        "run_id": "20260624T034357_216114Z",
+        "status": "completed",
+        "tokens_input": 10,
+        "tokens_output": 5,
+        "model_requests": 2,
+        "total_tool_calls": 0,
+    }))
+    write_jsonl(trace / 'model_responses.jsonl', [
+        {"ts": "2026-06-24T03:43:59+00:00", "payload": {"usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}}},
+        {"ts": "2026-06-24T03:44:00+00:00", "payload": {"usage": {"prompt_tokens": 6, "completion_tokens": 3, "total_tokens": 9}}},
+    ])
+
+    telemetry = parse_villani_code_debug_artifact(tmp_path / 'villani_code_debug')
+
+    assert telemetry.input_tokens == 10
+    assert telemetry.output_tokens == 5
+    assert telemetry.total_tokens == 15
+    assert telemetry.token_accounting_status == "verified"
+
+
+def test_parser_supports_response_wrapped_usage(tmp_path):
+    (tmp_path / 'final_summary.json').write_text(json.dumps(summary(tokens_input=10, tokens_output=5)))
+    write_jsonl(tmp_path / 'model_responses.jsonl', [
+        {"response": {"usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}}},
+        {"response": {"payload": {"usage": {"prompt_tokens": 6, "completion_tokens": 3, "total_tokens": 9}}}},
+    ])
+
+    telemetry = parse_villani_code_debug_artifact(tmp_path)
+
+    assert telemetry.input_tokens == 10
+    assert telemetry.output_tokens == 5
+    assert telemetry.total_tokens == 15
+    assert telemetry.token_accounting_status == "verified"
+
+
+def test_parser_uses_summary_only_when_responses_are_unavailable(tmp_path):
+    (tmp_path / 'final_summary.json').write_text(json.dumps(summary(tokens_input=10, tokens_output=5)))
+
+    telemetry = parse_villani_code_debug_artifact(tmp_path)
+
+    assert telemetry.input_tokens > 0
+    assert telemetry.output_tokens > 0
+    assert telemetry.token_accounting_status == "summary_only"
+
+
+def test_parser_supports_compatible_token_keys(tmp_path):
+    (tmp_path / 'final_summary.json').write_text(json.dumps(summary(tokens_input=10, tokens_output=5)))
+    write_jsonl(tmp_path / 'model_responses.jsonl', [
+        {"payload": {"usage": {"input_tokens": 4, "output_tokens": 2}}},
+        {"payload": {"usage": {"tokens_input": 6, "tokens_output": 3, "tokens_total": 9}}},
+    ])
+
+    telemetry = parse_villani_code_debug_artifact(tmp_path)
+
+    assert telemetry.input_tokens == 10
+    assert telemetry.output_tokens == 5
+    assert telemetry.total_tokens == 15
+    assert telemetry.token_accounting_status == "verified"
+
+
+def test_parser_uses_summary_only_when_response_usage_cannot_be_read(tmp_path):
+    (tmp_path / 'final_summary.json').write_text(json.dumps(summary(tokens_input=10, tokens_output=5)))
+    write_jsonl(tmp_path / 'model_responses.jsonl', [
+        {"payload": {"not_usage": {"prompt_tokens": 10}}},
+    ])
+
+    telemetry = parse_villani_code_debug_artifact(tmp_path)
+
+    assert telemetry.input_tokens == 10
+    assert telemetry.output_tokens == 5
+    assert telemetry.token_accounting_status == "summary_only"

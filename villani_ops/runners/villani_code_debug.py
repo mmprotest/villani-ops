@@ -82,6 +82,55 @@ def _jsonl(path: Path, warnings: list[str]) -> list[dict[str, Any]]:
     return rows
 
 
+def _usage_from_model_response(row: dict[str, Any]) -> dict[str, Any]:
+    usage = row.get("usage")
+    if isinstance(usage, dict):
+        return usage
+
+    payload = row.get("payload")
+    if isinstance(payload, dict):
+        usage = payload.get("usage")
+        if isinstance(usage, dict):
+            return usage
+
+    response = row.get("response")
+    if isinstance(response, dict):
+        usage = response.get("usage")
+        if isinstance(usage, dict):
+            return usage
+
+        payload = response.get("payload")
+        if isinstance(payload, dict):
+            usage = payload.get("usage")
+            if isinstance(usage, dict):
+                return usage
+
+    return {}
+
+
+def _int_token_value(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _first_token_value(data: dict[str, Any], keys: tuple[str, ...]) -> tuple[int, bool]:
+    for key in keys:
+        if data.get(key) is not None:
+            return _int_token_value(data.get(key)), True
+    return 0, False
+
+
+def _token_counts_from_usage(usage: dict[str, Any]) -> tuple[int, int, int, bool, bool, bool]:
+    input_tokens, has_input = _first_token_value(usage, ("prompt_tokens", "input_tokens", "tokens_input"))
+    output_tokens, has_output = _first_token_value(usage, ("completion_tokens", "output_tokens", "tokens_output"))
+    total_tokens, has_total = _first_token_value(usage, ("total_tokens", "tokens_total"))
+    if not has_total:
+        total_tokens = input_tokens + output_tokens
+    return input_tokens, output_tokens, total_tokens, has_input, has_output, has_total
+
+
 def _parse_ts(s: Any) -> datetime | None:
     if not isinstance(s, str) or not s:
         return None
@@ -170,12 +219,19 @@ def parse_villani_code_debug_artifact(debug_dir: Path) -> VillaniCodeTelemetry:
     if responses_path.exists():
         rin=rout=rtot=0; count=0
         for r in _jsonl(responses_path, warnings):
-            u=r.get('usage') or {}
-            if isinstance(u, dict):
-                rin += int(u.get('prompt_tokens') or 0); rout += int(u.get('completion_tokens') or 0); rtot += int(u.get('total_tokens') or ((u.get('prompt_tokens') or 0)+(u.get('completion_tokens') or 0))); count+=1
+            u = _usage_from_model_response(r)
+            if u:
+                input_tokens, output_tokens, total_tokens, has_input, has_output, has_total = _token_counts_from_usage(u)
+                rin += input_tokens; rout += output_tokens; rtot += total_tokens; count+=1
+                if has_total and not has_input:
+                    warnings.append('Model response usage has total tokens but no input token key.')
+                if has_total and not has_output:
+                    warnings.append('Model response usage has total tokens but no output token key.')
         if count and (rin,rout,rtot)==(tel.input_tokens,tel.output_tokens,tel.total_tokens): tel.token_accounting_status='verified'
-        else:
+        elif count:
             tel.token_accounting_status='mismatch'; warnings.append(f"Token totals mismatch: summary input/output/total={tel.input_tokens}/{tel.output_tokens}/{tel.total_tokens}; model_responses input/output/total={rin}/{rout}/{rtot}.")
+        else:
+            tel.token_accounting_status='summary_only'; warnings.append('No usable usage entries found in model_responses.jsonl')
     else:
         tel.token_accounting_status='summary_only'; warnings.append('Missing optional artifact: model_responses.jsonl')
 
