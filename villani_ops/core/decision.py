@@ -1,19 +1,11 @@
 from __future__ import annotations
 from typing import Any
-from pydantic import BaseModel, Field, field_validator
-
-class _ModeStr(str):
-    def __eq__(self, other):
-        return str.__eq__(self, other) or (str(self)=="performance" and other=="performance_orchestration")
+from pydantic import BaseModel, Field
 
 class Decision(BaseModel):
     run_id: str
 
     mode: str = "performance"
-    @field_validator("mode")
-    @classmethod
-    def _mode_compat(cls, v):
-        return _ModeStr("performance" if v == "performance_orchestration" else v)
     runner: str = "villani-code"
     orchestration_graph_path: str | None = None
     selected_attempt_id: str | None = None

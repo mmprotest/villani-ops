@@ -87,15 +87,15 @@ class OrchestrationEngine:
         recorder=ControllerStateRecorder(run_id, run_dir); scheduler=GraphScheduler(); warnings=[]; attempts=[]; prior_results=[]
         costs={'classification':0.0,'review':0.0,'coding':0.0,'investigation':0.0,'selection':0.0}; tin=tout=0
         ctx=TaskContext(objective=task.objective or task.instruction or '', success_criteria=task.success_criteria)
-        graph=build_fixed_graph(candidate_attempts, runner=runner, run_id=run_id, mode=mode, classify=classify, include_decompose=False)
+        graph=build_fixed_graph(candidate_attempts, runner=runner, run_id=run_id, mode=mode, classify=classify, include_decompose=True)
         graph.write(run_dir/'orchestration_graph.json')
         routing_decisions={}
         def write_node(nid, inp=None, out=None, raw=None):
-            nd=run_dir/'nodes'/nid; nd.mkdir(parents=True, exist_ok=True); graph.get(nid).artifacts['node_json']=str(nd/'node.json')
-            (nd/'node.json').write_text(graph.get(nid).model_dump_json(indent=2));
-            if inp is not None: (nd/'input.json').write_text(json.dumps(inp, indent=2, default=str)); graph.get(nid).artifacts['input']=str(nd/'input.json')
-            if out is not None: (nd/'output.json').write_text(json.dumps(out, indent=2, default=str)); graph.get(nid).artifacts['output']=str(nd/'output.json')
-            if raw is not None: (nd/'raw.txt').write_text(str(raw)); graph.get(nid).artifacts['raw']=str(nd/'raw.txt')
+            nd=run_dir/'nodes'/nid; nd.mkdir(parents=True, exist_ok=True); node=graph.get(nid); node.artifacts['node_json']=str(nd/'node.json')
+            if inp is not None: (nd/'input.json').write_text(json.dumps(inp, indent=2, default=str)); node.artifacts['input']=str(nd/'input.json')
+            if out is not None: (nd/'output.json').write_text(json.dumps(out, indent=2, default=str)); node.artifacts['output']=str(nd/'output.json')
+            if raw is not None: (nd/'raw.txt').write_text(str(raw)); node.artifacts['raw']=str(nd/'raw.txt')
+            (nd/'node.json').write_text(node.model_dump_json(indent=2))
             graph.write(run_dir/'orchestration_graph.json')
         def assign(n):
             sel=self.execution_policy.select_backend(node=n, backends=self.backends, task_context=ctx, prior_results=prior_results)
@@ -108,32 +108,28 @@ class OrchestrationEngine:
             try:
                 cls, call=TaskClassifier().classify(task, self.backends, run_dir/'classification.json', backend_override=self.backends[n.assigned_backend]); ctx.classification=cls.model_dump(mode='json'); task.classification=cls; self.storage.save_task(run_dir,task)
                 if mode!='performance': costs['classification']+=call.estimated_cost
-                tin+=call.input_tokens; tout+=call.output_tokens; graph.mark_succeeded(n.id, summary=getattr(cls,'summary','classification complete'), artifacts={'classification':str(run_dir/'classification.json')}, confidence=getattr(cls,'confidence',None)); write_node(n.id, {'task':ctx.objective}, ctx.classification, getattr(call,'raw_text',''))
+                tin+=call.input_tokens; tout+=call.output_tokens; graph.mark_succeeded(n.id, summary=getattr(cls,'summary','classification complete'), artifacts={'classification':str(run_dir/'classification.json')}, confidence=getattr(cls,'confidence',None)); write_node(n.id, {'task':ctx.objective}, ctx.classification, getattr(call,'raw_text','')); prior_results.append(NodeResult(node_id=n.id, status='succeeded', summary=getattr(cls,'summary','classification complete'), data=ctx.classification or {}))
             except Exception as e:
-                warnings.append(f'Classification failed: {e}'); graph.mark_succeeded(n.id, summary=f'Classification unavailable: {e}', confidence=0.0); write_node(n.id, out={'error':str(e), 'fallback_used': True})
+                warnings.append(f'Classification failed: {e}'); graph.mark_succeeded(n.id, summary=f'Classification unavailable: {e}', confidence=0.0); write_node(n.id, out={'error':str(e), 'fallback_used': True}); prior_results.append(NodeResult(node_id=n.id, status='uncertain', summary=str(e), data={'fallback_used': True}))
         scheduler.next_ready_nodes(graph); n=graph.get('investigate'); assign(n); graph.mark_running(n.id); write_node(n.id, {'task':ctx.objective})
         try:
             inv, call=Investigator().investigate(task, cls, n.assigned_backend, self.backends[n.assigned_backend], run_dir); (run_dir/'investigation.json').write_text(inv.model_dump_json(indent=2)); ctx.investigation=inv.model_dump(mode='json')
             if mode!='performance': costs['investigation']+=call.estimated_cost
-            tin+=call.input_tokens; tout+=call.output_tokens; graph.mark_succeeded(n.id, summary=inv.summary, artifacts={'investigation':str(run_dir/'investigation.json'),'raw':str(run_dir/'investigation.raw.txt')}, confidence=inv.confidence); write_node(n.id, {'task':ctx.objective}, ctx.investigation, getattr(call,'raw_text',''))
+            tin+=call.input_tokens; tout+=call.output_tokens; graph.mark_succeeded(n.id, summary=inv.summary, artifacts={'investigation':str(run_dir/'investigation.json'),'raw':str(run_dir/'investigation.raw.txt')}, confidence=inv.confidence); write_node(n.id, {'task':ctx.objective}, ctx.investigation, getattr(call,'raw_text','')); prior_results.append(NodeResult(node_id=n.id, status='succeeded', summary=inv.summary, data=ctx.investigation or {}))
         except Exception as e:
-            warnings.append(f'Investigation failed: {e}'); inv=InvestigationResult(summary=f'Investigation unavailable: {e}'); (run_dir/'investigation.json').write_text(inv.model_dump_json(indent=2)); (run_dir/'investigation.raw.txt').write_text(''); ctx.investigation=inv.model_dump(mode='json'); graph.mark_succeeded(n.id, summary=inv.summary, artifacts={'investigation':str(run_dir/'investigation.json')}, confidence=0.0); write_node(n.id, out=ctx.investigation)
+            warnings.append(f'Investigation failed: {e}'); inv=InvestigationResult(summary=f'Investigation unavailable: {e}'); (run_dir/'investigation.json').write_text(inv.model_dump_json(indent=2)); (run_dir/'investigation.raw.txt').write_text(''); ctx.investigation=inv.model_dump(mode='json'); graph.mark_succeeded(n.id, summary=inv.summary, artifacts={'investigation':str(run_dir/'investigation.json')}, confidence=0.0); write_node(n.id, out=ctx.investigation); prior_results.append(NodeResult(node_id=n.id, status='uncertain', summary=inv.summary, data=ctx.investigation or {}))
         scheduler.next_ready_nodes(graph); n=graph.get('plan'); assign(n); graph.mark_running(n.id); planner=Planner(self.llm_client)
-        plan, pcall=planner.plan(task=task, classification=ctx.classification, investigation=ctx.investigation, repo_summary=None, candidate_attempts=candidate_attempts, mode=mode, backend_name=n.assigned_backend, backend=self.backends[n.assigned_backend], run_dir=run_dir); ctx.plan=plan.model_dump(mode='json'); ctx.overall_difficulty=plan.expected_difficulty; ctx.confidence=plan.confidence; graph.mark_succeeded(n.id, summary=plan.summary, artifacts={'plan':str(run_dir/'plan.json'),'raw':str(run_dir/'plan.raw.txt')}, confidence=plan.confidence); write_node(n.id, {'task':ctx.objective}, ctx.plan, (pcall.raw_text if pcall else ''))
+        plan, pcall=planner.plan(task=task, classification=ctx.classification, investigation=ctx.investigation, repo_summary=None, candidate_attempts=candidate_attempts, mode=mode, backend_name=n.assigned_backend, backend=self.backends[n.assigned_backend], run_dir=run_dir); ctx.plan=plan.model_dump(mode='json'); ctx.overall_difficulty=plan.expected_difficulty; ctx.confidence=plan.confidence; graph.mark_succeeded(n.id, summary=plan.summary, artifacts={'plan':str(run_dir/'plan.json'),'raw':str(run_dir/'plan.raw.txt')}, confidence=plan.confidence); write_node(n.id, {'task':ctx.objective}, ctx.plan, (pcall.raw_text if pcall else '')); prior_results.append(NodeResult(node_id=n.id, status='succeeded', summary=plan.summary, data=ctx.plan or {}))
+        scheduler.next_ready_nodes(graph); n=graph.get('decompose')
         if plan.should_decompose:
-            graph=build_fixed_graph(candidate_attempts, runner=runner, run_id=run_id, mode=mode, classify=classify, include_decompose=True)
-            for nid in ['classify','investigate','plan']:
-                if any(x.id==nid for x in graph.nodes): graph.update_node(nid, status='succeeded')
-            scheduler.next_ready_nodes(graph); n=graph.get('decompose'); assign(n); graph.mark_running(n.id)
-            dec, dcall=planner.decompose(task=task, plan=plan, investigation=ctx.investigation, backend=self.backends[n.assigned_backend], run_dir=run_dir); ctx.decomposition=dec.model_dump(mode='json'); graph.mark_succeeded(n.id, summary=dec.reason, artifacts={'decomposition':str(run_dir/'decomposition.json'),'raw':str(run_dir/'decomposition.raw.txt')}, confidence=dec.confidence); write_node(n.id, {'plan':ctx.plan}, ctx.decomposition, (dcall.raw_text if dcall else ''))
-        # assign remaining nodes after context signals
-        for n in graph.nodes:
-            if not n.assigned_backend:
-                assign(n)
+            assign(n); graph.mark_running(n.id)
+            dec, dcall=planner.decompose(task=task, plan=plan, investigation=ctx.investigation, backend=self.backends[n.assigned_backend], run_dir=run_dir); ctx.decomposition=dec.model_dump(mode='json'); graph.mark_succeeded(n.id, summary=dec.reason, artifacts={'decomposition':str(run_dir/'decomposition.json'),'raw':str(run_dir/'decomposition.raw.txt')}, confidence=dec.confidence); write_node(n.id, {'plan':ctx.plan}, ctx.decomposition, (dcall.raw_text if dcall else '')); prior_results.append(NodeResult(node_id=n.id, status='succeeded', summary=dec.reason, data=ctx.decomposition or {}))
+        else:
+            graph.mark_skipped(n.id, 'Planner did not request decomposition'); write_node(n.id, {'plan':ctx.plan}, {'skipped': True, 'reason': 'Planner did not request decomposition'}); prior_results.append(NodeResult(node_id=n.id, status='skipped', summary='Planner did not request decomposition', data={'intentional_skip': True}))
         graph.write(run_dir/'orchestration_graph.json')
         # execute code/review nodes in dependency order
         for idx in range(1,candidate_attempts+1):
-            scheduler.next_ready_nodes(graph); aid=f'attempt_{idx:03d}'; cn=graph.get(f'code_{aid}'); graph.mark_running(cn.id); b=self.backends[cn.assigned_backend]; adir=run_dir/'attempts'/aid; adir.mkdir(parents=True, exist_ok=True)
+            scheduler.next_ready_nodes(graph); aid=f'attempt_{idx:03d}'; cn=graph.get(f'code_{aid}'); assign(cn); graph.mark_running(cn.id); b=self.backends[cn.assigned_backend]; adir=run_dir/'attempts'/aid; adir.mkdir(parents=True, exist_ok=True)
             prompt=_candidate_prompt(task, inv, idx, candidate_attempts)
             if ctx.decomposition: prompt += '\nAdvisory decomposition:\n' + json.dumps(ctx.decomposition, indent=2)[:12000]
             meta={'attempt_id':aid,'backend_name':b.name,'model':b.model,'runner_name':runner,'status':'running','started_at':datetime.now(timezone.utc).isoformat()}
@@ -151,8 +147,8 @@ class OrchestrationEngine:
                 graph.mark_succeeded(cn.id, summary=f'Candidate {aid} completed', artifacts={'attempt':str(adir/'attempt.json'),'patch':str(meta.get('patch_path') or '')})
             except Exception as e:
                 meta.update({'status':'failed','exit_code':meta.get('exit_code',1),'error':str(e),'changed_files':[],'patch_path':None}); (adir/'stderr.txt').write_text(str(e)); graph.mark_failed(cn.id, str(e))
-            write_node(cn.id, {'prompt':prompt}, meta)
-            scheduler.next_ready_nodes(graph); rn=graph.get(f'review_{aid}'); graph.mark_running(rn.id); rb=self.backends[rn.assigned_backend]
+            write_node(cn.id, {'prompt':prompt}, meta); prior_results.append(NodeResult(node_id=cn.id, status='failed' if meta.get('status')=='failed' or meta.get('exit_code',0) else 'succeeded', summary=meta.get('error') or f'Candidate {aid} completed', data=meta))
+            scheduler.next_ready_nodes(graph); rn=graph.get(f'review_{aid}'); assign(rn); graph.mark_running(rn.id); rb=self.backends[rn.assigned_backend]
             review_input={k:meta.get(k) for k in ['attempt_id','exit_code','stdout_path','stderr_path','changed_files','git_status','runner_telemetry']}; review_input.update({'stdout_summary':_tail(meta.get('stdout_path'),4000),'stderr_summary':_tail(meta.get('stderr_path'),4000),'patch':_patch_text(meta.get('patch_path'),50000),'investigation':ctx.investigation})
             try:
                 review, rcall=LLMReviewer().review(task, cls, rb, review_input, self.backends, adir/'review.json', backend_override=rb)
@@ -172,7 +168,7 @@ class OrchestrationEngine:
             meta['candidate_summary']=summary.model_dump(mode='json'); (adir/'attempt.json').write_text(json.dumps(meta, indent=2)); attempts.append(meta)
             graph.mark_succeeded(rn.id, summary=review.summary, artifacts={'review':str(adir/'review.json'),'attempt':str(adir/'attempt.json')}, confidence=review.score or 0.0); write_node(rn.id, review_input, review.model_dump(mode='json'))
             prior_results.append(NodeResult(node_id=rn.id, status='failed' if not eligible else 'succeeded', summary=review.summary, data={'acceptance_blockers':blockers}))
-        scheduler.next_ready_nodes(graph); sn=graph.get('select'); graph.mark_running(sn.id); select_backend=self.backends[sn.assigned_backend]
+        scheduler.next_ready_nodes(graph); sn=graph.get('select'); assign(sn); graph.mark_running(sn.id); select_backend=self.backends[sn.assigned_backend]
         candidates=[_selector_candidate_payload(a) for a in attempts]
         selection, scall=Selector().select(task, inv, candidates, sn.assigned_backend, select_backend, run_dir)
         if scall and mode!='performance': costs['selection']+=scall.estimated_cost
@@ -180,8 +176,8 @@ class OrchestrationEngine:
         if selection.decision=='select' and selection.selected_attempt_id not in eligible_ids:
             selection=deterministic_fallback(candidates); selection.selector_backend=sn.assigned_backend; (run_dir/'selection.json').write_text(selection.model_dump_json(indent=2))
         graph.mark_succeeded(sn.id, summary=selection.summary, artifacts={'selection':str(run_dir/'selection.json'),'selection_input':str(run_dir/'selection_input.json')}, confidence=selection.confidence); write_node(sn.id, {'candidates':candidates}, selection.model_dump(mode='json'), Path(run_dir/'selection.raw.txt').read_text(errors='replace') if (run_dir/'selection.raw.txt').exists() else '')
-        winner=next((a for a in attempts if a.get('attempt_id')==selection.selected_attempt_id and a.get('acceptance_eligible')), None) if selection.decision=='select' else None
-        scheduler.next_ready_nodes(graph); vn=graph.get('verify'); graph.mark_running(vn.id); accepted=bool(winner); graph.mark_succeeded(vn.id, summary='Accepted selected candidate.' if accepted else 'No eligible selected candidate.'); write_node(vn.id, {'selection':selection.model_dump(mode='json')}, {'accepted':accepted})
+        prior_results.append(NodeResult(node_id=sn.id, status='succeeded' if selection.decision=='select' else 'failed', summary=selection.summary, data=selection.model_dump(mode='json'))); winner=next((a for a in attempts if a.get('attempt_id')==selection.selected_attempt_id and a.get('acceptance_eligible')), None) if selection.decision=='select' else None
+        scheduler.next_ready_nodes(graph); vn=graph.get('verify'); assign(vn); graph.mark_running(vn.id); accepted=bool(winner); graph.mark_succeeded(vn.id, summary='Accepted selected candidate.' if accepted else 'No eligible selected candidate.'); write_node(vn.id, {'selection':selection.model_dump(mode='json')}, {'accepted':accepted})
         apply_opts={}
         if accepted: apply_opts={'apply_command':f'villani-ops apply {run_id}','branch_command':f'villani-ops branch {run_id} --name villani-ops/{run_id}','pr_command':f'villani-ops pr {run_id} --title "{(task.objective or "Villani Ops changes")[:60]}"'}
         decision=Decision(run_id=run_id, mode=mode, runner=runner, orchestration_graph_path=str(run_dir/'orchestration_graph.json'), node_backend_assignments={n.id:n.assigned_backend for n in graph.nodes if n.assigned_backend}, plan=ctx.plan, decomposition=ctx.decomposition, performance_backend_name=(graph.get('investigate').assigned_backend if mode=='performance' else None), performance_backend_model=(self.backends[graph.get('investigate').assigned_backend].model if mode=='performance' else None), accepted=accepted, lifecycle_completed=True, final_state='accepted' if accepted else 'failed', final_action='accept' if accepted else 'fail', winning_attempt_id=winner.get('attempt_id') if winner else None, winning_worktree_path=winner.get('worktree_path') if winner else None, winning_patch_path=winner.get('patch_path') if winner else None, reviewer_decision=(winner.get('review') or {}).get('decision') if winner else None, reviewer_score=(winner.get('review') or {}).get('score') if winner else None, classification=ctx.classification, investigation=ctx.investigation, selection=selection.model_dump(mode='json'), selected_attempt_id=selection.selected_attempt_id if accepted else None, candidate_attempts_requested=candidate_attempts, candidate_attempts_completed=len(attempts), eligible_candidate_attempts=[a['attempt_id'] for a in attempts if a.get('acceptance_eligible')], orchestration_summary=json.dumps(graph.summary()), total_cost=0 if mode=='performance' else sum(costs.values()), coding_cost=0 if mode=='performance' else costs['coding'], classification_cost=0 if mode=='performance' else costs['classification'], review_cost=0 if mode=='performance' else costs['review'], total_input_tokens=tin, total_output_tokens=tout, total_coding_input_tokens=sum(a.get('input_tokens') or 0 for a in attempts), total_coding_output_tokens=sum(a.get('output_tokens') or 0 for a in attempts), token_accounting_statuses=dict(Counter(a.get('token_accounting_status') or 'missing' for a in attempts)), attempts=attempts, warnings=warnings, apply_options=apply_opts, controller_steps=recorder.steps, acceptance_blockers=[] if accepted else [b for a in attempts for b in (a.get('acceptance_blockers') or [])], attempts_used=len(attempts), all_attempted_backends=[a.get('backend_name') for a in attempts], failure_reason='' if accepted else selection.summary, reason='Selected eligible candidate.' if accepted else 'No eligible candidate selected.', total_attempts=len(attempts))

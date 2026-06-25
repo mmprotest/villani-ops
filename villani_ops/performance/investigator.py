@@ -22,7 +22,7 @@ class Investigator:
         except Exception as e: repo_ctx={"error": str(e)}
         ctx={"task": task.model_dump(mode='json'), "classification": classification.model_dump(mode='json') if classification else None, "repo_path": task.repo_path, "repo_context": repo_ctx}
         call=self.client.complete_json(backend, INVESTIGATOR_SYSTEM, INVESTIGATOR_USER.format(context=json.dumps(ctx, indent=2)[:60000]), "InvestigationResult")
-        inv=InvestigationResult.model_validate(call.parsed_json); inv.investigator_backend=backend_name; inv.performance_backend={'name': backend_name, 'model': backend.model}
+        inv=InvestigationResult.model_validate(call.parsed_json); inv.investigator_backend=backend_name; inv.assigned_backend={'name': backend_name, 'model': backend.model}
         (run_dir/'investigation.json').write_text(inv.model_dump_json(indent=2)); (run_dir/'investigation.raw.txt').write_text(call.raw_text or '')
         cc=run_dir/'controller_calls'; cc.mkdir(exist_ok=True); (cc/'investigation.json').write_text(call.model_dump_json(indent=2))
         return inv, call
