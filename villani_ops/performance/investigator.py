@@ -184,9 +184,9 @@ class Investigator:
         ctx={"task": task.model_dump(mode='json'), "classification": classification.model_dump(mode='json') if classification else None, "repo_path": task.repo_path, "repo_context": repo_ctx}
 
         try:
-            call=self.client.complete_json(backend, INVESTIGATOR_SYSTEM, INVESTIGATOR_USER.format(context=json.dumps(ctx, indent=2)[:60000]), "InvestigationResult", estimate_cost=estimate_cost)
+            call=self.client.complete_json(backend, INVESTIGATOR_SYSTEM, INVESTIGATOR_USER.replace("{context}", json.dumps(ctx, indent=2)[:60000]), "InvestigationResult", estimate_cost=estimate_cost)
         except TypeError:
-            call=self.client.complete_json(backend, INVESTIGATOR_SYSTEM, INVESTIGATOR_USER.format(context=json.dumps(ctx, indent=2)[:60000]), "InvestigationResult")
+            call=self.client.complete_json(backend, INVESTIGATOR_SYSTEM, INVESTIGATOR_USER.replace("{context}", json.dumps(ctx, indent=2)[:60000]), "InvestigationResult")
         write_text_utf8(run_dir/'investigation.raw.txt', call.raw_text or '')
         raw_payload=call.parsed_json if isinstance(call.parsed_json, dict) else {}
         normalized_payload, notes = normalize_investigation_payload(raw_payload)

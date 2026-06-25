@@ -7,9 +7,11 @@ class ToolMessageResult(BaseModel):
 class ToolCallingLLMClient:
     def create_message(self,backend,messages,system,tools,max_tokens=None,tool_choice=None,strict=True):
         if hasattr(backend,'create_message'): return backend.create_message(backend=backend,messages=messages,system=system,tools=tools,max_tokens=max_tokens,tool_choice=tool_choice,strict=strict)
-        base=getattr(backend,'base_url',None) or os.getenv('OPENAI_BASE_URL','https://api.openai.com/v1')
-        key=getattr(backend,'api_key',None) or os.getenv(getattr(backend,'api_key_env',None) or 'OPENAI_API_KEY','')
-        model=getattr(backend,'model',None) or 'gpt-4o-mini'
+        base=getattr(backend,'base_url',None)
+        model=getattr(backend,'model',None)
+        if not base or not model:
+            raise ValueError('agentic orchestrator requires a configured backend with tool-calling support or OpenAI-compatible chat completions')
+        key=getattr(backend,'api_key',None) or os.getenv(getattr(backend,'api_key_env',None) or '', '')
         msgs=[{'role':'system','content':system if isinstance(system,str) else str(system)}]+messages
         payload={'model':model,'messages':msgs,'tools':tools}
         if max_tokens: payload['max_tokens']=max_tokens

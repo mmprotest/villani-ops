@@ -115,7 +115,9 @@ def run(ctx: typer.Context, repo: str|None=None, task: str|None=typer.Option(Non
         raise typer.BadParameter(f"Runner '{runner}' is registered but not implemented yet." if runner in {"claude-code","pi","aider","codex"} else f"Unsupported runner '{runner}'. Supported runner: villani-code.")
     if orchestrator == 'agentic':
         from villani_ops.agentic import OpsRunner, OpsRunRequest
-        result=OpsRunner(storage(workspace)).run(OpsRunRequest(repo_path=str(Path(repo).resolve()), task=t.objective, success_criteria=t.success_criteria, mode=mode, runner=runner, candidate_attempts=candidate_attempts, timeout_seconds=timeout_seconds, workspace=workspace))
+        
+        s=storage(workspace); s.init_workspace(); backends=s.load_backends()
+        result=OpsRunner(s, backends=backends).run(OpsRunRequest(repo_path=str(Path(repo).resolve()), task=t.objective, success_criteria=t.success_criteria, mode=mode, runner=runner, candidate_attempts=candidate_attempts, timeout_seconds=timeout_seconds, workspace=workspace, backends=backends))
     else:
         result=VillaniOps(storage(workspace), progress_reporter=RunProgressReporter(not quiet, verbose=verbose)).run(repo=repo, task=t, candidate_attempts=candidate_attempts, timeout_seconds=timeout_seconds, classify=classify, non_interactive=(non_interactive or not sys.stdin.isatty()), mode=mode, runner=runner)
     d=result.decision
