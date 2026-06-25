@@ -105,7 +105,7 @@ def test_decision_mode_and_selector_input_no_cost(tmp_path, monkeypatch):
     ops, ws=make_ops(tmp_path, monkeypatch, [ReviewResult(passed=True,decision='pass',recommended_action='accept',score=.9)])
     res=ops.run(repo, Task(repo_path=str(repo), objective='edit'), candidate_attempts=1, non_interactive=True)
     rd=Path(res.run_dir)
-    assert res.decision.mode == 'performance_orchestration'
+    assert res.decision.mode == 'performance'
     payload=json.loads((rd/'selection_input.json').read_text())
     cand=payload['candidates'][0]
     for key in ['patch_text','review','stdout_tail','stderr_tail','git_status','changed_files','acceptance_blockers']:

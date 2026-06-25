@@ -19,7 +19,7 @@ class ReviewResult(BaseModel):
     confidence: float=0.0
     requires_human_approval: bool=False
     reviewer_backend: str|None=None
-    performance_backend: dict[str, str]|None=None
+    assigned_backend: dict[str, str]|None=None
 
 def _key(v: Any) -> str:
     return re.sub(r'[^a-z0-9]+', '_', str(v or '').strip().lower()).strip('_')
@@ -99,6 +99,6 @@ class LLMReviewer:
             raise
         review.reviewer_backend=backend.name
         if backend_override is not None:
-            review.performance_backend={'name': backend.name, 'model': backend.model}
+            review.assigned_backend={'name': backend.name, 'model': backend.model}
         if out_path: Path(out_path).write_text(review.model_dump_json(indent=2))
         return review, result
