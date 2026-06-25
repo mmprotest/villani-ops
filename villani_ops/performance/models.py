@@ -47,6 +47,7 @@ class SelectionResult(BaseModel):
     selector_normalized: bool = False
     selector_normalization_notes: list[str] = Field(default_factory=list)
     selector_reason_synthesized: bool = False
+    selector_reason_synthesis_reason: str | None = None
     selector_fallback_used: bool = False
     selector_fallback_reason: str | None = None
     fallback_used: bool = False

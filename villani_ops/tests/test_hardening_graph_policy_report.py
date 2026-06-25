@@ -99,3 +99,22 @@ def test_controller_steps_populated_and_performance_avoids_estimate_cost(tmp_pat
             assert (nd/'node.json').exists() and (nd/'input.json').exists() and (nd/'output.json').exists()
     assert (rd/'nodes'/'select'/'output.json').exists()
     assert Decision.model_validate({'run_id':'legacy','accepted':False})
+
+
+def test_report_component_specific_fallback_labels(tmp_path):
+    from villani_ops.core.decision import Decision
+    from villani_ops.performance.models import InvestigationResult, SelectionResult
+    from villani_ops.core.task import Task
+    from villani_ops.performance.report import write_performance_report
+    inv=InvestigationResult(summary='investigate', investigation_fallback_used=True, investigation_fallback_reason='bad inv')
+    sel=SelectionResult(decision='reject_all', summary='none', reasons=['none'], selector_fallback_used=False, selector_normalized=True)
+    dec=Decision(run_id='r', accepted=False, plan={'strategy':'parallel_candidates','candidate_attempts':1,'planner_fallback_used':True,'planner_fallback_reason':'bad plan'}, failure_reason='none')
+    report=write_performance_report(tmp_path, Task(repo_path=str(tmp_path), objective='fix'), inv, [], sel, dec, 1.0).read_text()
+    assert 'Investigation fallback used:' in report
+    assert 'Planner fallback used:' in report
+    assert 'Selector fallback used:' in report
+    assert 'Planner normalized:' in report
+    assert 'Selector normalized:' in report
+    assert '\nFallback used:' not in report
+    assert 'Planner fallback used: true' in report
+    assert 'Selector fallback used: false' in report

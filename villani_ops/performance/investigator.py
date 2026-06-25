@@ -18,7 +18,7 @@ def _as_list(value: Any) -> list[str]:
 
 def normalize_investigation_payload(payload: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
     data=dict(payload or {}); notes=[]
-    aliases={'analysis':'summary','findings':'summary','diagnosis':'summary','repo_analysis':'summary','root_cause':'suspected_root_cause','suspected_cause':'suspected_root_cause','files':'relevant_files','relevant_file_paths':'relevant_files','tests':'relevant_tests','test_files':'relevant_tests','plan':'implementation_plan','steps':'implementation_plan','actions':'implementation_plan','warnings':'risks','risk_factors':'risks'}
+    aliases={'analysis':'summary','findings':'summary','diagnosis':'summary','repo_analysis':'summary','root_cause':'suspected_root_cause','suspected_cause':'suspected_root_cause','cause':'suspected_root_cause','files':'relevant_files','file_paths':'relevant_files','relevant_file_paths':'relevant_files','tests':'relevant_tests','test_files':'relevant_tests','plan':'implementation_plan','steps':'implementation_plan','actions':'implementation_plan','warnings':'risks','risk_factors':'risks'}
     for a,t in aliases.items():
         if t not in data and a in data:
             data[t]=data[a]; notes.append(f"Mapped {a} to {t}")
@@ -26,6 +26,8 @@ def normalize_investigation_payload(payload: dict[str, Any]) -> tuple[dict[str, 
         for k,v in data.items():
             if isinstance(v,str) and v.strip() and k not in {'suspected_root_cause'}:
                 data['summary']=v.strip(); notes.append(f"Mapped {k} to summary"); break
+    if not str(data.get('summary') or '').strip() and str(data.get('suspected_root_cause') or '').strip():
+        data['summary']=f"Suspected root cause: {data['suspected_root_cause']}"; notes.append('Derived summary from suspected_root_cause')
     if not str(data.get('summary') or '').strip(): return data, notes
     for key in ('implementation_plan','risks','relevant_files','relevant_tests'):
         if isinstance(data.get(key), str): notes.append(f"Converted {key} string to list")
@@ -56,12 +58,18 @@ class Investigator:
         normalized_payload=None; notes=[]
         try:
             inv=InvestigationResult.model_validate(call.parsed_json)
-        except Exception:
-            normalized_payload, notes = normalize_investigation_payload(call.parsed_json if isinstance(call.parsed_json, dict) else {})
-            inv=InvestigationResult.model_validate(normalized_payload)
-            inv.investigation_normalized=True; inv.investigation_normalization_notes=notes
+            (run_dir/'investigation_normalized.json').write_text(json.dumps({'normalized': False, 'notes': [], 'payload': inv.model_dump(mode='json')}, indent=2))
+        except Exception as original_error:
+            try:
+                normalized_payload, notes = normalize_investigation_payload(call.parsed_json if isinstance(call.parsed_json, dict) else {})
+                inv=InvestigationResult.model_validate(normalized_payload)
+                inv.investigation_normalized=True; inv.investigation_normalization_notes=notes; inv.investigation_fallback_used=False; inv.investigation_fallback_reason=None
+                (run_dir/'investigation_normalized.json').write_text(json.dumps({'normalized': True, 'payload': normalized_payload, 'notes': notes}, indent=2))
+            except Exception:
+                reason=str(original_error)
+                inv=InvestigationResult(summary=f'Investigation unavailable: {reason}', investigation_fallback_used=True, investigation_fallback_reason=reason)
+                (run_dir/'investigation_normalized.json').write_text(json.dumps({'normalized': False, 'payload': call.parsed_json if isinstance(call.parsed_json, dict) else {}, 'notes': [], 'error': reason}, indent=2))
         inv.investigator_backend=backend_name; inv.assigned_backend={'name': backend_name, 'model': backend.model}
-        if normalized_payload is not None: (run_dir/'investigation_normalized.json').write_text(json.dumps({'payload': normalized_payload, 'notes': notes}, indent=2))
         (run_dir/'investigation.json').write_text(inv.model_dump_json(indent=2))
         cc=run_dir/'controller_calls'; cc.mkdir(exist_ok=True); (cc/'investigation.json').write_text(call.model_dump_json(indent=2))
         return inv, call

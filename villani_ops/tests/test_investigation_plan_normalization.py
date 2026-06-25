@@ -47,3 +47,20 @@ def test_plan_approach_strategy_maps_defaults_and_no_summary_fallback_signal():
     assert norm["candidate_attempts"] == 4
     bad, _=normalize_plan_payload({"confidence": .8}, requested_candidate_attempts=3)
     assert not bad.get("summary")
+
+
+def test_additional_investigation_aliases_and_root_cause_summary():
+    norm, _ = normalize_investigation_payload({"diagnosis": "diag", "cause": "cause", "file_paths": "a.py"})
+    assert norm["summary"] == "diag"
+    assert norm["suspected_root_cause"] == "cause"
+    assert norm["relevant_files"] == ["a.py"]
+    norm, notes = normalize_investigation_payload({"root_cause": "only cause"})
+    assert norm["summary"] == "only cause"
+    assert "Mapped root_cause to suspected_root_cause" in notes
+
+
+def test_additional_plan_aliases():
+    norm, _ = normalize_plan_payload({"steps": ["a", "b"], "strategy_name": "multiple_candidates", "candidate_count": "2"}, requested_candidate_attempts=4)
+    assert norm["summary"] == "a; b"
+    assert norm["strategy"] == "parallel_candidates"
+    assert norm["candidate_attempts"] == 2
