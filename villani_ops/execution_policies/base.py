@@ -22,12 +22,46 @@ def enabled_backends(backends: Mapping[str, BackendConfig]) -> list[tuple[str, B
     if not vals: raise ValueError('No enabled backends configured')
     return vals
 
+def required_role_for_node(node: OrchestrationNode) -> str:
+    if node.kind == 'code': return 'coding'
+    if node.kind in {'review','final_review'}: return 'review'
+    if node.kind in {'classify'}: return 'classification'
+    if node.kind in {'investigate'}: return 'investigation'
+    if node.kind in {'plan','decompose'}: return 'planning'
+    if node.kind in {'select','verify','integration_validate'}: return 'selection'
+    if node.kind in {'integrate','integration_repair'}: return 'coding'
+    return node.kind
+
+def filter_backends_for_role(backends: Mapping[str, BackendConfig], role: str) -> dict[str, BackendConfig]:
+    vals={n:b for n,b in backends.items() if getattr(b,'enabled',True) and role in (getattr(b,'roles',[]) or [])}
+    return vals
+
+def select_backend_for_role(role: str, policy: str, registry: Mapping[str, BackendConfig], task_context: TaskContext | None = None, *, preferred: str = 'highest') -> tuple[str, BackendConfig, str]:
+    candidates=filter_backends_for_role(registry, role)
+    fallback=False
+    if not candidates:
+        candidates={n:b for n,b in registry.items() if getattr(b,'enabled',True)}
+        fallback=True
+    if not candidates: raise ValueError('No enabled backends configured')
+    ordered=sort_by_capability(candidates)
+    if preferred == 'lowest': n,b=ordered[0]
+    elif preferred == 'middle': n,b=ordered[len(ordered)//2]
+    else: n,b=sorted(candidates.items(), key=lambda x:(-x[1].capability_score, x[0]))[0]
+    reason=(f'Fallback: no enabled backend supports role {role}; selected by {preferred} capability.' if fallback else f'Filtered by required role {role} before {preferred} capability selection.')
+    return n,b,reason
+
 def sort_by_capability(backends: Mapping[str, BackendConfig]) -> list[tuple[str, BackendConfig]]:
     return sorted(enabled_backends(backends), key=lambda x:(x[1].capability_score, x[0]))
 def highest_capability(backends): return sorted(enabled_backends(backends), key=lambda x:(-x[1].capability_score, x[0]))[0]
 def lowest_capability(backends): return sort_by_capability(backends)[0]
 def middle_capability(backends):
     vals=sort_by_capability(backends); return vals[len(vals)//2]
+def role_highest(node, backends, task_context=None):
+    return select_backend_for_role(required_role_for_node(node), 'policy', backends, task_context, preferred='highest')
+def role_lowest(node, backends, task_context=None):
+    return select_backend_for_role(required_role_for_node(node), 'policy', backends, task_context, preferred='lowest')
+def role_middle(node, backends, task_context=None):
+    return select_backend_for_role(required_role_for_node(node), 'policy', backends, task_context, preferred='middle')
 
 def _strongest_signal(values: list[str], order: list[str]) -> str:
     ranks={v:i for i,v in enumerate(order)}; return max(values, key=lambda v:ranks.get(v,0)) if values else order[0]
