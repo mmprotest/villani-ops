@@ -19,7 +19,7 @@ from villani_ops.performance.investigator import Investigator
 from villani_ops.performance.selector import Selector, deterministic_fallback
 from villani_ops.performance.models import CandidateSummary, InvestigationResult
 from villani_ops.performance.report import write_performance_report
-from villani_ops.orchestration.planner import build_fixed_graph, Planner
+from villani_ops.orchestration.planner import build_fixed_graph, Planner, validate_decomposition_plan, revise_decomposition_plan
 from villani_ops.orchestration.artifacts import write_json, write_json_utf8, write_text_utf8
 from villani_ops.orchestration.nodes import OrchestrationNode, NodeExecutionResult, NodeResult
 from villani_ops.orchestration.context import TaskContext
@@ -378,18 +378,32 @@ class OrchestrationEngine:
             return self._finish(context,node,NodeExecutionResult(node_id=node.id,status='skipped',result_summary='Planner did not request decomposition',data={'intentional_skip':True}),{'intentional_skip':True,'reason':'Planner did not request decomposition'})
         dec,call=Planner(self.llm_client).decompose(task=context.task,plan=context.plan,investigation=context.task_context.investigation,backend=self.backends[node.assigned_backend],run_dir=context.run_dir,estimate_cost=(context.mode!='performance'))
         context.decomposition=dec; context.task_context.decomposition=dec.model_dump(mode='json'); self._write_node_artifacts(context,node,raw=(call.raw_text if call else ''))
+        ddir=context.run_dir/'decomposition'; ddir.mkdir(parents=True, exist_ok=True)
+        initial=validate_decomposition_plan(dec, task=context.task.objective or context.task.instruction, success_criteria=context.task.success_criteria, backends=self.backends)
+        write_json_utf8(ddir/'plan_validation_initial.json', initial.model_dump(mode='json'))
+        decision='decomposition_accepted'; validation=initial
+        if not initial.accepted:
+            revised=revise_decomposition_plan(dec, initial)
+            validation=validate_decomposition_plan(revised, task=context.task.objective or context.task.instruction, success_criteria=context.task.success_criteria, backends=self.backends)
+            write_json_utf8(ddir/'plan_validation_revised.json', validation.model_dump(mode='json'))
+            if validation.accepted:
+                dec=revised; context.decomposition=dec; decision='decomposition_revised_and_accepted'
+            else:
+                decision='decomposition_rejected_fallback_to_candidates'
+        write_json_utf8(ddir/'plan_validation_decision.json', {'decision':decision,'accepted':validation.accepted,'required_revisions':validation.required_revisions})
+        context.task_context.decomposition=dec.model_dump(mode='json') | {'plan_validation': validation.model_dump(mode='json'), 'plan_validation_decision': decision}
         usable=[s.model_dump(mode='json') for s in (dec.subtasks or []) if getattr(s,'id',None) and getattr(s,'objective',None)]
-        if getattr(dec,'should_use_decomposition',False) and len(usable) >= 2:
-            context.decomposed_active=True; dec.advisory_only=False; context.task_context.decomposition=dec.model_dump(mode='json'); context.subtasks=usable
+        if getattr(dec,'should_use_decomposition',False) and len(usable) >= 2 and validation.accepted:
+            context.decomposed_active=True; dec.advisory_only=False; context.task_context.decomposition=dec.model_dump(mode='json') | {'plan_validation': validation.model_dump(mode='json'), 'plan_validation_decision': decision}; context.subtasks=usable
             keep=[n for n in context.graph.nodes if n.id in {'classify','investigate','plan','decompose'}]
             new=[]
             ids={st['id'] for st in usable}
             for st in usable:
-                cid=f"subtask_{st['id']}_code"; rid=f"subtask_{st['id']}_review"
-                deps=[f"subtask_{d}_review" for d in (st.get('dependencies') or []) if d in ids] or ['decompose']
+                cid=f"subtask_{st['id']}_code"; rid=f"subtask_{st['id']}_acceptance_summary"
+                deps=[f"subtask_{d}_acceptance_summary" for d in (st.get('dependencies') or []) if d in ids] or ['decompose']
                 new.append(OrchestrationNode(id=cid, kind='code', objective=f"Execute decomposed subtask {st['id']}: {st.get('title')}", dependencies=deps, parallel_group='subtask_code', runner=context.runner))
-                new.append(OrchestrationNode(id=rid, kind='review', objective=f"Review decomposed subtask {st['id']}.", dependencies=[cid], parallel_group='subtask_review'))
-            review_ids=[f"subtask_{st['id']}_review" for st in usable]
+                new.append(OrchestrationNode(id=rid, kind='review', objective=f"Summarize accepted/failed status for decomposed subtask {st['id']}.", dependencies=[cid], parallel_group='subtask_review'))
+            review_ids=[f"subtask_{st['id']}_acceptance_summary" for st in usable]
             new.append(OrchestrationNode(id='integrate_subtasks', kind='integrate', objective='Integrate accepted subtask patches.', dependencies=review_ids))
             new.append(OrchestrationNode(id='integration_validate', kind='integration_validate', objective='Validate integrated patch.', dependencies=['integrate_subtasks']))
             new.append(OrchestrationNode(id='integration_repair', kind='integration_repair', objective='Repair integrated patch once if needed.', dependencies=['integration_validate']))
@@ -404,7 +418,7 @@ class OrchestrationEngine:
         elif usable:
             d=context.task_context.decomposition; d['advisory_only']=True; context.task_context.decomposition=d
         elif getattr(dec,'should_use_decomposition',False):
-            reason='Planner requested decomposition but decomposition produced no executable subtasks.'
+            reason=('Decomposition plan validation failed; falling back to candidate path.' if not validation.accepted else 'Planner requested decomposition but decomposition produced no executable subtasks.')
             d=context.task_context.decomposition
             d.update({'decomposition_requested': True, 'decomposition_executed': False, 'decomposition_fallback_to_candidate_path': True, 'decomposition_fallback_used': True, 'fallback_used': True, 'decomposition_fallback_reason': reason})
             context.task_context.decomposition=d
@@ -439,6 +453,35 @@ class OrchestrationEngine:
         write_json_utf8(context.run_dir/'decomposition'/'subtask_attempts.json', {'attempts_per_subtask':requested,'subtasks_total':len(context.subtasks),'subtasks_accepted':sum(1 for x in all_summaries if x.get('status')=='accepted'),'subtasks_failed':sum(1 for x in all_summaries if x.get('status')=='failed'),'subtask_attempts_completed':sum(int(x.get('attempts_completed') or 0) for x in all_summaries),'subtasks':all_summaries})
         return summary
 
+
+    def _accepted_dependency_order(self, context, sid: str) -> list[dict]:
+        by_id={st.get('id'): st for st in context.subtasks}
+        accepted={a.get('subtask_id'): a for a in context.accepted_subtasks if a.get('acceptance_eligible')}
+        seen=set(); order=[]
+        def visit(x):
+            for d in by_id.get(x, {}).get('dependencies') or []:
+                if d in seen: continue
+                visit(d); seen.add(d)
+                if d in accepted: order.append(accepted[d])
+        visit(sid)
+        return order
+
+    def _materialize_dependency_patches(self, context, sid: str, aid: str, worktree_path: str, adir: Path) -> dict:
+        deps=self._accepted_dependency_order(context, sid)
+        rows=[]; status='ok'
+        for dep in deps:
+            pp=dep.get('patch_path')
+            row={'subtask_id':dep.get('subtask_id'),'attempt_id':dep.get('attempt_id'),'patch_path':pp,'status':'pending'}
+            if not pp or not Path(pp).exists():
+                row.update({'status':'failed','stderr':'accepted dependency patch missing'}); status='failed'; rows.append(row); break
+            proc=subprocess.run(['git','apply','--whitespace=nowarn',str(Path(pp).resolve())], cwd=worktree_path, text=True, capture_output=True)
+            row.update({'stdout':proc.stdout,'stderr':proc.stderr,'status':'applied' if proc.returncode==0 else 'failed','exit_code':proc.returncode})
+            rows.append(row)
+            if proc.returncode != 0: status='failed'; break
+        artifact={'subtask_id':sid,'attempt_id':aid,'applied_dependencies':rows,'status':status}
+        write_json_utf8(adir/'applied_dependencies.json', artifact)
+        return artifact
+
     def _run_subtask_attempt(self, node, context, sid: str, st: dict, subtask_idx: int, attempt_idx: int, failure_memory: str) -> dict:
         aid=f"attempt_{attempt_idx:03d}"; adir=context.run_dir/'subtasks'/sid/'attempts'/aid; adir.mkdir(parents=True,exist_ok=True)
         b=self.backends[node.assigned_backend]
@@ -447,6 +490,10 @@ class OrchestrationEngine:
         meta={'attempt_id':aid,'subtask_id':sid,'subtask_title':st.get('title'),'subtask_objective':st.get('objective'),'backend_name':b.name,'model':b.model,'runner_name':context.runner,'status':'running','started_at':_now()}
         try:
             wt=GitWorktreeIsolation().create(context.repo,context.run_id,f"subtask_{sid}_{aid}",self.storage.workspace); meta.update(wt)
+            if st.get('dependencies'):
+                dep_art=self._materialize_dependency_patches(context, sid, aid, wt['worktree_path'], adir); meta['applied_dependencies']=dep_art
+                if dep_art.get('status') != 'ok':
+                    raise RuntimeError('Failed to apply accepted dependency patches before runner execution')
             res=self.runner_adapter.run_task(repo_path=Path(wt['worktree_path']), task=prompt, success_criteria=context.task.success_criteria, backend_name=b.name, backend_config=b, timeout_seconds=context.timeout_seconds or b.timeout_seconds or 1200, context={'attempt_id':aid,'subtask_id':sid,'node_id':node.id}, artifacts_dir=adir)
             write_text_utf8(adir/'stdout.txt', res.stdout); write_text_utf8(adir/'stderr.txt', res.stderr); context.input_tokens+=res.input_tokens; context.output_tokens+=res.output_tokens; context.costs['coding']+=0 if context.mode=='performance' else b.estimate_cost(res.input_tokens,res.output_tokens)
             meta.update({'exit_code':res.exit_code,'stdout_path':str(adir/'stdout.txt'),'stderr_path':str(adir/'stderr.txt'),'duration_ms':res.duration_ms,'input_tokens':res.input_tokens,'output_tokens':res.output_tokens,'token_accounting_status':res.token_accounting_status,'runner_telemetry':res.telemetry}); meta.update(capture_worktree(wt['worktree_path'],adir))
@@ -532,7 +579,7 @@ class OrchestrationEngine:
     def _execute_review_node(self,node,context):
         context.graph.mark_running(node.id)
         if node.id.startswith('subtask_'):
-            sid=node.id[len('subtask_'):-len('_review')]; aid=f"subtask_{sid}"; idx=next((i for i,s in enumerate(context.subtasks,1) if s['id']==sid),1); total=len(context.subtasks); cn=context.graph.get(f'subtask_{sid}_code'); adir=context.run_dir/'subtasks'/sid; st=next((s for s in context.subtasks if s['id']==sid),{})
+            suffix='_acceptance_summary' if node.id.endswith('_acceptance_summary') else '_review'; sid=node.id[len('subtask_'):-len(suffix)]; aid=f"subtask_{sid}"; idx=next((i for i,s in enumerate(context.subtasks,1) if s['id']==sid),1); total=len(context.subtasks); cn=context.graph.get(f'subtask_{sid}_code'); adir=context.run_dir/'subtasks'/sid; st=next((s for s in context.subtasks if s['id']==sid),{})
             summary=cn.result or {}
             data={'attempts_requested':summary.get('attempts_requested'),'attempts_completed':summary.get('attempts_completed'),'accepted_attempt_id':summary.get('accepted_attempt_id'),'status':summary.get('status'),'has_review_blocker':summary.get('status')!='accepted','has_acceptance_blocker':summary.get('status')!='accepted'}
             return self._finish(context,node,NodeExecutionResult(node_id=node.id,status='succeeded',result_summary=f'Subtask {sid} review summary: {summary.get("status")}',artifacts={'subtask_summary':str(adir/'subtask_summary.json')},data=data),data)
@@ -648,14 +695,29 @@ class OrchestrationEngine:
         if (repo/'pytest.ini').exists() or (repo/'tests').exists() or any(repo.glob('test_*.py')): return [sys.executable,'-m','pytest','-q']
         return [sys.executable,'-m','pytest','-q']
 
+    def _validation_plan(self, context) -> dict:
+        vp=(context.task_context.investigation or {}).get('validation_plan') if isinstance(context.task_context.investigation, dict) else None
+        if isinstance(vp, dict) and isinstance(vp.get('commands'), list) and vp.get('commands'):
+            return vp | {'fallback': False}
+        cmd=self._validation_command(Path(context.integration['worktree_path']))
+        return {'commands':[{'cmd':' '.join(cmd), 'argv':cmd, 'required':True, 'reason':'Conservative fallback validation command'}], 'notes':['fallback validation plan used'], 'success_criteria_mapping':[], 'fallback': True}
+
     def _execute_integration_validate_node(self,node,context):
-        context.graph.mark_running(node.id); idir=context.run_dir/'integration'; cmd=self._validation_command(Path(context.integration['worktree_path']))
-        self.progress_reporter.step(f'[6/8] Running integration validation with {cmd[0]}...')
-        res=self._run_cmd(cmd, context.integration['worktree_path'])
-        write_text_utf8(idir/'validation_initial_stdout.txt', res['stdout']); write_text_utf8(idir/'validation_initial_stderr.txt', res['stderr'])
-        val={'exit_code':res['exit_code'],'passed':res['passed'],'command':cmd,'python_executable':res.get('python_executable', sys.executable),'stdout_path':str(idir/'validation_initial_stdout.txt'),'stderr_path':str(idir/'validation_initial_stderr.txt'),'failure_reason':res.get('failure_reason')}
+        context.graph.mark_running(node.id); idir=context.run_dir/'integration'; plan=self._validation_plan(context); write_json_utf8(idir/'validation_plan.json', plan)
+        results=[]; passed=True
+        for i,c in enumerate(plan.get('commands') or [], 1):
+            argv=c.get('argv') or (c.get('cmd') if isinstance(c.get('cmd'), list) else str(c.get('cmd') or '').split())
+            required=bool(c.get('required', True))
+            self.progress_reporter.step(f'[6/8] Running integration validation command {i}/{len(plan.get("commands") or [])}...')
+            res=self._run_cmd(argv, context.integration['worktree_path'])
+            outp=idir/f'validation_initial_{i}_stdout.txt'; errp=idir/f'validation_initial_{i}_stderr.txt'
+            write_text_utf8(outp, res['stdout']); write_text_utf8(errp, res['stderr'])
+            row={'index':i,'cmd':c.get('cmd') or argv,'command':argv,'required':required,'reason':c.get('reason'),'exit_code':res['exit_code'],'passed':res['passed'],'stdout_path':str(outp),'stderr_path':str(errp),'failure_reason':res.get('failure_reason')}
+            results.append(row)
+            if required and not res['passed']: passed=False
+        val={'passed':passed,'commands':results,'fallback':bool(plan.get('fallback')),'exit_code':0 if passed else 1,'command':(results[0]['command'] if results else []),'failure_reason':None if passed else 'required validation command failed'}
         write_json_utf8(idir/'validation_initial.json', val); write_json_utf8(idir/'validation.json', val); context.integration['validation_initial']=val; context.integration['validation']=val
-        self.progress_reporter.step(f'[6/8] Integration validation {"passed" if val["passed"] else "failed"}: command="{" ".join(cmd)}"')
+        self.progress_reporter.step(f'[6/8] Integration validation {"passed" if val["passed"] else "failed"}')
         return self._finish(context,node,NodeExecutionResult(node_id=node.id,status='succeeded',result_summary='validation passed' if val['passed'] else 'validation failed',data=val),val)
 
     def _execute_integration_repair_node(self,node,context):

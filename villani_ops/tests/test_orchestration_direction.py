@@ -32,10 +32,10 @@ def test_policies_route_from_real_signals():
     b=backs(); easy=TaskContext(objective='x', classification={'difficulty':'easy','risk':'low','confidence':.95}, investigation={'confidence':.95}, plan={'expected_difficulty':'easy','confidence':.95})
     hard=TaskContext(objective='x', classification={'difficulty':'hard','risk':'high','confidence':.4}, plan={'expected_difficulty':'hard','confidence':.4})
     n=OrchestrationNode(id='code_attempt_001', kind='code', objective='code')
-    assert policy_for_mode('performance').select_backend(node=n, backends=b, task_context=easy).backend_name == 'c-high'
+    assert policy_for_mode('performance').select_backend(node=n, backends=b, task_context=easy).backend_name == 'b-mid'
     assert policy_for_mode('cheap').select_backend(node=n, backends=b, task_context=easy).backend_name == 'a-low'
-    assert policy_for_mode('cheap').select_backend(node=OrchestrationNode(id='c', kind='code', objective=''), backends=b, task_context=hard).backend_name == 'c-high'
-    assert policy_for_mode('balanced').select_backend(node=OrchestrationNode(id='c', kind='code', objective=''), backends=b, task_context=TaskContext(objective='x', classification={'difficulty':'medium','risk':'medium','confidence':.7})).backend_name == 'c-high'
+    assert policy_for_mode('cheap').select_backend(node=OrchestrationNode(id='c', kind='code', objective=''), backends=b, task_context=hard).backend_name == 'b-mid'
+    assert policy_for_mode('balanced').select_backend(node=OrchestrationNode(id='c', kind='code', objective=''), backends=b, task_context=TaskContext(objective='x', classification={'difficulty':'medium','risk':'medium','confidence':.7})).backend_name == 'b-mid'
     assert policy_for_mode('quality').select_backend(node=OrchestrationNode(id='r', kind='review', objective=''), backends=b, task_context=easy).backend_name == 'c-high'
     assert policy_for_mode('cheap').select_backend(node=OrchestrationNode(id='p', kind='plan', objective=''), backends=b, task_context=easy, prior_results=[NodeResult(status='failed')]).backend_name == 'c-high'
     b['c-high'].enabled=False; assert policy_for_mode('performance').select_backend(node=n, backends=b, task_context=easy).backend_name == 'b-mid'

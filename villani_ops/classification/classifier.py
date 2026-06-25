@@ -106,16 +106,12 @@ def normalize_task_classification_payload(raw: dict) -> dict:
 
 
 
-SUBSYSTEM_NOUNS={'checkout','pricing','inventory','reservation','order','orders','receipt','receipts','payment','tax','shipping','discount','coupon','transaction','rollback','atomic'}
-BEHAVIOR_VERBS={'price','prices','pricing','reserve','create','release','render','pass','validate','fix','apply'}
-
 def _count_behaviors(text: str) -> int:
-    parts=re.split(r",|;|\band\b", text.lower())
-    return sum(1 for p in parts if any(re.search(rf"\b{re.escape(v)}\w*\b", p) for v in BEHAVIOR_VERBS))
+    # General, domain-neutral approximation: count explicit list/conjunction segments.
+    return len([p for p in re.split(r",|;|\band\b", (text or '').lower()) if len(p.split()) >= 2])
 
 def _shape_signals(task_text: str, snippets: list[RelevantFileSnippet], likely_files: list[str]|None=None) -> dict[str, Any]:
     text=(task_text or '').lower()
-    subs={n for n in SUBSYSTEM_NOUNS if re.search(rf"\b{re.escape(n)}\b", text)}
     return {
         "relevant_file_count": len(snippets),
         "likely_file_count": len(likely_files or []),
@@ -124,8 +120,8 @@ def _shape_signals(task_text: str, snippets: list[RelevantFileSnippet], likely_f
         "do_not_change_tests": bool(re.search(r"do not (change|modify|edit) tests|don['’]t (change|modify|edit) tests", text)),
         "target_files_found": bool(snippets),
         "broad_change": bool(re.search(r"\b(entire app|architecture|redesign|migrate|rewrite|replatform)\b", text)),
-        "subsystem_noun_count": len(subs),
-        "subsystem_nouns": sorted(subs),
+        "subsystem_noun_count": 0,
+        "subsystem_nouns": [],
         "behavior_count": _count_behaviors(text),
     }
 
@@ -156,8 +152,7 @@ def adjust_classification_from_task_shape(classification: TaskClassification, ta
     if signals["relevant_file_count"] >= 4: medium_reasons.append(f"task spans {signals['relevant_file_count']} relevant files")
     if cls.estimated_attempts_needed >= 3: medium_reasons.append(f"estimated_attempts_needed={cls.estimated_attempts_needed}")
     if signals["behavior_count"] >= 3: medium_reasons.append("success criteria mention multiple behaviours")
-    if signals["subsystem_noun_count"] >= 4: medium_reasons.append("multiple checkout subsystems")
-    if any(x in str(cls.category).lower() for x in ["integration","checkout","workflow","transaction"]): medium_reasons.append(f"category={cls.category}")
+    if str(cls.category).lower() in {"integration", "workflow"}: medium_reasons.append(f"category={cls.category}")
     if signals["likely_file_count"] >= 8: hard_reasons.append(f"task spans {signals['likely_file_count']} likely files")
     if signals["relevant_file_count"] >= 8: hard_reasons.append(f"task spans {signals['relevant_file_count']} relevant files")
     if cls.estimated_attempts_needed >= 5: hard_reasons.append(f"estimated_attempts_needed={cls.estimated_attempts_needed}")

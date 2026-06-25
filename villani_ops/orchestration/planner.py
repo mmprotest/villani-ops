@@ -40,6 +40,17 @@ class Subtask(BaseModel):
     expected_difficulty: Literal['easy','medium','hard','unknown'] = 'unknown'
     risk: Literal['low','medium','high','unknown'] = 'unknown'
     confidence: float = 0.0
+    required_role: str = 'coding'
+    assigned_backend: str | None = None
+    can_run_parallel: bool | None = None
+    parallel_group: str | None = None
+    parallel_safety_reason: str | None = None
+    max_attempts: int | None = None
+    timeout_seconds: int | None = None
+    validation_commands: list[str] = Field(default_factory=list)
+    expected_artifacts: list[str] = Field(default_factory=list)
+    merge_contract: str | None = None
+    depends_on_acceptance: bool = True
 
 class DecompositionResult(BaseModel):
     should_use_decomposition: bool
@@ -290,50 +301,109 @@ def normalize_decomposition_payload(payload: dict[str, Any], *, task: str | None
     _, conf=_first_present(data, ('confidence','confidence_score','certainty'))
     return {'should_use_decomposition': bool(parsed), 'reason': reason if (reason or not parsed) else 'Task was decomposed into separable subtasks.', 'subtasks': subtasks, 'merge_strategy': merge, 'confidence': _parse_confidence(conf), 'advisory_only': True}, notes
 
-SUBSYSTEM_NOUNS={'checkout','pricing','inventory','reservation','order','orders','receipt','receipts','payment','tax','shipping','discount','coupon','transaction','rollback','atomic'}
-BEHAVIOR_VERBS={'price','reserve','create','release','render','pass','validate','fix'}
-
-def _list_from(src: dict[str, Any] | None, key: str) -> list[str]:
-    v=(src or {}).get(key)
-    return [str(x) for x in v if str(x).strip()] if isinstance(v, list) else []
-
-def _behavior_count(text: str | None) -> int:
-    parts=__import__('re').split(r",|;|\band\b", (text or '').lower())
-    return sum(1 for p in parts if any(__import__('re').search(rf"\b{v}\w*\b", p) for v in BEHAVIOR_VERBS))
-
-def _subsystems(text: str | None) -> set[str]:
-    import re
-    low=(text or '').lower()
-    return {n for n in SUBSYSTEM_NOUNS if re.search(rf"\b{re.escape(n)}\b", low)}
 
 def repair_plan_against_context(plan: PlanResult, *, requested_candidate_attempts: int, task: str | None, success_criteria: str | None, classification: dict[str, Any] | None, investigation: dict[str, Any] | None) -> tuple[PlanResult, list[str]]:
+    """Schema-only repair: clamp unsafe scalar values without injecting domain-specific decomposition."""
     fixed=plan.model_copy(deep=True)
     fixed.candidate_attempts=max(1, min(8, int(fixed.candidate_attempts or requested_candidate_attempts)))
-    likely=_list_from(classification, 'likely_files')
-    relevant=_list_from(investigation, 'relevant_files')
-    est=int((classification or {}).get('estimated_attempts_needed') or 0)
-    difficulty=str((classification or {}).get('difficulty') or '').lower()
-    conf=float((investigation or {}).get('confidence') or 0.0)
-    text='\n'.join([task or '', success_criteria or ''])
-    behaviors=_behavior_count(success_criteria or text)
-    subs=_subsystems(text)
-    signals=[]
-    if len(likely) >= 4: signals.append(f"likely_files={len(likely)}")
-    if len(relevant) >= 4: signals.append(f"relevant_files={len(relevant)}")
-    if est >= 3: signals.append(f"estimated_attempts_needed={est}")
-    if behaviors >= 4: signals.append(f"behaviours={behaviors}")
-    if len(subs) >= 4: signals.append('subsystems=' + ', '.join(sorted(subs)[:8]))
-    if conf >= .70 and len(relevant) >= 4: signals.append(f"investigation_confidence={conf:.2f}")
-    if difficulty in {'medium','hard'} and len(likely) >= 4: signals.append(f"classification_difficulty={difficulty}")
-    notes=[]
-    if (fixed.strategy == 'single_task' or not fixed.should_decompose) and len(signals) >= 2:
-        old=f"{fixed.strategy}/{fixed.should_decompose}"
-        fixed.strategy='decompose_then_execute'; fixed.should_decompose=True
-        evidence=', '.join(signals[:4])
-        fixed.decomposition_reason=f"Task spans multiple separable subsystems/files: {evidence}."
-        notes.append(f"Changed strategy from {old} to decompose_then_execute because {evidence}.")
-        fixed.planner_repaired=True; fixed.planner_repair_notes=notes
-    return fixed, notes
+    return fixed, []
+
+class ValidationSection(BaseModel):
+    passed: bool = True
+    issues: list[str] = Field(default_factory=list)
+
+class CompletenessSection(ValidationSection):
+    missing_success_criteria: list[str] = Field(default_factory=list)
+
+class NonRedundancySection(ValidationSection):
+    overlapping_subtasks: list[dict[str, Any]] = Field(default_factory=list)
+
+class ParallelSafetySection(ValidationSection):
+    unsafe_parallel_groups: list[dict[str, Any]] = Field(default_factory=list)
+
+class DecompositionPlanValidationResult(BaseModel):
+    accepted: bool = False
+    solvability: ValidationSection = Field(default_factory=ValidationSection)
+    completeness: CompletenessSection = Field(default_factory=CompletenessSection)
+    non_redundancy: NonRedundancySection = Field(default_factory=NonRedundancySection)
+    dependency_validity: ValidationSection = Field(default_factory=ValidationSection)
+    parallel_safety: ParallelSafetySection = Field(default_factory=ParallelSafetySection)
+    backend_fit: ValidationSection = Field(default_factory=ValidationSection)
+    required_revisions: list[str] = Field(default_factory=list)
+    revised_plan: dict[str, Any] | None = None
+
+def validate_decomposition_plan(dec: DecompositionResult, *, task: str | None, success_criteria: str | None, backends: dict[str, Backend] | None = None) -> DecompositionPlanValidationResult:
+    subtasks=[s.model_dump(mode='json') if hasattr(s,'model_dump') else dict(s) for s in (dec.subtasks or [])]
+    res=DecompositionPlanValidationResult()
+    ids=[s.get('id') for s in subtasks if s.get('id')]
+    idset=set(ids)
+    def issue(section, msg):
+        sec=getattr(res, section); sec.passed=False; sec.issues.append(msg); res.required_revisions.append(msg)
+    if not dec.should_use_decomposition or len(subtasks) < 2:
+        issue('completeness','Decomposition must contain at least two executable subtasks when requested.')
+    for s in subtasks:
+        if not s.get('objective') or not (s.get('success_criteria') or success_criteria): issue('solvability', f"Subtask {s.get('id')} lacks objective or success criteria.")
+        if not s.get('title'): issue('solvability', f"Subtask {s.get('id')} lacks title/context.")
+    text=' '.join((task or '', success_criteria or '')).lower()
+    covered=' '.join((s.get('title','')+' '+s.get('objective','')+' '+(s.get('success_criteria') or '')) for s in subtasks).lower()
+    for token in {w.strip('.,;:()[]') for w in text.split() if len(w.strip('.,;:()[]')) >= 5}:
+        if token not in covered:
+            res.completeness.missing_success_criteria.append(token)
+            if len(res.completeness.missing_success_criteria) >= 3: break
+    if (success_criteria or task) and res.completeness.missing_success_criteria:
+        issue('completeness','Plan may not cover important terms from task/success criteria.')
+    seen={}
+    for s in subtasks:
+        key=' '.join(str(s.get('objective') or s.get('title') or '').lower().split())
+        if key in seen:
+            res.non_redundancy.overlapping_subtasks.append({'subtasks':[seen[key], s.get('id')], 'reason':'same objective text'})
+        else: seen[key]=s.get('id')
+    if res.non_redundancy.overlapping_subtasks: issue('non_redundancy','Duplicate or overlapping subtask objectives are not justified.')
+    deps={s.get('id'): list(s.get('dependencies') or []) for s in subtasks}
+    for sid, ds in deps.items():
+        for d in ds:
+            if d not in idset: issue('dependency_validity', f'Subtask {sid} depends on unknown subtask {d}.')
+    visiting=set(); visited=set()
+    def dfs(x):
+        if x in visiting: return True
+        if x in visited: return False
+        visiting.add(x)
+        cyc=any(dfs(d) for d in deps.get(x,[]) if d in idset)
+        visiting.remove(x); visited.add(x); return cyc
+    if any(dfs(i) for i in ids): issue('dependency_validity','Subtask dependency graph contains a cycle.')
+    for a in subtasks:
+        for b in subtasks:
+            if a is b: continue
+            if a.get('can_run_parallel') and b.get('can_run_parallel') and (a.get('id') in (b.get('dependencies') or []) or b.get('id') in (a.get('dependencies') or [])):
+                res.parallel_safety.unsafe_parallel_groups.append({'subtasks':[a.get('id'),b.get('id')], 'reason':'parallel-safe subtasks depend on each other'})
+    file_groups={}
+    for s in subtasks:
+        if s.get('can_run_parallel'):
+            for f in s.get('relevant_files') or []: file_groups.setdefault(f, []).append(s.get('id'))
+    for f, group in file_groups.items():
+        if len(set(group)) > 1: res.parallel_safety.unsafe_parallel_groups.append({'subtasks':sorted(set(group)), 'reason':f'overlapping file {f}'})
+    if res.parallel_safety.unsafe_parallel_groups: issue('parallel_safety','Unsafe parallel subtask layout.')
+    if backends:
+        enabled=[(n,b) for n,b in backends.items() if getattr(b,'enabled',True)]
+        for s in subtasks:
+            role=s.get('required_role') or 'coding'; assigned=s.get('assigned_backend')
+            candidates=[(n,b) for n,b in enabled if role in (getattr(b,'roles',[]) or [])]
+            if assigned and (assigned not in backends or role not in (getattr(backends[assigned],'roles',[]) or [])): issue('backend_fit', f'Subtask {s.get("id")} assigned backend does not support role {role}.')
+            if not assigned and not candidates: issue('backend_fit', f'No enabled backend supports required role {role} for subtask {s.get("id")}.')
+    res.accepted=all(getattr(res,k).passed for k in ['solvability','completeness','non_redundancy','dependency_validity','parallel_safety','backend_fit'])
+    return res
+
+def revise_decomposition_plan(dec: DecompositionResult, validation: DecompositionPlanValidationResult) -> DecompositionResult:
+    fixed=dec.model_copy(deep=True)
+    ids=set(); unique=[]
+    for st in fixed.subtasks:
+        if st.id in ids: continue
+        ids.add(st.id); st.dependencies=[d for d in st.dependencies if d in ids or any(x.id==d for x in fixed.subtasks)]
+        if not st.success_criteria: st.success_criteria=st.objective
+        if st.can_run_parallel is None: st.can_run_parallel=not bool(st.dependencies)
+        unique.append(st)
+    fixed.subtasks=unique
+    return fixed
 
 def _parse_plan_payload_from_call(call: LLMCallResult) -> dict[str, Any]:
     if isinstance(call.parsed_json, dict) and call.parsed_json:
@@ -387,19 +457,7 @@ Valid expected_difficulty values are: easy, medium, hard, unknown.
 If the task spans multiple separable subsystems or files, set strategy to decompose_then_execute and should_decompose to true.
 If likely_files contains 4 or more distinct source files, do not choose single_task unless you explicitly explain why the changes are tightly coupled and not decomposable.
 If success criteria lists multiple independent behaviours, prefer decompose_then_execute.
-If the task spans checkout, pricing, inventory, orders, payment, receipts, transaction handling, rollback, or formatting, treat it as a multi-subsystem task and prefer decompose_then_execute.
 You must return planning JSON only. Do not return command/action/tool-call JSON.
-Concrete example:
-{
-  "summary": "Inspect checkout-related modules, then fix pricing and inventory behavior with targeted tests.",
-  "strategy": "decompose_then_execute",
-  "should_decompose": true,
-  "decomposition_reason": "Task spans separable pricing and inventory subsystems.",
-  "candidate_attempts": 3,
-  "risks": ["Changes may need coordination across checkout modules."],
-  "expected_difficulty": "medium",
-  "confidence": 0.75
-}
 """
         try:
             call=self.client.complete_json(backend, system_prompt, json.dumps(ctx, indent=2)[:80000], 'PlanResult', estimate_cost=(mode != 'performance'))

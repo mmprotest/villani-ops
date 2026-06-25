@@ -27,6 +27,8 @@ class OrchestrationGraph(BaseModel):
     def dependency_satisfied(self, dep_id: str, node: OrchestrationNode | None = None) -> bool:
         dep = self.get(dep_id)
         if dep.status == 'succeeded':
+            if node is not None and node.kind == 'code' and node.id.startswith('subtask_') and dep.id.startswith('subtask_') and dep.id.endswith('_acceptance_summary'):
+                return bool((dep.result or {}).get('accepted_attempt_id')) or (dep.result or {}).get('status') == 'accepted'
             return True
         if dep.status == 'skipped' and dep.kind == 'decompose':
             return True
