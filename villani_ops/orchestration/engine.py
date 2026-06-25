@@ -819,6 +819,8 @@ class OrchestrationEngine:
             return self._finish(context,node,NodeExecutionResult(node_id=node.id,status='skipped',result_summary='No repair needed',data={'repair_used':False,'validation_after_repair':None}),{'repair_used':False})
         b=self.backends[node.assigned_backend]
         init=context.integration.get('validation_initial') or context.integration.get('validation') or {}
+        repair_validation_context=self._repair_validation_context(init)
+        write_json_utf8(idir/'repair_validation_context.json', repair_validation_context)
         conflicts=context.integration.get('apply_results') or []
         prompt=f"""You are repairing an integrated decomposition patch.
 
@@ -849,10 +851,8 @@ Skipped subtask patches and reasons:
 Apply conflicts:
 {json.dumps([r for r in conflicts if r.get('conflicted')], indent=2)}
 
-Initial validation command/stdout/stderr:
-command={init.get('command')}
-stdout={_tail(init.get('stdout_path'), 12000)}
-stderr={_tail(init.get('stderr_path'), 12000)}
+Validation failure context:
+{json.dumps(repair_validation_context, indent=2)}
 
 Current git diff:
 {_patch_text(context.integration.get('combined_patch_path'), 60000)}
@@ -872,6 +872,28 @@ Current git status:
         write_json_utf8(idir/'validation_after_repair.json', context.integration['validation_after_repair']); write_json_utf8(idir/'validation.json', context.integration['validation'])
         self.progress_reporter.step(f'[6/8] Post-repair validation {"passed" if context.integration["validation"]["passed"] else "failed"}')
         return self._finish(context,node,NodeExecutionResult(node_id=node.id,status='succeeded',result_summary='repair attempted',data={'repair_used':True,'validation_after_repair':context.integration['validation_after_repair']}),{'repair_used':True,'validation_after_repair':context.integration['validation_after_repair']})
+
+    def _repair_validation_context(self, validation: dict) -> dict:
+        def row(c: dict) -> dict:
+            return {
+                'cmd': c.get('cmd'),
+                'argv': c.get('argv') if c.get('argv') is not None else (c.get('command') if isinstance(c.get('command'), list) else None),
+                'shell': bool(c.get('shell', False)),
+                'required': bool(c.get('required', True)),
+                'reason': c.get('reason'),
+                'timeout_seconds': c.get('timeout_seconds'),
+                'returncode': c.get('returncode', c.get('exit_code')),
+                'stdout_tail': _tail(c.get('stdout_path'), 12000) if c.get('stdout_path') else str(c.get('stdout') or '')[-12000:],
+                'stderr_tail': _tail(c.get('stderr_path'), 12000) if c.get('stderr_path') else str(c.get('stderr') or '')[-12000:],
+            }
+        failed=[c for c in validation.get('commands') or [] if not c.get('passed')]
+        return {
+            'aggregate_status': 'passed' if validation.get('passed') else 'failed',
+            'fallback': bool(validation.get('fallback')),
+            'source': validation.get('source'),
+            'required_failed_commands': [row(c) for c in failed if c.get('required', True)],
+            'optional_failed_commands': [row(c) for c in failed if not c.get('required', True)],
+        }
 
     def _execute_final_review_node(self,node,context):
         context.graph.mark_running(node.id); idir=context.run_dir/'integration'; cap=capture_worktree(context.integration['worktree_path'], idir)

@@ -111,3 +111,70 @@ def test_structured_reviser_malformed_plan_falls_back_signal():
     validation=DecompositionPlanValidationResult(accepted=False, required_revisions=["fix"])
     plan, meta=revise_decomposition_with_feedback(task="t", success_criteria=["s"], original_plan=_good(), validation_result=validation, backend_registry=_backs(), client=_SeqClient([{"not":"a decomposition"}]), backend=_backs()["reviewer"])
     assert plan is None and not meta["parsed_cleanly"]
+
+
+def test_runtime_semantic_rejection_revises_once_and_activates(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from villani_ops.orchestration.engine import OrchestrationEngine, EngineContext
+    from villani_ops.orchestration.graph import OrchestrationGraph
+    from villani_ops.orchestration.nodes import OrchestrationNode
+    from villani_ops.orchestration.context import TaskContext
+    from villani_ops.core.task import Task
+    from villani_ops.core.backend import Backend
+    from villani_ops.execution_policies.base import BackendSelection
+    from villani_ops.orchestration.planner import PlanResult, DecompositionResult, Subtask, DecompositionPlanValidationResult
+    import threading, time, json
+    class Policy:
+        mode='performance'
+        def select_backend(self, **kw): b=kw['backends']['b']; return BackendSelection(backend_name='b',backend=b,reason='x')
+    class Runner: name='villani-code'
+    def dec():
+        return DecompositionResult(should_use_decomposition=True, reason='r', subtasks=[Subtask(id='a',title='A',objective='oa',success_criteria='sa'),Subtask(id='b',title='B',objective='ob',success_criteria='sb')])
+    calls={'rev':0,'sem':0}
+    monkeypatch.setattr('villani_ops.orchestration.engine.Planner.decompose', lambda *a, **k: (dec(), SimpleNamespace(raw_text='{}')))
+    monkeypatch.setattr('villani_ops.orchestration.engine.validate_decomposition_plan', lambda *a, **k: DecompositionPlanValidationResult(accepted=True))
+    def sem(*a, **k):
+        calls['sem']+=1
+        return DecompositionPlanValidationResult(accepted=calls['sem']==2, required_revisions=[] if calls['sem']==2 else ['missing']), {'status':'ok'}
+    monkeypatch.setattr('villani_ops.orchestration.engine.semantic_validate_decomposition_plan', sem)
+    def rev(*a, **k): calls['rev']+=1; return dec(), {'parsed_cleanly':True,'revision_request':{'x':1}}
+    monkeypatch.setattr('villani_ops.orchestration.engine.revise_decomposition_with_feedback', rev)
+    e=OrchestrationEngine(backends={'b':Backend(name='b',provider='openai',model='m')},execution_policy=Policy(),runner_adapter=Runner(),workspace=tmp_path/'ws')
+    g=OrchestrationGraph(run_id='r',nodes=[OrchestrationNode(id='decompose',kind='decompose',objective='d')])
+    ctx=EngineContext(repo=tmp_path,task=Task(repo_path=str(tmp_path),objective='x'),candidate_attempts=2,timeout_seconds=None,isolation='worktree',run_id='r',run_dir=tmp_path/'run',mode='performance',runner='villani-code',graph=g,scheduler=None,task_context=TaskContext(objective='x'),start=time.time())
+    (ctx.run_dir).mkdir(); ctx.plan=PlanResult(summary='p',should_decompose=True,candidate_attempts=2); node=g.get('decompose'); node.assigned_backend='b'; node.assigned_model='m'
+    e._execute_decompose_node(node,ctx)
+    assert ctx.decomposed_active is True and calls['rev']==1
+    assert json.loads((ctx.run_dir/'decomposition'/'plan_validation_decision.json').read_text())['decision']=='decomposition_revised_and_accepted'
+    assert (ctx.run_dir/'decomposition'/'plan_revision_request.json').exists()
+
+
+def test_runtime_semantic_rejection_twice_falls_back(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from villani_ops.orchestration.engine import OrchestrationEngine, EngineContext
+    from villani_ops.orchestration.graph import OrchestrationGraph
+    from villani_ops.orchestration.nodes import OrchestrationNode
+    from villani_ops.orchestration.context import TaskContext
+    from villani_ops.core.task import Task
+    from villani_ops.core.backend import Backend
+    from villani_ops.execution_policies.base import BackendSelection
+    from villani_ops.orchestration.planner import PlanResult, DecompositionResult, Subtask, DecompositionPlanValidationResult
+    import time, json
+    class Policy:
+        mode='performance'
+        def select_backend(self, **kw): b=kw['backends']['b']; return BackendSelection(backend_name='b',backend=b,reason='x')
+    class Runner: name='villani-code'
+    dec=DecompositionResult(should_use_decomposition=True, reason='r', subtasks=[Subtask(id='a',title='A',objective='oa',success_criteria='sa'),Subtask(id='b',title='B',objective='ob',success_criteria='sb')])
+    calls={'rev':0}
+    monkeypatch.setattr('villani_ops.orchestration.engine.Planner.decompose', lambda *a, **k: (dec, SimpleNamespace(raw_text='{}')))
+    monkeypatch.setattr('villani_ops.orchestration.engine.validate_decomposition_plan', lambda *a, **k: DecompositionPlanValidationResult(accepted=True))
+    monkeypatch.setattr('villani_ops.orchestration.engine.semantic_validate_decomposition_plan', lambda *a, **k: (DecompositionPlanValidationResult(accepted=False, required_revisions=['bad']), {'status':'ok'}))
+    def rev(*a, **k): calls['rev']+=1; return dec, {'parsed_cleanly':True,'revision_request':{}}
+    monkeypatch.setattr('villani_ops.orchestration.engine.revise_decomposition_with_feedback', rev)
+    e=OrchestrationEngine(backends={'b':Backend(name='b',provider='openai',model='m')},execution_policy=Policy(),runner_adapter=Runner(),workspace=tmp_path/'ws')
+    g=OrchestrationGraph(run_id='r',nodes=[OrchestrationNode(id='decompose',kind='decompose',objective='d')])
+    ctx=EngineContext(repo=tmp_path,task=Task(repo_path=str(tmp_path),objective='x'),candidate_attempts=2,timeout_seconds=None,isolation='worktree',run_id='r',run_dir=tmp_path/'run',mode='performance',runner='villani-code',graph=g,scheduler=None,task_context=TaskContext(objective='x'),start=time.time())
+    ctx.run_dir.mkdir(); ctx.plan=PlanResult(summary='p',should_decompose=True,candidate_attempts=2); node=g.get('decompose'); node.assigned_backend='b'; node.assigned_model='m'
+    e._execute_decompose_node(node,ctx)
+    assert ctx.decomposed_active is False and calls['rev']==1
+    assert json.loads((ctx.run_dir/'decomposition'/'plan_validation_decision.json').read_text())['decision']=='decomposition_rejected_fallback_to_candidates'
