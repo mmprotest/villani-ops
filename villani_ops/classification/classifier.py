@@ -150,14 +150,18 @@ def adjust_classification_from_task_shape(classification: TaskClassification, ta
 class TaskClassifier:
     def __init__(self, client: LLMClient | None=None): self.client=client or LLMClient()
     def select_backend(self, backends: dict[str, Backend]) -> Backend: return select_backend(backends, 'classification')
-    def classify(self, task: Task, backends: dict[str, Backend], out_path: str|Path|None=None, backend_override: Backend|None=None) -> tuple[TaskClassification, LLMCallResult]:
+    def classify(self, task: Task, backends: dict[str, Backend], out_path: str|Path|None=None, backend_override: Backend|None=None, estimate_cost: bool=True) -> tuple[TaskClassification, LLMCallResult]:
         backend=backend_override or self.select_backend(backends); repo=Path(task.repo_path).resolve()
         tree=_repo_tree(repo)
         task_text="\n".join(str(x or "") for x in [task.objective, task.instruction, task.success_criteria, "\n".join(task.constraints)])
         snippets=collect_relevant_file_snippets(repo, task_text, tree)
         relevant=[{"path":s.path,"reason":s.reason,"content_excerpt":s.content_excerpt} for s in snippets]
         context={"objective":task.objective,"success_criteria":task.success_criteria,"constraints":task.constraints,"repo":_repo_context(repo),"relevant_files":relevant}
-        result=self.client.complete_json(backend, SYSTEM, USER.format(context=json.dumps(context, indent=2)), 'TaskClassification')
+
+        try:
+            result=self.client.complete_json(backend, SYSTEM, USER.format(context=json.dumps(context, indent=2)), 'TaskClassification', estimate_cost=estimate_cost)
+        except TypeError:
+            result=self.client.complete_json(backend, SYSTEM, USER.format(context=json.dumps(context, indent=2)), 'TaskClassification')
         normalized=normalize_task_classification_payload(result.parsed_json)
         try:
             cls=TaskClassification.model_validate(normalized)

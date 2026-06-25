@@ -3,6 +3,8 @@ from .graph import OrchestrationGraph
 from .nodes import OrchestrationNode
 
 class GraphScheduler:
+    def dependency_statuses(self, node: OrchestrationNode, graph: OrchestrationGraph) -> dict[str, str]:
+        return {dep: graph.get(dep).status for dep in node.dependencies}
     def can_run(self, node: OrchestrationNode, graph: OrchestrationGraph) -> bool:
         return node.status in {'pending','ready'} and not graph.has_failed_required_dependency(node) and all(graph.dependency_satisfied(d, node) for d in node.dependencies)
     def next_ready_nodes(self, graph: OrchestrationGraph) -> list[OrchestrationNode]:

@@ -8,9 +8,29 @@ Difficulty = Literal['easy','medium','hard','unknown']
 Risk = Literal['low','medium','high','unknown']
 
 class NodeResult(BaseModel):
-    node_id: str | None = None
+    node_id: str = ''
+    kind: str = ''
     status: str = 'pending'
-    summary: str = ''
+    result_summary: str | None = None
+    confidence: float | None = None
+    difficulty: str | None = None
+    risk: str | None = None
+    has_failure: bool = False
+    has_review_blocker: bool = False
+    has_acceptance_blocker: bool = False
+    data: dict[str, Any] = Field(default_factory=dict)
+    error: str | None = None
+    # legacy alias accepted by old tests
+    summary: str | None = None
+
+class NodeExecutionResult(BaseModel):
+    node_id: str
+    status: Literal['succeeded','failed','skipped']
+    result_summary: str | None = None
+    confidence: float | None = None
+    difficulty: str | None = None
+    risk: str | None = None
+    artifacts: dict[str, str] = Field(default_factory=dict)
     data: dict[str, Any] = Field(default_factory=dict)
     error: str | None = None
 
@@ -32,5 +52,4 @@ class OrchestrationNode(BaseModel):
     started_at: str | None = None
     completed_at: str | None = None
     error: str | None = None
-    # legacy shim
     result: dict[str, Any] | None = None

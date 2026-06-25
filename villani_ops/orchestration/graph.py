@@ -43,16 +43,22 @@ class OrchestrationGraph(BaseModel):
         return all(n.status in {'succeeded','failed','skipped'} for n in self.nodes)
     def mark_running(self, node_id: str) -> None:
         self.update_node(node_id, status='running', started_at=_now(), error=None)
-    def mark_succeeded(self, node_id: str, *, summary: str | None=None, artifacts: dict[str,str] | None=None, confidence: float | None=None) -> None:
+    def mark_succeeded(self, node_id: str, *, summary: str | None=None, artifacts: dict[str,str] | None=None, confidence: float | None=None, difficulty: str | None=None, risk: str | None=None) -> None:
         n=self.get(node_id); n.status='succeeded'; n.completed_at=_now(); n.result_summary=summary or n.result_summary; n.error=None
         if artifacts: n.artifacts.update(artifacts)
         if confidence is not None: n.confidence=confidence
+        if difficulty is not None: n.difficulty=difficulty
+        if risk is not None: n.risk=risk
     def mark_failed(self, node_id: str, error: str, *, summary: str | None=None) -> None:
         n=self.get(node_id); n.status='failed'; n.completed_at=_now(); n.error=error; n.result_summary=summary or error
     def mark_skipped(self, node_id: str, reason: str) -> None:
         n=self.get(node_id); n.status='skipped'; n.completed_at=_now(); n.error=reason; n.result_summary=reason
     def to_json(self) -> str:
         return self.model_dump_json(indent=2)
+    def terminal_nodes(self) -> list[OrchestrationNode]:
+        return [n for n in self.nodes if n.status in {'succeeded','failed','skipped'}]
+    def pending_nodes(self) -> list[OrchestrationNode]:
+        return [n for n in self.nodes if n.status in {'pending','ready','running'}]
     def summary(self) -> dict:
         return {'run_id':self.run_id,'mode':self.mode,'runner':self.runner,'node_count':len(self.nodes),'nodes':[n.model_dump(mode='json') for n in self.nodes]}
     def write(self, path) -> None:
