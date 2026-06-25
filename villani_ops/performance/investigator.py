@@ -33,10 +33,56 @@ def _parse_conf(value: Any) -> float:
     except Exception:
         return 0.0
 
+def _is_nonempty_str(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+def _summary_from_value(value: Any) -> str | None:
+    if _is_nonempty_str(value):
+        return value.strip()
+    if isinstance(value, dict):
+        for key in ('summary','text','description','details','diagnosis','analysis','finding','findings'):
+            got=_summary_from_value(value.get(key))
+            if got:
+                return got
+        return None
+    if isinstance(value, list):
+        vals=[]
+        for item in value:
+            if _is_nonempty_str(item): vals.append(item.strip())
+            elif isinstance(item, dict):
+                got=_summary_from_value({k:item.get(k) for k in ('summary','issue','description') if k in item})
+                if got: vals.append(got)
+            if len(vals) >= 3: break
+        return '; '.join(vals) if vals else None
+    return None
+
+def _structured_items(value: Any) -> list[dict[str, Any]]:
+    if isinstance(value, dict): return [value]
+    if isinstance(value, list): return [x for x in value if isinstance(x, dict)]
+    return []
+
 def normalize_investigation_payload(payload: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
     original=dict(payload or {}); data=dict(original); notes=[]
+    summary_aliases=('analysis','findings','diagnosis','repo_analysis','investigation','summary')
+    structured_keys=('root_causes','causes','identified_bugs','bugs','issues','risks','warnings','findings')
+    raw_findings={}
+    for alias in summary_aliases:
+        if alias not in data: continue
+        value=data.get(alias)
+        summary=_summary_from_value(value)
+        if summary and not _is_nonempty_str(data.get('summary')):
+            data['summary']=summary; notes.append(f'Mapped {alias} to summary')
+        elif isinstance(value, dict) and not summary:
+            if any(k in value for k in structured_keys):
+                data.setdefault('summary', 'Investigation identified relevant files and implementation steps.')
+                notes.append(f'Synthesized summary from structured {alias}')
+        if isinstance(value, dict):
+            for key in structured_keys:
+                if key in value:
+                    raw_findings[f'{alias}.{key}']=value[key]
+                    data[key]=_merge_unique(_as_list(data.get(key)), _as_list(value[key])) if key in {'risks','warnings'} else data.get(key, value[key])
+
     aliases={
-        'analysis':'summary','findings':'summary','diagnosis':'summary','repo_analysis':'summary','investigation':'summary',
         'root_cause':'suspected_root_cause','suspected_cause':'suspected_root_cause','cause':'suspected_root_cause',
         'files':'relevant_files','file_paths':'relevant_files','files_to_modify':'relevant_files','affected_files':'relevant_files','modified_files':'relevant_files','target_files':'relevant_files','relevant_file_paths':'relevant_files',
         'tests':'relevant_tests','test_files':'relevant_tests','test_validation':'relevant_tests','validation_plan':'relevant_tests','tests_to_run':'relevant_tests',
@@ -48,49 +94,54 @@ def normalize_investigation_payload(payload: dict[str, Any]) -> tuple[dict[str, 
             before=_as_list(data.get(t)) if t in {'relevant_files','relevant_tests','implementation_plan','risks'} else data.get(t)
             if t in {'relevant_files','relevant_tests','implementation_plan','risks'}:
                 data[t]=_merge_unique(_as_list(data.get(t)), _as_list(data[a]))
-            elif not str(data.get(t) or '').strip():
+            elif not _is_nonempty_str(data.get(t)):
                 data[t]=data[a]
             if data.get(t) != before: notes.append(f"Mapped {a} to {t}")
+
     bug_items=[]
-    for key in ('identified_bugs','bugs'):
-        v=data.get(key)
-        if isinstance(v, dict): v=[v]
-        if isinstance(v, list): bug_items.extend([x for x in v if isinstance(x, dict)])
+    for key in ('root_causes','causes','identified_bugs','bugs','issues','findings'):
+        bug_items.extend(_structured_items(data.get(key)))
     bug_summaries=[]
     if bug_items:
         files=[]; issues=[]; fixes=[]
         for bug in bug_items:
-            if bug.get('file'): files.append(str(bug['file']))
-            if bug.get('issue'): issues.append(str(bug['issue']))
-            if bug.get('fix'): fixes.append(str(bug['fix']))
-            if bug.get('issue') or bug.get('fix'):
-                bug_summaries.append(': '.join(str(x) for x in [bug.get('file'), bug.get('issue')] if x))
+            f=bug.get('file') or bug.get('path') or bug.get('file_path')
+            issue=bug.get('issue') or bug.get('risk') or bug.get('description') or bug.get('summary')
+            fix=bug.get('fix') or bug.get('action') or bug.get('recommendation')
+            if f: files.append(str(f))
+            if issue: issues.append(str(issue))
+            if fix: fixes.append(str(fix))
+            if issue or fix: bug_summaries.append(': '.join(str(x) for x in [f, issue] if x))
         data['relevant_files']=_merge_unique(_as_list(data.get('relevant_files')), files)
         data['risks']=_merge_unique(_as_list(data.get('risks')), issues)
         data['implementation_plan']=_merge_unique(_as_list(data.get('implementation_plan')), fixes)
-        notes.append('Mapped identified_bugs/bugs to relevant_files, risks, and implementation_plan')
-    if not str(data.get('summary') or '').strip() and bug_summaries:
-        data['summary']='Identified bugs: ' + '; '.join(bug_summaries[:5])
-        notes.append('Synthesized summary from identified_bugs')
-    if not str(data.get('summary') or '').strip():
+        raw_findings.update({k:data[k] for k in ('root_causes','causes','identified_bugs','bugs','issues','findings') if k in data})
+        notes.append('Mapped structured findings to relevant_files, risks, and implementation_plan')
+    if not _is_nonempty_str(data.get('summary')) and bug_summaries:
+        data['summary']='Identified findings: ' + '; '.join(bug_summaries[:5]); notes.append('Synthesized summary from structured findings')
+    if not _is_nonempty_str(data.get('summary')):
         for k,v in data.items():
             if isinstance(v,str) and v.strip() and k not in {'suspected_root_cause'}:
                 data['summary']=v.strip(); notes.append(f"Mapped {k} to summary"); break
-    if not str(data.get('summary') or '').strip() and str(data.get('suspected_root_cause') or '').strip():
+    if not _is_nonempty_str(data.get('summary')) and _is_nonempty_str(data.get('suspected_root_cause')):
         data['summary']=f"Suspected root cause: {data['suspected_root_cause']}"; notes.append('Derived summary from suspected_root_cause')
     for key in ('implementation_plan','risks','relevant_files','relevant_tests'):
         if isinstance(data.get(key), str): notes.append(f"Converted {key} string to list")
         data[key]=_as_list(data.get(key))
-    if not str(data.get('summary') or '').strip() and any(data.get(k) for k in ('relevant_files','implementation_plan','risks','relevant_tests')):
-        data['summary']='Investigation identified relevant files, risks, or implementation steps.'; notes.append('Synthesized summary from investigation signals')
+    useful=any(data.get(k) for k in ('relevant_files','implementation_plan','risks','relevant_tests')) or bool(raw_findings)
+    if not _is_nonempty_str(data.get('summary')) and useful:
+        data['summary']='Investigation identified relevant files, risks, or implementation steps for the task.'; notes.append('Synthesized safe summary from investigation signals')
+    if not _is_nonempty_str(data.get('summary')) and isinstance(data.get('summary'), (dict, list)):
+        data.pop('summary', None)
     conf=_parse_conf(data.get('confidence'))
-    if 'confidence' not in original and any(data.get(k) for k in ('relevant_files','implementation_plan','risks','relevant_tests')):
+    if 'confidence' not in original and useful:
         conf=max(conf, .65); notes.append('Raised confidence to 0.65 because useful investigation signals were present')
-    if str(data.get('summary') or '').strip() and len(data.get('relevant_files') or []) >= 4:
+    if _is_nonempty_str(data.get('summary')) and len(data.get('relevant_files') or []) >= 4:
         conf=max(conf, .70); notes.append('Raised confidence to 0.70 because summary and at least four relevant files were present')
     data['confidence']=conf
-    extra_keys=['identified_bugs','bugs','files_to_modify','implementation_steps','test_validation','validation_plan','tests_to_run','affected_files','modified_files','target_files']
+    extra_keys=['identified_bugs','bugs','root_causes','causes','issues','findings','files_to_modify','implementation_steps','test_validation','validation_plan','tests_to_run','affected_files','modified_files','target_files']
     extras={k:original[k] for k in extra_keys if k in original}
+    extras.update(raw_findings)
     if extras: data['raw_findings']=extras
     changed={k:v for k,v in data.items() if original.get(k)!=v}
     data['investigation_normalized']=bool(changed or notes)

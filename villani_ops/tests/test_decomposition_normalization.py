@@ -104,3 +104,50 @@ def test_normalized_decomposition_artifact_preserves_relevant_files(tmp_path):
     write_json_utf8(tmp_path/'decomposition_normalized.json', {'normalized_payload': norm})
     loaded=json.loads((tmp_path/'decomposition_normalized.json').read_text())
     assert loaded['normalized_payload']['subtasks'][0]['relevant_files'] == ['a.py']
+
+
+def test_top_level_decomposition_list_normalizes_exact_failure_shape():
+    raw={"decomposition":[{"id":1,"title":"Fix Cart Pricing Logic","instruction":"Review and correct pricing calculations.","relevant_files":["src/signalshop/pricing.py"]}]}
+    norm, _=normalize_decomposition_payload(raw)
+    assert norm["should_use_decomposition"] is True
+    assert len(norm["subtasks"]) == 1
+    st=norm["subtasks"][0]
+    assert st["id"] == "fix_cart_pricing_logic"
+    assert st["objective"] == "Review and correct pricing calculations."
+    assert st["relevant_files"] == ["src/signalshop/pricing.py"]
+    assert DecompositionResult.model_validate(norm).subtasks[0].id == "fix_cart_pricing_logic"
+
+
+def test_top_level_decomposition_string_is_reason():
+    norm, _=normalize_decomposition_payload({"decomposition":"because multi-part"})
+    assert norm["reason"] == "because multi-part"
+    assert norm["subtasks"] == []
+
+
+def test_top_level_decomposition_object_extracts_subtasks():
+    norm, _=normalize_decomposition_payload({"decomposition":{"subtasks":[{"title":"Fix A","instruction":"Do A"}]}})
+    assert len(norm["subtasks"]) == 1
+    assert norm["subtasks"][0]["objective"] == "Do A"
+
+
+def test_numeric_id_without_title_and_duplicate_slugs():
+    norm, _=normalize_decomposition_payload({"subtasks":[{"id":1,"instruction":"Do one"},{"id":2,"title":"Fix Pricing","instruction":"A"},{"id":3,"title":"Fix Pricing","instruction":"B"}]})
+    assert [s["id"] for s in norm["subtasks"]] == ["subtask_001", "fix_pricing", "fix_pricing_2"]
+    assert norm["should_use_decomposition"] is True
+
+
+def test_exact_run_failure_investigation_and_decomposition_regression():
+    from villani_ops.performance.investigator import normalize_investigation_payload
+    inv_raw={"analysis":{"summary":"The checkout flow spans pricing, inventory, orders, and receipts.","root_causes":[{"file":"src/signalshop/pricing.py","issue":"tax before discount","fix":"apply coupon before tax"}]},"files_to_modify":["src/signalshop/pricing.py","src/signalshop/inventory.py"],"implementation_steps":["Fix pricing","Fix inventory"]}
+    inv_norm, _=normalize_investigation_payload(inv_raw)
+    assert isinstance(inv_norm["summary"], str)
+    assert "src/signalshop/pricing.py" in inv_norm["relevant_files"] and "src/signalshop/inventory.py" in inv_norm["relevant_files"]
+    assert "apply coupon before tax" in inv_norm["implementation_plan"]
+    assert inv_norm["investigation_fallback_used"] is False
+    dec_raw={"decomposition":[{"id":1,"title":"Fix Cart Pricing Logic","instruction":"Review and correct pricing calculations.","relevant_files":["src/signalshop/pricing.py"]}]}
+    dec_norm, _=normalize_decomposition_payload(dec_raw)
+    assert len(dec_norm["subtasks"]) == 1
+    assert dec_norm["subtasks"][0]["id"] == "fix_cart_pricing_logic"
+    assert dec_norm["subtasks"][0]["objective"] == "Review and correct pricing calculations."
+    assert dec_norm["subtasks"][0]["relevant_files"] == ["src/signalshop/pricing.py"]
+    assert dec_norm.get("fallback_used") is not True

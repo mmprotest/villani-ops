@@ -100,3 +100,36 @@ def test_advisory_only_report_is_explicit(tmp_path):
     )
     path = write_performance_report(tmp_path, Task(repo_path=str(tmp_path), objective="Fix"), None, [], None, decision, 0)
     assert "advisory-only and does not count as active decomposition" in path.read_text()
+
+
+def test_decomposition_zero_subtask_fallback_progress_is_explicit(capsys):
+    from types import SimpleNamespace
+    from villani_ops.orchestration.progress import ConsoleProgressReporter
+    reporter=ConsoleProgressReporter()
+    node=SimpleNamespace(kind="decompose")
+    reporter.node_completed(node, {"should_use_decomposition": True, "subtasks": [], "decomposition_fallback_to_candidate_path": True, "decomposition_fallback_reason": "Planner requested decomposition but decomposition produced no executable subtasks."})
+    out=capsys.readouterr().out
+    assert "Decomposition fallback to candidate path: no executable subtasks produced" in out
+    assert "Decomposition complete" not in out
+
+
+def test_report_records_decomposition_fallback_reason(tmp_path):
+    decision = Decision(
+        run_id="r",
+        decomposition={
+            "should_use_decomposition": True,
+            "subtasks": [],
+            "decomposition_requested": True,
+            "decomposition_executed": False,
+            "decomposition_fallback_to_candidate_path": True,
+            "decomposition_fallback_used": True,
+            "decomposition_fallback_reason": "Planner requested decomposition but decomposition produced no executable subtasks.",
+        },
+        decomposition_executed=False,
+        decomposition_advisory_only=True,
+        subtask_count=0,
+    )
+    path = write_performance_report(tmp_path, Task(repo_path=str(tmp_path), objective="Fix"), None, [], None, decision, 0)
+    text = path.read_text()
+    assert "Decomposition fallback used: true" in text
+    assert "Planner requested decomposition but decomposition produced no executable subtasks." in text

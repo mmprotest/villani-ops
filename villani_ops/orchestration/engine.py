@@ -393,7 +393,15 @@ class OrchestrationEngine:
             self._write_parallel_execution_summary(context)
         elif usable:
             d=context.task_context.decomposition; d['advisory_only']=True; context.task_context.decomposition=d
-        return self._finish(context,node,NodeExecutionResult(node_id=node.id,status='succeeded',result_summary=dec.reason,confidence=dec.confidence,artifacts={'raw':'decomposition.raw.txt','normalized':'decomposition_normalized.json','decomposition':'decomposition.json','output':str(context.run_dir/'nodes'/node.id/'output.json')}),context.task_context.decomposition)
+        elif getattr(dec,'should_use_decomposition',False):
+            reason='Planner requested decomposition but decomposition produced no executable subtasks.'
+            d=context.task_context.decomposition
+            d.update({'decomposition_requested': True, 'decomposition_executed': False, 'decomposition_fallback_to_candidate_path': True, 'decomposition_fallback_used': True, 'fallback_used': True, 'decomposition_fallback_reason': reason})
+            context.task_context.decomposition=d
+            dec.decomposition_fallback_used=True; dec.fallback_used=True; dec.decomposition_fallback_reason=reason
+            self.record_controller_step(context,node=node,action='decomposition_fallback_to_candidate_path',status='fallback',summary=reason)
+            self.progress_reporter.step('[4/8] Decomposition fallback to candidate path: no executable subtasks produced')
+        return self._finish(context,node,NodeExecutionResult(node_id=node.id,status='succeeded',result_summary=(getattr(dec,'decomposition_fallback_reason',None) or dec.reason),confidence=dec.confidence,artifacts={'raw':'decomposition.raw.txt','normalized':'decomposition_normalized.json','decomposition':'decomposition.json','output':str(context.run_dir/'nodes'/node.id/'output.json')}),context.task_context.decomposition)
 
     def _execute_code_node(self,node,context):
         context.graph.mark_running(node.id)
