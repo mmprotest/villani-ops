@@ -159,3 +159,20 @@ def test_classification_cost_tokens_preserved_when_initial_validation_would_fail
     assert call.estimated_cost > 0
     assert call.input_tokens > 0
     assert call.output_tokens > 0
+
+from villani_ops.classification.classifier import adjust_classification_from_task_shape
+from villani_ops.core.task import TaskClassification
+
+
+def test_multifile_and_attempt_guardrails_prevent_easy():
+    cls=TaskClassification(difficulty="easy", category="bug_fix", estimated_attempts_needed=3, likely_files=["a.py","b.py","c.py","d.py","e.py"], confidence=.9)
+    out=adjust_classification_from_task_shape(cls, "Fix checkout pricing inventory orders receipts", [])
+    assert out.difficulty in {"medium","hard"}
+    assert any("Raised difficulty" in n for n in out.adjustment_notes)
+
+
+def test_likely_file_count_eight_is_hard_and_narrow_can_be_easy():
+    hard=adjust_classification_from_task_shape(TaskClassification(difficulty="medium", likely_files=[f"f{i}.py" for i in range(8)]), "fix", [])
+    assert hard.difficulty == "hard"
+    easy=adjust_classification_from_task_shape(TaskClassification(difficulty="easy", likely_files=["a.py"], estimated_attempts_needed=1, confidence=.9), "fix failing tests", [])
+    assert easy.difficulty == "easy"

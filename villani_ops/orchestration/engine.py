@@ -215,6 +215,9 @@ class OrchestrationEngine:
         context.plan=plan; context.task_context.plan=plan.model_dump(mode='json'); context.task_context.overall_difficulty=plan.expected_difficulty; context.task_context.confidence=plan.confidence
         if getattr(plan, 'planner_normalized', False):
             for note in plan.planner_normalization_notes: self.record_controller_step(context,node=node,action='planner_normalized',status='normalized',summary=note)
+        if getattr(plan, 'planner_repaired', False):
+            for note in plan.planner_repair_notes: self.record_controller_step(context,node=node,action='planner_repaired',status='repaired',summary=note)
+            self.progress_reporter.step('[3/8] Plan repaired: strategy=decompose_then_execute, decompose=true, reason=multi-file/multi-subsystem context')
         if getattr(plan, 'planner_fallback_used', False) or getattr(plan, 'fallback_used', False): self.record_controller_step(context,node=node,action='planner_fallback_used',status='fallback',summary=plan.planner_fallback_reason or plan.summary)
         if call: context.input_tokens+=call.input_tokens; context.output_tokens+=call.output_tokens
         self._write_node_artifacts(context,node,raw=(call.raw_text if call else ''))

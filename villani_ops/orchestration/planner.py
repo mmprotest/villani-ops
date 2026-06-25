@@ -27,6 +27,8 @@ class PlanResult(BaseModel):
     decomposition_fallback_used: bool = False
     decomposition_fallback_reason: str | None = None
     fallback_used: bool = False
+    planner_repaired: bool = False
+    planner_repair_notes: list[str] = Field(default_factory=list)
 
 class Subtask(BaseModel):
     id: str
@@ -259,6 +261,51 @@ def normalize_decomposition_payload(payload: dict[str, Any], *, task: str | None
     _, conf=_first_present(data, ('confidence','confidence_score','certainty'))
     return {'should_use_decomposition': bool(parsed), 'reason': reason if (reason or not parsed) else 'Task was decomposed into separable subtasks.', 'subtasks': subtasks, 'merge_strategy': merge, 'confidence': _parse_confidence(conf), 'advisory_only': True}, notes
 
+SUBSYSTEM_NOUNS={'checkout','pricing','inventory','reservation','order','orders','receipt','receipts','payment','tax','shipping','discount','coupon','transaction','rollback','atomic'}
+BEHAVIOR_VERBS={'price','reserve','create','release','render','pass','validate','fix'}
+
+def _list_from(src: dict[str, Any] | None, key: str) -> list[str]:
+    v=(src or {}).get(key)
+    return [str(x) for x in v if str(x).strip()] if isinstance(v, list) else []
+
+def _behavior_count(text: str | None) -> int:
+    parts=__import__('re').split(r",|;|\band\b", (text or '').lower())
+    return sum(1 for p in parts if any(__import__('re').search(rf"\b{v}\w*\b", p) for v in BEHAVIOR_VERBS))
+
+def _subsystems(text: str | None) -> set[str]:
+    import re
+    low=(text or '').lower()
+    return {n for n in SUBSYSTEM_NOUNS if re.search(rf"\b{re.escape(n)}\b", low)}
+
+def repair_plan_against_context(plan: PlanResult, *, requested_candidate_attempts: int, task: str | None, success_criteria: str | None, classification: dict[str, Any] | None, investigation: dict[str, Any] | None) -> tuple[PlanResult, list[str]]:
+    fixed=plan.model_copy(deep=True)
+    fixed.candidate_attempts=max(1, min(8, int(fixed.candidate_attempts or requested_candidate_attempts)))
+    likely=_list_from(classification, 'likely_files')
+    relevant=_list_from(investigation, 'relevant_files')
+    est=int((classification or {}).get('estimated_attempts_needed') or 0)
+    difficulty=str((classification or {}).get('difficulty') or '').lower()
+    conf=float((investigation or {}).get('confidence') or 0.0)
+    text='\n'.join([task or '', success_criteria or ''])
+    behaviors=_behavior_count(success_criteria or text)
+    subs=_subsystems(text)
+    signals=[]
+    if len(likely) >= 4: signals.append(f"likely_files={len(likely)}")
+    if len(relevant) >= 4: signals.append(f"relevant_files={len(relevant)}")
+    if est >= 3: signals.append(f"estimated_attempts_needed={est}")
+    if behaviors >= 4: signals.append(f"behaviours={behaviors}")
+    if len(subs) >= 4: signals.append('subsystems=' + ', '.join(sorted(subs)[:8]))
+    if conf >= .70 and len(relevant) >= 4: signals.append(f"investigation_confidence={conf:.2f}")
+    if difficulty in {'medium','hard'} and len(likely) >= 4: signals.append(f"classification_difficulty={difficulty}")
+    notes=[]
+    if (fixed.strategy == 'single_task' or not fixed.should_decompose) and len(signals) >= 2:
+        old=f"{fixed.strategy}/{fixed.should_decompose}"
+        fixed.strategy='decompose_then_execute'; fixed.should_decompose=True
+        evidence=', '.join(signals[:4])
+        fixed.decomposition_reason=f"Task spans multiple separable subsystems/files: {evidence}."
+        notes.append(f"Changed strategy from {old} to decompose_then_execute because {evidence}.")
+        fixed.planner_repaired=True; fixed.planner_repair_notes=notes
+    return fixed, notes
+
 def _parse_plan_payload_from_call(call: LLMCallResult) -> dict[str, Any]:
     if isinstance(call.parsed_json, dict) and call.parsed_json:
         return call.parsed_json
@@ -309,6 +356,10 @@ Required schema:
 Valid strategy values are: single_task, parallel_candidates, decompose_then_execute.
 Valid expected_difficulty values are: easy, medium, hard, unknown.
 If the task spans multiple separable subsystems or files, set strategy to decompose_then_execute and should_decompose to true.
+If likely_files contains 4 or more distinct source files, do not choose single_task unless you explicitly explain why the changes are tightly coupled and not decomposable.
+If success criteria lists multiple independent behaviours, prefer decompose_then_execute.
+If the task spans checkout, pricing, inventory, orders, payment, receipts, transaction handling, rollback, or formatting, treat it as a multi-subsystem task and prefer decompose_then_execute.
+You must return planning JSON only. Do not return command/action/tool-call JSON.
 Concrete example:
 {
   "summary": "Inspect checkout-related modules, then fix pricing and inventory behavior with targeted tests.",
@@ -343,6 +394,15 @@ Concrete example:
             plan=PlanResult(summary=f'Planner fallback used: {reason}', strategy='parallel_candidates', should_decompose=False, candidate_attempts=candidate_attempts, expected_difficulty='unknown', confidence=0.0, fallback_used=True, planner_fallback_used=True, planner_fallback_reason=reason)
             if not (run_dir/'plan_normalized.json').exists():
                 write_json_utf8(run_dir/'plan_normalized.json', {'planner_normalized': False, 'planner_normalization_notes': [], 'normalized_payload': {}, 'raw_payload': getattr(call, 'parsed_json', {}) if call else {}, 'planner_fallback_used': True, 'planner_fallback_reason': reason})
+        repair_notes=[]
+        if not getattr(plan, 'planner_fallback_used', False):
+            plan, repair_notes = repair_plan_against_context(plan, requested_candidate_attempts=candidate_attempts, task=getattr(task, 'objective', None) or getattr(task, 'instruction', None), success_criteria=getattr(task, 'success_criteria', None), classification=classification if isinstance(classification, dict) else None, investigation=investigation if isinstance(investigation, dict) else None)
+        if (run_dir/'plan_normalized.json').exists():
+            try:
+                pn=json.loads((run_dir/'plan_normalized.json').read_text())
+                pn.update({'planner_repaired': plan.planner_repaired, 'planner_repair_notes': plan.planner_repair_notes, 'normalized_payload': plan.model_dump(mode='json')})
+                write_json_utf8(run_dir/'plan_normalized.json', pn)
+            except Exception: pass
         write_text_utf8(run_dir/'plan.raw.txt', (call.raw_text if call else f'ERROR: {plan.planner_fallback_reason or ""}') or '')
         write_json_utf8(run_dir/'plan.json', plan)
         return plan, call if 'call' in locals() else None
