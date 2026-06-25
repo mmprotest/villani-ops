@@ -54,40 +54,111 @@ def _as_list(value: Any) -> list[str]:
     if isinstance(value, str): return [value.strip()] if value.strip() else []
     return [str(value)]
 
-def normalize_plan_payload(payload: dict[str, Any], *, requested_candidate_attempts: int) -> tuple[dict[str, Any], list[str]]:
-    data=dict(payload or {}); notes=[]
-    def map_alias(alias, target):
-        if target not in data and alias in data:
-            data[target]=data[alias]; notes.append(f"Mapped {alias} to {target}")
-    map_alias('approach','summary'); map_alias('strategy_summary','summary'); map_alias('execution_strategy','strategy'); map_alias('strategy_name','strategy')
-    map_alias('requires_decomposition','should_decompose'); map_alias('num_candidates','candidate_attempts'); map_alias('candidates','candidate_attempts'); map_alias('attempts','candidate_attempts'); map_alias('candidate_count','candidate_attempts'); map_alias('difficulty','expected_difficulty')
-    if 'risks' not in data:
-        for a in ('risk_factors','warnings'):
-            if a in data: data['risks']=data[a]; notes.append(f"Mapped {a} to risks"); break
-    if 'should_decompose' not in data and 'decompose' in data: data['should_decompose']=data['decompose']; notes.append('Mapped decompose to should_decompose')
-    if 'decomposition' in data and 'should_decompose' not in data:
-        v=data['decomposition']; data['should_decompose']=bool(v) if not isinstance(v, str) else v.lower() in {'true','yes','needed','required'}; notes.append('Mapped decomposition to should_decompose')
-    if 'decomposition' in data and 'decomposition_reason' not in data and isinstance(data['decomposition'], str): data['decomposition_reason']=data['decomposition']; notes.append('Mapped decomposition to decomposition_reason')
-    if not str(data.get('summary') or '').strip() and isinstance(data.get('plan'), list): data['summary']='; '.join(str(x) for x in data['plan'] if str(x).strip()); notes.append('Mapped plan list to summary')
-    elif not str(data.get('summary') or '').strip() and isinstance(data.get('plan'), str): data['summary']=data['plan']; notes.append('Mapped plan to summary')
-    if not str(data.get('summary') or '').strip() and isinstance(data.get('steps'), list): data['summary']='; '.join(str(x) for x in data['steps'] if str(x).strip()); notes.append('Mapped steps to summary')
-    if not str(data.get('summary') or '').strip(): return data, notes
-    if not data.get('strategy'): data['strategy']='parallel_candidates'; notes.append('Defaulted strategy to parallel_candidates')
-    maps={'parallel':'parallel_candidates','multi_candidate':'parallel_candidates','multiple_candidates':'parallel_candidates','single':'single_task','decompose':'decompose_then_execute'}
-    if data.get('strategy') in maps: data['strategy']=maps[data['strategy']]; notes.append('Mapped strategy alias')
-    if data.get('strategy') not in {'single_task','parallel_candidates','decompose_then_execute'}: data['strategy']='parallel_candidates'; notes.append('Defaulted invalid strategy to parallel_candidates')
-    if not data.get('candidate_attempts'): data['candidate_attempts']=requested_candidate_attempts; notes.append('Defaulted candidate_attempts to requested value')
+def normalize_plan_payload(payload: dict[str, Any], *, requested_candidate_attempts: int, task: str | None = None, success_criteria: str | None = None, classification: dict[str, Any] | None = None, investigation: dict[str, Any] | None = None) -> tuple[dict[str, Any], list[str]]:
+    data=dict(payload or {}); notes=[]; out: dict[str, Any]={}
+    def nonempty(v: Any) -> bool: return isinstance(v, str) and bool(v.strip())
+    def join_items(items: Any) -> str:
+        vals=[]
+        for x in items if isinstance(items, list) else []:
+            if isinstance(x, dict):
+                s=x.get('title') or x.get('objective') or x.get('summary') or x.get('name')
+                if s and x.get('objective') and s != x.get('objective'): s=f"{s}: {x.get('objective')}"
+            else: s=x
+            if str(s or '').strip(): vals.append(str(s).strip())
+        return '; '.join(vals)
+    def nested_files(src: dict[str, Any] | None, key: str) -> list[str]:
+        v=(src or {}).get(key)
+        return [str(x) for x in v if str(x).strip()] if isinstance(v, list) else []
+    files=[]
+    rs=data.get('resulting_state')
+    if isinstance(rs, dict): files=nested_files(rs, 'files')
+    files = files or nested_files(classification, 'likely_files') or nested_files(investigation, 'relevant_files')
+    subtasks=data.get('subtasks') if isinstance(data.get('subtasks'), list) and data.get('subtasks') else []
+
+    if nonempty(data.get('summary')): out['summary']=data['summary'].strip()
+    else:
+        for key in ('plan','steps','implementation_plan','execution_plan','task_plan'):
+            if isinstance(data.get(key), list):
+                s=join_items(data[key])
+                if s: out['summary']=s; notes.append(f"Mapped {key} list to summary"); break
+            elif nonempty(data.get(key)):
+                out['summary']=data[key].strip(); notes.append(f"Mapped {key} to summary"); break
+        if 'summary' not in out:
+            for key in ('analysis','thought','reasoning','approach','strategy_summary'):
+                if nonempty(data.get(key)): out['summary']=data[key].strip(); notes.append(f"Mapped {key} to summary"); break
+        if 'summary' not in out and files:
+            out['summary']='Planner identified relevant files: ' + ', '.join(files[:8]) + '.'
+            notes.append('Synthesized summary from relevant files')
+        if 'summary' not in out and subtasks:
+            s=join_items(subtasks)
+            if s: out['summary']=s; notes.append('Synthesized summary from subtasks')
+        if 'summary' not in out: return data, notes
+
+    strategy_aliases={'parallel':'parallel_candidates','parallel_candidates':'parallel_candidates','multi_candidate':'parallel_candidates','multiple_candidates':'parallel_candidates','independent_candidates':'parallel_candidates','single':'single_task','single_task':'single_task','one_shot':'single_task','direct':'single_task','decompose':'decompose_then_execute','decomposition':'decompose_then_execute','decompose_then_execute':'decompose_then_execute','subtasks':'decompose_then_execute'}
+    raw_strategy=next((data[k] for k in ('strategy','execution_strategy','strategy_name','mode','approach_type') if data.get(k) is not None), None)
+    explicit_valid=False
+    if raw_strategy is not None:
+        mapped=strategy_aliases.get(str(raw_strategy).strip().lower())
+        if mapped: out['strategy']=mapped; explicit_valid=True; notes.append('Mapped strategy alias')
+    if 'strategy' not in out:
+        out['strategy']='decompose_then_execute' if subtasks else 'parallel_candidates'; notes.append(f"Defaulted strategy to {out['strategy']}")
+
+    def parse_bool(v: Any) -> bool | None:
+        if isinstance(v, bool): return v
+        if isinstance(v, (int,float)): return bool(v)
+        if isinstance(v, str):
+            s=v.strip().lower()
+            if s in {'true','yes','needed','required','need','requires','use'}: return True
+            if s in {'false','no','not needed','none','unneeded'}: return False
+        return None
+    raw_dec=next((data[k] for k in ('should_decompose','decompose','requires_decomposition','needs_decomposition','use_decomposition','decomposition') if k in data), None)
+    dec=parse_bool(raw_dec)
+    out['should_decompose']=bool(dec) if dec is not None else False
+    if dec is not None: notes.append('Mapped decomposition flag to should_decompose')
+    if out['strategy']=='decompose_then_execute' or subtasks or len(files) >= 4:
+        out['should_decompose']=True
+        if len(files) >= 4: out['strategy']='decompose_then_execute'; notes.append('Mapped resulting_state.files to decomposition signal')
+    if subtasks and not explicit_valid: out['strategy']='decompose_then_execute'
+
+    reason=next((data[k] for k in ('decomposition_reason','decomposition','reason','rationale','why_decompose') if nonempty(data.get(k))), None)
+    out['decomposition_reason']=str(reason).strip() if reason else None
+    if reason: notes.append('Mapped decomposition reason')
+    if not out['decomposition_reason'] and subtasks: out['decomposition_reason']='Task contains multiple separable subtasks.'; notes.append('Synthesized decomposition reason from subtasks')
+    if not out['decomposition_reason'] and len(files) >= 4: out['decomposition_reason']='Planner identified multiple relevant files across the task.'; notes.append('Synthesized decomposition reason from relevant files')
+
+    raw_attempts=next((data[k] for k in ('candidate_attempts','num_candidates','candidate_count','candidates','attempts','num_attempts','parallel_attempts') if k in data), None)
+    try: attempts=int(raw_attempts) if raw_attempts is not None and not isinstance(raw_attempts, list) else int(requested_candidate_attempts)
+    except Exception: attempts=int(requested_candidate_attempts); notes.append('Defaulted invalid candidate_attempts to requested value')
+    if raw_attempts is None: notes.append('Defaulted candidate_attempts to requested value')
+    out['candidate_attempts']=max(1,min(8,attempts))
+    if out['candidate_attempts'] != attempts: notes.append('Clamped candidate_attempts to 1..8')
+
+    diff_alias={'simple':'easy','low':'easy','moderate':'medium','normal':'medium','complex':'hard','high':'hard','difficult':'hard','easy':'easy','medium':'medium','hard':'hard','unknown':'unknown'}
+    raw_diff=next((data[k] for k in ('expected_difficulty','difficulty','complexity','task_difficulty') if data.get(k) is not None), None)
+    out['expected_difficulty']=diff_alias.get(str(raw_diff).strip().lower(), 'unknown')
+    if raw_diff is not None and out['expected_difficulty']=='unknown' and str(raw_diff).strip().lower()!='unknown': notes.append('Defaulted invalid expected_difficulty to unknown')
+
+    raw_risks=next((data[k] for k in ('risks','risk_factors','warnings','concerns','caveats','failure_modes') if k in data), [])
+    risks=_as_list(raw_risks)
+    coord='Multi-part task may require coordinated changes across subsystems.'
+    if out['should_decompose'] and not risks: risks.append(coord); notes.append('Added decomposition coordination risk')
+    out['risks']=risks
+
+    raw_conf=next((data[k] for k in ('confidence','confidence_score','certainty') if data.get(k) is not None), 0.0)
     try:
-        c=int(data['candidate_attempts']); data['candidate_attempts']=max(1,min(8,c))
-        if c!=data['candidate_attempts']: notes.append('Clamped candidate_attempts to 1..8')
-    except Exception: data['candidate_attempts']=requested_candidate_attempts; notes.append('Defaulted invalid candidate_attempts to requested value')
-    if 'should_decompose' not in data or data.get('should_decompose') is None: data['should_decompose']=data.get('strategy')=='decompose_then_execute'; notes.append('Defaulted should_decompose from strategy')
-    if isinstance(data.get('risks'), str): data['risks']=[data['risks']]; notes.append('Converted risks string to list')
-    data['risks']=_as_list(data.get('risks'))
-    try: conf=float(data.get('confidence',0.0)); data['confidence']=max(0.0,min(1.0,conf));
-    except Exception: data['confidence']=0.0
-    if data.get('expected_difficulty') not in {'easy','medium','hard','unknown'}: data['expected_difficulty']='unknown'; notes.append('Defaulted invalid expected_difficulty to unknown')
-    return data, notes
+        s=str(raw_conf).strip(); conf=float(s[:-1])/100 if s.endswith('%') else float(raw_conf)
+        if conf > 1: conf=conf/100
+        out['confidence']=max(0.0,min(1.0,conf))
+    except Exception: out['confidence']=0.0
+    return out, notes
+
+def _parse_plan_payload_from_call(call: LLMCallResult) -> dict[str, Any]:
+    if isinstance(call.parsed_json, dict) and call.parsed_json:
+        return call.parsed_json
+    raw=(call.raw_text or '').strip()
+    if raw:
+        return json.loads(raw)
+    return {}
 
 def build_fixed_graph(candidate_attempts: int, runner: str = 'villani-code', *, run_id: str='', mode: str='performance', classify: bool=True, include_decompose: bool=True) -> OrchestrationGraph:
     nodes=[]
@@ -112,25 +183,59 @@ class Planner:
     def plan(self, *, task, classification, investigation, repo_summary: str|None, candidate_attempts: int, mode: str, backend_name: str, backend: Backend, run_dir: Path) -> tuple[PlanResult, LLMCallResult|None]:
         ctx={'task':task.model_dump(mode='json'),'classification':classification,'investigation':investigation,'repo_summary':repo_summary,'candidate_attempts':candidate_attempts,'mode':mode}
         normalized_payload=None; notes=[]
+        system_prompt = """You are a planning component. You are not executing shell commands.
+Do not return command, thought, action, observation, or tool-call JSON.
+Return only the required planning JSON object.
+
+Required schema:
+{
+  "summary": "One or two sentence plan summary",
+  "strategy": "parallel_candidates",
+  "should_decompose": false,
+  "decomposition_reason": null,
+  "candidate_attempts": 3,
+  "risks": [],
+  "expected_difficulty": "medium",
+  "confidence": 0.75
+}
+
+Valid strategy values are: single_task, parallel_candidates, decompose_then_execute.
+Valid expected_difficulty values are: easy, medium, hard, unknown.
+If the task spans multiple separable subsystems or files, set strategy to decompose_then_execute and should_decompose to true.
+Concrete example:
+{
+  "summary": "Inspect checkout-related modules, then fix pricing and inventory behavior with targeted tests.",
+  "strategy": "decompose_then_execute",
+  "should_decompose": true,
+  "decomposition_reason": "Task spans separable pricing and inventory subsystems.",
+  "candidate_attempts": 3,
+  "risks": ["Changes may need coordination across checkout modules."],
+  "expected_difficulty": "medium",
+  "confidence": 0.75
+}
+"""
         try:
-            call=self.client.complete_json(backend, 'Return JSON matching PlanResult.', json.dumps(ctx, indent=2)[:80000], 'PlanResult', estimate_cost=(mode != 'performance'))
+            call=self.client.complete_json(backend, system_prompt, json.dumps(ctx, indent=2)[:80000], 'PlanResult', estimate_cost=(mode != 'performance'))
             try:
                 plan=PlanResult.model_validate(call.parsed_json)
                 plan.candidate_attempts=max(1, min(8, int(plan.candidate_attempts or candidate_attempts)))
-                (run_dir/'plan_normalized.json').write_text(json.dumps({'normalized': False, 'notes': [], 'payload': plan.model_dump(mode='json')}, indent=2))
+                (run_dir/'plan_normalized.json').write_text(json.dumps({'planner_normalized': False, 'planner_normalization_notes': [], 'normalized_payload': plan.model_dump(mode='json'), 'planner_fallback_used': False, 'planner_fallback_reason': None}, indent=2))
             except Exception as original_error:
                 try:
-                    normalized_payload, notes = normalize_plan_payload(call.parsed_json if isinstance(call.parsed_json, dict) else {}, requested_candidate_attempts=candidate_attempts)
+                    raw_payload = _parse_plan_payload_from_call(call)
+                    normalized_payload, notes = normalize_plan_payload(raw_payload if isinstance(raw_payload, dict) else {}, requested_candidate_attempts=candidate_attempts, task=getattr(task, 'objective', None) or getattr(task, 'instruction', None), success_criteria=getattr(task, 'success_criteria', None), classification=classification if isinstance(classification, dict) else None, investigation=investigation if isinstance(investigation, dict) else None)
                     plan=PlanResult.model_validate(normalized_payload)
                     plan.planner_normalized=True; plan.planner_normalization_notes=notes; plan.planner_fallback_used=False; plan.planner_fallback_reason=None
-                    (run_dir/'plan_normalized.json').write_text(json.dumps({'normalized': True, 'payload': normalized_payload, 'notes': notes}, indent=2))
-                except Exception:
+                    (run_dir/'plan_normalized.json').write_text(json.dumps({'planner_normalized': True, 'planner_normalization_notes': notes, 'normalized_payload': normalized_payload, 'planner_fallback_used': False, 'planner_fallback_reason': None}, indent=2))
+                except Exception as normalize_error:
+                    (run_dir/'plan_normalized.json').write_text(json.dumps({'planner_normalized': False, 'planner_normalization_notes': [], 'normalized_payload': normalized_payload or {}, 'planner_fallback_used': True, 'planner_fallback_reason': f'{original_error}; normalization failed: {normalize_error}'}, indent=2, default=str))
                     raise original_error
         except Exception as e:
             call=locals().get('call')
             reason=str(e)
             plan=PlanResult(summary=f'Planner fallback used: {reason}', strategy='parallel_candidates', should_decompose=False, candidate_attempts=candidate_attempts, expected_difficulty='unknown', confidence=0.0, fallback_used=True, planner_fallback_used=True, planner_fallback_reason=reason)
-            (run_dir/'plan_normalized.json').write_text(json.dumps({'normalized': False, 'payload': getattr(call, 'parsed_json', {}) if call else {}, 'notes': [], 'error': reason}, indent=2, default=str))
+            if not (run_dir/'plan_normalized.json').exists():
+                (run_dir/'plan_normalized.json').write_text(json.dumps({'planner_normalized': False, 'planner_normalization_notes': [], 'normalized_payload': {}, 'raw_payload': getattr(call, 'parsed_json', {}) if call else {}, 'planner_fallback_used': True, 'planner_fallback_reason': reason}, indent=2, default=str))
         (run_dir/'plan.raw.txt').write_text((call.raw_text if call else f'ERROR: {plan.planner_fallback_reason or ""}') or '')
         (run_dir/'plan.json').write_text(plan.model_dump_json(indent=2))
         return plan, call if 'call' in locals() else None
