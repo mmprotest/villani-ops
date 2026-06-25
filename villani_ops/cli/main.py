@@ -112,7 +112,22 @@ def run(ctx: typer.Context, repo: str|None=None, task: str|None=typer.Option(Non
     console.print(f"Result: {'ACCEPTED' if d.accepted else 'FAILED'}")
     console.print(f'Mode: {d.mode}')
     console.print(f'Task: {t.objective}')
-    console.print(f"Runner: {runner}"); console.print(f"Primary backend: {d.performance_backend_name}/{d.performance_backend_model}")
+    console.print(f"Runner: {runner}")
+    if d.mode == 'performance' and d.performance_backend_name and d.performance_backend_model:
+        console.print(f"Performance backend: {d.performance_backend_name}/{d.performance_backend_model}")
+    elif d.mode in {'cheap', 'balanced', 'quality'}:
+        graph_path = d.orchestration_graph_path or 'orchestration_graph.json'
+        assignments = [(node, backend) for node, backend in (d.node_backend_assignments or {}).items() if backend]
+        if assignments:
+            console.print('Backend assignments:')
+            for node, backend in assignments[:8]:
+                console.print(f"- {node}: {backend}")
+            if len(assignments) > 8:
+                console.print(f"- ... {len(assignments) - 8} more; see {graph_path}")
+            else:
+                console.print(f"Backend assignments graph: {graph_path}")
+        else:
+            console.print(f"Backend assignments: see {graph_path}")
     console.print(f"Candidate attempts requested/completed: {d.candidate_attempts_requested}/{d.candidate_attempts_completed}")
     console.print(f"Winner: {d.winning_attempt_id or 'none'}")
     console.print(f"Controller reason: {d.reason}")
