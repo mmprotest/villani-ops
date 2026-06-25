@@ -45,7 +45,12 @@ class ConsoleProgressReporter(ProgressReporter):
             else:
                 extra=', normalized=true' if data.get("planner_normalized") else ''
                 self._print(f'[{STEP[k]}] Plan complete: strategy={data.get("strategy")}, candidates={data.get("candidate_attempts") or data.get("candidates")}, decompose={str(bool(data.get("should_decompose"))).lower()}{extra}')
-        elif k=='decompose': self._print(f'[{STEP[k]}] Decomposition complete: subtask_count={len(data.get("subtasks") or [])}')
+        elif k=='decompose':
+            if data.get('decomposition_fallback_used') or data.get('fallback_used') or data.get('planner_fallback_used'):
+                self._print(f'[{STEP[k]}] Decomposition fallback used: reason={data.get("decomposition_fallback_reason") or data.get("planner_fallback_reason") or data.get("reason") or ""}')
+            else:
+                extra=', normalized=true' if data.get('decomposition_normalized') or data.get('planner_normalized') else ''
+                self._print(f'[{STEP[k]}] Decomposition complete: subtask_count={len(data.get("subtasks") or [])}{extra}')
     def node_skipped(self, node: Any, reason: str) -> None:
         if node.kind=='decompose': self._print(f'[{STEP[node.kind]}] Decomposition skipped: {reason}')
     def node_failed(self, node: Any, error: str) -> None: self._print(f'[{STEP.get(node.kind,"?")}] {node.kind} failed: {error}')

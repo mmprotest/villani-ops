@@ -7,6 +7,7 @@ from villani_ops.core.backend import Backend
 from villani_ops.llm.client import LLMClient, LLMCallResult
 from .graph import OrchestrationGraph
 from .nodes import OrchestrationNode
+from .artifacts import write_text_utf8, write_json_utf8
 
 class PlanResult(BaseModel):
     summary: str
@@ -21,6 +22,10 @@ class PlanResult(BaseModel):
     planner_normalization_notes: list[str] = Field(default_factory=list)
     planner_fallback_used: bool = False
     planner_fallback_reason: str | None = None
+    decomposition_normalized: bool = False
+    decomposition_normalization_notes: list[str] = Field(default_factory=list)
+    decomposition_fallback_used: bool = False
+    decomposition_fallback_reason: str | None = None
     fallback_used: bool = False
 
 class Subtask(BaseModel):
@@ -45,6 +50,10 @@ class DecompositionResult(BaseModel):
     planner_normalization_notes: list[str] = Field(default_factory=list)
     planner_fallback_used: bool = False
     planner_fallback_reason: str | None = None
+    decomposition_normalized: bool = False
+    decomposition_normalization_notes: list[str] = Field(default_factory=list)
+    decomposition_fallback_used: bool = False
+    decomposition_fallback_reason: str | None = None
     fallback_used: bool = False
 
 
@@ -152,6 +161,104 @@ def normalize_plan_payload(payload: dict[str, Any], *, requested_candidate_attem
     except Exception: out['confidence']=0.0
     return out, notes
 
+
+def _first_present(data: dict[str, Any], keys: tuple[str, ...]) -> tuple[str | None, Any]:
+    for k in keys:
+        if k in data and data[k] is not None:
+            return k, data[k]
+    return None, None
+
+def _parse_boolish(value: Any) -> bool | None:
+    if isinstance(value, bool): return value
+    if isinstance(value, (int, float)): return bool(value)
+    if isinstance(value, str):
+        s=value.strip().lower()
+        if s in {'true','yes','needed','required','need','requires','use','needed/required'}: return True
+        if s in {'false','no','not needed','not required','none','unneeded','unnecessary'}: return False
+    return None
+
+def _parse_confidence(value: Any) -> float:
+    try:
+        if value is None: return 0.0
+        s=str(value).strip()
+        n=float(s[:-1])/100 if s.endswith('%') else float(s)
+        if n > 1 and n <= 100: n=n/100
+        return max(0.0, min(1.0, n))
+    except Exception:
+        return 0.0
+
+def _slug(value: Any) -> str:
+    s=str(value or '').strip().replace(' ', '_')
+    return ''.join(ch for ch in s if ch.isalnum() or ch in {'_','-','.'})
+
+def _short_text(value: Any) -> str:
+    s=str(value or '').strip()
+    if not s: return ''
+    first=s.split('.', 1)[0].strip()
+    if first and len(first) <= 80: return first + ('.' if s.startswith(first + '.') else '')
+    return s[:80].strip()
+
+def _string_or_none(value: Any) -> str | None:
+    if isinstance(value, list):
+        vals=[str(x).strip() for x in value if str(x).strip()]
+        return '; '.join(vals) if vals else None
+    if value is None: return None
+    s=str(value).strip()
+    return s or None
+
+def normalize_decomposition_payload(payload: dict[str, Any], *, task: str | None = None, success_criteria: str | None = None, plan: dict[str, Any] | None = None, classification: dict[str, Any] | None = None, investigation: dict[str, Any] | None = None) -> tuple[dict[str, Any], list[str]]:
+    data=dict(payload or {}); notes: list[str]=[]
+    _, raw_items=_first_present(data, ('subtasks','tasks','work_items','steps','components','modules'))
+    if raw_items is None: raw_items=[]
+    if not isinstance(raw_items, list): raw_items=[]
+    subtasks=[]
+    diff_map={'easy':'easy','medium':'medium','hard':'hard','unknown':'unknown','simple':'easy','low':'easy','moderate':'medium','normal':'medium','complex':'hard','high':'hard','difficult':'hard'}
+    risk_map={'low':'low','medium':'medium','high':'high','unknown':'unknown','simple':'low','safe':'low','moderate':'medium','normal':'medium','complex':'high','dangerous':'high'}
+    for idx,item in enumerate(raw_items, 1):
+        if item is None or item == '': continue
+        if isinstance(item, str):
+            title=_short_text(item) or f'subtask {idx:03d}'; objective=str(item).strip() or title
+            subtasks.append({'id':f'subtask_{idx:03d}','title':title,'objective':objective,'success_criteria':None,'relevant_files':[],'dependencies':[],'expected_difficulty':'unknown','risk':'unknown','confidence':0.0})
+            notes.append('Converted string subtask to title/objective')
+            continue
+        if not isinstance(item, dict): continue
+        src=dict(item)
+        id_key, raw_id=_first_present(src, ('id','name','key','slug','task_id'))
+        sid=_slug(raw_id) if raw_id is not None else f'subtask_{idx:03d}'
+        if raw_id is None: notes.append(f'Generated deterministic subtask id {sid}')
+        title_key, title=_first_present(src, ('title','name','summary','label'))
+        obj_key, objective=_first_present(src, ('objective','description','details','task','instruction','goal'))
+        if not title:
+            title=_short_text(objective) or sid.replace('_',' ')
+            if obj_key == 'description': notes.append('Mapped subtask description to title/objective')
+        if not objective: objective=title
+        sc_key, sc=_first_present(src, ('success_criteria','acceptance_criteria','validation','done_when'))
+        files_key, files=_first_present(src, ('relevant_files','files','file_paths','paths','modules','affected_files'))
+        deps_key, deps=_first_present(src, ('dependencies','depends_on','prerequisites','blocked_by'))
+        if files_key and files_key != 'relevant_files': notes.append(f'Mapped subtask {files_key} to relevant_files')
+        _, diff=_first_present(src, ('expected_difficulty','difficulty','complexity'))
+        _, risk=_first_present(src, ('risk','risk_level','impact'))
+        _, conf=_first_present(src, ('confidence','confidence_score','certainty'))
+        subtasks.append({'id':sid or f'subtask_{idx:03d}','title':str(title).strip(),'objective':str(objective).strip(),'success_criteria':_string_or_none(sc),'relevant_files':_as_list(files),'dependencies':_as_list(deps),'expected_difficulty':diff_map.get(str(diff).strip().lower(), 'unknown'),'risk':risk_map.get(str(risk).strip().lower(), 'unknown'),'confidence':_parse_confidence(conf)})
+    flag_key, flag=_first_present(data, ('should_use_decomposition','should_decompose','use_decomposition','decompose','requires_decomposition','needs_decomposition'))
+    parsed=_parse_boolish(flag)
+    if parsed is None:
+        if subtasks: parsed=True; notes.append('Defaulted should_use_decomposition to true because subtasks were present')
+        elif isinstance(plan, dict) and plan.get('should_decompose'): parsed=True; notes.append('Defaulted should_use_decomposition to true because plan requested decomposition')
+        else: parsed=False
+    reason_key, reason=_first_present(data, ('reason','rationale','decomposition_reason','why_decompose','summary','analysis'))
+    reason=str(reason).strip() if reason is not None and str(reason).strip() else ''
+    if not reason and subtasks:
+        reason='Task was decomposed into separable subtasks.'; notes.append('Synthesized decomposition reason from subtasks')
+    if not reason and isinstance(plan, dict) and plan.get('decomposition_reason'):
+        reason=str(plan.get('decomposition_reason'))
+    merge_key, merge=_first_present(data, ('merge_strategy','integration_strategy','combine_strategy','validation_strategy'))
+    merge=str(merge).strip() if merge is not None and str(merge).strip() else None
+    if not merge and subtasks:
+        merge='Apply coordinated changes in one candidate patch and validate full test suite.'; notes.append('Defaulted merge_strategy because subtasks were present')
+    _, conf=_first_present(data, ('confidence','confidence_score','certainty'))
+    return {'should_use_decomposition': bool(parsed), 'reason': reason if (reason or not parsed) else 'Task was decomposed into separable subtasks.', 'subtasks': subtasks, 'merge_strategy': merge, 'confidence': _parse_confidence(conf), 'advisory_only': True}, notes
+
 def _parse_plan_payload_from_call(call: LLMCallResult) -> dict[str, Any]:
     if isinstance(call.parsed_json, dict) and call.parsed_json:
         return call.parsed_json
@@ -219,34 +326,52 @@ Concrete example:
             try:
                 plan=PlanResult.model_validate(call.parsed_json)
                 plan.candidate_attempts=max(1, min(8, int(plan.candidate_attempts or candidate_attempts)))
-                (run_dir/'plan_normalized.json').write_text(json.dumps({'planner_normalized': False, 'planner_normalization_notes': [], 'normalized_payload': plan.model_dump(mode='json'), 'planner_fallback_used': False, 'planner_fallback_reason': None}, indent=2))
+                write_json_utf8(run_dir/'plan_normalized.json', {'planner_normalized': False, 'planner_normalization_notes': [], 'normalized_payload': plan.model_dump(mode='json'), 'planner_fallback_used': False, 'planner_fallback_reason': None})
             except Exception as original_error:
                 try:
                     raw_payload = _parse_plan_payload_from_call(call)
                     normalized_payload, notes = normalize_plan_payload(raw_payload if isinstance(raw_payload, dict) else {}, requested_candidate_attempts=candidate_attempts, task=getattr(task, 'objective', None) or getattr(task, 'instruction', None), success_criteria=getattr(task, 'success_criteria', None), classification=classification if isinstance(classification, dict) else None, investigation=investigation if isinstance(investigation, dict) else None)
                     plan=PlanResult.model_validate(normalized_payload)
                     plan.planner_normalized=True; plan.planner_normalization_notes=notes; plan.planner_fallback_used=False; plan.planner_fallback_reason=None
-                    (run_dir/'plan_normalized.json').write_text(json.dumps({'planner_normalized': True, 'planner_normalization_notes': notes, 'normalized_payload': normalized_payload, 'planner_fallback_used': False, 'planner_fallback_reason': None}, indent=2))
+                    write_json_utf8(run_dir/'plan_normalized.json', {'planner_normalized': True, 'planner_normalization_notes': notes, 'normalized_payload': normalized_payload, 'planner_fallback_used': False, 'planner_fallback_reason': None})
                 except Exception as normalize_error:
-                    (run_dir/'plan_normalized.json').write_text(json.dumps({'planner_normalized': False, 'planner_normalization_notes': [], 'normalized_payload': normalized_payload or {}, 'planner_fallback_used': True, 'planner_fallback_reason': f'{original_error}; normalization failed: {normalize_error}'}, indent=2, default=str))
+                    write_json_utf8(run_dir/'plan_normalized.json', {'planner_normalized': False, 'planner_normalization_notes': [], 'normalized_payload': normalized_payload or {}, 'planner_fallback_used': True, 'planner_fallback_reason': f'{original_error}; normalization failed: {normalize_error}'})
                     raise original_error
         except Exception as e:
             call=locals().get('call')
             reason=str(e)
             plan=PlanResult(summary=f'Planner fallback used: {reason}', strategy='parallel_candidates', should_decompose=False, candidate_attempts=candidate_attempts, expected_difficulty='unknown', confidence=0.0, fallback_used=True, planner_fallback_used=True, planner_fallback_reason=reason)
             if not (run_dir/'plan_normalized.json').exists():
-                (run_dir/'plan_normalized.json').write_text(json.dumps({'planner_normalized': False, 'planner_normalization_notes': [], 'normalized_payload': {}, 'raw_payload': getattr(call, 'parsed_json', {}) if call else {}, 'planner_fallback_used': True, 'planner_fallback_reason': reason}, indent=2, default=str))
-        (run_dir/'plan.raw.txt').write_text((call.raw_text if call else f'ERROR: {plan.planner_fallback_reason or ""}') or '')
-        (run_dir/'plan.json').write_text(plan.model_dump_json(indent=2))
+                write_json_utf8(run_dir/'plan_normalized.json', {'planner_normalized': False, 'planner_normalization_notes': [], 'normalized_payload': {}, 'raw_payload': getattr(call, 'parsed_json', {}) if call else {}, 'planner_fallback_used': True, 'planner_fallback_reason': reason})
+        write_text_utf8(run_dir/'plan.raw.txt', (call.raw_text if call else f'ERROR: {plan.planner_fallback_reason or ""}') or '')
+        write_json_utf8(run_dir/'plan.json', plan)
         return plan, call if 'call' in locals() else None
     def decompose(self, *, task, plan: PlanResult, investigation, backend: Backend, run_dir: Path, estimate_cost: bool = True) -> tuple[DecompositionResult, LLMCallResult|None]:
         ctx={'task':task.model_dump(mode='json'),'plan':plan.model_dump(mode='json'),'investigation':investigation}
+        normalized_payload=None; notes=[]; normalized=False; fallback_reason=None
         try:
             call=self.client.complete_json(backend, 'Return JSON matching DecompositionResult. Decomposition is advisory only.', json.dumps(ctx, indent=2)[:80000], 'DecompositionResult', estimate_cost=estimate_cost)
-            dec=DecompositionResult.model_validate(call.parsed_json)
-            dec.advisory_only=True
+            try:
+                dec=DecompositionResult.model_validate(call.parsed_json)
+                dec.advisory_only=True
+                write_json_utf8(run_dir/'decomposition_normalized.json', {'decomposition_normalized': False, 'decomposition_normalization_notes': [], 'normalized_payload': dec.model_dump(mode='json'), 'decomposition_fallback_used': False, 'decomposition_fallback_reason': None})
+            except Exception as original_error:
+                raw_payload=_parse_plan_payload_from_call(call)
+                normalized_payload, notes = normalize_decomposition_payload(raw_payload if isinstance(raw_payload, dict) else {}, task=getattr(task, 'objective', None) or getattr(task, 'instruction', None), success_criteria=getattr(task, 'success_criteria', None), plan=plan.model_dump(mode='json'), investigation=investigation if isinstance(investigation, dict) else None)
+
+                if not normalized_payload.get('subtasks') and not str(normalized_payload.get('reason') or '').strip():
+                    raise ValueError('normalization produced no useful subtasks or reason')
+                dec=DecompositionResult.model_validate(normalized_payload)
+                dec.advisory_only=True; dec.planner_normalized=True; dec.planner_normalization_notes=notes; dec.decomposition_normalized=True; dec.decomposition_normalization_notes=notes
+                normalized=True
+                write_json_utf8(run_dir/'decomposition_normalized.json', {'decomposition_normalized': True, 'decomposition_normalization_notes': notes, 'normalized_payload': normalized_payload, 'decomposition_fallback_used': False, 'decomposition_fallback_reason': None})
         except Exception as e:
             call=locals().get('call')
-            dec=DecompositionResult(should_use_decomposition=False, reason=f'Decomposition fallback used: {e}', subtasks=[], confidence=0.0, advisory_only=True, fallback_used=True)
-        (run_dir/'decomposition.json').write_text(dec.model_dump_json(indent=2)); (run_dir/'decomposition.raw.txt').write_text((call.raw_text if call else '') or '')
+            fallback_reason=str(e)
+            dec=DecompositionResult(should_use_decomposition=False, reason=f'Decomposition fallback used: {e}', subtasks=[], confidence=0.0, advisory_only=True, fallback_used=True, planner_fallback_used=True, planner_fallback_reason=fallback_reason, decomposition_fallback_used=True, decomposition_fallback_reason=fallback_reason)
+            if not (run_dir/'decomposition_normalized.json').exists():
+                write_json_utf8(run_dir/'decomposition_normalized.json', {'decomposition_normalized': False, 'decomposition_normalization_notes': [], 'normalized_payload': normalized_payload or {}, 'raw_payload': getattr(call, 'parsed_json', {}) if call else {}, 'decomposition_fallback_used': True, 'decomposition_fallback_reason': fallback_reason})
+        final=dec.model_dump(mode='json') | {'decomposition_normalized': normalized, 'decomposition_normalization_notes': notes if normalized else [], 'decomposition_fallback_used': bool(getattr(dec, 'fallback_used', False) or getattr(dec, 'planner_fallback_used', False)), 'decomposition_fallback_reason': fallback_reason}
+        write_text_utf8(run_dir/'decomposition.raw.txt', (call.raw_text if call else f'ERROR: {fallback_reason or ""}') or '')
+        write_json_utf8(run_dir/'decomposition.json', final)
         return dec, call if 'call' in locals() else None
