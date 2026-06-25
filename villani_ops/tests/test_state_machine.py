@@ -7,7 +7,7 @@ def strat(): return ExecutionStrategy(profile='balanced', attempts=[])
 def review(decision='pass', passed=True, rec='accept'):
     return ReviewResult(decision=decision, passed=passed, recommended_action=rec)
 def attempt(exit_code=0, status='validated', r=None):
-    return {'attempt_id':'attempt_001','exit_code':exit_code,'status':status,'review':(r or review()).model_dump(mode='json')}
+    return {'attempt_id':'attempt_001','exit_code':exit_code,'status':status,'patch_path':__file__,'changed_files':['hello.txt'],'review':(r or review()).model_dump(mode='json')}
 def ctx(**kw):
     data=dict(run_id='r', attempt=attempt(), review=review(), strategy=strat(), attempts_remaining_for_backend=0, escalation_available=False, non_interactive=True)
     data.update(kw); return ControllerDecisionContext(**data)

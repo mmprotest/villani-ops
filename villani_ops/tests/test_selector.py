@@ -103,10 +103,39 @@ class DummyInv:
 def test_selector_writes_raw_normalized_and_final_artifacts(tmp_path, monkeypatch):
     def complete_json(self, *a, **k):
         return LLMCallResult(parsed_json={"selected_candidate_id":"attempt_002", "reasoning":"All three candidates successfully resolve the failing tests."}, raw_text='{"selected_candidate_id":"attempt_002"}', backend_name='code', model='m')
-    monkeypatch.setattr('villani_ops.llm.client.LLMClient.complete_json', complete_json)
+    monkeypatch.setattr('villani_ops.performance.selector.LLMClient.complete_json', complete_json)
     sel, call, notes = Selector().select(DummyTask(), DummyInv(), [c("attempt_001"), c("attempt_002"), c("attempt_003")], 'code', Backend(name='code', provider='local', model='m'), tmp_path)
     assert sel.selected_attempt_id == 'attempt_002'
     assert not sel.fallback_used
     assert (tmp_path/'selection.raw.txt').read_text() == '{"selected_candidate_id":"attempt_002"}'
     assert 'selected_attempt_id' in (tmp_path/'selection_normalized.json').read_text()
     assert 'fallback_used' in (tmp_path/'selection.json').read_text()
+
+
+def test_selector_prompt_requires_rationale_and_no_cost_choice():
+    from villani_ops.performance.prompts import SELECTOR_USER
+    assert 'selected_attempt_id' in SELECTOR_USER
+    assert 'Include at least one reason' in SELECTOR_USER or 'reasons' in SELECTOR_USER
+    assert 'Do not choose ineligible candidates' in SELECTOR_USER
+    assert 'Do not choose based on cost' in SELECTOR_USER
+
+
+def test_thin_valid_selector_output_synthesizes_reason_from_evidence():
+    cand=c('attempt_001') | {'review_decision':'pass','review_recommended_action':'accept','acceptance_blockers':[]}
+    sel, _, _=resolve_selection({'selected_attempt_id':'attempt_001'}, [cand])
+    assert sel.selected_attempt_id == 'attempt_001'
+    assert sel.selector_reason_synthesized is True
+    assert 'acceptance-eligible' in sel.reasons[0]
+    assert 'reviewer returned pass/accept' in sel.reasons[0]
+
+
+def test_meaningful_selector_reasons_preserved_no_synthesis():
+    sel, _, _=resolve_selection({'selected_attempt_id':'attempt_001','summary':'good','reasons':['specific evidence']}, [c('attempt_001')])
+    assert sel.reasons == ['specific evidence']
+    assert sel.selector_reason_synthesized is False
+
+
+def test_selector_fallback_explicit_field_for_ineligible():
+    sel, _, _=resolve_selection({'selected_attempt_id':'attempt_002'}, [c('attempt_001'), c('attempt_002', eligible=False)])
+    assert sel.selector_fallback_used is True
+    assert 'ineligible' in sel.selector_fallback_reason

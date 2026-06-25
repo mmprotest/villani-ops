@@ -1,11 +1,21 @@
 from __future__ import annotations
 from typing import Any
+from pathlib import Path
 
 
 def _get(attempt: Any, key: str, default=None):
     if isinstance(attempt, dict):
         return attempt.get(key, default)
     return getattr(attempt, key, default)
+
+
+def has_non_empty_patch(patch_path: Any) -> bool:
+    if not patch_path:
+        return False
+    try:
+        return bool(Path(patch_path).read_text(errors="replace").strip())
+    except Exception:
+        return False
 
 
 def is_attempt_acceptance_eligible(attempt: Any, human_approval: Any | None = None) -> tuple[bool, list[str]]:
@@ -24,6 +34,11 @@ def is_attempt_acceptance_eligible(attempt: Any, human_approval: Any | None = No
             return True, []
         return False, override_blockers
 
+    patch_path = _get(attempt, "patch_path")
+    if not has_non_empty_patch(patch_path):
+        blockers.append("patch is missing or empty")
+    if not (_get(attempt, "changed_files") or []):
+        blockers.append("changed files are missing")
     exit_code = _get(attempt, "exit_code")
     if exit_code != 0:
         blockers.append(f"runner exit code is {exit_code}")
@@ -67,8 +82,8 @@ def human_override_blockers(attempt: Any, human_approval: Any | None = None) -> 
         blockers.append("human override requires non-empty request reasons")
     patch_path = _get(attempt, "patch_path")
     changed = _get(attempt, "changed_files") or []
-    if not patch_path:
-        blockers.append("human override requires a patch")
+    if not has_non_empty_patch(patch_path):
+        blockers.append("human override requires a non-empty patch")
     if not changed:
         blockers.append("human override requires changed-file evidence")
     shown = human.get("shown_evidence")

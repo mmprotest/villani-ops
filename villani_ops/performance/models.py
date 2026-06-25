@@ -12,6 +12,10 @@ class InvestigationResult(BaseModel):
     confidence: float = 0.0
     investigator_backend: str | None = None
     assigned_backend: dict[str, str] | None = None
+    investigation_normalized: bool = False
+    investigation_normalization_notes: list[str] = Field(default_factory=list)
+    investigation_fallback_used: bool = False
+    investigation_fallback_reason: str | None = None
 
 class CandidateSummary(BaseModel):
     attempt_id: str
@@ -28,6 +32,7 @@ class CandidateSummary(BaseModel):
     review_issues: list[str] = Field(default_factory=list)
     acceptance_eligible: bool = False
     acceptance_blockers: list[str] = Field(default_factory=list)
+    has_patch: bool = False
     telemetry: dict[str, Any] = Field(default_factory=dict)
 
 class SelectionResult(BaseModel):
@@ -39,5 +44,10 @@ class SelectionResult(BaseModel):
     confidence: float = 0.0
     selector_backend: str | None = None
     selector_backend_details: dict[str, str] | None = None
+    selector_normalized: bool = False
+    selector_normalization_notes: list[str] = Field(default_factory=list)
+    selector_reason_synthesized: bool = False
+    selector_fallback_used: bool = False
+    selector_fallback_reason: str | None = None
     fallback_used: bool = False
     fallback_reason: str | None = None
