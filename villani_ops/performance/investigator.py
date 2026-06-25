@@ -1,6 +1,7 @@
 from __future__ import annotations
 import json
 from pathlib import Path
+from villani_ops.orchestration.artifacts import write_text_utf8, write_json_utf8
 from typing import Any
 from villani_ops.core.backend import Backend
 from villani_ops.core.task import Task
@@ -54,22 +55,22 @@ class Investigator:
             call=self.client.complete_json(backend, INVESTIGATOR_SYSTEM, INVESTIGATOR_USER.format(context=json.dumps(ctx, indent=2)[:60000]), "InvestigationResult", estimate_cost=estimate_cost)
         except TypeError:
             call=self.client.complete_json(backend, INVESTIGATOR_SYSTEM, INVESTIGATOR_USER.format(context=json.dumps(ctx, indent=2)[:60000]), "InvestigationResult")
-        (run_dir/'investigation.raw.txt').write_text(call.raw_text or '')
+        write_text_utf8(run_dir/'investigation.raw.txt', call.raw_text or '')
         normalized_payload=None; notes=[]
         try:
             inv=InvestigationResult.model_validate(call.parsed_json)
-            (run_dir/'investigation_normalized.json').write_text(json.dumps({'normalized': False, 'notes': [], 'payload': inv.model_dump(mode='json')}, indent=2))
+            write_json_utf8(run_dir/'investigation_normalized.json', {'normalized': False, 'notes': [], 'payload': inv.model_dump(mode='json')})
         except Exception as original_error:
             try:
                 normalized_payload, notes = normalize_investigation_payload(call.parsed_json if isinstance(call.parsed_json, dict) else {})
                 inv=InvestigationResult.model_validate(normalized_payload)
                 inv.investigation_normalized=True; inv.investigation_normalization_notes=notes; inv.investigation_fallback_used=False; inv.investigation_fallback_reason=None
-                (run_dir/'investigation_normalized.json').write_text(json.dumps({'normalized': True, 'payload': normalized_payload, 'notes': notes}, indent=2))
+                write_json_utf8(run_dir/'investigation_normalized.json', {'normalized': True, 'payload': normalized_payload, 'notes': notes})
             except Exception:
                 reason=str(original_error)
                 inv=InvestigationResult(summary=f'Investigation unavailable: {reason}', investigation_fallback_used=True, investigation_fallback_reason=reason)
-                (run_dir/'investigation_normalized.json').write_text(json.dumps({'normalized': False, 'payload': call.parsed_json if isinstance(call.parsed_json, dict) else {}, 'notes': [], 'error': reason}, indent=2))
+                write_json_utf8(run_dir/'investigation_normalized.json', {'normalized': False, 'payload': call.parsed_json if isinstance(call.parsed_json, dict) else {}, 'notes': [], 'error': reason})
         inv.investigator_backend=backend_name; inv.assigned_backend={'name': backend_name, 'model': backend.model}
-        (run_dir/'investigation.json').write_text(inv.model_dump_json(indent=2))
-        cc=run_dir/'controller_calls'; cc.mkdir(exist_ok=True); (cc/'investigation.json').write_text(call.model_dump_json(indent=2))
+        write_json_utf8(run_dir/'investigation.json', inv)
+        cc=run_dir/'controller_calls'; cc.mkdir(exist_ok=True); write_json_utf8(cc/'investigation.json', call)
         return inv, call

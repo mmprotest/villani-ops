@@ -63,4 +63,4 @@ class OrchestrationGraph(BaseModel):
         return {'run_id':self.run_id,'mode':self.mode,'runner':self.runner,'node_count':len(self.nodes),'nodes':[n.model_dump(mode='json') for n in self.nodes]}
     def write(self, path) -> None:
         from pathlib import Path
-        Path(path).write_text(self.to_json())
+        Path(path).write_text(self.to_json(), encoding="utf-8")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 import json
 from pathlib import Path
+from villani_ops.orchestration.artifacts import write_text_utf8, write_json_utf8
 from typing import Any
 from villani_ops.core.backend import Backend
 from villani_ops.llm.client import LLMClient, LLMCallResult
@@ -132,7 +133,7 @@ class Selector:
     def select(self, task: Any, investigation: Any, candidates: list[dict[str, Any]], backend_name: str, backend: Backend, run_dir: str|Path, estimate_cost: bool=True) -> tuple[SelectionResult, LLMCallResult|None, list[str]]:
         run_dir=Path(run_dir)
         ctx={"task": task.model_dump(mode='json'), "selector_backend": {"name": backend_name, "model": backend.model}, "investigation": investigation.model_dump(mode='json') if investigation else None, "candidates": candidates}
-        (run_dir/'selection_input.json').write_text(json.dumps(ctx, indent=2))
+        write_json_utf8(run_dir/'selection_input.json', ctx)
         call=None; raw_payload: Any = {}
         if any(c.get('acceptance_eligible') for c in candidates):
             try:
@@ -144,7 +145,7 @@ class Selector:
             except Exception:
                 raw_payload={}
         sel, normalized, notes = resolve_selection(raw_payload, candidates, selector_backend=backend_name, backend_model=backend.model)
-        (run_dir/'selection.raw.txt').write_text((call.raw_text if call else '') or (json.dumps(raw_payload) if raw_payload else ''))
-        (run_dir/'selection_normalized.json').write_text(json.dumps({'payload': normalized, 'notes': notes}, indent=2, default=str))
-        (run_dir/'selection.json').write_text(sel.model_dump_json(indent=2))
+        write_text_utf8(run_dir/'selection.raw.txt', (call.raw_text if call else '') or (json.dumps(raw_payload, ensure_ascii=False) if raw_payload else ''))
+        write_json_utf8(run_dir/'selection_normalized.json', {'payload': normalized, 'notes': notes})
+        write_json_utf8(run_dir/'selection.json', sel)
         return sel, call, notes

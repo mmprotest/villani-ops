@@ -2,6 +2,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 from villani_ops.core.acceptance import has_non_empty_patch
+from villani_ops.orchestration.artifacts import write_text_utf8
 
 def _selection_evidence_lines(candidates: list[dict], selection: Any) -> list[str]:
     selected_id = selection.selected_attempt_id if selection and selection.decision == 'select' else None
@@ -72,8 +73,11 @@ def write_performance_report(run_dir: str|Path, task: Any, investigation: Any, c
     plan=decision.plan or {}; dec=decision.decomposition or {}
     lines += ['', '## Plan', f"Planner normalized: {str(plan.get('planner_normalized', False)).lower()}", 'Planner normalization notes:', *[f'- {x}' for x in plan.get('planner_normalization_notes', [])], f"Planner fallback used: {str(plan.get('planner_fallback_used', plan.get('fallback_used', False))).lower()}", f"Planner fallback reason: {plan.get('planner_fallback_reason', '') or ''}", f"Strategy: {plan.get('strategy','')}", f"Should decompose: {plan.get('should_decompose', False)}", f"Candidate attempts: {plan.get('candidate_attempts', decision.candidate_attempts_requested)}", f"Expected difficulty: {plan.get('expected_difficulty','')}", f"Confidence: {plan.get('confidence','')}", 'Risks:', *[f"- {x}" for x in plan.get('risks', [])], '', '## Decomposition']
     if dec:
-        lines += [f"Reason: {dec.get('reason','')}", f"Merge strategy: {dec.get('merge_strategy') or 'not implemented'}", f"Advisory only: {dec.get('advisory_only', True)}"]
-        for st in dec.get('subtasks', []): lines.append(f"- {st.get('id')}: {st.get('title')} — {st.get('objective')}")
+        subtasks=dec.get('subtasks', []) or []
+        lines += [f"Decomposition normalized: {str(dec.get('decomposition_normalized', dec.get('planner_normalized', False))).lower()}", f"Decomposition fallback used: {str(dec.get('decomposition_fallback_used', dec.get('planner_fallback_used', dec.get('fallback_used', False)))).lower()}", f"Decomposition fallback reason: {dec.get('decomposition_fallback_reason', dec.get('planner_fallback_reason', '')) or ''}", f"Subtask count: {len(subtasks)}", f"Reason: {dec.get('reason','')}", f"Merge strategy: {dec.get('merge_strategy') or ''}", f"Advisory only: {dec.get('advisory_only', True)}"]
+        for st in subtasks:
+            files=', '.join(st.get('relevant_files') or [])
+            lines.append(f"- {st.get('id')}: {st.get('title') or st.get('objective')}" + (f" Files: {files}" if files else ''))
     else: lines.append('No decomposition was used.')
     lines += ['', '## Candidate Attempts', '| Attempt | Backend | Model | Status | Exit | Changed files | Review decision | Review score | Eligible | Blockers | Patch | Patch path |', '| --- | --- | --- | --- | ---: | --- | --- | ---: | --- | --- | --- | --- |']
     for c in candidates:
@@ -90,5 +94,5 @@ def write_performance_report(run_dir: str|Path, task: Any, investigation: Any, c
         lines += [f"villani-ops apply {decision.run_id}", f"villani-ops branch {decision.run_id} --name villani-ops/{decision.run_id}", f"villani-ops pr {decision.run_id} --title \"{(task.objective or 'Villani Ops changes')[:60]}\""]
     else: lines.append('No apply/branch/PR commands because no candidate was accepted.')
     lines += ['', '## Warnings', *[f"- {x}" for x in decision.warnings], f"Duration seconds: {duration:.1f}"]
-    p.write_text('\n'.join(lines)+'\n')
+    write_text_utf8(p, '\n'.join(lines)+'\n')
     return p

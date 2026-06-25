@@ -19,7 +19,7 @@ from villani_ops.performance.selector import Selector, deterministic_fallback
 from villani_ops.performance.models import CandidateSummary, InvestigationResult
 from villani_ops.performance.report import write_performance_report
 from villani_ops.orchestration.planner import build_fixed_graph, Planner
-from villani_ops.orchestration.artifacts import write_json
+from villani_ops.orchestration.artifacts import write_json, write_json_utf8, write_text_utf8
 from villani_ops.orchestration.nodes import OrchestrationNode, NodeExecutionResult, NodeResult
 from villani_ops.orchestration.context import TaskContext
 from villani_ops.orchestration.scheduler import GraphScheduler
@@ -39,8 +39,47 @@ class EngineContext:
     classification:Any=None; investigation:Any=None; plan:Any=None; decomposition:Any=None; selection:Any=None; winner:dict|None=None; final_decision:Decision|None=None
 
 def _now(): return datetime.now(timezone.utc).isoformat()
-def _candidate_prompt(task: Task, inv, n: int, total: int) -> str:
-    return f"""Original objective:\n{task.objective or task.instruction or ''}\n\nSuccess criteria:\n{task.success_criteria or ''}\n\nInvestigation summary:\n{inv.summary if inv else ''}\n\nSuspected root cause:\n{(getattr(inv,'suspected_root_cause','') if inv else '') or ''}\n\nRelevant files:\n{', '.join(getattr(inv,'relevant_files',[]) if inv else [])}\n\nRelevant tests:\n{', '.join(getattr(inv,'relevant_tests',[]) if inv else [])}\n\nImplementation plan:\n{chr(10).join('- '+x for x in (getattr(inv,'implementation_plan',[]) if inv else []))}\n\nYou are candidate attempt {n} of {total}.\nWork independently.\nProduce the smallest correct patch you can.\nRun relevant tests when possible.\n"""
+def _candidate_prompt(task: Task, inv, n: int, total: int, decomposition=None) -> str:
+    decomp_lines=[]
+    if decomposition and getattr(decomposition, 'should_use_decomposition', False):
+        decomp_lines.append('\nDecomposition guidance (advisory):')
+        if getattr(decomposition, 'merge_strategy', None): decomp_lines.append(f"Merge/integration strategy: {decomposition.merge_strategy}")
+        for st in getattr(decomposition, 'subtasks', []) or []:
+            files=', '.join(getattr(st, 'relevant_files', []) or [])
+            deps=', '.join(getattr(st, 'dependencies', []) or [])
+            sc=getattr(st, 'success_criteria', None)
+            line=f"- {st.id}: {st.title}. Objective: {st.objective}"
+            if files: line += f" Files: {files}."
+            if deps: line += f" Dependencies: {deps}."
+            if sc: line += f" Success criteria: {sc}."
+            decomp_lines.append(line)
+    return f"""Original objective:
+{task.objective or task.instruction or ''}
+
+Success criteria:
+{task.success_criteria or ''}
+
+Investigation summary:
+{inv.summary if inv else ''}
+
+Suspected root cause:
+{(getattr(inv,'suspected_root_cause','') if inv else '') or ''}
+
+Relevant files:
+{', '.join(getattr(inv,'relevant_files',[]) if inv else [])}
+
+Relevant tests:
+{', '.join(getattr(inv,'relevant_tests',[]) if inv else [])}
+
+Implementation plan:
+{chr(10).join('- '+x for x in (getattr(inv,'implementation_plan',[]) if inv else []))}
+{chr(10).join(decomp_lines)}
+
+You are candidate attempt {n} of {total}.
+Work independently.
+Produce the smallest correct patch you can.
+Run relevant tests when possible.
+"""
 def _tail(path: str | None, limit: int = 8000) -> str:
     try: return Path(path).read_text(errors='replace')[-limit:] if path else ''
     except Exception: return ''
@@ -122,11 +161,11 @@ class OrchestrationEngine:
 
     def _write_node_artifacts(self, context, node, inp=None, out=None, raw=None):
         nd=context.run_dir/'nodes'/node.id; nd.mkdir(parents=True, exist_ok=True); node.artifacts['node_json']=str(nd/'node.json')
-        if node.artifacts.get('policy_decision'): (nd/'policy_decision.json').write_text(json.dumps(context.routing_decisions.get(node.id,{}), indent=2, default=str))
+        if node.artifacts.get('policy_decision'): write_json_utf8(nd/'policy_decision.json', context.routing_decisions.get(node.id,{}))
         for name,obj in [('input',inp),('output',out)]:
-            if obj is not None: (nd/f'{name}.json').write_text(json.dumps(obj, indent=2, default=str)); node.artifacts[name]=str(nd/f'{name}.json'); self.record_controller_step(context,node=node,action='artifact_written',status=node.status,summary=f'{name}.json')
-        if raw is not None: (nd/'raw.txt').write_text(str(raw)); node.artifacts['raw']=str(nd/'raw.txt'); self.record_controller_step(context,node=node,action='artifact_written',status=node.status,summary='raw.txt')
-        (nd/'node.json').write_text(node.model_dump_json(indent=2)); context.graph.write(context.run_dir/'orchestration_graph.json')
+            if obj is not None: write_json_utf8(nd/f'{name}.json', obj); node.artifacts[name]=str(nd/f'{name}.json'); self.record_controller_step(context,node=node,action='artifact_written',status=node.status,summary=f'{name}.json')
+        if raw is not None: write_text_utf8(nd/'raw.txt', str(raw)); node.artifacts['raw']=str(nd/'raw.txt'); self.record_controller_step(context,node=node,action='artifact_written',status=node.status,summary='raw.txt')
+        write_json_utf8(nd/'node.json', node); context.graph.write(context.run_dir/'orchestration_graph.json')
 
     def _finish(self, context, node, result:NodeExecutionResult, data=None):
         if result.status=='succeeded': context.graph.mark_succeeded(node.id, summary=result.result_summary, artifacts=result.artifacts, confidence=result.confidence, difficulty=result.difficulty, risk=result.risk)
@@ -160,9 +199,9 @@ class OrchestrationEngine:
                 inv,call=Investigator().investigate(context.task,context.classification,node.assigned_backend,self.backends[node.assigned_backend],context.run_dir)
         except Exception as e:
             context.warnings.append(f'Investigation failed: {e}'); inv=InvestigationResult(summary=f'Investigation unavailable: {e}', investigation_fallback_used=True, investigation_fallback_reason=str(e)); call=None
-            (context.run_dir/'investigation.raw.txt').write_text(f'ERROR: {e}')
-            (context.run_dir/'investigation_normalized.json').write_text(json.dumps({'normalized': False, 'payload': {}, 'notes': [], 'error': str(e)}, indent=2))
-        (context.run_dir/'investigation.json').write_text(inv.model_dump_json(indent=2)); context.investigation=inv; context.task_context.investigation=inv.model_dump(mode='json')
+            write_text_utf8(context.run_dir/'investigation.raw.txt', f'ERROR: {e}')
+            write_json_utf8(context.run_dir/'investigation_normalized.json', {'normalized': False, 'payload': {}, 'notes': [], 'error': str(e)})
+        write_json_utf8(context.run_dir/'investigation.json', inv); context.investigation=inv; context.task_context.investigation=inv.model_dump(mode='json')
         if getattr(inv, 'investigation_normalized', False):
             for note in inv.investigation_normalization_notes: self.record_controller_step(context,node=node,action='investigation_normalized',status='normalized',summary=note)
         if getattr(inv, 'investigation_fallback_used', False): self.record_controller_step(context,node=node,action='investigation_fallback_used',status='fallback',summary=inv.investigation_fallback_reason or inv.summary)
@@ -187,25 +226,25 @@ class OrchestrationEngine:
             return self._finish(context,node,NodeExecutionResult(node_id=node.id,status='skipped',result_summary='Planner did not request decomposition',data={'intentional_skip':True}),{'intentional_skip':True,'reason':'Planner did not request decomposition'})
         dec,call=Planner(self.llm_client).decompose(task=context.task,plan=context.plan,investigation=context.task_context.investigation,backend=self.backends[node.assigned_backend],run_dir=context.run_dir,estimate_cost=(context.mode!='performance'))
         context.decomposition=dec; context.task_context.decomposition=dec.model_dump(mode='json'); self._write_node_artifacts(context,node,raw=(call.raw_text if call else ''))
-        return self._finish(context,node,NodeExecutionResult(node_id=node.id,status='succeeded',result_summary=dec.reason,confidence=dec.confidence,artifacts={'decomposition':str(context.run_dir/'decomposition.json')}),context.task_context.decomposition)
+        return self._finish(context,node,NodeExecutionResult(node_id=node.id,status='succeeded',result_summary=dec.reason,confidence=dec.confidence,artifacts={'raw':'decomposition.raw.txt','normalized':'decomposition_normalized.json','decomposition':'decomposition.json','output':str(context.run_dir/'nodes'/node.id/'output.json')}),context.task_context.decomposition)
 
     def _execute_code_node(self,node,context):
         context.graph.mark_running(node.id); aid=node.id.replace('code_',''); idx=int(aid.split('_')[-1]); adir=context.run_dir/'attempts'/aid; adir.mkdir(parents=True,exist_ok=True); b=self.backends[node.assigned_backend]
         self.progress_reporter.candidate_started(aid, idx, context.candidate_attempts, b.name)
-        prompt=_candidate_prompt(context.task,context.investigation,idx,context.candidate_attempts); meta={'attempt_id':aid,'backend_name':b.name,'model':b.model,'runner_name':context.runner,'status':'running','started_at':_now()}; self._write_node_artifacts(context,node,inp={'prompt':prompt})
+        prompt=_candidate_prompt(context.task,context.investigation,idx,context.candidate_attempts, context.decomposition); meta={'attempt_id':aid,'backend_name':b.name,'model':b.model,'runner_name':context.runner,'status':'running','started_at':_now()}; self._write_node_artifacts(context,node,inp={'prompt':prompt, 'decomposition_context': context.task_context.decomposition})
         try:
             if context.isolation!='worktree': raise ValueError('Only worktree isolation is supported')
             wt=GitWorktreeIsolation().create(context.repo,context.run_id,aid,self.storage.workspace); meta.update(wt)
             res=self.runner_adapter.run_task(repo_path=Path(wt['worktree_path']), task=prompt, success_criteria=context.task.success_criteria, backend_name=b.name, backend_config=b, timeout_seconds=context.timeout_seconds or b.timeout_seconds or 1200, context={'attempt_id':aid,'node_id':node.id}, artifacts_dir=adir)
-            (adir/'stdout.txt').write_text(res.stdout); (adir/'stderr.txt').write_text(res.stderr); (adir/'stdout.log').write_text(res.stdout); (adir/'stderr.log').write_text(res.stderr); context.input_tokens+=res.input_tokens; context.output_tokens+=res.output_tokens; context.costs['coding']+=0 if context.mode=='performance' else b.estimate_cost(res.input_tokens,res.output_tokens)
+            write_text_utf8(adir/'stdout.txt', res.stdout); write_text_utf8(adir/'stderr.txt', res.stderr); write_text_utf8(adir/'stdout.log', res.stdout); write_text_utf8(adir/'stderr.log', res.stderr); context.input_tokens+=res.input_tokens; context.output_tokens+=res.output_tokens; context.costs['coding']+=0 if context.mode=='performance' else b.estimate_cost(res.input_tokens,res.output_tokens)
             meta.update({'exit_code':res.exit_code,'stdout_path':str(adir/'stdout.txt'),'stderr_path':str(adir/'stderr.txt'),'duration_ms':res.duration_ms,'input_tokens':res.input_tokens,'output_tokens':res.output_tokens,'token_accounting_status':res.token_accounting_status,'runner_telemetry':res.telemetry}); meta.update(capture_worktree(wt['worktree_path'],adir))
             if meta.get('patch_path'):
-                compat=adir/'patch.diff'; compat.write_text(Path(meta['patch_path']).read_text(errors='replace') if Path(meta['patch_path']).exists() else ''); meta['patch_path']=str(compat)
+                compat=adir/'patch.diff'; write_text_utf8(compat, Path(meta['patch_path']).read_text(encoding='utf-8', errors='replace') if Path(meta['patch_path']).exists() else ''); meta['patch_path']=str(compat)
             meta['has_patch']=has_non_empty_patch(meta.get('patch_path'))
             status='succeeded' if res.exit_code==0 else 'failed'
         except Exception as e:
-            meta.update({'status':'failed','exit_code':meta.get('exit_code',1),'error':str(e),'changed_files':[],'patch_path':None,'has_patch':False}); (adir/'stderr.txt').write_text(str(e)); status='failed'
-        (adir/'attempt.json').write_text(json.dumps(meta,indent=2)); node.result=meta
+            meta.update({'status':'failed','exit_code':meta.get('exit_code',1),'error':str(e),'changed_files':[],'patch_path':None,'has_patch':False}); write_text_utf8(adir/'stderr.txt', str(e)); status='failed'
+        write_json_utf8(adir/'attempt.json', meta); node.result=meta
         self.progress_reporter.candidate_completed(aid, idx, context.candidate_attempts, meta)
         return self._finish(context,node,NodeExecutionResult(node_id=node.id,status=status,result_summary=meta.get('error') or f'Candidate {aid} completed',artifacts={'attempt':str(adir/'attempt.json'),'patch':str(meta.get('patch_path') or '')},data=meta,error=meta.get('error')),meta)
 
@@ -218,7 +257,7 @@ class OrchestrationEngine:
             except TypeError:
                 review,call=LLMReviewer().review(context.task,context.classification,rb,review_input,self.backends,adir/'review.json',backend_override=rb)
             context.costs['review']+=0 if context.mode=='performance' else call.estimated_cost; context.input_tokens+=call.input_tokens; context.output_tokens+=call.output_tokens; self._write_node_artifacts(context,node,raw=call.raw_text)
-        except Exception as e: review=ReviewResult(decision='fail',summary=f'Reviewer failed: {e}',issues=[str(e)],recommended_action='fail'); (adir/'review.json').write_text(review.model_dump_json(indent=2))
+        except Exception as e: review=ReviewResult(decision='fail',summary=f'Reviewer failed: {e}',issues=[str(e)],recommended_action='fail'); write_json_utf8(adir/'review.json', review)
         meta['review']=review.model_dump(mode='json'); meta['status']='validated' if meta.get('exit_code')==0 and review.decision=='pass' and review.recommended_action=='accept' else ('failed' if meta.get('exit_code') else 'completed')
         has_patch=has_non_empty_patch(meta.get('patch_path'))
         eligible,blockers=(False, ['patch is missing or empty'] if not has_patch else [])
@@ -227,7 +266,7 @@ class OrchestrationEngine:
         meta['has_patch']=has_patch
         meta['acceptance_eligible']=eligible; meta['acceptance_blockers']=blockers
         summary=CandidateSummary(attempt_id=aid,backend_name=meta.get('backend_name'),model=meta.get('model'),status=meta['status'],exit_code=meta.get('exit_code'),changed_files=meta.get('changed_files') or [],patch_path=meta.get('patch_path'),review_decision=review.decision,review_score=review.score,review_recommended_action=review.recommended_action,review_summary=review.summary,review_issues=review.issues,acceptance_eligible=eligible,acceptance_blockers=blockers,has_patch=has_patch, telemetry=meta.get('runner_telemetry') or {})
-        meta['candidate_summary']=summary.model_dump(mode='json'); (adir/'attempt.json').write_text(json.dumps(meta,indent=2)); context.attempts.append(meta)
+        meta['candidate_summary']=summary.model_dump(mode='json'); write_json_utf8(adir/'attempt.json', meta); context.attempts.append(meta)
         self.progress_reporter.review_completed(aid, idx, context.candidate_attempts, {**review.model_dump(mode='json'), 'acceptance_eligible': eligible})
         data={'has_review_blocker': review.decision!='pass' or review.recommended_action!='accept','has_acceptance_blocker': bool(blockers),'acceptance_blockers':blockers, **review.model_dump(mode='json')}
         return self._finish(context,node,NodeExecutionResult(node_id=node.id,status='succeeded',result_summary=review.summary,confidence=review.score or 0.0,artifacts={'review':str(adir/'review.json'),'attempt':str(adir/'attempt.json')},data=data),data)
@@ -246,7 +285,7 @@ class OrchestrationEngine:
         eligible_ids={a['attempt_id'] for a in context.attempts if a.get('acceptance_eligible')}
         fallback=selection.fallback_used
         if selection.decision=='select' and selection.selected_attempt_id not in eligible_ids:
-            selection=deterministic_fallback(candidates, f'Selector selected invalid or ineligible candidate {selection.selected_attempt_id}.'); selection.selector_backend=node.assigned_backend; (context.run_dir/'selection.json').write_text(selection.model_dump_json(indent=2)); fallback=True
+            selection=deterministic_fallback(candidates, f'Selector selected invalid or ineligible candidate {selection.selected_attempt_id}.'); selection.selector_backend=node.assigned_backend; write_json_utf8(context.run_dir/'selection.json', selection); fallback=True
         for note in (normalization_notes or []): self.record_controller_step(context,node=node,action='selector_normalized',status='normalized',summary=note)
         if getattr(selection, 'selector_reason_synthesized', False): self.record_controller_step(context,node=node,action='selector_reason_synthesized',status='normalized',summary=(selection.reasons or [''])[0])
         if fallback: self.record_controller_step(context,node=node,action='selector_fallback_used',status='fallback',summary=selection.selector_fallback_reason or selection.fallback_reason or selection.summary)
@@ -293,4 +332,4 @@ class OrchestrationEngine:
 
     def record_controller_step(self, context, *, node=None, action:str, status:str, summary:str|None=None, details:dict|None=None):
         p=context.run_dir/'controller_steps.jsonl'; rec={'timestamp':_now(),'run_id':context.run_id,'node_id':getattr(node,'id',None),'node_kind':getattr(node,'kind',None),'action':action,'status':status,'backend':getattr(node,'assigned_backend',None),'model':getattr(node,'assigned_model',None),'summary':summary,'details':details or {}}
-        p.parent.mkdir(parents=True,exist_ok=True); p.open('a').write(json.dumps(rec,default=str)+'\n')
+        p.parent.mkdir(parents=True,exist_ok=True); p.open('a', encoding='utf-8').write(json.dumps(rec, ensure_ascii=False, default=str)+'\n')
