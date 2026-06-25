@@ -75,6 +75,9 @@ class Decision(BaseModel):
     integration_worktree_path: str | None = None
     integration_patch_path: str | None = None
     integration_validation: dict[str, Any] | None = None
+    integration_validation_initial: dict[str, Any] | None = None
+    integration_validation_after_repair: dict[str, Any] | None = None
+    integration_scope_analysis: dict[str, Any] | None = None
     integration_repair_used: bool = False
     final_review: dict[str, Any] | None = None
 

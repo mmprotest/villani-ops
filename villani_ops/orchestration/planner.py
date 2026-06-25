@@ -235,7 +235,7 @@ def normalize_decomposition_payload(payload: dict[str, Any], *, task: str | None
             if obj_key == 'description': notes.append('Mapped subtask description to title/objective')
         if not objective: objective=title
         sc_key, sc=_first_present(src, ('success_criteria','acceptance_criteria','validation','done_when'))
-        files_key, files=_first_present(src, ('relevant_files','files','file_paths','paths','modules','affected_files'))
+        files_key, files=_first_present(src, ('relevant_files','files','file_paths','paths','modules','affected_files','relevant_file_paths'))
         deps_key, deps=_first_present(src, ('dependencies','depends_on','prerequisites','blocked_by'))
         if files_key and files_key != 'relevant_files': notes.append(f'Mapped subtask {files_key} to relevant_files')
         _, diff=_first_present(src, ('expected_difficulty','difficulty','complexity'))
