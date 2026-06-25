@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Literal, Any
 from pydantic import BaseModel, Field
 from villani_ops.core.backend import Backend
-from villani_ops.llm.client import LLMClient, LLMCallResult
+from villani_ops.llm.client import LLMClient, LLMCallResult, complete_controller_json
 from .graph import OrchestrationGraph
 from .nodes import OrchestrationNode
 from .artifacts import write_text_utf8, write_json_utf8
@@ -395,7 +395,7 @@ def semantic_validate_decomposition_plan(client: LLMClient, dec: DecompositionRe
         return None, {'status': 'skipped', 'reason': 'no semantic validation backend provided'}
     prompt=json.dumps({'task': task, 'success_criteria': success_criteria, 'decomposition': dec.model_dump(mode='json'), 'deterministic_validation': deterministic.model_dump(mode='json'), 'instructions': 'Validate solvability, completeness, non-redundancy, parallel safety, backend fit, and required revisions. Return DecompositionPlanValidationResult JSON.'}, indent=2)[:80000]
     try:
-        call=client.complete_json(backend, 'Return only DecompositionPlanValidationResult JSON.', prompt, 'DecompositionPlanValidationResult')
+        call=complete_controller_json(client, backend, 'Return only DecompositionPlanValidationResult JSON.', prompt, 'DecompositionPlanValidationResult', DecompositionPlanValidationResult)
         payload=call.parsed_json if isinstance(call.parsed_json, dict) else json.loads(call.raw_text or '{}')
         result=DecompositionPlanValidationResult.model_validate(payload)
         return result, {'status': 'succeeded', 'raw_text': getattr(call, 'raw_text', ''), 'malformed': False}
@@ -432,7 +432,7 @@ def revise_decomposition_with_feedback(*, task: str | None, success_criteria: li
         return repaired, {'parsed_cleanly': True, 'source': 'schema_guardrail', 'revision_request': request, 'raw_text': ''}
     try:
         prompt=json.dumps(request, indent=2)[:80000]
-        call=client.complete_json(backend, 'Return only corrected DecompositionResult JSON. Use the validation_failures and required_revisions explicitly; do not merely normalize schema.', prompt, 'DecompositionResult')
+        call=complete_controller_json(client, backend, 'Return only corrected DecompositionResult JSON. Use the validation_failures and required_revisions explicitly; do not merely normalize schema.', prompt, 'DecompositionResult', DecompositionResult)
         payload=call.parsed_json if isinstance(call.parsed_json, dict) else json.loads(call.raw_text or '{}')
         revised=DecompositionResult.model_validate(payload)
         revised=repair_decomposition_plan_schema(revised, validation_result)
@@ -498,7 +498,7 @@ If success criteria lists multiple independent behaviours, prefer decompose_then
 You must return planning JSON only. Do not return command/action/tool-call JSON.
 """
         try:
-            call=self.client.complete_json(backend, system_prompt, json.dumps(ctx, indent=2)[:80000], 'PlanResult', estimate_cost=(mode != 'performance'))
+            call=complete_controller_json(self.client, backend, system_prompt, json.dumps(ctx, indent=2)[:80000], 'PlanResult', PlanResult, estimate_cost=(mode != 'performance'))
             try:
                 plan=PlanResult.model_validate(call.parsed_json)
                 plan.candidate_attempts=max(1, min(8, int(plan.candidate_attempts or candidate_attempts)))
@@ -535,7 +535,7 @@ You must return planning JSON only. Do not return command/action/tool-call JSON.
         ctx={'task':task.model_dump(mode='json'),'plan':plan.model_dump(mode='json'),'investigation':investigation}
         normalized_payload=None; notes=[]; normalized=False; fallback_reason=None
         try:
-            call=self.client.complete_json(backend, 'Return JSON matching DecompositionResult. Decomposition is advisory only.', json.dumps(ctx, indent=2)[:80000], 'DecompositionResult', estimate_cost=estimate_cost)
+            call=complete_controller_json(self.client, backend, 'Return JSON matching DecompositionResult. Decomposition is advisory only.', json.dumps(ctx, indent=2)[:80000], 'DecompositionResult', DecompositionResult, estimate_cost=estimate_cost)
             try:
                 dec=DecompositionResult.model_validate(call.parsed_json)
                 dec.advisory_only=True

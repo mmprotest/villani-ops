@@ -5,7 +5,7 @@ from villani_ops.orchestration.artifacts import write_text_utf8, write_json_utf8
 from typing import Any
 from villani_ops.core.backend import Backend
 from villani_ops.core.task import Task
-from villani_ops.llm.client import LLMClient, LLMCallResult
+from villani_ops.llm.client import LLMClient, LLMCallResult, complete_controller_json
 from villani_ops.classification.context import collect_relevant_file_snippets, is_skipped_repo_file
 from .models import InvestigationResult
 from .prompts import INVESTIGATOR_SYSTEM, INVESTIGATOR_USER
@@ -184,7 +184,7 @@ class Investigator:
         ctx={"task": task.model_dump(mode='json'), "classification": classification.model_dump(mode='json') if classification else None, "repo_path": task.repo_path, "repo_context": repo_ctx}
 
         try:
-            call=self.client.complete_json(backend, INVESTIGATOR_SYSTEM, INVESTIGATOR_USER.format(context=json.dumps(ctx, indent=2)[:60000]), "InvestigationResult", estimate_cost=estimate_cost)
+            call=complete_controller_json(self.client, backend, INVESTIGATOR_SYSTEM, INVESTIGATOR_USER.format(context=json.dumps(ctx, indent=2)[:60000]), "InvestigationResult", InvestigationResult, estimate_cost=estimate_cost)
         except TypeError:
             call=self.client.complete_json(backend, INVESTIGATOR_SYSTEM, INVESTIGATOR_USER.format(context=json.dumps(ctx, indent=2)[:60000]), "InvestigationResult")
         write_text_utf8(run_dir/'investigation.raw.txt', call.raw_text or '')
@@ -197,7 +197,13 @@ class Investigator:
             inv.investigation_fallback_used=False; inv.investigation_fallback_reason=None
             write_json_utf8(run_dir/'investigation_normalized.json', {'normalized': inv.investigation_normalized, 'payload': normalized_payload, 'notes': notes, 'raw_payload': raw_payload})
         except Exception as original_error:
-            reason=str(original_error)
+            parts=[]
+            if getattr(call, 'schema_name', None): parts.append(f"schema={call.schema_name}")
+            if getattr(call, 'structured_output_mode', None): parts.append(f"mode={call.structured_output_mode}")
+            if getattr(call, 'schema_validation_error', None): parts.append(f"schema validation failed: {call.schema_validation_error}")
+            if getattr(call, 'structured_fallback_reason', None): parts.append(f"structured fallback: {call.structured_fallback_reason}")
+            parts.append(str(original_error))
+            reason='; '.join(p for p in parts if p)
             inv=InvestigationResult(summary=f'Investigation unavailable: {reason}', investigation_fallback_used=True, investigation_fallback_reason=reason)
             write_json_utf8(run_dir/'investigation_normalized.json', {'normalized': False, 'payload': normalized_payload, 'notes': notes, 'raw_payload': raw_payload, 'error': reason})
         inv.investigator_backend=backend_name; inv.assigned_backend={'name': backend_name, 'model': backend.model}

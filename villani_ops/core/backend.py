@@ -5,6 +5,7 @@ from pydantic import BaseModel, Field
 
 Provider = Literal["openai-compatible", "openai", "anthropic", "villani-code", "local", "custom"]
 Role = Literal["coding", "classification", "review", "policy", "investigation", "selection"]
+StructuredOutputMode = Literal["auto", "disabled", "openai_json_schema", "openai_json_object", "anthropic_json_schema", "anthropic_strict_tool", "prompt_only"]
 
 class Backend(BaseModel):
     name: str
@@ -24,6 +25,8 @@ class Backend(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
     env: dict[str, str] = Field(default_factory=dict)  # backward compatible
     command_name: str | None = None
+    structured_output_mode: StructuredOutputMode = "auto"
+    structured_output_strict: bool = True
 
     def resolved_api_key(self) -> str | None:
         if self.api_key_env:

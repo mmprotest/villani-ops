@@ -5,7 +5,7 @@ from pathlib import Path
 import json, re
 from villani_ops.core.backend import Backend, select_backend
 from villani_ops.core.task import Task, TaskClassification
-from villani_ops.llm.client import LLMClient, LLMCallResult
+from villani_ops.llm.client import LLMClient, LLMCallResult, complete_controller_json
 from .prompts import SYSTEM, USER
 
 class ReviewResult(BaseModel):
@@ -92,7 +92,7 @@ class LLMReviewer:
         ctx={"task":task.model_dump(mode='json'),"classification":classification.model_dump(mode='json') if classification else None,"coding_backend":coding_backend.redacted_dict(),"attempt":attempt}
 
         try:
-            result=self.client.complete_json(backend, SYSTEM, USER.format(context=json.dumps(ctx, indent=2)[:60000]), 'ReviewResult', estimate_cost=estimate_cost)
+            result=complete_controller_json(self.client, backend, SYSTEM, USER.format(context=json.dumps(ctx, indent=2)[:60000]), 'ReviewResult', ReviewResult, estimate_cost=estimate_cost)
         except TypeError:
             result=self.client.complete_json(backend, SYSTEM, USER.format(context=json.dumps(ctx, indent=2)[:60000]), 'ReviewResult')
         normalized=normalize_review_payload(result.parsed_json)

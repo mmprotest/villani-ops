@@ -4,7 +4,7 @@ from pathlib import Path
 from villani_ops.orchestration.artifacts import write_text_utf8, write_json_utf8
 from typing import Any
 from villani_ops.core.backend import Backend
-from villani_ops.llm.client import LLMClient, LLMCallResult
+from villani_ops.llm.client import LLMClient, LLMCallResult, complete_controller_json
 from .models import SelectionResult
 from .prompts import SELECTOR_SYSTEM, SELECTOR_USER
 
@@ -138,7 +138,7 @@ class Selector:
         if any(c.get('acceptance_eligible') for c in candidates):
             try:
                 try:
-                    call=self.client.complete_json(backend, SELECTOR_SYSTEM, SELECTOR_USER.format(context=json.dumps(ctx, indent=2)[:90000]), "SelectionResult", estimate_cost=estimate_cost)
+                    call=complete_controller_json(self.client, backend, SELECTOR_SYSTEM, SELECTOR_USER.format(context=json.dumps(ctx, indent=2)[:90000]), "SelectionResult", SelectionResult, estimate_cost=estimate_cost)
                 except TypeError:
                     call=self.client.complete_json(backend, SELECTOR_SYSTEM, SELECTOR_USER.format(context=json.dumps(ctx, indent=2)[:90000]), "SelectionResult")
                 raw_payload=call.parsed_json

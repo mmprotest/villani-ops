@@ -21,22 +21,25 @@ def init(workspace: str='.villani-ops'):
     storage(workspace).init_workspace(); console.print(f'Initialized Villani Ops workspace at {workspace}')
 
 @backend_app.command('add')
-def backend_add(name: str, provider: str=typer.Option(...), base_url: str|None=None, model: str=typer.Option(...), api_key: str|None=None, api_key_env: str|None=None, input_cost: float=0.0, output_cost: float=0.0, roles: str='coding', capability_score: int=0, max_parallel: int=typer.Option(1, '--max-parallel', help='Maximum concurrent calls/tasks allowed for this backend.'), max_tokens: int|None=None, timeout_seconds: int|None=None, workspace: str='.villani-ops'):
+def backend_add(name: str, provider: str=typer.Option(...), base_url: str|None=None, model: str=typer.Option(...), api_key: str|None=None, api_key_env: str|None=None, input_cost: float=0.0, output_cost: float=0.0, roles: str='coding', capability_score: int=0, max_parallel: int=typer.Option(1, '--max-parallel', help='Maximum concurrent calls/tasks allowed for this backend.'), max_tokens: int|None=None, timeout_seconds: int|None=None, structured_output_mode: str=typer.Option('auto', '--structured-output-mode', help='Structured output mode: auto, disabled, openai_json_schema, openai_json_object, anthropic_json_schema, anthropic_strict_tool, prompt_only'), workspace: str='.villani-ops'):
     if api_key and api_key_env:
         raise typer.BadParameter('Choose only one of --api-key or --api-key-env')
     if max_parallel < 1 or max_parallel > 32:
         raise typer.BadParameter('--max-parallel must be between 1 and 32')
+    allowed_modes={'auto','disabled','openai_json_schema','openai_json_object','anthropic_json_schema','anthropic_strict_tool','prompt_only'}
+    if structured_output_mode not in allowed_modes:
+        raise typer.BadParameter('--structured-output-mode must be one of: ' + ', '.join(sorted(allowed_modes)))
     if provider=='local' and not api_key and not api_key_env:
         api_key='dummy'
-    s=storage(workspace); s.init_workspace(); b=s.load_backends(); b[name]=Backend(name=name,provider=provider,base_url=base_url,model=model,api_key=api_key,api_key_env=api_key_env,input_cost_per_million=input_cost,output_cost_per_million=output_cost,roles=[r.strip() for r in roles.split(',') if r.strip()],capability_score=capability_score,max_parallel=max_parallel,max_tokens=max_tokens,timeout_seconds=timeout_seconds); s.save_backends(b); console.print(f'Added backend {name}')
+    s=storage(workspace); s.init_workspace(); b=s.load_backends(); b[name]=Backend(name=name,provider=provider,base_url=base_url,model=model,api_key=api_key,api_key_env=api_key_env,input_cost_per_million=input_cost,output_cost_per_million=output_cost,roles=[r.strip() for r in roles.split(',') if r.strip()],capability_score=capability_score,max_parallel=max_parallel,max_tokens=max_tokens,timeout_seconds=timeout_seconds,structured_output_mode=structured_output_mode); s.save_backends(b); console.print(f'Added backend {name}')
 
 @backend_app.command('list')
 def backend_list(workspace: str='.villani-ops'):
-    table=Table('Name','Provider','Model','Roles','Capability','max_parallel','Costs $/M','State','Base URL','API key')
+    table=Table('Name','Provider','Model','Roles','Capability','max_parallel','Structured Output','Costs $/M','State','Base URL','API key')
     loaded=list(storage(workspace).load_backends().values())
-    for b in loaded: table.add_row(b.name,b.provider,b.model,','.join(b.roles),str(b.capability_score),str(b.max_parallel),f'{b.input_cost_per_million}/{b.output_cost_per_million}','enabled' if b.enabled else 'disabled',b.base_url or '', 'configured' if b.api_key_configured() else 'missing')
+    for b in loaded: table.add_row(b.name,b.provider,b.model,','.join(b.roles),str(b.capability_score),str(b.max_parallel),b.structured_output_mode,f'{b.input_cost_per_million}/{b.output_cost_per_million}','enabled' if b.enabled else 'disabled',b.base_url or '', 'configured' if b.api_key_configured() else 'missing')
     console.print(table)
-    for b in loaded: console.print(f'{b.name} capability={b.capability_score} max_parallel={b.max_parallel}')
+    for b in loaded: console.print(f'{b.name} capability={b.capability_score} max_parallel={b.max_parallel} structured_output_mode={b.structured_output_mode}')
 @backend_app.command('show')
 def backend_show(name: str, workspace: str='.villani-ops'):
     console.print_json(json.dumps(storage(workspace).load_backends()[name].redacted_dict()))

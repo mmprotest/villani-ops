@@ -4,7 +4,7 @@ from typing import Any
 import subprocess, json, re
 from villani_ops.core.backend import Backend, select_backend
 from villani_ops.core.task import Task, TaskClassification
-from villani_ops.llm.client import LLMClient, LLMCallResult
+from villani_ops.llm.client import LLMClient, LLMCallResult, complete_controller_json
 from villani_ops.policy_engine.engine import _write_controller_error
 from .prompts import SYSTEM, USER
 from .context import collect_relevant_file_snippets, RelevantFileSnippet, is_skipped_repo_file
@@ -182,7 +182,7 @@ class TaskClassifier:
         context={"objective":task.objective,"success_criteria":task.success_criteria,"constraints":task.constraints,"repo":_repo_context(repo),"relevant_files":relevant}
 
         try:
-            result=self.client.complete_json(backend, SYSTEM, USER.format(context=json.dumps(context, indent=2)), 'TaskClassification', estimate_cost=estimate_cost)
+            result=complete_controller_json(self.client, backend, SYSTEM, USER.format(context=json.dumps(context, indent=2)), 'TaskClassification', TaskClassification, estimate_cost=estimate_cost)
         except TypeError:
             result=self.client.complete_json(backend, SYSTEM, USER.format(context=json.dumps(context, indent=2)), 'TaskClassification')
         normalized=normalize_task_classification_payload(result.parsed_json)

@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 from villani_ops.core.backend import Backend, select_backend, coding_backends
 from villani_ops.core.task import TaskClassification
-from villani_ops.llm.client import LLMClient, LLMCallResult, LLMCallError
+from villani_ops.llm.client import LLMClient, LLMCallResult, complete_controller_json, LLMCallError
 from .defaults import DEFAULT_PROFILES
 from .prompts import SYSTEM, USER
 
@@ -229,7 +229,7 @@ class PolicyEngine:
         allowed={b.name for b in coding}; max_total=DEFAULT_PROFILES[profile]['max_total_attempts']
         ctx={"classification":classification.model_dump(),"profile":profile,"profile_rules":DEFAULT_PROFILES[profile],"coding_backends":[b.redacted_dict() for b in coding]}
         try:
-            result=self.client.complete_json(policy_backend, SYSTEM, USER.format(context=json.dumps(ctx, indent=2)), 'ExecutionStrategy')
+            result=complete_controller_json(self.client, policy_backend, SYSTEM, USER.format(context=json.dumps(ctx, indent=2)), 'ExecutionStrategy', ExecutionStrategy)
         except LLMCallError as e:
             strat=build_deterministic_fallback_strategy(classification, backends, profile, str(e))
             _write_controller_error(Path(out_path).parent if out_path else None, 'policy', policy_backend, 'ExecutionStrategy', e.result, parse_error=e.parse_error, fallback_used=True, fallback_payload=strat.model_dump())
