@@ -106,8 +106,16 @@ def normalize_task_classification_payload(raw: dict) -> dict:
 
 
 
+SUBSYSTEM_NOUNS={'checkout','pricing','inventory','reservation','order','orders','receipt','receipts','payment','tax','shipping','discount','coupon','transaction','rollback','atomic'}
+BEHAVIOR_VERBS={'price','prices','pricing','reserve','create','release','render','pass','validate','fix','apply'}
+
+def _count_behaviors(text: str) -> int:
+    parts=re.split(r",|;|\band\b", text.lower())
+    return sum(1 for p in parts if any(re.search(rf"\b{re.escape(v)}\w*\b", p) for v in BEHAVIOR_VERBS))
+
 def _shape_signals(task_text: str, snippets: list[RelevantFileSnippet], likely_files: list[str]|None=None) -> dict[str, Any]:
     text=(task_text or '').lower()
+    subs={n for n in SUBSYSTEM_NOUNS if re.search(rf"\b{re.escape(n)}\b", text)}
     return {
         "relevant_file_count": len(snippets),
         "likely_file_count": len(likely_files or []),
@@ -116,6 +124,9 @@ def _shape_signals(task_text: str, snippets: list[RelevantFileSnippet], likely_f
         "do_not_change_tests": bool(re.search(r"do not (change|modify|edit) tests|don['’]t (change|modify|edit) tests", text)),
         "target_files_found": bool(snippets),
         "broad_change": bool(re.search(r"\b(entire app|architecture|redesign|migrate|rewrite|replatform)\b", text)),
+        "subsystem_noun_count": len(subs),
+        "subsystem_nouns": sorted(subs),
+        "behavior_count": _count_behaviors(text),
     }
 
 def _lower_level(value: str, levels: list[str]) -> str:
@@ -135,11 +146,28 @@ def adjust_classification_from_task_shape(classification: TaskClassification, ta
         if new != cls.risk:
             notes.append(f"Classification adjusted: risk {cls.risk} -> {new} because relevant context is narrow and explicit tests or success criteria are present.")
             cls.risk=new
-    if cls.confidence >= .80 and signals["relevant_file_count"] <= 2 and tests_clear and not signals["broad_change"]:
+    if cls.confidence >= .80 and signals["relevant_file_count"] <= 2 and signals["likely_file_count"] < 4 and tests_clear and not signals["broad_change"]:
         new=_lower_level(cls.difficulty, ["easy","medium","hard"])
         if new != cls.difficulty:
             notes.append(f"Classification adjusted: difficulty {cls.difficulty} -> {new} because relevant context is narrow, validation is explicit, and confidence is high.")
             cls.difficulty=new
+    medium_reasons=[]; hard_reasons=[]
+    if signals["likely_file_count"] >= 4: medium_reasons.append(f"task spans {signals['likely_file_count']} likely files")
+    if signals["relevant_file_count"] >= 4: medium_reasons.append(f"task spans {signals['relevant_file_count']} relevant files")
+    if cls.estimated_attempts_needed >= 3: medium_reasons.append(f"estimated_attempts_needed={cls.estimated_attempts_needed}")
+    if signals["behavior_count"] >= 3: medium_reasons.append("success criteria mention multiple behaviours")
+    if signals["subsystem_noun_count"] >= 4: medium_reasons.append("multiple checkout subsystems")
+    if any(x in str(cls.category).lower() for x in ["integration","checkout","workflow","transaction"]): medium_reasons.append(f"category={cls.category}")
+    if signals["likely_file_count"] >= 8: hard_reasons.append(f"task spans {signals['likely_file_count']} likely files")
+    if signals["relevant_file_count"] >= 8: hard_reasons.append(f"task spans {signals['relevant_file_count']} relevant files")
+    if cls.estimated_attempts_needed >= 5: hard_reasons.append(f"estimated_attempts_needed={cls.estimated_attempts_needed}")
+    if signals["behavior_count"] >= 6: hard_reasons.append("success criteria mention six or more behaviours")
+    if hard_reasons and cls.difficulty != 'hard':
+        notes.append('Raised difficulty to hard because ' + ' and '.join(hard_reasons) + '.')
+        cls.difficulty='hard'
+    elif medium_reasons and cls.difficulty == 'easy':
+        notes.append('Raised difficulty to medium because ' + ' and '.join(medium_reasons) + '.')
+        cls.difficulty='medium'
     cls.adjustment_notes=notes
     cls.relevant_file_paths=[s.path for s in relevant_files]
     cls.task_shape_signals=signals

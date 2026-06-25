@@ -8,6 +8,7 @@ from villani_ops.llm.client import LLMCallResult
 from villani_ops.orchestration.planner import Planner, PlanResult, DecompositionResult, normalize_plan_payload
 from villani_ops.orchestration.progress import ConsoleProgressReporter
 from villani_ops.performance.report import write_performance_report
+from villani_ops.performance.investigator import normalize_investigation_payload
 from villani_ops.core.decision import Decision
 
 
@@ -144,3 +145,24 @@ def test_regression_action_shaped_payload_requests_decompose_node(tmp_path, monk
     assert plan["candidate_attempts"] == 3
     graph=json.loads((Path(res.run_dir)/"orchestration_graph.json").read_text())
     assert {n["id"]: n for n in graph["nodes"]}["decompose"]["status"] == "succeeded"
+
+from villani_ops.orchestration.planner import repair_plan_against_context
+
+
+def test_plan_repair_regression_checkout_context():
+    classification={"difficulty":"easy","category":"bug_fix","estimated_attempts_needed":3,"likely_files":["src/signalshop/checkout.py","src/signalshop/inventory.py","src/signalshop/orders.py","src/signalshop/pricing.py","src/signalshop/receipts.py"]}
+    inv_raw={"summary":"Task spans checkout flow failures.","files_to_modify":classification["likely_files"],"implementation_steps":["Fix pricing","Fix inventory reservation","Fix payment rollback","Fix receipt rendering"]}
+    inv_norm,_=normalize_investigation_payload(inv_raw)
+    plan=PlanResult(summary="Fix failing checkout tests directly.", strategy="single_task", should_decompose=False, candidate_attempts=1, expected_difficulty="easy", confidence=.85)
+    repaired, notes=repair_plan_against_context(plan, requested_candidate_attempts=1, task="Fix the failing tests", success_criteria="Fix the failing tests. The checkout flow must correctly price carts, reserve inventory atomically, create orders with stable IDs, release reservations on payment failure, and render deterministic receipts. Tests pass and diff is minimal.", classification=classification, investigation=inv_norm)
+    assert len(inv_norm["relevant_files"]) == 5 and inv_norm["confidence"] >= .70
+    assert repaired.strategy == "decompose_then_execute"
+    assert repaired.should_decompose is True
+    assert repaired.candidate_attempts == 1
+    assert repaired.planner_repaired is True and notes
+
+
+def test_plan_repair_not_for_narrow_task():
+    plan=PlanResult(summary="x", strategy="single_task", should_decompose=False, candidate_attempts=2)
+    repaired, notes=repair_plan_against_context(plan, requested_candidate_attempts=2, task="fix typo", success_criteria="tests pass", classification={"likely_files":["a.py"],"estimated_attempts_needed":1}, investigation={"relevant_files":["a.py"],"confidence":.9})
+    assert not repaired.planner_repaired and not notes

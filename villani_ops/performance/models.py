@@ -16,6 +16,7 @@ class InvestigationResult(BaseModel):
     investigation_normalization_notes: list[str] = Field(default_factory=list)
     investigation_fallback_used: bool = False
     investigation_fallback_reason: str | None = None
+    raw_findings: dict[str, Any] = Field(default_factory=dict)
 
 class CandidateSummary(BaseModel):
     attempt_id: str
