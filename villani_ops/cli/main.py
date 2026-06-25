@@ -80,7 +80,7 @@ def policy_create_default(name: str=typer.Option('balanced'), workspace: str='.v
     pol=Policy(name=name, attempts=attempts); path=s.workspace/'policies'/f'{name}.yaml'; pol.save(path); console.print(f'Created policy at {path}')
 
 @app.command(context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
-def run(ctx: typer.Context, repo: str|None=None, task: str|None=typer.Option(None,'--task'), task_id: str|None=None, success_criteria: str|None=None, mode: str=typer.Option('performance', '--mode', help='Execution mode: performance, cheap, balanced, or quality'), runner: str=typer.Option('villani-code', '--runner'), candidate_attempts: int=typer.Option(3, '--candidate-attempts', min=1, max=8), timeout_seconds: int|None=None, classify: bool=typer.Option(True, '--classify/--no-classify'), non_interactive: bool=False, workspace: str='.villani-ops'):
+def run(ctx: typer.Context, repo: str|None=None, task: str|None=typer.Option(None,'--task'), task_id: str|None=None, success_criteria: str|None=None, mode: str=typer.Option('performance', '--mode', help='Execution mode: performance, cheap, balanced, or quality'), runner: str=typer.Option('villani-code', '--runner'), candidate_attempts: int=typer.Option(3, '--candidate-attempts', min=1, max=8), timeout_seconds: int|None=None, classify: bool=typer.Option(True, '--classify/--no-classify'), non_interactive: bool=False, quiet: bool=typer.Option(False, '--quiet'), verbose: bool=typer.Option(False, '--verbose'), workspace: str='.villani-ops'):
     forbidden = {
         '--policy': '--policy has been replaced by --mode. Use --mode performance|cheap|balanced|quality. Cost policies moved to villani-ops cost-run.',
         '--backend': 'Backend assignment is controlled by the execution policy. Configure backends, then use --mode. Performance orchestration always uses the most capable enabled backend in performance mode.',
@@ -107,7 +107,7 @@ def run(ctx: typer.Context, repo: str|None=None, task: str|None=typer.Option(Non
         raise typer.BadParameter('Invalid mode. Choose one of: performance, cheap, balanced, quality')
     if runner != 'villani-code':
         raise typer.BadParameter(f"Runner '{runner}' is registered but not implemented yet." if runner in {"claude-code","pi","aider","codex"} else f"Unsupported runner '{runner}'. Supported runner: villani-code.")
-    result=VillaniOps(storage(workspace), progress_reporter=RunProgressReporter(True)).run(repo=repo, task=t, candidate_attempts=candidate_attempts, timeout_seconds=timeout_seconds, classify=classify, non_interactive=(non_interactive or not sys.stdin.isatty()), mode=mode, runner=runner)
+    result=VillaniOps(storage(workspace), progress_reporter=RunProgressReporter(not quiet, verbose=verbose)).run(repo=repo, task=t, candidate_attempts=candidate_attempts, timeout_seconds=timeout_seconds, classify=classify, non_interactive=(non_interactive or not sys.stdin.isatty()), mode=mode, runner=runner)
     d=result.decision
     console.print(f"Result: {'ACCEPTED' if d.accepted else 'FAILED'}")
     console.print(f'Mode: {d.mode}')
