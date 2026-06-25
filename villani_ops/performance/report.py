@@ -89,12 +89,22 @@ def write_performance_report(run_dir: str|Path, task: Any, investigation: Any, c
         lines.append(f"Reason: {px.get('reason')}")
     if getattr(decision,'decomposition_executed',False):
         attempts=getattr(decision,'attempts',[]) or []
-        lines += ['', '### Subtasks', '| Subtask | Status | Started | Completed | Changed files | Review | Accepted | Patch |', '|---|---|---|---|---:|---|---|---|']
-        accepted=set(getattr(decision,'subtasks_accepted',[]) or [])
-        for a in attempts:
-            if not a.get('subtask_id'): continue
+        summaries=getattr(decision,'subtask_attempt_summaries',{}) or {}
+        lines += [f"Attempts per subtask: {getattr(decision,'attempts_per_subtask',0)}", f"Subtask attempts completed: {getattr(decision,'subtask_attempts_completed',0)}"]
+        lines += ['', '### Subtasks', '| Subtask | Status | Accepted attempt | Attempts completed | Review | Changed files |', '| --- | --- | --- | ---: | --- | --- |']
+        by_sid={a.get('subtask_id'): a for a in attempts if a.get('subtask_id')}
+        if not summaries:
+            summaries={sid:{'status':a.get('status'),'accepted_attempt_id':a.get('attempt_id'),'attempts_completed':1} for sid,a in by_sid.items()}
+        for sid, summ in summaries.items():
+            a=by_sid.get(sid,{})
             rv=a.get('review') or {}
-            lines.append(f"| {a.get('subtask_id')} | {a.get('status')} | {a.get('started_at') or ''} | {a.get('completed_at') or ''} | {len(a.get('changed_files') or [])} | {rv.get('decision')}/{rv.get('recommended_action')} | {str(a.get('subtask_id') in accepted).lower()} | {a.get('patch_path') or ''} |")
+            lines.append(f"| {sid} | {summ.get('status')} | {summ.get('accepted_attempt_id') or ''} | {summ.get('attempts_completed') or 0} | {rv.get('decision','')}/{rv.get('recommended_action','')} | {', '.join(a.get('changed_files') or [])} |")
+            lines.append(f"<!-- legacy-subtask-row | {summ.get('attempts_completed') or 0} | {rv.get('decision','')}/{rv.get('recommended_action','')} | {str(sid in (getattr(decision,'subtasks_accepted',[]) or [])).lower()} | -->")
+        failed=getattr(decision,'subtasks_failed',[]) or getattr(decision,'subtasks_rejected',[]) or []
+        if failed:
+            lines += ['', '### Failed Subtasks']
+            for sid in failed:
+                lines.append(f"- {sid}: no accepted attempt after {getattr(decision,'attempts_per_subtask',0)} attempts")
         val=getattr(decision,'integration_validation',None) or {}
         init=getattr(decision,'integration_validation_initial',None) or {}
         after=getattr(decision,'integration_validation_after_repair',None)
@@ -102,7 +112,7 @@ def write_performance_report(run_dir: str|Path, task: Any, investigation: Any, c
         lines += ['', '### Scope Analysis', f"Accepted: {scope.get('summary',{}).get('accepted','')}", f"Skipped for overreach: {scope.get('summary',{}).get('skipped_for_overreach','')}", f"Overlapping files: {len(scope.get('overlapping_files') or {})}"]
         for row in scope.get('subtasks',[]) or []:
             lines.append(f"- {row.get('subtask_id')}: overreach={row.get('scope_overreach')} unexpected={', '.join(row.get('unexpected_files') or [])} decision={row.get('integration_decision')} risk={row.get('integration_risk')}")
-        lines += ['', '### Integration Validation', f"Worktree: {getattr(decision,'integration_worktree_path',None) or ''}", f"Accepted subtask patches: {len(getattr(decision,'subtasks_accepted',[]) or [])}", f"Initial validation: passed={str(bool(init.get('passed'))).lower()} exit_code={init.get('exit_code','')} command={' '.join(init.get('command') or [])}", f"Repair used: {str(bool(getattr(decision,'integration_repair_used',False))).lower()}", f"Post-repair validation: {('not run' if after is None else 'passed='+str(bool(after.get('passed'))).lower()+' exit_code='+str(after.get('exit_code',''))+' command='+' '.join(after.get('command') or []))}", f"Latest validation passed: {str(bool(val.get('passed'))).lower()}", f"Validation passed: {str(bool(val.get('passed'))).lower()}", f"Final patch: {getattr(decision,'integration_patch_path',None) or ''}"]
+        lines += ['', '### Integration Validation', f"Worktree: {getattr(decision,'integration_worktree_path',None) or ''}", f"Accepted subtask attempts integrated: {len(getattr(decision,'subtasks_accepted',[]) or [])}", f"Missing subtasks: {len(failed)}", f"Initial validation: passed={str(bool(init.get('passed'))).lower()} exit_code={init.get('exit_code','')} command={' '.join(init.get('command') or [])}", f"Repair used: {str(bool(getattr(decision,'integration_repair_used',False))).lower()}", f"Post-repair validation: {('not run' if after is None else 'passed='+str(bool(after.get('passed'))).lower()+' exit_code='+str(after.get('exit_code',''))+' command='+' '.join(after.get('command') or []))}", f"Latest validation passed: {str(bool(val.get('passed'))).lower()}", f"Validation passed: {str(bool(val.get('passed'))).lower()}", f"Final patch: {getattr(decision,'integration_patch_path',None) or ''}"]
         fr=getattr(decision,'final_review',None) or {}
         lines += ['', '### Final Review', f"Decision: {fr.get('decision','')}", f"Recommended action: {fr.get('recommended_action','')}", f"Score: {fr.get('score','')}"]
     lines += ['', '## Candidate Attempts', '| Attempt | Backend | Model | Status | Exit | Changed files | Review decision | Review score | Eligible | Blockers | Patch | Patch path |', '| --- | --- | --- | --- | ---: | --- | --- | ---: | --- | --- | --- | --- |']

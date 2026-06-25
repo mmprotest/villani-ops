@@ -72,6 +72,10 @@ class Decision(BaseModel):
     subtasks_executed: list[str] = Field(default_factory=list)
     subtasks_accepted: list[str] = Field(default_factory=list)
     subtasks_rejected: list[str] = Field(default_factory=list)
+    subtasks_failed: list[str] = Field(default_factory=list)
+    attempts_per_subtask: int = 0
+    subtask_attempts_completed: int = 0
+    subtask_attempt_summaries: dict[str, Any] = Field(default_factory=dict)
     integration_worktree_path: str | None = None
     integration_patch_path: str | None = None
     integration_validation: dict[str, Any] | None = None
