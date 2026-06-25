@@ -82,14 +82,14 @@ def policy_create_default(name: str=typer.Option('balanced'), workspace: str='.v
 @app.command(context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
 def run(ctx: typer.Context, repo: str|None=None, task: str|None=typer.Option(None,'--task'), task_id: str|None=None, success_criteria: str|None=None, mode: str=typer.Option('performance', '--mode', help='Execution mode: performance, cheap, balanced, or quality'), runner: str=typer.Option('villani-code', '--runner'), candidate_attempts: int=typer.Option(3, '--candidate-attempts', min=1, max=8), timeout_seconds: int|None=None, classify: bool=typer.Option(True, '--classify/--no-classify'), non_interactive: bool=False, workspace: str='.villani-ops'):
     forbidden = {
-        '--policy': 'Cost policies moved to villani-ops cost-run. The primary run command uses --mode, not --policy. Use --mode performance|cheap|balanced|quality.',
-        '--backend': 'Performance orchestration always uses the most capable enabled backend. The primary run command does not accept --backend; backend assignment belongs to the selected execution policy (--mode).',
-        '--human-approval': 'Human approval is not supported in performance orchestration. Use villani-ops cost-run for the legacy approval path.',
+        '--policy': '--policy has been replaced by --mode. Use --mode performance|cheap|balanced|quality. Cost policies moved to villani-ops cost-run.',
+        '--backend': 'Backend assignment is controlled by the execution policy. Configure backends, then use --mode. Performance orchestration always uses the most capable enabled backend in performance mode.',
+        '--human-approval': 'Human approval is not supported in the primary orchestration path. Human approval is not supported in performance orchestration.',
     }
     for arg in ctx.args:
         for opt, msg in forbidden.items():
             if arg == opt or arg.startswith(opt + '='):
-                console.print(msg)
+                console.print(msg, soft_wrap=True)
                 raise typer.Exit(2)
         if arg.startswith('-'):
             console.print(f'Unknown option: {arg}')
@@ -106,7 +106,7 @@ def run(ctx: typer.Context, repo: str|None=None, task: str|None=typer.Option(Non
     if mode not in {'performance','cheap','balanced','quality'}:
         raise typer.BadParameter('Invalid mode. Choose one of: performance, cheap, balanced, quality')
     if runner != 'villani-code':
-        raise typer.BadParameter(f"Unsupported runner '{runner}'. Supported runner: villani-code.")
+        raise typer.BadParameter(f"Runner '{runner}' is registered but not implemented yet." if runner in {"claude-code","pi","aider","codex"} else f"Unsupported runner '{runner}'. Supported runner: villani-code.")
     result=VillaniOps(storage(workspace), progress_reporter=RunProgressReporter(True)).run(repo=repo, task=t, candidate_attempts=candidate_attempts, timeout_seconds=timeout_seconds, classify=classify, non_interactive=(non_interactive or not sys.stdin.isatty()), mode=mode, runner=runner)
     d=result.decision
     console.print(f"Result: {'ACCEPTED' if d.accepted else 'FAILED'}")

@@ -1,9 +1,16 @@
-from villani_ops.execution_policies.cheap import CheapExecutionPolicy, _strongest
-from villani_ops.execution_policies.base import BackendSelection
-class BalancedExecutionPolicy(CheapExecutionPolicy):
+from __future__ import annotations
+from typing import Mapping
+from villani_ops.core.backend import Backend as BackendConfig
+from villani_ops.orchestration.context import TaskContext
+from villani_ops.orchestration.nodes import OrchestrationNode, NodeResult
+from .base import BackendSelection, lowest_capability, middle_capability, highest_capability, estimate_node_difficulty, prior_forces_escalation
+
+class BalancedExecutionPolicy:
     mode='balanced'
-    def select_backend(self, **kwargs):
-        node=kwargs['node']; conf=kwargs.get('confidence'); backends=kwargs['backends']
-        if node.kind in {'investigate','review','select','verify'} or conf is None or conf < .8:
-            n,_=_strongest(backends); return BackendSelection(backend_name=n, reason='Balanced mode preferred a capable backend for ambiguous/high-impact orchestration node.', escalated=conf is not None and conf < .8)
-        return super().select_backend(**kwargs)
+    def select_backend(self, *, node: OrchestrationNode, backends: Mapping[str, BackendConfig], task_context: TaskContext, prior_results: list[NodeResult] | None = None) -> BackendSelection:
+        d,r,c=estimate_node_difficulty(node, task_context); node.difficulty=d; node.risk=r; node.confidence=c
+        if prior_forces_escalation(prior_results) or d=='hard' or r=='high' or c < .80:
+            n,b=highest_capability(backends); return BackendSelection(backend_name=n, backend=b, reason=f'Balanced mode escalated for difficulty={d}, risk={r}, confidence={c:.2f}, or prior failure/review blocker.', confidence=c, escalated=True)
+        if d=='easy' and r=='low' and c >= .85:
+            n,b=lowest_capability(backends); return BackendSelection(backend_name=n, backend=b, reason='Balanced mode allowed smaller backend for clearly easy, low-risk, high-confidence work.', confidence=c)
+        n,b=middle_capability(backends); return BackendSelection(backend_name=n, backend=b, reason='Balanced mode used middle backend for sufficiently confident medium work.', confidence=c)

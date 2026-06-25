@@ -1,147 +1,62 @@
 # Villani Ops
 
-Villani Ops is a CLI-only multi-agent performance orchestrator for coding tasks. In performance mode, it uses the most capable configured backend for investigation, independent candidate attempts, LLM review, and selector-based final decisioning. Phase 1 is focused on solve-rate lift, not cost optimisation.
+Villani Ops is a CLI-only multi-agent orchestration engine for coding tasks. The user gives a task, and Villani Ops decides how to investigate, plan, decompose, sequence, run candidates, review outputs, and select the final result.
 
-## Performance orchestration
+The main command is `villani-ops run`.
 
-`villani-ops run` is pure performance orchestration. It always chooses the enabled backend with the highest `capability_score` and uses that same backend for classification (when enabled), investigation, every candidate Villani Code attempt, every LLM review, and selector decisioning. Backend roles and prices are ignored in this path.
+## Execution modes
 
-The performance command does not support `--backend`, `--policy`, or `--human-approval`; passing them fails clearly before a run starts. Cost optimisation is intentionally out of scope for the main performance path. Cost metrics in old artifacts are legacy compatibility or telemetry only.
+- `performance`: use the most capable enabled backend for every node.
+- `cheap`: use the same orchestration engine, but route easy/low-risk work to smaller backends when confidence is high.
+- `balanced`: conservative cost-aware routing with stronger escalation.
+- `quality`: near-performance mode with limited routing for clearly safe subtasks.
+
+```bash
+villani-ops run --mode performance
+villani-ops run --mode cheap
+villani-ops run --mode balanced
+villani-ops run --mode quality
+```
+
+Default mode is `performance`; default runner is `villani-code`; default candidate attempts is `3`.
+
+## Example
 
 ```bash
 villani-ops run \
   --repo ./repo \
   --task "Fix the failing auth tests" \
   --success-criteria "Tests pass and diff is minimal" \
+  --mode performance \
+  --runner villani-code \
   --candidate-attempts 3 \
   --non-interactive
 ```
 
-## Legacy cost policy runs
+## Orchestration lifecycle
 
-`villani-ops cost-run` contains the old cost-aware policy system, including policy profiles and legacy approval behavior where configured. Use this command for backend policy experiments.
+A run creates and updates a real orchestration graph with classification (optional), investigation, planning, advisory decomposition when requested, candidate coding nodes, candidate review nodes, selection, verification, and reporting. Graph nodes record status, timing, backend assignment, model assignment, risk/difficulty/confidence signals, summaries, and artifact paths.
 
-```bash
-villani-ops cost-run \
-  --repo ./repo \
-  --task "Fix the failing auth tests" \
-  --success-criteria "Tests pass and diff is minimal" \
-  --policy balanced \
-  --max-attempts 3 \
-  --non-interactive
-```
+Only the `villani-code` runner is implemented today. `claude-code`, `pi`, `aider`, and `codex` are registered adapter stubs and fail clearly as unsupported for execution.
 
-## Main performance path
+## Legacy compatibility
+
+`villani-ops cost-run` is a legacy compatibility command for the previous cost-policy runner. New work should use `villani-ops run --mode cheap|balanced|quality`.
+
+## Core commands
 
 ```bash
-villani-ops run \
-  --repo ./some-git-repo \
-  --task "Fix the failing auth tests" \
-  --success-criteria "Tests pass and diff is minimal" \
-  --candidate-attempts 3 \
-  --non-interactive
+villani-ops init
+villani-ops backend add strong --provider openai --model gpt-5.5 --capability-score 100 --api-key dummy
+villani-ops backend list
+villani-ops run --repo ./repo --task "Implement the requested change" --non-interactive
+villani-ops apply <run-id>
+villani-ops branch <run-id> --name villani-ops/<run-id>
+villani-ops pr <run-id> --title "Villani Ops changes"
 ```
 
-The performance run lifecycle is:
+`villani-ops run` rejects legacy primary-path options:
 
-1. Save the task in a new run directory.
-2. Optionally classify the task.
-3. Run an investigator LLM call.
-4. Run multiple independent Villani Code candidates in isolated git worktrees.
-5. Capture patches, changed files, stdout, stderr, diffs, and runner telemetry.
-6. Review every candidate with the LLM reviewer.
-7. Run a selector LLM call over reviewed candidates.
-8. Accept only a selected candidate that passes strict acceptance gates.
-9. Write `decision.json`, `report.md`, `controller_steps.jsonl`, and per-attempt artifacts.
-10. Print apply/branch/PR commands only when there is an accepted winner.
-
-`--candidate-attempts` accepts 1 through 8. All planned candidate attempts run independently, and every candidate uses the same selected performance backend. `villani-ops run` never cycles across backends, never applies a cost policy, and never routes by backend role.
-
-## Legacy cost-policy path
-
-The previous cost-aware product path is preserved as a secondary command:
-
-```bash
-villani-ops cost-run \
-  --repo ./some-git-repo \
-  --task "Fix the failing auth tests" \
-  --success-criteria "Tests pass and diff is minimal" \
-  --policy balanced \
-  --max-attempts 3 \
-  --non-interactive
-```
-
-Use `cost-run` for the old `cheap`, `balanced`, and `quality` policy profiles, `--max-attempts`, `--legacy-yaml-policy`, controller timeline, reports, human approval, apply, branch, PR, and cost-policy comparison workflows.
-
-Passing `--policy`, `--backend`, or `--human-approval` to `villani-ops run` fails clearly. Cost policies, manual backend experiments, and the legacy approval path live under `villani-ops cost-run`.
-
-## Backend roles
-
-Backends can declare roles such as `coding`, `classification`, `review`, `policy`, `investigation`, and `selection`:
-
-```bash
-villani-ops backend add local-qwen \
-  --provider openai-compatible \
-  --base-url http://localhost:1234/v1 \
-  --model qwen3.6-27b \
-  --api-key dummy \
-  --roles coding,classification,review,investigation,selection \
-  --capability-score 80 \
-  --max-tokens 50000
-```
-
-Existing backend configs remain valid. Backend roles are ignored by `villani-ops run` and remain available for `villani-ops cost-run` and other legacy policy workflows.
-
-## Safe git commands
-
-Accepted runs can be applied, branched, or prepared for PR:
-
-```bash
-villani-ops apply latest
-villani-ops branch latest --name villani-ops/latest
-villani-ops pr latest --title "Fix auth tests" --body "Generated by Villani Ops"
-villani-ops report latest
-```
-
-These commands continue to use the accepted attempt recorded in `decision.json`. They refuse unsafe mutations such as dirty source repos unless explicitly forced.
-
-## Cost-policy comparison
-
-`compare` is explicitly a cost-policy comparison command:
-
-```bash
-villani-ops compare \
-  --repo ./some-git-repo \
-  --tasks tasks.jsonl \
-  --policies cheap balanced quality
-```
-
-It runs the legacy cost-policy runner internally and writes Markdown/CSV/JSON reports with policy, task id, run id, final action, strategy, winner backend/model, costs, tokens, reviewer score, wall time, and failure reason.
-
-## Task creation
-
-```bash
-villani-ops task create \
-  --repo ./repo \
-  --objective "Fix auth tests" \
-  --success-criteria "Tests pass" \
-  --classify
-```
-
-## Legacy YAML policies
-
-YAML policy files are quarantined behind the cost command and require explicit opt-in:
-
-```bash
-villani-ops cost-run --legacy-yaml-policy --policy path/to/policy.yaml --repo ./repo --task "..."
-```
-
-Legacy reports include: `LEGACY MODE: This run used diff_review smoke validation, not LLM task validation.`
-
-## Testing
-
-The test suite uses mocked LLM responses, fake Villani Code behavior, temporary git repositories, and mocked GitHub/`gh` interactions. Tests must not call real external LLMs, real Villani Code, or real GitHub.
-
-```bash
-pytest
-```
+- `--policy` has been replaced by `--mode`.
+- `--backend` is not accepted because backend assignment is controlled by execution policy.
+- `--human-approval` is not supported in the primary orchestration path.
