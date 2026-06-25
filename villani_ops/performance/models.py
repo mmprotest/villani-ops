@@ -2,6 +2,20 @@ from __future__ import annotations
 from typing import Any, Literal
 from pydantic import BaseModel, Field
 
+
+class ValidationCommand(BaseModel):
+    cmd: str
+    required: bool = True
+    reason: str | None = None
+    timeout_seconds: int | None = None
+
+class ValidationPlan(BaseModel):
+    commands: list[ValidationCommand] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+    success_criteria_mapping: list[dict[str, Any]] = Field(default_factory=list)
+    fallback: bool = False
+    source: str | None = None
+
 class InvestigationResult(BaseModel):
     summary: str
     suspected_root_cause: str | None = None
@@ -17,6 +31,7 @@ class InvestigationResult(BaseModel):
     investigation_fallback_used: bool = False
     investigation_fallback_reason: str | None = None
     raw_findings: dict[str, Any] = Field(default_factory=dict)
+    validation_plan: ValidationPlan | None = None
 
 class CandidateSummary(BaseModel):
     attempt_id: str

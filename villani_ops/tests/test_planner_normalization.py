@@ -125,7 +125,7 @@ def test_regression_action_shaped_payload_requests_decompose_node(tmp_path, monk
     from villani_ops.runners.base import RunnerResult
     import subprocess, os
     repo=tmp_path/"repo"; repo.mkdir(); subprocess.run(["git","init"],cwd=repo,check=True,capture_output=True); subprocess.run(["git","config","user.email","a@b.c"],cwd=repo,check=True); subprocess.run(["git","config","user.name","A"],cwd=repo,check=True); (repo/"a.txt").write_text("a\n"); subprocess.run(["git","add","."],cwd=repo,check=True); subprocess.run(["git","commit","-m","init"],cwd=repo,check=True,capture_output=True)
-    backend=Backend(name="b", provider="local", model="m", base_url="http://x", roles=["coding","review","classification","investigation","selection"])
+    backend=Backend(name="b", provider="local", model="m", base_url="http://x", roles=["coding","review","classification","investigation","selection","policy"])
     raw={"thought":"The task spans checkout, pricing, inventory, orders, and receipts.","command":"ls -R","resulting_state":{"files":["src/signalshop/pricing.py","src/signalshop/inventory.py","src/signalshop/checkout.py","src/signalshop/orders.py","src/signalshop/receipts.py"]}}
     class Client:
         def complete_json(self, backend, system_prompt, user_prompt, schema_name, **kw):
@@ -149,17 +149,18 @@ def test_regression_action_shaped_payload_requests_decompose_node(tmp_path, monk
 from villani_ops.orchestration.planner import repair_plan_against_context
 
 
-def test_plan_repair_regression_checkout_context():
+def test_plan_repair_regression_checkout_context_does_not_inject_domain_decomposition():
     classification={"difficulty":"easy","category":"bug_fix","estimated_attempts_needed":3,"likely_files":["src/signalshop/checkout.py","src/signalshop/inventory.py","src/signalshop/orders.py","src/signalshop/pricing.py","src/signalshop/receipts.py"]}
     inv_raw={"summary":"Task spans checkout flow failures.","files_to_modify":classification["likely_files"],"implementation_steps":["Fix pricing","Fix inventory reservation","Fix payment rollback","Fix receipt rendering"]}
     inv_norm,_=normalize_investigation_payload(inv_raw)
     plan=PlanResult(summary="Fix failing checkout tests directly.", strategy="single_task", should_decompose=False, candidate_attempts=1, expected_difficulty="easy", confidence=.85)
     repaired, notes=repair_plan_against_context(plan, requested_candidate_attempts=1, task="Fix the failing tests", success_criteria="Fix the failing tests. The checkout flow must correctly price carts, reserve inventory atomically, create orders with stable IDs, release reservations on payment failure, and render deterministic receipts. Tests pass and diff is minimal.", classification=classification, investigation=inv_norm)
     assert len(inv_norm["relevant_files"]) == 5 and inv_norm["confidence"] >= .70
-    assert repaired.strategy == "decompose_then_execute"
-    assert repaired.should_decompose is True
+    assert repaired.strategy == "single_task"
+    assert repaired.should_decompose is False
     assert repaired.candidate_attempts == 1
-    assert repaired.planner_repaired is True and notes
+    assert repaired.planner_repaired is False
+    assert notes == []
 
 
 def test_plan_repair_not_for_narrow_task():

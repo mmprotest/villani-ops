@@ -188,3 +188,67 @@ def test_parallel_subtask_code_nodes_observe_limit_distinct_worktrees_and_artifa
     steps = (tmp_path / "controller_steps.jsonl").read_text()
     assert "subtask_scheduled" in steps
     assert "parallel_group_completed" in steps
+
+class _CandidateParallelProbeEngine(OrchestrationEngine):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.active = 0
+        self.max_seen = 0
+        self.lock = threading.Lock()
+        self.barrier = threading.Barrier(2)
+        self.worktrees = []
+
+    def _execute_code_node(self, node, context):
+        with self.lock:
+            self.active += 1
+            self.max_seen = max(self.max_seen, self.active)
+        if node.id in {"code_attempt_001", "code_attempt_002"}:
+            self.barrier.wait(timeout=2)
+        time.sleep(0.02)
+        aid = node.id.replace("code_", "")
+        worktree = str(context.run_dir / "worktrees" / aid)
+        Path(worktree).mkdir(parents=True, exist_ok=True)
+        meta = {"attempt_id": aid, "status": "succeeded", "started_at": aid, "completed_at": aid, "worktree_path": worktree}
+        node.result = meta
+        context.graph.mark_succeeded(node.id, summary="ok")
+        with self.lock:
+            self.active -= 1
+        self.worktrees.append(worktree)
+        return NodeExecutionResult(node_id=node.id, status="succeeded", data=meta)
+
+
+def test_parallel_normal_candidate_code_nodes_observe_backend_limit_and_artifact(tmp_path):
+    backends = {"b": Backend(name="b", provider="openai", model="m", max_parallel=2)}
+    engine = _CandidateParallelProbeEngine(backends=backends, execution_policy=_Policy(), runner_adapter=_Runner(), workspace=tmp_path)
+    nodes = [OrchestrationNode(id=f"code_attempt_{i:03d}", kind="code", objective=str(i)) for i in range(1, 4)]
+    graph = OrchestrationGraph(run_id="r", nodes=nodes)
+    context = SimpleNamespace(
+        run_id="r",
+        run_dir=tmp_path,
+        graph=graph,
+        routing_decisions={},
+        task_context=SimpleNamespace(classification=None, investigation=None, plan=None, decomposition=None),
+        candidate_attempts=3,
+        parallel_execution={},
+        controller_step_lock=threading.Lock(),
+    )
+    engine._execute_parallel_candidate_code_nodes(nodes, context)
+    assert engine.max_seen == 2
+    assert context.parallel_execution["max_observed_parallelism"] == 2
+    assert context.parallel_execution["started_attempts"] == ["code_attempt_001", "code_attempt_002", "code_attempt_003"]
+    assert sorted(context.parallel_execution["completed_attempts"]) == ["code_attempt_001", "code_attempt_002", "code_attempt_003"]
+    assert len(set(engine.worktrees)) == 3
+    assert (tmp_path / "candidates" / "parallel_execution.json").exists()
+
+
+def test_parallel_normal_candidate_code_nodes_respect_max_parallel_one(tmp_path):
+    backends = {"b": Backend(name="b", provider="openai", model="m", max_parallel=1)}
+    engine = _CandidateParallelProbeEngine(backends=backends, execution_policy=_Policy(), runner_adapter=_Runner(), workspace=tmp_path)
+    # Avoid waiting for a second simultaneous task when the backend limit is one.
+    engine.barrier = threading.Barrier(1)
+    nodes = [OrchestrationNode(id=f"code_attempt_{i:03d}", kind="code", objective=str(i)) for i in range(1, 4)]
+    graph = OrchestrationGraph(run_id="r", nodes=nodes)
+    context = SimpleNamespace(run_id="r", run_dir=tmp_path, graph=graph, routing_decisions={}, task_context=SimpleNamespace(classification=None, investigation=None, plan=None, decomposition=None), candidate_attempts=3, parallel_execution={}, controller_step_lock=threading.Lock())
+    engine._execute_parallel_candidate_code_nodes(nodes, context)
+    assert engine.max_seen == 1
+    assert context.parallel_execution["max_observed_parallelism"] == 1

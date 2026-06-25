@@ -1,5 +1,7 @@
 INVESTIGATOR_SYSTEM = "Return only JSON. You investigate coding tasks. Do not propose edits outside the repo."
-INVESTIGATOR_USER = """Analyze this coding task and return JSON matching InvestigationResult.\n{context}"""
+INVESTIGATOR_USER = """Analyze this coding task and return JSON matching InvestigationResult.
+Include a first-class validation_plan when reliable commands can be inferred from repository files or package scripts. The validation_plan shape is: {"commands":[{"cmd":"command string","required":true,"reason":"why relevant","timeout_seconds":null}],"notes":[],"success_criteria_mapping":[],"fallback":false,"source":"investigation"}. Mark optional commands with required=false. Do not hardcode a language; infer commands from the repo context. If no reliable command can be inferred, omit commands or mark fallback=true.
+{context}"""
 SELECTOR_SYSTEM = "Return only JSON. Select the best eligible coding candidate or reject all."
 SELECTOR_USER = """Choose among reviewed candidates and return JSON with this shape:
 {{

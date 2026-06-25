@@ -344,14 +344,10 @@ def validate_decomposition_plan(dec: DecompositionResult, *, task: str | None, s
     for s in subtasks:
         if not s.get('objective') or not (s.get('success_criteria') or success_criteria): issue('solvability', f"Subtask {s.get('id')} lacks objective or success criteria.")
         if not s.get('title'): issue('solvability', f"Subtask {s.get('id')} lacks title/context.")
-    text=' '.join((task or '', success_criteria or '')).lower()
-    covered=' '.join((s.get('title','')+' '+s.get('objective','')+' '+(s.get('success_criteria') or '')) for s in subtasks).lower()
-    for token in {w.strip('.,;:()[]') for w in text.split() if len(w.strip('.,;:()[]')) >= 5}:
-        if token not in covered:
-            res.completeness.missing_success_criteria.append(token)
-            if len(res.completeness.missing_success_criteria) >= 3: break
-    if (success_criteria or task) and res.completeness.missing_success_criteria:
-        issue('completeness','Plan may not cover important terms from task/success criteria.')
+    # Semantic completeness is handled by the LLM-backed validator; deterministic validation
+    # only rejects structurally empty or obviously unusable success criteria.
+    if (success_criteria or task) and not any((st.get('objective') or st.get('success_criteria')) for st in subtasks):
+        issue('completeness','Plan has no substantive subtask objectives or success criteria.')
     seen={}
     for s in subtasks:
         key=' '.join(str(s.get('objective') or s.get('title') or '').lower().split())
@@ -392,6 +388,19 @@ def validate_decomposition_plan(dec: DecompositionResult, *, task: str | None, s
             if not assigned and not candidates: issue('backend_fit', f'No enabled backend supports required role {role} for subtask {s.get("id")}.')
     res.accepted=all(getattr(res,k).passed for k in ['solvability','completeness','non_redundancy','dependency_validity','parallel_safety','backend_fit'])
     return res
+
+def semantic_validate_decomposition_plan(client: LLMClient, dec: DecompositionResult, *, task: str | None, success_criteria: str | None, deterministic: DecompositionPlanValidationResult, backend: Backend | None = None) -> tuple[DecompositionPlanValidationResult | None, dict[str, Any]]:
+    """Ask an LLM/stub for semantic decomposition validation. Never silently accepts malformed output."""
+    if backend is None:
+        return None, {'status': 'skipped', 'reason': 'no semantic validation backend provided'}
+    prompt=json.dumps({'task': task, 'success_criteria': success_criteria, 'decomposition': dec.model_dump(mode='json'), 'deterministic_validation': deterministic.model_dump(mode='json'), 'instructions': 'Validate solvability, completeness, non-redundancy, parallel safety, backend fit, and required revisions. Return DecompositionPlanValidationResult JSON.'}, indent=2)[:80000]
+    try:
+        call=client.complete_json(backend, 'Return only DecompositionPlanValidationResult JSON.', prompt, 'DecompositionPlanValidationResult')
+        payload=call.parsed_json if isinstance(call.parsed_json, dict) else json.loads(call.raw_text or '{}')
+        result=DecompositionPlanValidationResult.model_validate(payload)
+        return result, {'status': 'succeeded', 'raw_text': getattr(call, 'raw_text', ''), 'malformed': False}
+    except Exception as e:
+        return None, {'status': 'failed', 'reason': str(e), 'malformed': True}
 
 def revise_decomposition_plan(dec: DecompositionResult, validation: DecompositionPlanValidationResult) -> DecompositionResult:
     fixed=dec.model_copy(deep=True)
