@@ -190,8 +190,11 @@ def _parse_confidence(value: Any) -> float:
         return 0.0
 
 def _slug(value: Any) -> str:
-    s=str(value or '').strip().replace(' ', '_')
-    return ''.join(ch for ch in s if ch.isalnum() or ch in {'_','-','.'})
+    import re
+    s=str(value or '').strip().lower()
+    s=re.sub(r'[^a-z0-9]+', '_', s)
+    s=re.sub(r'_+', '_', s).strip('_')
+    return s
 
 def _short_text(value: Any) -> str:
     s=str(value or '').strip()
@@ -210,30 +213,54 @@ def _string_or_none(value: Any) -> str | None:
 
 def normalize_decomposition_payload(payload: dict[str, Any], *, task: str | None = None, success_criteria: str | None = None, plan: dict[str, Any] | None = None, classification: dict[str, Any] | None = None, investigation: dict[str, Any] | None = None) -> tuple[dict[str, Any], list[str]]:
     data=dict(payload or {}); notes: list[str]=[]
-    _, raw_items=_first_present(data, ('subtasks','tasks','work_items','steps','components','modules'))
-    if raw_items is None: raw_items=[]
-    if not isinstance(raw_items, list): raw_items=[]
-    subtasks=[]
+    raw_items=None
+    for key in ('subtasks','tasks','work_items','steps','components','modules','decomposition'):
+        if key not in data or data[key] is None: continue
+        value=data[key]
+        if key == 'decomposition':
+            if isinstance(value, list):
+                raw_items=value; notes.append('Mapped top-level decomposition list to subtasks'); break
+            if isinstance(value, dict):
+                nested_key, nested=_first_present(value, ('subtasks','tasks','steps','work_items','components','modules'))
+                if isinstance(nested, list):
+                    raw_items=nested; notes.append(f'Mapped decomposition.{nested_key} to subtasks'); break
+                notes.append('Preserved decomposition object as metadata')
+                continue
+            continue
+        if isinstance(value, list):
+            raw_items=value; break
+    if raw_items is None or not isinstance(raw_items, list): raw_items=[]
+    subtasks=[]; used_ids=set()
     diff_map={'easy':'easy','medium':'medium','hard':'hard','unknown':'unknown','simple':'easy','low':'easy','moderate':'medium','normal':'medium','complex':'hard','high':'hard','difficult':'hard'}
     risk_map={'low':'low','medium':'medium','high':'high','unknown':'unknown','simple':'low','safe':'low','moderate':'medium','normal':'medium','complex':'high','dangerous':'high'}
+    def unique_id(base: str, idx: int) -> str:
+        base=_slug(base) or f'subtask_{idx:03d}'
+        sid=base; n=2
+        while sid in used_ids:
+            sid=f'{base}_{n}'; n+=1
+        used_ids.add(sid); return sid
     for idx,item in enumerate(raw_items, 1):
         if item is None or item == '': continue
         if isinstance(item, str):
             title=_short_text(item) or f'subtask {idx:03d}'; objective=str(item).strip() or title
-            subtasks.append({'id':f'subtask_{idx:03d}','title':title,'objective':objective,'success_criteria':None,'relevant_files':[],'dependencies':[],'expected_difficulty':'unknown','risk':'unknown','confidence':0.0})
+            subtasks.append({'id':unique_id(f'subtask_{idx:03d}', idx),'title':title,'objective':objective,'success_criteria':None,'relevant_files':[],'dependencies':[],'expected_difficulty':'unknown','risk':'unknown','confidence':0.0})
             notes.append('Converted string subtask to title/objective')
             continue
         if not isinstance(item, dict): continue
         src=dict(item)
         id_key, raw_id=_first_present(src, ('id','name','key','slug','task_id'))
-        sid=_slug(raw_id) if raw_id is not None else f'subtask_{idx:03d}'
-        if raw_id is None: notes.append(f'Generated deterministic subtask id {sid}')
         title_key, title=_first_present(src, ('title','name','summary','label'))
-        obj_key, objective=_first_present(src, ('objective','description','details','task','instruction','goal'))
+        obj_key, objective=_first_present(src, ('objective','description','details','task','instruction','goal','fix','action','work'))
         if not title:
-            title=_short_text(objective) or sid.replace('_',' ')
+            title=_short_text(objective) or f'subtask {idx:03d}'
             if obj_key == 'description': notes.append('Mapped subtask description to title/objective')
         if not objective: objective=title
+        if isinstance(raw_id, (int, float)) and not isinstance(raw_id, bool):
+            sid=unique_id(title if title_key else f'subtask_{idx:03d}', idx); notes.append(f'Normalized numeric subtask id to {sid}')
+        elif raw_id is not None:
+            sid=unique_id(str(raw_id), idx)
+        else:
+            sid=unique_id(f'subtask_{idx:03d}', idx); notes.append(f'Generated deterministic subtask id {sid}')
         sc_key, sc=_first_present(src, ('success_criteria','acceptance_criteria','validation','done_when'))
         files_key, files=_first_present(src, ('relevant_files','files','file_paths','paths','modules','affected_files','relevant_file_paths'))
         deps_key, deps=_first_present(src, ('dependencies','depends_on','prerequisites','blocked_by'))
@@ -241,7 +268,7 @@ def normalize_decomposition_payload(payload: dict[str, Any], *, task: str | None
         _, diff=_first_present(src, ('expected_difficulty','difficulty','complexity'))
         _, risk=_first_present(src, ('risk','risk_level','impact'))
         _, conf=_first_present(src, ('confidence','confidence_score','certainty'))
-        subtasks.append({'id':sid or f'subtask_{idx:03d}','title':str(title).strip(),'objective':str(objective).strip(),'success_criteria':_string_or_none(sc),'relevant_files':_as_list(files),'dependencies':_as_list(deps),'expected_difficulty':diff_map.get(str(diff).strip().lower(), 'unknown'),'risk':risk_map.get(str(risk).strip().lower(), 'unknown'),'confidence':_parse_confidence(conf)})
+        subtasks.append({'id':sid,'title':str(title).strip(),'objective':str(objective).strip(),'success_criteria':_string_or_none(sc),'relevant_files':_as_list(files),'dependencies':_as_list(deps),'expected_difficulty':diff_map.get(str(diff).strip().lower(), 'unknown'),'risk':risk_map.get(str(risk).strip().lower(), 'unknown'),'confidence':_parse_confidence(conf)})
     flag_key, flag=_first_present(data, ('should_use_decomposition','should_decompose','use_decomposition','decompose','requires_decomposition','needs_decomposition'))
     parsed=_parse_boolish(flag)
     if parsed is None:
@@ -249,6 +276,8 @@ def normalize_decomposition_payload(payload: dict[str, Any], *, task: str | None
         elif isinstance(plan, dict) and plan.get('should_decompose'): parsed=True; notes.append('Defaulted should_use_decomposition to true because plan requested decomposition')
         else: parsed=False
     reason_key, reason=_first_present(data, ('reason','rationale','decomposition_reason','why_decompose','summary','analysis'))
+    if reason is None and isinstance(data.get('decomposition'), str):
+        reason=data.get('decomposition'); notes.append('Mapped string decomposition to decomposition reason')
     reason=str(reason).strip() if reason is not None and str(reason).strip() else ''
     if not reason and subtasks:
         reason='Task was decomposed into separable subtasks.'; notes.append('Synthesized decomposition reason from subtasks')

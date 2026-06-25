@@ -48,7 +48,9 @@ class ConsoleProgressReporter(ProgressReporter):
                 if data.get("planner_repaired"): extra += ', repaired=true'
                 self._print(f'[{STEP[k]}] Plan complete: strategy={data.get("strategy")}, candidates={data.get("candidate_attempts") or data.get("candidates")}, decompose={str(bool(data.get("should_decompose"))).lower()}{extra}')
         elif k=='decompose':
-            if data.get('decomposition_fallback_used') or data.get('fallback_used') or data.get('planner_fallback_used'):
+            if data.get('decomposition_fallback_to_candidate_path'):
+                self._print(f'[{STEP[k]}] Decomposition fallback to candidate path: no executable subtasks produced')
+            elif data.get('decomposition_fallback_used') or data.get('fallback_used') or data.get('planner_fallback_used'):
                 self._print(f'[{STEP[k]}] Decomposition fallback used: reason={data.get("decomposition_fallback_reason") or data.get("planner_fallback_reason") or data.get("reason") or ""}')
             else:
                 extra=', normalized=true' if data.get('decomposition_normalized') or data.get('planner_normalized') else ''
