@@ -41,7 +41,7 @@ class EngineContext:
     classification:Any=None; investigation:Any=None; plan:Any=None; decomposition:Any=None; selection:Any=None; winner:dict|None=None; final_decision:Decision|None=None
     subtasks:list[dict]=field(default_factory=list); accepted_subtasks:list[dict]=field(default_factory=list); rejected_subtasks:list[dict]=field(default_factory=list)
     integration:dict[str,Any]=field(default_factory=dict); decomposed_active:bool=False
-    parallel_execution:dict[str,Any]=field(default_factory=dict); controller_step_lock:Any=field(default_factory=threading.Lock); state_lock:Any=field(default_factory=threading.Lock)
+    parallel_execution:dict[str,Any]=field(default_factory=dict); controller_step_lock:Any=field(default_factory=threading.Lock); state_lock:Any=field(default_factory=threading.RLock)
 
 def _now(): return datetime.now(timezone.utc).isoformat()
 def _candidate_prompt(task: Task, inv, n: int, total: int, decomposition=None) -> str:
@@ -364,19 +364,31 @@ class OrchestrationEngine:
         write_json_utf8(context.run_dir/'decomposition'/'parallel_execution.json', data)
 
     def _write_node_artifacts(self, context, node, inp=None, out=None, raw=None):
-        nd=context.run_dir/'nodes'/node.id; nd.mkdir(parents=True, exist_ok=True); node.artifacts['node_json']=str(nd/'node.json')
-        if node.artifacts.get('policy_decision'): write_json_utf8(nd/'policy_decision.json', context.routing_decisions.get(node.id,{}))
-        for name,obj in [('input',inp),('output',out)]:
-            if obj is not None: write_json_utf8(nd/f'{name}.json', obj); node.artifacts[name]=str(nd/f'{name}.json'); self.record_controller_step(context,node=node,action='artifact_written',status=node.status,summary=f'{name}.json')
-        if raw is not None: write_text_utf8(nd/'raw.txt', str(raw)); node.artifacts['raw']=str(nd/'raw.txt'); self.record_controller_step(context,node=node,action='artifact_written',status=node.status,summary='raw.txt')
-        write_json_utf8(nd/'node.json', node); context.graph.write(context.run_dir/'orchestration_graph.json')
+        lock=getattr(context, 'state_lock', None)
+        def write_all():
+            nd=context.run_dir/'nodes'/node.id; nd.mkdir(parents=True, exist_ok=True); node.artifacts['node_json']=str(nd/'node.json')
+            if node.artifacts.get('policy_decision'): write_json_utf8(nd/'policy_decision.json', context.routing_decisions.get(node.id,{}))
+            for name,obj in [('input',inp),('output',out)]:
+                if obj is not None: write_json_utf8(nd/f'{name}.json', obj); node.artifacts[name]=str(nd/f'{name}.json'); self.record_controller_step(context,node=node,action='artifact_written',status=node.status,summary=f'{name}.json')
+            if raw is not None: write_text_utf8(nd/'raw.txt', str(raw)); node.artifacts['raw']=str(nd/'raw.txt'); self.record_controller_step(context,node=node,action='artifact_written',status=node.status,summary='raw.txt')
+            write_json_utf8(nd/'node.json', node); context.graph.write(context.run_dir/'orchestration_graph.json')
+        if lock:
+            with lock: write_all()
+        else:
+            write_all()
 
     def _finish(self, context, node, result:NodeExecutionResult, data=None):
-        if result.status=='succeeded': context.graph.mark_succeeded(node.id, summary=result.result_summary, artifacts=result.artifacts, confidence=result.confidence, difficulty=result.difficulty, risk=result.risk)
-        elif result.status=='skipped': context.graph.mark_skipped(node.id, result.result_summary or result.error or 'skipped')
-        else: context.graph.mark_failed(node.id, result.error or result.result_summary or 'failed')
-        node.result=data or result.data; self._write_node_artifacts(context,node,out=data or result.model_dump(mode='json'))
-        self.record_controller_step(context,node=node,action=f'node_{result.status}',status=result.status,summary=result.result_summary or result.error)
+        lock=getattr(context, 'state_lock', None)
+        def mutate():
+            if result.status=='succeeded': context.graph.mark_succeeded(node.id, summary=result.result_summary, artifacts=result.artifacts, confidence=result.confidence, difficulty=result.difficulty, risk=result.risk)
+            elif result.status=='skipped': context.graph.mark_skipped(node.id, result.result_summary or result.error or 'skipped')
+            else: context.graph.mark_failed(node.id, result.error or result.result_summary or 'failed')
+            node.result=data or result.data; self._write_node_artifacts(context,node,out=data or result.model_dump(mode='json'))
+            self.record_controller_step(context,node=node,action=f'node_{result.status}',status=result.status,summary=result.result_summary or result.error)
+        if lock:
+            with lock: mutate()
+        else:
+            mutate()
         if result.status=='succeeded': self.progress_reporter.node_completed(node, data or result.data or {}, result.result_summary)
         elif result.status=='skipped': self.progress_reporter.node_skipped(node, result.result_summary or result.error or 'skipped')
         else: self.progress_reporter.node_failed(node, result.error or result.result_summary or 'failed')
@@ -439,7 +451,11 @@ class OrchestrationEngine:
         context.decomposition=dec; context.task_context.decomposition=dec.model_dump(mode='json'); self._write_node_artifacts(context,node,raw=(call.raw_text if call else ''))
         ddir=context.run_dir/'decomposition'; ddir.mkdir(parents=True, exist_ok=True)
         initial=validate_decomposition_plan(dec, task=context.task.objective or context.task.instruction, success_criteria=context.task.success_criteria, backends=self.backends)
-        semantic, sem_meta=semantic_validate_decomposition_plan(self.llm_client, dec, task=context.task.objective or context.task.instruction, success_criteria=context.task.success_criteria, deterministic=initial, backend=self.backends[node.assigned_backend])
+        
+        if initial.accepted:
+            semantic, sem_meta=semantic_validate_decomposition_plan(self.llm_client, dec, task=context.task.objective or context.task.instruction, success_criteria=context.task.success_criteria, deterministic=initial, backend=self.backends[node.assigned_backend])
+        else:
+            semantic, sem_meta=None, {'status':'skipped','reason':'deterministic validation failed','malformed':False}
         write_json_utf8(ddir/'plan_validation_initial.json', {'deterministic': initial.model_dump(mode='json'), 'semantic': semantic.model_dump(mode='json') if semantic else None, 'semantic_status': sem_meta})
         write_json_utf8(ddir/'plan_validation_semantic_initial.json', sem_meta | ({'result': semantic.model_dump(mode='json')} if semantic else {}))
         validation=semantic or initial
@@ -462,7 +478,7 @@ class OrchestrationEngine:
             else:
                 write_json_utf8(ddir/'plan_validation_revised.json', {'deterministic': None, 'semantic': None, 'semantic_status': {'status':'skipped','reason':'revision did not parse cleanly'}})
                 decision='decomposition_rejected_fallback_to_candidates'
-        write_json_utf8(ddir/'plan_validation_decision.json', {'decision':decision,'accepted':decision in {'decomposition_accepted','decomposition_revised_and_accepted'},'deterministic_accepted':initial.accepted,'semantic_available':semantic is not None,'required_revisions':validation.required_revisions, 'final_decision': 'accepted' if decision in {'decomposition_accepted','decomposition_revised_and_accepted'} else 'rejected'})
+        write_json_utf8(ddir/'plan_validation_decision.json', {'decision':decision,'accepted':decision in {'decomposition_accepted','decomposition_revised_and_accepted'},'deterministic_accepted':initial.accepted,'semantic_available':semantic is not None,'semantic_status':sem_meta,'deterministic_failures': initial.model_dump(mode='json') if not initial.accepted else None,'required_revisions':validation.required_revisions, 'final_decision': 'accepted' if decision in {'decomposition_accepted','decomposition_revised_and_accepted'} else 'rejected'})
         validation.accepted = decision in {'decomposition_accepted','decomposition_revised_and_accepted'}
         context.task_context.decomposition=dec.model_dump(mode='json') | {'plan_validation': validation.model_dump(mode='json'), 'plan_validation_decision': decision}
         usable=[s.model_dump(mode='json') for s in (dec.subtasks or []) if getattr(s,'id',None) and getattr(s,'objective',None)]
