@@ -1,12 +1,10 @@
-from __future__ import annotations
+from villani_ops.orchestration.progress import ProgressReporter, ConsoleProgressReporter, NullProgressReporter
 
-class RunProgressReporter:
-    def __init__(self, enabled: bool = True):
-        self.enabled = enabled
-    def info(self, message: str) -> None:
-        if self.enabled:
-            print(message, flush=True)
-    def warning(self, message: str) -> None:
-        self.info(f"Warning: {message}")
-    def step(self, message: str) -> None:
-        self.info(message)
+class RunProgressReporter(ConsoleProgressReporter):
+    def __init__(self, enabled: bool = True, verbose: bool = False):
+        self.enabled = enabled; self.verbose = verbose
+    def _print(self, msg: str = "") -> None:
+        if self.enabled: print(msg, flush=True)
+    def info(self, message: str) -> None: self._print(message)
+    def warning(self, message: str) -> None: self._print(f"Warning: {message}")
+    def step(self, message: str) -> None: self._print(message)

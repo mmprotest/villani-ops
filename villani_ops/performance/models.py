@@ -40,3 +40,4 @@ class SelectionResult(BaseModel):
     selector_backend: str | None = None
     selector_backend_details: dict[str, str] | None = None
     fallback_used: bool = False
+    fallback_reason: str | None = None

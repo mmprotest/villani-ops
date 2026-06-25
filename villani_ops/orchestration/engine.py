@@ -63,6 +63,7 @@ class OrchestrationEngine:
         run_id=datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')+'-'+secrets.token_hex(3); run_dir=self.storage.create_run_dir(run_id); self.storage.save_task(run_dir, task)
         graph=build_fixed_graph(candidate_attempts, runner=self.runner_adapter.name, run_id=run_id, mode=self.execution_policy.mode, classify=classify, include_decompose=True); graph.write(run_dir/'orchestration_graph.json')
         context=EngineContext(repo, task, candidate_attempts, timeout_seconds, isolation, run_id, run_dir, self.execution_policy.mode, self.runner_adapter.name, graph, GraphScheduler(), TaskContext(objective=task.objective or task.instruction or '', success_criteria=task.success_criteria), time.time())
+        self.progress_reporter.start_run(run_dir=str(run_dir), mode=context.mode, runner=context.runner, candidate_attempts=candidate_attempts)
         while not graph.is_terminal():
             ready_nodes=context.scheduler.next_ready_nodes(graph)
             if not ready_nodes:
@@ -114,9 +115,10 @@ class OrchestrationEngine:
         if node.kind not in dispatch: raise ValueError(f'Unknown orchestration node kind: {node.kind}')
         self.assign_backend_for_node(node=node, context=context)
         self.record_controller_step(context, node=node, action='node_started', status='running')
+        self.progress_reporter.node_started(node)
         try: return dispatch[node.kind](node, context)
         except Exception as e:
-            context.graph.mark_failed(node.id, str(e)); self._write_node_artifacts(context, node, out={'error':str(e)}); self.record_controller_step(context,node=node,action='node_failed',status='failed',summary=str(e)); return NodeExecutionResult(node_id=node.id,status='failed',error=str(e))
+            context.graph.mark_failed(node.id, str(e)); self._write_node_artifacts(context, node, out={'error':str(e)}); self.record_controller_step(context,node=node,action='node_failed',status='failed',summary=str(e)); self.progress_reporter.node_failed(node, str(e)); return NodeExecutionResult(node_id=node.id,status='failed',error=str(e))
 
     def _write_node_artifacts(self, context, node, inp=None, out=None, raw=None):
         nd=context.run_dir/'nodes'/node.id; nd.mkdir(parents=True, exist_ok=True); node.artifacts['node_json']=str(nd/'node.json')
@@ -132,6 +134,9 @@ class OrchestrationEngine:
         else: context.graph.mark_failed(node.id, result.error or result.result_summary or 'failed')
         node.result=data or result.data; self._write_node_artifacts(context,node,out=data or result.model_dump(mode='json'))
         self.record_controller_step(context,node=node,action=f'node_{result.status}',status=result.status,summary=result.result_summary or result.error)
+        if result.status=='succeeded': self.progress_reporter.node_completed(node, data or result.data or {}, result.result_summary)
+        elif result.status=='skipped': self.progress_reporter.node_skipped(node, result.result_summary or result.error or 'skipped')
+        else: self.progress_reporter.node_failed(node, result.error or result.result_summary or 'failed')
         return result
 
     def _execute_classify_node(self,node,context):
@@ -177,6 +182,7 @@ class OrchestrationEngine:
 
     def _execute_code_node(self,node,context):
         context.graph.mark_running(node.id); aid=node.id.replace('code_',''); idx=int(aid.split('_')[-1]); adir=context.run_dir/'attempts'/aid; adir.mkdir(parents=True,exist_ok=True); b=self.backends[node.assigned_backend]
+        self.progress_reporter.candidate_started(aid, idx, context.candidate_attempts, b.name)
         prompt=_candidate_prompt(context.task,context.investigation,idx,context.candidate_attempts); meta={'attempt_id':aid,'backend_name':b.name,'model':b.model,'runner_name':context.runner,'status':'running','started_at':_now()}; self._write_node_artifacts(context,node,inp={'prompt':prompt})
         try:
             if context.isolation!='worktree': raise ValueError('Only worktree isolation is supported')
@@ -190,10 +196,11 @@ class OrchestrationEngine:
         except Exception as e:
             meta.update({'status':'failed','exit_code':meta.get('exit_code',1),'error':str(e),'changed_files':[],'patch_path':None}); (adir/'stderr.txt').write_text(str(e)); status='failed'
         (adir/'attempt.json').write_text(json.dumps(meta,indent=2)); node.result=meta
+        self.progress_reporter.candidate_completed(aid, idx, context.candidate_attempts, meta)
         return self._finish(context,node,NodeExecutionResult(node_id=node.id,status=status,result_summary=meta.get('error') or f'Candidate {aid} completed',artifacts={'attempt':str(adir/'attempt.json'),'patch':str(meta.get('patch_path') or '')},data=meta,error=meta.get('error')),meta)
 
     def _execute_review_node(self,node,context):
-        context.graph.mark_running(node.id); aid=node.id.replace('review_',''); cn=context.graph.get(f'code_{aid}'); meta=dict(cn.result or {}); adir=context.run_dir/'attempts'/aid; rb=self.backends[node.assigned_backend]
+        context.graph.mark_running(node.id); aid=node.id.replace('review_',''); idx=int(aid.split('_')[-1]); self.progress_reporter.review_started(aid, idx, context.candidate_attempts); cn=context.graph.get(f'code_{aid}'); meta=dict(cn.result or {}); adir=context.run_dir/'attempts'/aid; rb=self.backends[node.assigned_backend]
         review_input={k:meta.get(k) for k in ['attempt_id','exit_code','stdout_path','stderr_path','changed_files','git_status','runner_telemetry']}; review_input.update({'stdout_summary':_tail(meta.get('stdout_path'),4000),'stderr_summary':_tail(meta.get('stderr_path'),4000),'patch':_patch_text(meta.get('patch_path'),50000),'investigation':context.task_context.investigation}); self._write_node_artifacts(context,node,inp=review_input)
         try:
             try:
@@ -209,19 +216,28 @@ class OrchestrationEngine:
         meta['acceptance_eligible']=eligible; meta['acceptance_blockers']=blockers
         summary=CandidateSummary(attempt_id=aid,backend_name=meta.get('backend_name'),model=meta.get('model'),status=meta['status'],exit_code=meta.get('exit_code'),changed_files=meta.get('changed_files') or [],patch_path=meta.get('patch_path'),review_decision=review.decision,review_score=review.score,review_recommended_action=review.recommended_action,review_summary=review.summary,review_issues=review.issues,acceptance_eligible=eligible,acceptance_blockers=blockers,telemetry=meta.get('runner_telemetry') or {})
         meta['candidate_summary']=summary.model_dump(mode='json'); (adir/'attempt.json').write_text(json.dumps(meta,indent=2)); context.attempts.append(meta)
+        self.progress_reporter.review_completed(aid, idx, context.candidate_attempts, {**review.model_dump(mode='json'), 'acceptance_eligible': eligible})
         data={'has_review_blocker': review.decision!='pass' or review.recommended_action!='accept','has_acceptance_blocker': bool(blockers),'acceptance_blockers':blockers, **review.model_dump(mode='json')}
         return self._finish(context,node,NodeExecutionResult(node_id=node.id,status='succeeded',result_summary=review.summary,confidence=review.score or 0.0,artifacts={'review':str(adir/'review.json'),'attempt':str(adir/'attempt.json')},data=data),data)
 
     def _execute_select_node(self,node,context):
-        context.graph.mark_running(node.id); candidates=[_selector_candidate_payload(a) for a in context.attempts]; self._write_node_artifacts(context,node,inp={'candidates':candidates})
+        context.graph.mark_running(node.id); self.progress_reporter.selector_started(); candidates=[_selector_candidate_payload(a) for a in context.attempts]; self._write_node_artifacts(context,node,inp={'candidates':candidates})
 
         try:
-            selection,call=Selector().select(context.task,context.investigation,candidates,node.assigned_backend,self.backends[node.assigned_backend],context.run_dir,estimate_cost=(context.mode!='performance'))
+            selector_result=Selector().select(context.task,context.investigation,candidates,node.assigned_backend,self.backends[node.assigned_backend],context.run_dir,estimate_cost=(context.mode!='performance'))
         except TypeError:
-            selection,call=Selector().select(context.task,context.investigation,candidates,node.assigned_backend,self.backends[node.assigned_backend],context.run_dir)
-        eligible_ids={a['attempt_id'] for a in context.attempts if a.get('acceptance_eligible')}; fallback=False
+            selector_result=Selector().select(context.task,context.investigation,candidates,node.assigned_backend,self.backends[node.assigned_backend],context.run_dir)
+        if len(selector_result) == 2:
+            selection,call=selector_result; normalization_notes=[]
+        else:
+            selection,call,normalization_notes=selector_result
+        eligible_ids={a['attempt_id'] for a in context.attempts if a.get('acceptance_eligible')}
+        fallback=selection.fallback_used
         if selection.decision=='select' and selection.selected_attempt_id not in eligible_ids:
-            selection=deterministic_fallback(candidates); selection.selector_backend=node.assigned_backend; (context.run_dir/'selection.json').write_text(selection.model_dump_json(indent=2)); fallback=True; self.record_controller_step(context,node=node,action='selector_fallback_used',status='fallback',summary=selection.summary)
+            selection=deterministic_fallback(candidates, f'Selector selected invalid or ineligible candidate {selection.selected_attempt_id}.'); selection.selector_backend=node.assigned_backend; (context.run_dir/'selection.json').write_text(selection.model_dump_json(indent=2)); fallback=True
+        for note in (normalization_notes or []): self.record_controller_step(context,node=node,action='selector_normalized',status='normalized',summary=note)
+        if fallback: self.record_controller_step(context,node=node,action='selector_fallback_used',status='fallback',summary=selection.fallback_reason or selection.summary); self.progress_reporter.fallback_used(selection.fallback_reason or selection.summary, selection.selected_attempt_id)
+        self.progress_reporter.selector_completed(selection, normalization_notes)
         context.selection=selection; context.winner=next((a for a in context.attempts if a.get('attempt_id')==selection.selected_attempt_id and a.get('acceptance_eligible')),None) if selection.decision=='select' else None
         raw=Path(context.run_dir/'selection.raw.txt').read_text(errors='replace') if (context.run_dir/'selection.raw.txt').exists() else ''
         self._write_node_artifacts(context,node,raw=raw)
@@ -230,8 +246,10 @@ class OrchestrationEngine:
 
     def _execute_verify_node(self,node,context):
         context.graph.mark_running(node.id); accepted=bool(context.winner); data={'accepted':accepted,'winner':context.winner.get('attempt_id') if context.winner else None}; self._write_node_artifacts(context,node,inp={'selection':context.selection.model_dump(mode='json') if context.selection else None})
-        self.record_controller_step(context,node=node,action='final_decision_accepted' if accepted else 'final_decision_failed',status='accepted' if accepted else 'failed',summary=data['winner'] or 'No eligible selected candidate')
-        return self._finish(context,node,NodeExecutionResult(node_id=node.id,status='succeeded',result_summary='Accepted selected candidate.' if accepted else 'No eligible selected candidate.',artifacts={'verification':str(context.run_dir/'nodes'/node.id/'output.json')},data=data),data)
+        reason=self._failure_reason(context) if not accepted else 'Accepted selected candidate.'
+        self.record_controller_step(context,node=node,action='final_decision_accepted' if accepted else 'final_decision_failed',status='accepted' if accepted else 'failed',summary=data['winner'] or reason)
+        self.progress_reporter.final_decision(accepted, data['winner'], reason)
+        return self._finish(context,node,NodeExecutionResult(node_id=node.id,status='succeeded',result_summary='Accepted selected candidate.' if accepted else reason,artifacts={'verification':str(context.run_dir/'nodes'/node.id/'output.json')},data=data),data)
 
     def _compact_controller_steps(self, context):
         p=context.run_dir/'controller_steps.jsonl'
@@ -245,10 +263,19 @@ class OrchestrationEngine:
             steps.append(compact)
         return steps
 
+
+    def _failure_reason(self, context):
+        eligible=[a.get('attempt_id') for a in context.attempts if a.get('acceptance_eligible')]
+        sel=context.selection
+        if not eligible: return 'No candidate passed acceptance gates.'
+        if sel and sel.decision=='reject_all' and (sel.summary or sel.reasons): return f'Selector intentionally rejected all candidates despite eligibility: {sel.summary or "; ".join(sel.reasons)}'
+        if sel and sel.fallback_used and not sel.selected_attempt_id: return 'Eligible candidates existed, but selector did not return a valid eligible selected_attempt_id and fallback could not select a winner.'
+        return 'Eligible candidates existed, but selector did not return a valid eligible selected_attempt_id and fallback could not select a winner.'
+
     def _finalize(self, context):
         accepted=bool(context.winner); apply_opts={}
         if accepted: apply_opts={'apply_command':f'villani-ops apply {context.run_id}','branch_command':f'villani-ops branch {context.run_id} --name villani-ops/{context.run_id}','pr_command':f'villani-ops pr {context.run_id} --title "{(context.task.objective or "Villani Ops changes")[:60]}"'}
-        decision=Decision(run_id=context.run_id, mode=context.mode, runner=context.runner, orchestration_graph_path=str(context.run_dir/'orchestration_graph.json'), node_backend_assignments={n.id:n.assigned_backend for n in context.graph.nodes if n.assigned_backend}, plan=context.task_context.plan, decomposition=context.task_context.decomposition, performance_backend_name=(next((n.assigned_backend for n in context.graph.nodes if n.assigned_backend),None) if context.mode=='performance' else None), performance_backend_model=(next((n.assigned_model for n in context.graph.nodes if n.assigned_model),None) if context.mode=='performance' else None), accepted=accepted, lifecycle_completed=True, final_state='accepted' if accepted else 'failed', final_action='accept' if accepted else 'fail', winning_attempt_id=context.winner.get('attempt_id') if context.winner else None, winning_worktree_path=context.winner.get('worktree_path') if context.winner else None, winning_patch_path=context.winner.get('patch_path') if context.winner else None, reviewer_decision=(context.winner.get('review') or {}).get('decision') if context.winner else None, reviewer_score=(context.winner.get('review') or {}).get('score') if context.winner else None, classification=context.task_context.classification, investigation=context.task_context.investigation, selection=context.selection.model_dump(mode='json') if context.selection else None, selected_attempt_id=context.selection.selected_attempt_id if accepted and context.selection else None, candidate_attempts_requested=context.candidate_attempts, candidate_attempts_completed=len(context.attempts), eligible_candidate_attempts=[a['attempt_id'] for a in context.attempts if a.get('acceptance_eligible')], orchestration_summary=json.dumps(context.graph.summary()), total_cost=0 if context.mode=='performance' else sum(context.costs.values()), coding_cost=0 if context.mode=='performance' else context.costs['coding'], classification_cost=0 if context.mode=='performance' else context.costs['classification'], review_cost=0 if context.mode=='performance' else context.costs['review'], total_input_tokens=context.input_tokens, total_output_tokens=context.output_tokens, total_coding_input_tokens=sum(a.get('input_tokens') or 0 for a in context.attempts), total_coding_output_tokens=sum(a.get('output_tokens') or 0 for a in context.attempts), token_accounting_statuses=dict(Counter(a.get('token_accounting_status') or 'missing' for a in context.attempts)), attempts=context.attempts, warnings=context.warnings, apply_options=apply_opts, controller_steps=self._compact_controller_steps(context), controller_steps_path='controller_steps.jsonl', acceptance_blockers=[] if accepted else [b for a in context.attempts for b in (a.get('acceptance_blockers') or [])], attempts_used=len(context.attempts), all_attempted_backends=[a.get('backend_name') for a in context.attempts], failure_reason='' if accepted else (context.selection.summary if context.selection else 'No selection'), reason='Selected eligible candidate.' if accepted else 'No eligible candidate selected.', total_attempts=len(context.attempts))
+        decision=Decision(run_id=context.run_id, mode=context.mode, runner=context.runner, orchestration_graph_path=str(context.run_dir/'orchestration_graph.json'), node_backend_assignments={n.id:n.assigned_backend for n in context.graph.nodes if n.assigned_backend}, plan=context.task_context.plan, decomposition=context.task_context.decomposition, performance_backend_name=(next((n.assigned_backend for n in context.graph.nodes if n.assigned_backend),None) if context.mode=='performance' else None), performance_backend_model=(next((n.assigned_model for n in context.graph.nodes if n.assigned_model),None) if context.mode=='performance' else None), accepted=accepted, lifecycle_completed=True, final_state='accepted' if accepted else 'failed', final_action='accept' if accepted else 'fail', winning_attempt_id=context.winner.get('attempt_id') if context.winner else None, winning_worktree_path=context.winner.get('worktree_path') if context.winner else None, winning_patch_path=context.winner.get('patch_path') if context.winner else None, reviewer_decision=(context.winner.get('review') or {}).get('decision') if context.winner else None, reviewer_score=(context.winner.get('review') or {}).get('score') if context.winner else None, classification=context.task_context.classification, investigation=context.task_context.investigation, selection=context.selection.model_dump(mode='json') if context.selection else None, selected_attempt_id=context.selection.selected_attempt_id if accepted and context.selection else None, candidate_attempts_requested=context.candidate_attempts, candidate_attempts_completed=len(context.attempts), eligible_candidate_attempts=[a['attempt_id'] for a in context.attempts if a.get('acceptance_eligible')], orchestration_summary=json.dumps(context.graph.summary()), total_cost=0 if context.mode=='performance' else sum(context.costs.values()), coding_cost=0 if context.mode=='performance' else context.costs['coding'], classification_cost=0 if context.mode=='performance' else context.costs['classification'], review_cost=0 if context.mode=='performance' else context.costs['review'], total_input_tokens=context.input_tokens, total_output_tokens=context.output_tokens, total_coding_input_tokens=sum(a.get('input_tokens') or 0 for a in context.attempts), total_coding_output_tokens=sum(a.get('output_tokens') or 0 for a in context.attempts), token_accounting_statuses=dict(Counter(a.get('token_accounting_status') or 'missing' for a in context.attempts)), attempts=context.attempts, warnings=context.warnings, apply_options=apply_opts, controller_steps=self._compact_controller_steps(context), controller_steps_path='controller_steps.jsonl', acceptance_blockers=[] if accepted else [b for a in context.attempts for b in (a.get('acceptance_blockers') or [])], attempts_used=len(context.attempts), all_attempted_backends=[a.get('backend_name') for a in context.attempts], failure_reason='' if accepted else self._failure_reason(context), reason='Selected eligible candidate.' if accepted else self._failure_reason(context), total_attempts=len(context.attempts))
         write_json(context.run_dir/'decision.json', decision.model_dump(mode='json')); context.final_decision=decision; return decision
 
     def record_controller_step(self, context, *, node=None, action:str, status:str, summary:str|None=None, details:dict|None=None):
