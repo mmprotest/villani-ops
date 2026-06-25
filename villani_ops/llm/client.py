@@ -29,7 +29,7 @@ class LLMCallResult(BaseModel):
     max_tokens: int | None = None
 
 class LLMClient:
-    def complete_json(self, backend: Backend, system_prompt: str, user_prompt: str, schema_name: str, timeout_seconds: int | None = None) -> LLMCallResult:
+    def complete_json(self, backend: Backend, system_prompt: str, user_prompt: str, schema_name: str, timeout_seconds: int | None = None, estimate_cost: bool = True) -> LLMCallResult:
         if backend.provider not in {"openai-compatible","local","custom"}:
             raise ValueError(f"Backend provider '{backend.provider}' cannot be used for JSON LLM calls")
         if not backend.base_url:
@@ -48,7 +48,7 @@ class LLMClient:
             raw=msg.get("content", "") or ""
             reasoning=msg.get("reasoning_content")
             usage=data.get("usage") or {}; inp=int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0); out=int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
-            base=dict(parsed_json={}, raw_text=raw, input_tokens=inp, output_tokens=out, estimated_cost=backend.estimate_cost(inp,out), backend_name=backend.name, model=backend.model, url=url, http_status=getattr(r, "status_code", None), finish_reason=choice.get("finish_reason"), usage=usage, raw_response=data, reasoning_content=reasoning, max_tokens=payload.get("max_tokens"))
+            base=dict(parsed_json={}, raw_text=raw, input_tokens=inp, output_tokens=out, estimated_cost=(backend.estimate_cost(inp,out) if estimate_cost else 0.0), backend_name=backend.name, model=backend.model, url=url, http_status=getattr(r, "status_code", None), finish_reason=choice.get("finish_reason"), usage=usage, raw_response=data, reasoning_content=reasoning, max_tokens=payload.get("max_tokens"))
             try:
                 parsed=extract_json(raw)
             except Exception as pe:

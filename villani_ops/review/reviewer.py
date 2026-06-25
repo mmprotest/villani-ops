@@ -87,10 +87,14 @@ def normalize_review_payload(raw: dict) -> dict:
 
 class LLMReviewer:
     def __init__(self, client: LLMClient|None=None): self.client=client or LLMClient()
-    def review(self, task: Task, classification: TaskClassification|None, coding_backend: Backend, attempt: dict[str,Any], backends: dict[str, Backend], out_path: str|Path|None=None, backend_override: Backend|None=None) -> tuple[ReviewResult, LLMCallResult]:
+    def review(self, task: Task, classification: TaskClassification|None, coding_backend: Backend, attempt: dict[str,Any], backends: dict[str, Backend], out_path: str|Path|None=None, backend_override: Backend|None=None, estimate_cost: bool=True) -> tuple[ReviewResult, LLMCallResult]:
         backend=backend_override or select_backend(backends,'review')
         ctx={"task":task.model_dump(mode='json'),"classification":classification.model_dump(mode='json') if classification else None,"coding_backend":coding_backend.redacted_dict(),"attempt":attempt}
-        result=self.client.complete_json(backend, SYSTEM, USER.format(context=json.dumps(ctx, indent=2)[:60000]), 'ReviewResult')
+
+        try:
+            result=self.client.complete_json(backend, SYSTEM, USER.format(context=json.dumps(ctx, indent=2)[:60000]), 'ReviewResult', estimate_cost=estimate_cost)
+        except TypeError:
+            result=self.client.complete_json(backend, SYSTEM, USER.format(context=json.dumps(ctx, indent=2)[:60000]), 'ReviewResult')
         normalized=normalize_review_payload(result.parsed_json)
         try:
             review=ReviewResult.model_validate(normalized)

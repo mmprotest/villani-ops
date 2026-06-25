@@ -7,9 +7,9 @@ The main command is `villani-ops run`.
 ## Execution modes
 
 - `performance`: use the most capable enabled backend for every node.
-- `cheap`: use the same orchestration engine, but route easy/low-risk work to smaller backends when confidence is high.
-- `balanced`: conservative cost-aware routing with stronger escalation.
-- `quality`: near-performance mode with limited routing for clearly safe subtasks.
+- `cheap`: same orchestration engine, aggressive routing to smaller backends for easy low-risk work.
+- `balanced`: same engine, conservative cost-aware routing.
+- `quality`: same engine, near-performance mode with limited routing for clearly safe subtasks.
 
 ```bash
 villani-ops run --mode performance
@@ -37,11 +37,11 @@ villani-ops run \
 
 A run creates and updates a real orchestration graph with classification (optional), investigation, planning, advisory decomposition when requested, candidate coding nodes, candidate review nodes, selection, verification, and reporting. Graph nodes record status, timing, backend assignment, model assignment, risk/difficulty/confidence signals, summaries, and artifact paths.
 
-Only the `villani-code` runner is implemented today. `claude-code`, `pi`, `aider`, and `codex` are registered adapter stubs and fail clearly as unsupported for execution.
+Villani Code is the default runner. Future runners should be added through `RunnerAdapter`. Claude Code, Pi, Aider, and Codex are stubs unless implemented.
 
 ## Legacy compatibility
 
-`villani-ops cost-run` is a legacy compatibility command for the previous cost-policy runner. New work should use `villani-ops run --mode cheap|balanced|quality`.
+`villani-ops cost-run` is a legacy compatibility command for the previous cost-policy runner. New work should use `villani-ops run --mode cheap|balanced|quality`. Do not present `cost-run` as the main cost optimisation path.
 
 ## Core commands
 

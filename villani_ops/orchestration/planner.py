@@ -62,7 +62,7 @@ class Planner:
     def plan(self, *, task, classification, investigation, repo_summary: str|None, candidate_attempts: int, mode: str, backend_name: str, backend: Backend, run_dir: Path) -> tuple[PlanResult, LLMCallResult|None]:
         ctx={'task':task.model_dump(mode='json'),'classification':classification,'investigation':investigation,'repo_summary':repo_summary,'candidate_attempts':candidate_attempts,'mode':mode}
         try:
-            call=self.client.complete_json(backend, 'Return JSON matching PlanResult.', json.dumps(ctx, indent=2)[:80000], 'PlanResult')
+            call=self.client.complete_json(backend, 'Return JSON matching PlanResult.', json.dumps(ctx, indent=2)[:80000], 'PlanResult', estimate_cost=(mode != 'performance'))
             plan=PlanResult.model_validate(call.parsed_json)
             plan.candidate_attempts=max(1, min(8, int(plan.candidate_attempts or candidate_attempts)))
         except Exception as e:
@@ -70,10 +70,10 @@ class Planner:
             plan=PlanResult(summary=f'Planner fallback used: {e}', strategy='parallel_candidates', should_decompose=False, candidate_attempts=candidate_attempts, expected_difficulty='unknown', confidence=0.0, fallback_used=True)
         (run_dir/'plan.json').write_text(plan.model_dump_json(indent=2)); (run_dir/'plan.raw.txt').write_text((call.raw_text if call else '') or '')
         return plan, call if 'call' in locals() else None
-    def decompose(self, *, task, plan: PlanResult, investigation, backend: Backend, run_dir: Path) -> tuple[DecompositionResult, LLMCallResult|None]:
+    def decompose(self, *, task, plan: PlanResult, investigation, backend: Backend, run_dir: Path, estimate_cost: bool = True) -> tuple[DecompositionResult, LLMCallResult|None]:
         ctx={'task':task.model_dump(mode='json'),'plan':plan.model_dump(mode='json'),'investigation':investigation}
         try:
-            call=self.client.complete_json(backend, 'Return JSON matching DecompositionResult. Decomposition is advisory only.', json.dumps(ctx, indent=2)[:80000], 'DecompositionResult')
+            call=self.client.complete_json(backend, 'Return JSON matching DecompositionResult. Decomposition is advisory only.', json.dumps(ctx, indent=2)[:80000], 'DecompositionResult', estimate_cost=estimate_cost)
             dec=DecompositionResult.model_validate(call.parsed_json)
             dec.advisory_only=True
         except Exception as e:
