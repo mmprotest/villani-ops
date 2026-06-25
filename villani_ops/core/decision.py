@@ -80,6 +80,7 @@ class Decision(BaseModel):
     integration_scope_analysis: dict[str, Any] | None = None
     integration_repair_used: bool = False
     final_review: dict[str, Any] | None = None
+    parallel_execution: dict[str, Any] | None = None
 
 # Backward-compatible helper with the P0 acceptance guard.
 def select_attempt(run_id, attempts, selection=None, warnings=None):

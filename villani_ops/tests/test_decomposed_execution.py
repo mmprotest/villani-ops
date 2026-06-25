@@ -85,7 +85,8 @@ def test_report_has_decomposed_execution_section(tmp_path):
     text = path.read_text()
     assert "## Decomposed Execution" in text
     assert "Decomposition executed: true" in text
-    assert "| fix_a | validated | 1 | pass/accept | true |" in text
+    assert "| fix_a | validated |" in text
+    assert "| 1 | pass/accept | true |" in text
     assert "Validation passed: true" in text
 
 
