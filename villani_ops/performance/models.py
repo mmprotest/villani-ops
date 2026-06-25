@@ -4,10 +4,12 @@ from pydantic import BaseModel, Field
 
 
 class ValidationCommand(BaseModel):
-    cmd: str
+    cmd: str | None = None
+    argv: list[str] | None = None
     required: bool = True
     reason: str | None = None
     timeout_seconds: int | None = None
+    shell: bool = False
 
 class ValidationPlan(BaseModel):
     commands: list[ValidationCommand] = Field(default_factory=list)

@@ -402,7 +402,7 @@ def semantic_validate_decomposition_plan(client: LLMClient, dec: DecompositionRe
     except Exception as e:
         return None, {'status': 'failed', 'reason': str(e), 'malformed': True}
 
-def revise_decomposition_plan(dec: DecompositionResult, validation: DecompositionPlanValidationResult) -> DecompositionResult:
+def repair_decomposition_plan_schema(dec: DecompositionResult, validation: DecompositionPlanValidationResult) -> DecompositionResult:
     fixed=dec.model_copy(deep=True)
     ids=set(); unique=[]
     for st in fixed.subtasks:
@@ -413,6 +413,35 @@ def revise_decomposition_plan(dec: DecompositionResult, validation: Decompositio
         unique.append(st)
     fixed.subtasks=unique
     return fixed
+
+
+def _validation_failure_payload(validation: DecompositionPlanValidationResult) -> dict[str, Any]:
+    data=validation.model_dump(mode='json')
+    return {k:v for k,v in data.items() if isinstance(v, dict) and not v.get('passed', True)} | {'required_revisions': validation.required_revisions}
+
+def revise_decomposition_with_feedback(*, task: str | None, success_criteria: list[str] | str | None, original_plan: DecompositionResult, validation_result: DecompositionPlanValidationResult, backend_registry: dict[str, Backend] | None = None, policy_context: dict[str, Any] | None = None, client: LLMClient | None = None, backend: Backend | None = None) -> tuple[DecompositionResult | None, dict[str, Any]]:
+    """Structured reviser: use validation failures to ask an LLM/stub for a corrected decomposition.
+
+    Schema-only repair remains a guardrail after parsing; malformed or missing reviser output is returned
+    as a non-clean parse so callers can fall back safely instead of activating decomposition silently.
+    """
+    criteria = success_criteria if isinstance(success_criteria, list) else _as_list(success_criteria)
+    request={'original_task': task or '', 'success_criteria': criteria, 'validation_failures': _validation_failure_payload(validation_result), 'required_revisions': validation_result.required_revisions, 'original_plan': original_plan.model_dump(mode='json'), 'policy_context': policy_context or {}, 'available_backends': {n:{'roles':getattr(b,'roles',[]),'max_parallel':getattr(b,'max_parallel',1)} for n,b in (backend_registry or {}).items()}}
+    if client is None or backend is None:
+        repaired=repair_decomposition_plan_schema(original_plan, validation_result)
+        return repaired, {'parsed_cleanly': True, 'source': 'schema_guardrail', 'revision_request': request, 'raw_text': ''}
+    try:
+        prompt=json.dumps(request, indent=2)[:80000]
+        call=client.complete_json(backend, 'Return only corrected DecompositionResult JSON. Use the validation_failures and required_revisions explicitly; do not merely normalize schema.', prompt, 'DecompositionResult')
+        payload=call.parsed_json if isinstance(call.parsed_json, dict) else json.loads(call.raw_text or '{}')
+        revised=DecompositionResult.model_validate(payload)
+        revised=repair_decomposition_plan_schema(revised, validation_result)
+        return revised, {'parsed_cleanly': True, 'source': 'structured_reviser', 'revision_request': request, 'raw_text': getattr(call,'raw_text',''), 'revised_decomposition': revised.model_dump(mode='json')}
+    except Exception as e:
+        return None, {'parsed_cleanly': False, 'source': 'structured_reviser', 'revision_request': request, 'error': str(e), 'raw_text': getattr(locals().get('call', None), 'raw_text', '')}
+
+def revise_decomposition_plan(dec: DecompositionResult, validation: DecompositionPlanValidationResult) -> DecompositionResult:
+    return repair_decomposition_plan_schema(dec, validation)
 
 def _parse_plan_payload_from_call(call: LLMCallResult) -> dict[str, Any]:
     if isinstance(call.parsed_json, dict) and call.parsed_json:
