@@ -2,7 +2,7 @@ from __future__ import annotations
 from typing import Any, Literal
 from pydantic import BaseModel, Field
 
-NodeKind = Literal['classify','investigate','plan','decompose','code','test','review','select','merge','verify']
+NodeKind = Literal['classify','investigate','plan','decompose','code','test','review','select','merge','verify','integrate','integration_validate','integration_repair','final_review']
 NodeStatus = Literal['pending','ready','running','succeeded','failed','skipped']
 Difficulty = Literal['easy','medium','hard','unknown']
 Risk = Literal['low','medium','high','unknown']

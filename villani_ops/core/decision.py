@@ -66,6 +66,17 @@ class Decision(BaseModel):
     reason: str = ''
     total_attempts: int = 0
     discarded_attempts: list[dict] = Field(default_factory=list)
+    decomposition_executed: bool = False
+    decomposition_advisory_only: bool = False
+    subtask_count: int = 0
+    subtasks_executed: list[str] = Field(default_factory=list)
+    subtasks_accepted: list[str] = Field(default_factory=list)
+    subtasks_rejected: list[str] = Field(default_factory=list)
+    integration_worktree_path: str | None = None
+    integration_patch_path: str | None = None
+    integration_validation: dict[str, Any] | None = None
+    integration_repair_used: bool = False
+    final_review: dict[str, Any] | None = None
 
 # Backward-compatible helper with the P0 acceptance guard.
 def select_attempt(run_id, attempts, selection=None, warnings=None):
