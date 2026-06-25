@@ -1,5 +1,6 @@
 from __future__ import annotations
 from typing import Any
+from villani_ops.core.acceptance import has_non_empty_patch
 
 STEP = {"classify":"1/8","investigate":"2/8","plan":"3/8","decompose":"4/8","code":"5/8","review":"6/8","select":"7/8","verify":"8/8"}
 
@@ -34,20 +35,25 @@ class ConsoleProgressReporter(ProgressReporter):
     def node_completed(self, node: Any, data: Any = None, summary: str | None = None) -> None:
         data=data or {}; k=node.kind
         if k=='classify': self._print(f'[{STEP[k]}] Classification complete: {data.get("category") or data.get("task_type") or "unknown"}, difficulty={data.get("difficulty")}, confidence={data.get("confidence","")}')
-        elif k=='investigate': self._print(f'[{STEP[k]}] Investigation complete: {len(data.get("relevant_files") or [])} relevant files, confidence={data.get("confidence","")}')
-        elif k=='plan': self._print(f'[{STEP[k]}] Plan complete: strategy={data.get("strategy")}, candidates={data.get("candidate_attempts") or data.get("candidates")}, decompose={data.get("should_decompose")}')
+        elif k=='investigate':
+            if data.get("investigation_fallback_used"): self._print(f'[{STEP[k]}] Investigation fallback used: reason={data.get("investigation_fallback_reason") or ""}')
+            else: self._print(f'[{STEP[k]}] Investigation complete: relevant_files={len(data.get("relevant_files") or [])}, confidence={data.get("confidence","")}, normalized={str(bool(data.get("investigation_normalized"))).lower()}')
+        elif k=='plan':
+            if data.get("planner_fallback_used") or data.get("fallback_used"): self._print(f'[{STEP[k]}] Plan complete using fallback: strategy={data.get("strategy")}, candidates={data.get("candidate_attempts") or data.get("candidates")}, reason={data.get("planner_fallback_reason") or ""}')
+            else: self._print(f'[{STEP[k]}] Plan complete: strategy={data.get("strategy")}, candidates={data.get("candidate_attempts") or data.get("candidates")}, decompose={str(bool(data.get("should_decompose"))).lower()}, normalized={str(bool(data.get("planner_normalized"))).lower()}')
         elif k=='decompose': self._print(f'[{STEP[k]}] Decomposition complete: subtask_count={len(data.get("subtasks") or [])}')
     def node_skipped(self, node: Any, reason: str) -> None:
         if node.kind=='decompose': self._print(f'[{STEP[node.kind]}] Decomposition skipped: {reason}')
     def node_failed(self, node: Any, error: str) -> None: self._print(f'[{STEP.get(node.kind,"?")}] {node.kind} failed: {error}')
     def candidate_started(self, attempt_id: str, index: int, total: int, backend: str | None = None) -> None: self._print(f'[{STEP["code"]}] Running candidate attempt {index}/{total}' + (f' with {backend}' if backend else '') + '...')
-    def candidate_completed(self, attempt_id: str, index: int, total: int, data: dict) -> None: self._print(f'[{STEP["code"]}] Candidate attempt {index} complete: exit={data.get("exit_code")}, changed_files={len(data.get("changed_files") or [])}, patch={"yes" if data.get("patch_path") else "no"}')
+    def candidate_completed(self, attempt_id: str, index: int, total: int, data: dict) -> None: self._print(f'[{STEP["code"]}] Candidate attempt {index} complete: exit={data.get("exit_code")}, changed_files={len(data.get("changed_files") or [])}, patch={"yes" if has_non_empty_patch(data.get("patch_path")) else "no"}')
     def review_started(self, attempt_id: str, index: int, total: int) -> None: self._print(f'[{STEP["review"]}] Reviewing candidate attempt {index}/{total}...')
     def review_completed(self, attempt_id: str, index: int, total: int, data: dict) -> None: self._print(f'[{STEP["review"]}] Review complete: {data.get("decision")}/{data.get("recommended_action")}, score={data.get("score")}, eligible={data.get("acceptance_eligible")}')
     def selector_started(self) -> None: self._print(f'[{STEP["select"]}] Selecting winner...')
     def selector_completed(self, selection: Any, notes: list[str] | None = None) -> None:
         for n in notes or []: self._print(f'[{STEP["select"]}] Selector output used alias/normalization: {n}')
+        if getattr(selection,'selector_reason_synthesized',False): self._print(f'[{STEP["select"]}] Selector reason synthesized from candidate evidence')
         if getattr(selection,'decision',None)=='select': self._print(f'[{STEP["select"]}] Selector chose {selection.selected_attempt_id}')
         else: self._print(f'[{STEP["select"]}] Selector rejected all candidates')
-    def fallback_used(self, reason: str, selected_attempt_id: str | None) -> None: self._print(f'[{STEP["select"]}] Selector returned invalid winner; deterministic fallback selected {selected_attempt_id}: {reason}')
+    def fallback_used(self, reason: str, selected_attempt_id: str | None) -> None: self._print(f'[{STEP["select"]}] Selector fallback selected {selected_attempt_id}: {reason}')
     def final_decision(self, accepted: bool, winner: str | None = None, reason: str | None = None) -> None: self._print(f'[{STEP["verify"]}] Final decision: {"accepted" if accepted else "failed"}' + (f', winner={winner}' if winner else f', {reason}' if reason else ''))

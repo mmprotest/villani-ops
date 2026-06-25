@@ -47,13 +47,23 @@ def normalize_selector_payload(payload: Any, candidates: list[dict[str, Any]]) -
     return data, notes
 
 
+
+def synthesize_reason(selected_id: str, candidates: list[dict[str, Any]]) -> str:
+    c=next((x for x in candidates if x.get('attempt_id')==selected_id), {})
+    bits=[f"Selected {selected_id} because it was acceptance-eligible" if c.get('acceptance_eligible') else f"Selected {selected_id}"]
+    if c.get('review_decision') or c.get('review_recommended_action'):
+        bits.append(f"reviewer returned {c.get('review_decision') or 'unknown'}/{c.get('review_recommended_action') or 'unknown'}")
+    if not c.get('acceptance_blockers'): bits.append('no acceptance blockers were present')
+    if c.get('changed_files'): bits.append('changed files were present')
+    return ', '.join(bits) + '.'
+
 def deterministic_fallback(candidates: list[dict[str, Any]], reason: str | None = None) -> SelectionResult:
     eligible=[c for c in candidates if c.get('acceptance_eligible')]
     if not eligible:
-        return SelectionResult(decision='reject_all', summary='No candidate passed acceptance gates.', reasons=['No candidate passed acceptance gates.'], rejected_attempts=[c.get('attempt_id') for c in candidates], fallback_used=True, fallback_reason=reason or 'No eligible candidates were available for fallback.')
+        return SelectionResult(decision='reject_all', summary='No candidate passed acceptance gates.', reasons=['No candidate passed acceptance gates.'], rejected_attempts=[c.get('attempt_id') for c in candidates], fallback_used=True, fallback_reason=reason or 'No eligible candidates were available for fallback.', selector_fallback_used=True, selector_fallback_reason=reason or 'No eligible candidates were available for fallback.')
     best=sorted(eligible, key=lambda c: (-(c.get('review_score') or 0), len(c.get('review_issues') or []), len(c.get('changed_files') or []), c.get('attempt_id') or ''))[0]
     fallback_reason = reason or 'Selector did not return a valid eligible selected_attempt_id.'
-    return SelectionResult(decision='select', selected_attempt_id=best.get('attempt_id'), summary=f'Deterministic fallback selected {best.get("attempt_id")}.', reasons=[fallback_reason], fallback_used=True, fallback_reason=fallback_reason)
+    return SelectionResult(decision='select', selected_attempt_id=best.get('attempt_id'), summary=f'Deterministic fallback selected {best.get("attempt_id")}.', reasons=[fallback_reason], fallback_used=True, fallback_reason=fallback_reason, selector_fallback_used=True, selector_fallback_reason=fallback_reason)
 
 
 def resolve_selection(payload: Any, candidates: list[dict[str, Any]], *, selector_backend: str | None = None, backend_model: str | None = None) -> tuple[SelectionResult, dict[str, Any], list[str]]:
@@ -76,12 +86,15 @@ def resolve_selection(payload: Any, candidates: list[dict[str, Any]], *, selecto
             return attach(deterministic_fallback(candidates, f'Selector returned invalid selected attempt id {sel.selected_attempt_id!r}.')), normalized, notes
         if sel.selected_attempt_id not in elig:
             return attach(deterministic_fallback(candidates, f'Selector selected ineligible candidate {sel.selected_attempt_id}.')), normalized, notes
-        sel.fallback_used=False; sel.fallback_reason=None
+        if not sel.summary.strip() and not sel.reasons:
+            reason=synthesize_reason(sel.selected_attempt_id, candidates)
+            sel.summary=reason; sel.reasons=[reason]; sel.selector_reason_synthesized=True
+        sel.selector_normalized=bool(notes); sel.selector_normalization_notes=notes; sel.fallback_used=False; sel.fallback_reason=None; sel.selector_fallback_used=False; sel.selector_fallback_reason=None
         return attach(sel), normalized, notes
     if malformed or (not sel.selected_attempt_id and not sel.summary.strip() and not sel.reasons):
         return attach(deterministic_fallback(candidates, 'Selector rejected all without meaningful reasons despite eligible candidates.')), normalized, notes
     sel.summary = sel.summary or 'Selector intentionally rejected all candidates despite eligibility.'
-    sel.fallback_used=False; sel.fallback_reason=None
+    sel.selector_normalized=bool(notes); sel.selector_normalization_notes=notes; sel.fallback_used=False; sel.fallback_reason=None; sel.selector_fallback_used=False; sel.selector_fallback_reason=None
     return attach(sel), normalized, notes
 
 
@@ -103,6 +116,6 @@ class Selector:
                 raw_payload={}
         sel, normalized, notes = resolve_selection(raw_payload, candidates, selector_backend=backend_name, backend_model=backend.model)
         (run_dir/'selection.raw.txt').write_text((call.raw_text if call else '') or (json.dumps(raw_payload) if raw_payload else ''))
-        (run_dir/'selection_normalized.json').write_text(json.dumps(normalized, indent=2, default=str))
+        (run_dir/'selection_normalized.json').write_text(json.dumps({'payload': normalized, 'notes': notes}, indent=2, default=str))
         (run_dir/'selection.json').write_text(sel.model_dump_json(indent=2))
         return sel, call, notes

@@ -18,7 +18,7 @@ runner = CliRunner()
 def _attempt(human, patch=True, changed=True):
     return {
         'status':'human_approved','exit_code':1,'error':'boom',
-        'patch_path':'/tmp/x.patch' if patch else None,
+        'patch_path':__file__ if patch else None,
         'changed_files':['hello.txt'] if changed else [],
         'review':{'decision':'fail','passed':False,'recommended_action':'fail'},
         'human_approval':human,
@@ -29,7 +29,7 @@ def _valid_human(**updates):
     h={
         'requested':True,'request_reasons':['reviewer_recommended_ask_human'],
         'prompted':True,'skipped_reason':None,'decision':'accept','valid_override':True,
-        'shown_evidence':{'patch_path':'/tmp/x.patch','changed_files':['hello.txt'],'reviewer_summary':'bad but approved','acceptance_blockers':['runner exit code is 1']},
+        'shown_evidence':{'patch_path':__file__,'changed_files':['hello.txt'],'reviewer_summary':'bad but approved','acceptance_blockers':['runner exit code is 1']},
     }
     h.update(updates)
     return h

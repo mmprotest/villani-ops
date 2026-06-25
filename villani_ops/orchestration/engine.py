@@ -12,7 +12,7 @@ from villani_ops.storage.files import FileStorage
 from villani_ops.classification import TaskClassifier
 from villani_ops.isolation.worktree import GitWorktreeIsolation, capture_worktree
 from villani_ops.review import LLMReviewer, ReviewResult
-from villani_ops.core.acceptance import is_attempt_acceptance_eligible
+from villani_ops.core.acceptance import is_attempt_acceptance_eligible, has_non_empty_patch
 from villani_ops.controller.progress import RunProgressReporter
 from villani_ops.performance.investigator import Investigator
 from villani_ops.performance.selector import Selector, deterministic_fallback
@@ -158,8 +158,11 @@ class OrchestrationEngine:
                 inv,call=Investigator().investigate(context.task,context.classification,node.assigned_backend,self.backends[node.assigned_backend],context.run_dir,estimate_cost=(context.mode!='performance'))
             except TypeError:
                 inv,call=Investigator().investigate(context.task,context.classification,node.assigned_backend,self.backends[node.assigned_backend],context.run_dir)
-        except Exception as e: context.warnings.append(f'Investigation failed: {e}'); inv=InvestigationResult(summary=f'Investigation unavailable: {e}'); call=None
+        except Exception as e: context.warnings.append(f'Investigation failed: {e}'); inv=InvestigationResult(summary=f'Investigation unavailable: {e}', investigation_fallback_used=True, investigation_fallback_reason=str(e)); call=None
         (context.run_dir/'investigation.json').write_text(inv.model_dump_json(indent=2)); context.investigation=inv; context.task_context.investigation=inv.model_dump(mode='json')
+        if getattr(inv, 'investigation_normalized', False):
+            for note in inv.investigation_normalization_notes: self.record_controller_step(context,node=node,action='investigation_normalized',status='normalized',summary=note)
+        if getattr(inv, 'investigation_fallback_used', False): self.record_controller_step(context,node=node,action='investigation_fallback_used',status='fallback',summary=inv.investigation_fallback_reason or inv.summary)
         if call: context.input_tokens+=call.input_tokens; context.output_tokens+=call.output_tokens; context.costs['investigation']+=0 if context.mode=='performance' else call.estimated_cost
         self._write_node_artifacts(context,node,raw=(call.raw_text if call else ''))
         return self._finish(context,node,NodeExecutionResult(node_id=node.id,status='succeeded',result_summary=inv.summary,confidence=inv.confidence,artifacts={'investigation':str(context.run_dir/'investigation.json')}),context.task_context.investigation)
@@ -168,6 +171,9 @@ class OrchestrationEngine:
         context.graph.mark_running(node.id); self._write_node_artifacts(context,node,inp={'task':context.task_context.objective})
         plan,call=Planner(self.llm_client).plan(task=context.task,classification=context.task_context.classification,investigation=context.task_context.investigation,repo_summary=None,candidate_attempts=context.candidate_attempts,mode=context.mode,backend_name=node.assigned_backend,backend=self.backends[node.assigned_backend],run_dir=context.run_dir)
         context.plan=plan; context.task_context.plan=plan.model_dump(mode='json'); context.task_context.overall_difficulty=plan.expected_difficulty; context.task_context.confidence=plan.confidence
+        if getattr(plan, 'planner_normalized', False):
+            for note in plan.planner_normalization_notes: self.record_controller_step(context,node=node,action='planner_normalized',status='normalized',summary=note)
+        if getattr(plan, 'planner_fallback_used', False) or getattr(plan, 'fallback_used', False): self.record_controller_step(context,node=node,action='planner_fallback_used',status='fallback',summary=plan.planner_fallback_reason or plan.summary)
         if call: context.input_tokens+=call.input_tokens; context.output_tokens+=call.output_tokens
         self._write_node_artifacts(context,node,raw=(call.raw_text if call else ''))
         return self._finish(context,node,NodeExecutionResult(node_id=node.id,status='succeeded',result_summary=plan.summary,confidence=plan.confidence,difficulty=plan.expected_difficulty,artifacts={'plan':str(context.run_dir/'plan.json')}),context.task_context.plan)
@@ -192,9 +198,10 @@ class OrchestrationEngine:
             meta.update({'exit_code':res.exit_code,'stdout_path':str(adir/'stdout.txt'),'stderr_path':str(adir/'stderr.txt'),'duration_ms':res.duration_ms,'input_tokens':res.input_tokens,'output_tokens':res.output_tokens,'token_accounting_status':res.token_accounting_status,'runner_telemetry':res.telemetry}); meta.update(capture_worktree(wt['worktree_path'],adir))
             if meta.get('patch_path'):
                 compat=adir/'patch.diff'; compat.write_text(Path(meta['patch_path']).read_text(errors='replace') if Path(meta['patch_path']).exists() else ''); meta['patch_path']=str(compat)
+            meta['has_patch']=has_non_empty_patch(meta.get('patch_path'))
             status='succeeded' if res.exit_code==0 else 'failed'
         except Exception as e:
-            meta.update({'status':'failed','exit_code':meta.get('exit_code',1),'error':str(e),'changed_files':[],'patch_path':None}); (adir/'stderr.txt').write_text(str(e)); status='failed'
+            meta.update({'status':'failed','exit_code':meta.get('exit_code',1),'error':str(e),'changed_files':[],'patch_path':None,'has_patch':False}); (adir/'stderr.txt').write_text(str(e)); status='failed'
         (adir/'attempt.json').write_text(json.dumps(meta,indent=2)); node.result=meta
         self.progress_reporter.candidate_completed(aid, idx, context.candidate_attempts, meta)
         return self._finish(context,node,NodeExecutionResult(node_id=node.id,status=status,result_summary=meta.get('error') or f'Candidate {aid} completed',artifacts={'attempt':str(adir/'attempt.json'),'patch':str(meta.get('patch_path') or '')},data=meta,error=meta.get('error')),meta)
@@ -210,11 +217,13 @@ class OrchestrationEngine:
             context.costs['review']+=0 if context.mode=='performance' else call.estimated_cost; context.input_tokens+=call.input_tokens; context.output_tokens+=call.output_tokens; self._write_node_artifacts(context,node,raw=call.raw_text)
         except Exception as e: review=ReviewResult(decision='fail',summary=f'Reviewer failed: {e}',issues=[str(e)],recommended_action='fail'); (adir/'review.json').write_text(review.model_dump_json(indent=2))
         meta['review']=review.model_dump(mode='json'); meta['status']='validated' if meta.get('exit_code')==0 and review.decision=='pass' and review.recommended_action=='accept' else ('failed' if meta.get('exit_code') else 'completed')
-        eligible,blockers=(False, ['patch is missing'] if not meta.get('patch_path') else []);
-        if meta.get('patch_path') and meta.get('changed_files'): eligible,blockers=is_attempt_acceptance_eligible(meta)
+        has_patch=has_non_empty_patch(meta.get('patch_path'))
+        eligible,blockers=(False, ['patch is missing or empty'] if not has_patch else [])
+        if has_patch and meta.get('changed_files'): eligible,blockers=is_attempt_acceptance_eligible(meta)
         elif not meta.get('changed_files'): blockers.append('changed files are missing')
+        meta['has_patch']=has_patch
         meta['acceptance_eligible']=eligible; meta['acceptance_blockers']=blockers
-        summary=CandidateSummary(attempt_id=aid,backend_name=meta.get('backend_name'),model=meta.get('model'),status=meta['status'],exit_code=meta.get('exit_code'),changed_files=meta.get('changed_files') or [],patch_path=meta.get('patch_path'),review_decision=review.decision,review_score=review.score,review_recommended_action=review.recommended_action,review_summary=review.summary,review_issues=review.issues,acceptance_eligible=eligible,acceptance_blockers=blockers,telemetry=meta.get('runner_telemetry') or {})
+        summary=CandidateSummary(attempt_id=aid,backend_name=meta.get('backend_name'),model=meta.get('model'),status=meta['status'],exit_code=meta.get('exit_code'),changed_files=meta.get('changed_files') or [],patch_path=meta.get('patch_path'),review_decision=review.decision,review_score=review.score,review_recommended_action=review.recommended_action,review_summary=review.summary,review_issues=review.issues,acceptance_eligible=eligible,acceptance_blockers=blockers,has_patch=has_patch, telemetry=meta.get('runner_telemetry') or {})
         meta['candidate_summary']=summary.model_dump(mode='json'); (adir/'attempt.json').write_text(json.dumps(meta,indent=2)); context.attempts.append(meta)
         self.progress_reporter.review_completed(aid, idx, context.candidate_attempts, {**review.model_dump(mode='json'), 'acceptance_eligible': eligible})
         data={'has_review_blocker': review.decision!='pass' or review.recommended_action!='accept','has_acceptance_blocker': bool(blockers),'acceptance_blockers':blockers, **review.model_dump(mode='json')}
@@ -236,12 +245,13 @@ class OrchestrationEngine:
         if selection.decision=='select' and selection.selected_attempt_id not in eligible_ids:
             selection=deterministic_fallback(candidates, f'Selector selected invalid or ineligible candidate {selection.selected_attempt_id}.'); selection.selector_backend=node.assigned_backend; (context.run_dir/'selection.json').write_text(selection.model_dump_json(indent=2)); fallback=True
         for note in (normalization_notes or []): self.record_controller_step(context,node=node,action='selector_normalized',status='normalized',summary=note)
-        if fallback: self.record_controller_step(context,node=node,action='selector_fallback_used',status='fallback',summary=selection.fallback_reason or selection.summary); self.progress_reporter.fallback_used(selection.fallback_reason or selection.summary, selection.selected_attempt_id)
+        if getattr(selection, 'selector_reason_synthesized', False): self.record_controller_step(context,node=node,action='selector_reason_synthesized',status='normalized',summary=(selection.reasons or [''])[0])
+        if fallback: self.record_controller_step(context,node=node,action='selector_fallback_used',status='fallback',summary=selection.selector_fallback_reason or selection.fallback_reason or selection.summary); self.progress_reporter.fallback_used(selection.selector_fallback_reason or selection.fallback_reason or selection.summary, selection.selected_attempt_id)
         self.progress_reporter.selector_completed(selection, normalization_notes)
         context.selection=selection; context.winner=next((a for a in context.attempts if a.get('attempt_id')==selection.selected_attempt_id and a.get('acceptance_eligible')),None) if selection.decision=='select' else None
         raw=Path(context.run_dir/'selection.raw.txt').read_text(errors='replace') if (context.run_dir/'selection.raw.txt').exists() else ''
         self._write_node_artifacts(context,node,raw=raw)
-        data=selection.model_dump(mode='json')|{'fallback_used':fallback}
+        data=selection.model_dump(mode='json')|{'selector_fallback_used':fallback}
         return self._finish(context,node,NodeExecutionResult(node_id=node.id,status='succeeded',result_summary=selection.summary,confidence=selection.confidence,artifacts={'selection':str(context.run_dir/'selection.json'),'selection_input':str(context.run_dir/'selection_input.json')},data=data),data)
 
     def _execute_verify_node(self,node,context):

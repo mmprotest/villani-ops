@@ -11,19 +11,20 @@ from villani_ops.llm.client import LLMCallResult
 
 runner=CliRunner()
 
-def test_acceptance_requires_successful_runner_and_passing_review():
-    base={'status':'validated','exit_code':0,'review':{'passed':True,'decision':'pass','recommended_action':'accept'}}
+def test_acceptance_requires_successful_runner_and_passing_review(tmp_path):
+    patch=tmp_path/"diff.patch"; patch.write_text("diff --git a/a b/a")
+    base={'status':'validated','exit_code':0,'patch_path':str(patch),'changed_files':['hello.txt'],'review':{'passed':True,'decision':'pass','recommended_action':'accept'}}
     assert is_attempt_acceptance_eligible(base)[0]
-    bad={**base,'exit_code':1,'patch_path':'diff.patch'}
+    bad={**base,'exit_code':1,'patch_path':str(patch)}
     ok, blockers=is_attempt_acceptance_eligible(bad)
     assert not ok and any('exit code' in b for b in blockers)
     bad={**base,'review':{'passed':False,'decision':'fail','recommended_action':'fail'}}
     assert not is_attempt_acceptance_eligible(bad)[0]
     bad={**base,'review':{'passed':False,'decision':'uncertain','recommended_action':'ask_human'}}
     assert not is_attempt_acceptance_eligible(bad)[0]
-    human={**bad,'status':'human_approved','patch_path':'diff.patch','changed_files':['hello.txt'],'human_approval':{'decision':'accept'}}
+    human={**bad,'status':'human_approved','patch_path':str(patch),'changed_files':['hello.txt'],'human_approval':{'decision':'accept'}}
     assert not is_attempt_acceptance_eligible(human)[0]
-    valid={**human,'human_approval':{'decision':'accept','valid_override':True,'requested':True,'prompted':True,'skipped_reason':None,'request_reasons':['reviewer_recommended_ask_human'],'shown_evidence':{'patch_path':'diff.patch','changed_files':['hello.txt'],'reviewer_decision':'uncertain','acceptance_blockers':['review decision is uncertain']}}}
+    valid={**human,'human_approval':{'decision':'accept','valid_override':True,'requested':True,'prompted':True,'skipped_reason':None,'request_reasons':['reviewer_recommended_ask_human'],'shown_evidence':{'patch_path':str(patch),'changed_files':['hello.txt'],'reviewer_decision':'uncertain','acceptance_blockers':['review decision is uncertain']}}}
     assert is_attempt_acceptance_eligible(valid)[0]
 
 def _backend(name, roles=('coding',), cap=10, in_cost=1, out_cost=1, enabled=True):
