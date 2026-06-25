@@ -46,6 +46,8 @@ class RunnerResult(BaseModel):
     token_accounting_warnings: list[str] = Field(default_factory=list)
     telemetry: dict[str, Any] = Field(default_factory=dict)
 
-class Runner(Protocol):
+class RunnerAdapter(Protocol):
     name: str
     def run(self, context: RunnerContext) -> RunnerResult: ...
+
+Runner = RunnerAdapter

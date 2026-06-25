@@ -2,9 +2,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-def write_performance_report(run_dir: str|Path, task: Any, investigation: Any, candidates: list[dict], selection: Any, decision: Any, duration: float) -> Path:
+def write_performance_report(run_dir: str|Path, task: Any, investigation: Any, candidates: list[dict], selection: Any, decision: Any, duration: float, mode: str = 'performance', runner: str = 'villani-code', graph: Any = None, selected_backend_per_node: dict | None = None, routing_decisions: dict | None = None) -> Path:
     p=Path(run_dir)/'report.md'
-    lines=['# Villani Ops Performance Run Report','', '## Task', f"Objective: {task.objective or task.instruction or ''}", f"Success criteria: {task.success_criteria or ''}", '', '## Mode', 'performance_orchestration', '', '## Performance Backend', f"performance_backend: {getattr(decision, 'performance_backend_name', '')}/{getattr(decision, 'performance_backend_model', '')}", '', '## Classification', 'See classification.json if present.', '', '## Investigation']
+    lines=['# Villani Ops Orchestration Run Report','', '## Task', f"Objective: {task.objective or task.instruction or ''}", f"Success criteria: {task.success_criteria or ''}", '', '## Mode', mode, '', '## Runner', runner, '', '## Graph Shape', str((graph.summary() if graph else {})), '', '## Backend Assignments', *[f'- {k}: {v}' for k,v in (selected_backend_per_node or {}).items()], '', '## Performance Backend', f"performance_backend: {getattr(decision, 'performance_backend_name', '')}/{getattr(decision, 'performance_backend_model', '')}", ('Performance mode used the most capable enabled backend for every node.' if mode == 'performance' else ''), '', '## Classification', 'See classification.json if present.', '', '## Investigation']
     if investigation:
         lines += [f"Summary: {investigation.summary}", f"Suspected root cause: {investigation.suspected_root_cause or ''}", 'Relevant files: '+', '.join(investigation.relevant_files), 'Relevant tests: '+', '.join(investigation.relevant_tests), 'Implementation plan:', *[f"- {x}" for x in investigation.implementation_plan], 'Risks:', *[f"- {x}" for x in investigation.risks], f"Confidence: {investigation.confidence}"]
     lines += ['', '## Candidate Attempts', '| Attempt | Backend | Model | Status | Exit | Review | Score | Eligible | Blockers | Changed files | Patch |', '| --- | --- | --- | --- | ---: | --- | ---: | --- | --- | --- | --- |']
@@ -13,6 +13,8 @@ def write_performance_report(run_dir: str|Path, task: Any, investigation: Any, c
     lines += ['', '## Candidate Reviews']
     for c in candidates:
         lines += [f"### {c.get('attempt_id')}", c.get('review_summary') or '', 'Issues:', *[f"- {x}" for x in (c.get('review_issues') or [])], f"Recommended action: {c.get('review_recommended_action')}"]
+    if mode != 'performance':
+        lines += ['', '## Backend Routing Decisions and Escalations', *[f"- {k}: {v.get('backend_name')} — {v.get('reason')}" for k,v in (routing_decisions or {}).items()]]
     lines += ['', '## Selection', f"Decision: {selection.decision if selection else 'reject_all'}", f"Selected attempt id: {selection.selected_attempt_id if selection else ''}", f"Summary: {selection.summary if selection else ''}", 'Reasons:', *[f"- {x}" for x in ((selection.reasons if selection else []) or [])], f"Confidence: {selection.confidence if selection else 0}", f"Fallback used: {getattr(selection, 'fallback_used', False) if selection else False}"]
     lines += ['', '## Final Decision', f"Accepted: {decision.accepted}", f"Winner: {decision.winning_attempt_id or ''}", f"Failure reason: {decision.failure_reason}", 'Acceptance blockers:', *[f"- {x}" for x in decision.acceptance_blockers], '', '## Telemetry', f"Input tokens: {decision.total_input_tokens}", f"Output tokens: {decision.total_output_tokens}", f"Duration seconds: {duration:.1f}", '', '## Next Commands']
     if decision.accepted:
