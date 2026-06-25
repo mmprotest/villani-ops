@@ -150,8 +150,8 @@ def adjust_classification_from_task_shape(classification: TaskClassification, ta
 class TaskClassifier:
     def __init__(self, client: LLMClient | None=None): self.client=client or LLMClient()
     def select_backend(self, backends: dict[str, Backend]) -> Backend: return select_backend(backends, 'classification')
-    def classify(self, task: Task, backends: dict[str, Backend], out_path: str|Path|None=None) -> tuple[TaskClassification, LLMCallResult]:
-        backend=self.select_backend(backends); repo=Path(task.repo_path).resolve()
+    def classify(self, task: Task, backends: dict[str, Backend], out_path: str|Path|None=None, backend_override: Backend|None=None) -> tuple[TaskClassification, LLMCallResult]:
+        backend=backend_override or self.select_backend(backends); repo=Path(task.repo_path).resolve()
         tree=_repo_tree(repo)
         task_text="\n".join(str(x or "") for x in [task.objective, task.instruction, task.success_criteria, "\n".join(task.constraints)])
         snippets=collect_relevant_file_snippets(repo, task_text, tree)

@@ -6,6 +6,8 @@ class Decision(BaseModel):
     run_id: str
 
     mode: str = "performance"
+    performance_backend_name: str | None = None
+    performance_backend_model: str | None = None
     investigation: dict[str, Any] | None = None
     selection: dict[str, Any] | None = None
     selected_attempt_id: str | None = None

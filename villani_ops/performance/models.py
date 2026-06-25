@@ -11,6 +11,7 @@ class InvestigationResult(BaseModel):
     risks: list[str] = Field(default_factory=list)
     confidence: float = 0.0
     investigator_backend: str | None = None
+    performance_backend: dict[str, str] | None = None
 
 class CandidateSummary(BaseModel):
     attempt_id: str
@@ -37,4 +38,5 @@ class SelectionResult(BaseModel):
     rejected_attempts: list[str] = Field(default_factory=list)
     confidence: float = 0.0
     selector_backend: str | None = None
+    performance_backend: dict[str, str] | None = None
     fallback_used: bool = False

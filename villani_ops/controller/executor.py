@@ -8,7 +8,8 @@ from villani_ops.core.task import Task
 from villani_ops.core.decision import Decision
 from villani_ops.storage.files import FileStorage
 from villani_ops.classification import TaskClassifier
-from villani_ops.core.backend import Backend, coding_backends
+from villani_ops.core.backend import Backend
+from villani_ops.performance.backend_selection import select_performance_backend
 from villani_ops.isolation.worktree import GitWorktreeIsolation, capture_worktree
 from villani_ops.runners.base import RunnerContext
 from villani_ops.runners.villani_code import VillaniCodeRunner
@@ -24,21 +25,57 @@ from villani_ops.performance.report import write_performance_report
 class RunResult(BaseModel):
     run_id: str; run_dir: str; decision: Decision; report_path: str; attempts: list[dict]
 
-def _highest_coding(backends: dict[str, Backend]) -> Backend:
-    xs=coding_backends(backends)
-    if not xs: raise ValueError("No enabled coding backend configured")
-    return sorted(xs, key=lambda b:(-b.capability_score,b.name))[0]
-
 def _candidate_prompt(task: Task, inv, n: int, total: int) -> str:
     return f"""Original objective:\n{task.objective or task.instruction or ''}\n\nSuccess criteria:\n{task.success_criteria or ''}\n\nInvestigation summary:\n{inv.summary if inv else ''}\n\nSuspected root cause:\n{(inv.suspected_root_cause if inv else '') or ''}\n\nRelevant files:\n{', '.join(inv.relevant_files if inv else [])}\n\nRelevant tests:\n{', '.join(inv.relevant_tests if inv else [])}\n\nImplementation plan:\n{chr(10).join('- '+x for x in (inv.implementation_plan if inv else []))}\n\nYou are candidate attempt {n} of {total}.\nWork independently.\nDo not assume the other candidates are correct.\nProduce the smallest correct patch you can.\nRun relevant tests when possible.\nDo not add generated/cache artifacts.\nDo not edit files outside the repository.\n"""
 
+
+def _tail(path: str | None, limit: int = 8000) -> str:
+    if not path:
+        return ''
+    try:
+        return Path(path).read_text(errors='replace')[-limit:]
+    except Exception:
+        return ''
+
+def _patch_text(path: str | None, limit: int = 60000) -> str:
+    if not path:
+        return ''
+    try:
+        text=Path(path).read_text(errors='replace')
+        return text[:limit] + ("\n...[truncated]" if len(text) > limit else '')
+    except Exception:
+        return ''
+
+def _selector_candidate_payload(a: dict) -> dict:
+    review=a.get('review') or {}
+    return {
+        'attempt_id': a.get('attempt_id'),
+        'backend_name': a.get('backend_name'),
+        'model': a.get('model'),
+        'status': a.get('status'),
+        'exit_code': a.get('exit_code'),
+        'changed_files': a.get('changed_files') or [],
+        'git_status': a.get('git_status') or '',
+        'patch_text': _patch_text(a.get('patch_path')),
+        'stdout_tail': _tail(a.get('stdout_path')),
+        'stderr_tail': _tail(a.get('stderr_path')),
+        'review': review,
+        'review_score': review.get('score'),
+        'review_summary': review.get('summary') or '',
+        'review_evidence': review.get('evidence') or [],
+        'review_issues': review.get('issues') or [],
+        'review_recommended_action': review.get('recommended_action') or '',
+        'acceptance_eligible': bool(a.get('acceptance_eligible')),
+        'acceptance_blockers': a.get('acceptance_blockers') or [],
+    }
+
 class VillaniOps:
-    def __init__(self, storage: FileStorage, human_approval_provider=None, progress_reporter=None):
-        self.storage=storage; self.human_approval_provider=human_approval_provider; self.progress_reporter=progress_reporter or RunProgressReporter(False)
+    def __init__(self, storage: FileStorage, progress_reporter=None):
+        self.storage=storage; self.progress_reporter=progress_reporter or RunProgressReporter(False)
     @classmethod
     def from_workspace(cls, path: str | Path = '.villani-ops') -> 'VillaniOps': return cls(FileStorage(Path(path).expanduser().resolve()))
 
-    def run(self, repo: str|Path, task: Task, candidate_attempts: int=3, backend: list[str]|None=None, timeout_seconds: int|None=None, classify: bool=True, human_approval: bool=False, non_interactive: bool=False, isolation: str='worktree') -> RunResult:
+    def run(self, repo: str|Path, task: Task, candidate_attempts: int=3, timeout_seconds: int|None=None, classify: bool=True, non_interactive: bool=False, isolation: str='worktree') -> RunResult:
         if candidate_attempts < 1 or candidate_attempts > 8: raise ValueError('candidate_attempts must be between 1 and 8')
         self.storage.init_workspace(); start=time.time(); repo=Path(repo).resolve(); task.repo_path=str(repo)
         run_id=datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')+'-'+secrets.token_hex(3)
@@ -46,22 +83,18 @@ class VillaniOps:
         progress=self.progress_reporter; progress.info('Starting Villani Ops performance orchestration run')
         backends=self.storage.load_backends(); warnings=[]; attempts=[]; costs={'classification':0.0,'review':0.0,'coding':0.0,'investigation':0.0,'selection':0.0}; tin=tout=0
         recorder=ControllerStateRecorder(run_id, run_dir); cls=None; inv=None; selection=None
-        if backend:
-            missing=[b for b in backend if b not in backends]
-            if missing: raise ValueError('Unknown backend(s): '+', '.join(missing))
-            coding_plan=[backends[backend[i % len(backend)]] for i in range(candidate_attempts)]
-        else:
-            coding_plan=[_highest_coding(backends)]*candidate_attempts
+        performance_backend_name, performance_backend = select_performance_backend(backends)
+        coding_plan=[performance_backend]*candidate_attempts
         if classify:
             recorder.transition('classify','classifying','Starting task classification.')
             try:
-                cls, call=TaskClassifier().classify(task, backends, run_dir/'classification.json'); task.classification=cls; self.storage.save_task(run_dir, task)
+                cls, call=TaskClassifier().classify(task, backends, run_dir/'classification.json', backend_override=performance_backend); task.classification=cls; self.storage.save_task(run_dir, task)
                 costs['classification']+=call.estimated_cost; tin+=call.input_tokens; tout+=call.output_tokens
             except Exception as e:
                 warnings.append(f'Classification failed: {e}')
         recorder.transition('investigate','planning','Starting investigation.')
         try:
-            inv, call=Investigator().investigate(task, cls, backends, run_dir); (run_dir/'investigation.json').write_text(inv.model_dump_json(indent=2)); costs['investigation']+=call.estimated_cost; tin+=call.input_tokens; tout+=call.output_tokens
+            inv, call=Investigator().investigate(task, cls, performance_backend_name, performance_backend, run_dir); (run_dir/'investigation.json').write_text(inv.model_dump_json(indent=2)); costs['investigation']+=call.estimated_cost; tin+=call.input_tokens; tout+=call.output_tokens
         except Exception as e:
             warnings.append(f'Investigation failed: {e}')
             from villani_ops.performance.models import InvestigationResult
@@ -70,7 +103,7 @@ class VillaniOps:
         runner=VillaniCodeRunner()
         for idx,b in enumerate(coding_plan, start=1):
             aid=f'attempt_{idx:03d}'; adir=run_dir/'attempts'/aid; adir.mkdir(parents=True, exist_ok=True)
-            meta={'attempt_id':aid,'backend_name':b.name,'model':b.model,'runner_name':'villani_code','status':'running','started_at':datetime.now(timezone.utc).isoformat()}
+            meta={'attempt_id':aid,'backend_name':b.name,'model':b.model,'performance_backend':{'name':performance_backend_name,'model':performance_backend.model},'runner_name':'villani_code','status':'running','started_at':datetime.now(timezone.utc).isoformat()}
             recorder.transition('run_candidate','attempting','Starting candidate attempt.', aid, {'backend':b.name,'model':b.model})
             try:
                 if isolation!='worktree': raise ValueError('Only worktree isolation is supported')
@@ -90,7 +123,7 @@ class VillaniOps:
             review_input['patch']=(Path(meta['patch_path']).read_text(errors='replace')[:50000] if meta.get('patch_path') else '')
             review_input['investigation']=inv.model_dump(mode='json') if inv else None
             try:
-                review, rcall=LLMReviewer().review(task, cls, b, review_input, backends, adir/'review.json'); costs['review']+=rcall.estimated_cost; tin+=rcall.input_tokens; tout+=rcall.output_tokens
+                review, rcall=LLMReviewer().review(task, cls, b, review_input, backends, adir/'review.json', backend_override=performance_backend); costs['review']+=rcall.estimated_cost; tin+=rcall.input_tokens; tout+=rcall.output_tokens
             except Exception as e:
                 from villani_ops.review import ReviewResult
                 review=ReviewResult(decision='fail', summary=f'Reviewer failed: {e}', issues=[str(e)], recommended_action='fail')
@@ -108,17 +141,18 @@ class VillaniOps:
             meta['candidate_summary']=summary.model_dump(mode='json')
             (adir/'attempt.json').write_text(__import__('json').dumps(meta, indent=2)); attempts.append(meta)
         recorder.transition('select_winner','deciding','Selecting winner from reviewed candidates.')
-        selection, scall=Selector().select(task, inv, [a['candidate_summary'] for a in attempts], backends, run_dir)
+        selection, scall=Selector().select(task, inv, [_selector_candidate_payload(a) for a in attempts], performance_backend_name, performance_backend, run_dir)
         eligible_ids={a['attempt_id'] for a in attempts if a.get('acceptance_eligible')}
         if selection.decision == 'select' and selection.selected_attempt_id not in eligible_ids:
             from villani_ops.performance.selector import deterministic_fallback
-            selection = deterministic_fallback([a['candidate_summary'] for a in attempts])
+            selection = deterministic_fallback([_selector_candidate_payload(a) for a in attempts])
+            selection.selector_backend=performance_backend_name; selection.performance_backend={'name': performance_backend_name, 'model': performance_backend.model}
             (run_dir/'selection.json').write_text(selection.model_dump_json(indent=2))
         if scall: costs['selection']+=scall.estimated_cost; tin+=scall.input_tokens; tout+=scall.output_tokens
         winner=next((a for a in attempts if a.get('attempt_id')==selection.selected_attempt_id and a.get('acceptance_eligible')), None) if selection.decision=='select' else None
         accepted=bool(winner); recorder.transition('accept' if accepted else 'fail','accepted' if accepted else 'failed','Accepted selected candidate.' if accepted else 'No eligible selected candidate.')
         apply_opts={}
         if accepted: apply_opts={'apply_command':f'villani-ops apply {run_id}','branch_command':f'villani-ops branch {run_id} --name villani-ops/{run_id}','pr_command':f'villani-ops pr {run_id} --title "{(task.objective or "Villani Ops changes")[:60]}"'}
-        decision=Decision(run_id=run_id, mode='performance', accepted=accepted, lifecycle_completed=True, final_state='accepted' if accepted else 'failed', final_action='accept' if accepted else 'fail', winning_attempt_id=winner.get('attempt_id') if winner else None, winning_branch=winner.get('branch_name') if winner else None, winning_worktree_path=winner.get('worktree_path') if winner else None, winning_patch_path=winner.get('patch_path') if winner else None, reviewer_decision=(winner.get('review') or {}).get('decision') if winner else None, reviewer_score=(winner.get('review') or {}).get('score') if winner else None, classification=cls.model_dump(mode='json') if cls else None, investigation=inv.model_dump(mode='json') if inv else None, selection=selection.model_dump(mode='json') if selection else None, selected_attempt_id=selection.selected_attempt_id if selection else None, candidate_attempts_requested=candidate_attempts, candidate_attempts_completed=len(attempts), eligible_candidate_attempts=[a['attempt_id'] for a in attempts if a.get('acceptance_eligible')], orchestration_summary=selection.summary if selection else '', total_cost=sum(costs.values()), coding_cost=costs['coding'], classification_cost=costs['classification'], policy_cost=0, review_cost=costs['review'], total_input_tokens=tin, total_output_tokens=tout, total_coding_input_tokens=sum(a.get('input_tokens') or 0 for a in attempts), total_coding_output_tokens=sum(a.get('output_tokens') or 0 for a in attempts), token_accounting_statuses=dict(Counter(a.get('token_accounting_status') or 'missing' for a in attempts)), attempts=attempts, warnings=warnings, apply_options=apply_opts, controller_steps=recorder.steps, acceptance_blockers=[] if accepted else [b for a in attempts for b in (a.get('acceptance_blockers') or [])], attempts_used=len(attempts), all_attempted_backends=[a.get('backend_name') for a in attempts], failure_reason='' if accepted else (selection.summary if selection else 'No eligible candidate selected.'), reason='Selected eligible candidate.' if accepted else 'No eligible candidate selected.', total_attempts=len(attempts))
+        decision=Decision(run_id=run_id, mode='performance_orchestration', performance_backend_name=performance_backend_name, performance_backend_model=performance_backend.model, accepted=accepted, lifecycle_completed=True, final_state='accepted' if accepted else 'failed', final_action='accept' if accepted else 'fail', winning_attempt_id=winner.get('attempt_id') if winner else None, winning_branch=winner.get('branch_name') if winner else None, winning_worktree_path=winner.get('worktree_path') if winner else None, winning_patch_path=winner.get('patch_path') if winner else None, reviewer_decision=(winner.get('review') or {}).get('decision') if winner else None, reviewer_score=(winner.get('review') or {}).get('score') if winner else None, classification=cls.model_dump(mode='json') if cls else None, investigation=inv.model_dump(mode='json') if inv else None, selection=selection.model_dump(mode='json') if selection else None, selected_attempt_id=selection.selected_attempt_id if selection else None, candidate_attempts_requested=candidate_attempts, candidate_attempts_completed=len(attempts), eligible_candidate_attempts=[a['attempt_id'] for a in attempts if a.get('acceptance_eligible')], orchestration_summary=selection.summary if selection else '', total_cost=sum(costs.values()), coding_cost=costs['coding'], classification_cost=costs['classification'], policy_cost=0, review_cost=costs['review'], total_input_tokens=tin, total_output_tokens=tout, total_coding_input_tokens=sum(a.get('input_tokens') or 0 for a in attempts), total_coding_output_tokens=sum(a.get('output_tokens') or 0 for a in attempts), token_accounting_statuses=dict(Counter(a.get('token_accounting_status') or 'missing' for a in attempts)), attempts=attempts, warnings=warnings, apply_options=apply_opts, controller_steps=recorder.steps, acceptance_blockers=[] if accepted else [b for a in attempts for b in (a.get('acceptance_blockers') or [])], attempts_used=len(attempts), all_attempted_backends=[a.get('backend_name') for a in attempts], failure_reason='' if accepted else (selection.summary if selection else 'No eligible candidate selected.'), reason='Selected eligible candidate.' if accepted else 'No eligible candidate selected.', total_attempts=len(attempts))
         self.storage.save_decision(run_dir, decision); report=write_performance_report(run_dir, task, inv, [a['candidate_summary'] for a in attempts], selection, decision, time.time()-start)
         return RunResult(run_id=run_id, run_dir=str(run_dir), decision=decision, report_path=str(report), attempts=attempts)
