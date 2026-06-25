@@ -80,10 +80,10 @@ def policy_create_default(name: str=typer.Option('balanced'), workspace: str='.v
     pol=Policy(name=name, attempts=attempts); path=s.workspace/'policies'/f'{name}.yaml'; pol.save(path); console.print(f'Created policy at {path}')
 
 @app.command(context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
-def run(ctx: typer.Context, repo: str|None=None, task: str|None=typer.Option(None,'--task'), task_id: str|None=None, success_criteria: str|None=None, candidate_attempts: int=typer.Option(3, '--candidate-attempts', min=1, max=8), timeout_seconds: int|None=None, classify: bool=typer.Option(True, '--classify/--no-classify'), non_interactive: bool=False, workspace: str='.villani-ops'):
+def run(ctx: typer.Context, repo: str|None=None, task: str|None=typer.Option(None,'--task'), task_id: str|None=None, success_criteria: str|None=None, mode: str=typer.Option('performance', '--mode', help='Execution mode: performance, cheap, balanced, or quality'), runner: str=typer.Option('villani-code', '--runner'), candidate_attempts: int=typer.Option(3, '--candidate-attempts', min=1, max=8), timeout_seconds: int|None=None, classify: bool=typer.Option(True, '--classify/--no-classify'), non_interactive: bool=False, workspace: str='.villani-ops'):
     forbidden = {
-        '--policy': 'Cost policies moved to villani-ops cost-run',
-        '--backend': 'Performance orchestration always uses the most capable enabled backend. Use villani-ops cost-run for backend policy experiments.',
+        '--policy': 'Cost policies moved to villani-ops cost-run. The primary run command uses --mode, not --policy. Use --mode performance|cheap|balanced|quality.',
+        '--backend': 'Performance orchestration always uses the most capable enabled backend. The primary run command does not accept --backend; backend assignment belongs to the selected execution policy (--mode).',
         '--human-approval': 'Human approval is not supported in performance orchestration. Use villani-ops cost-run for the legacy approval path.',
     }
     for arg in ctx.args:
@@ -103,12 +103,16 @@ def run(ctx: typer.Context, repo: str|None=None, task: str|None=typer.Option(Non
     else:
         if not repo or not task: raise typer.BadParameter('Provide --task-id or both --repo and --task')
         t=Task(repo_path=str(Path(repo).resolve()), objective=task, success_criteria=success_criteria)
-    result=VillaniOps(storage(workspace), progress_reporter=RunProgressReporter(True)).run(repo=repo, task=t, candidate_attempts=candidate_attempts, timeout_seconds=timeout_seconds, classify=classify, non_interactive=(non_interactive or not sys.stdin.isatty()))
+    if mode not in {'performance','cheap','balanced','quality'}:
+        raise typer.BadParameter('Invalid mode. Choose one of: performance, cheap, balanced, quality')
+    if runner != 'villani-code':
+        raise typer.BadParameter(f"Unsupported runner '{runner}'. Supported runner: villani-code.")
+    result=VillaniOps(storage(workspace), progress_reporter=RunProgressReporter(True)).run(repo=repo, task=t, candidate_attempts=candidate_attempts, timeout_seconds=timeout_seconds, classify=classify, non_interactive=(non_interactive or not sys.stdin.isatty()), mode=mode, runner=runner)
     d=result.decision
     console.print(f"Result: {'ACCEPTED' if d.accepted else 'FAILED'}")
-    console.print('Mode: performance_orchestration')
+    console.print(f'Mode: {d.mode}')
     console.print(f'Task: {t.objective}')
-    console.print(f"Performance backend: {d.performance_backend_name}/{d.performance_backend_model}")
+    console.print(f"Runner: {runner}"); console.print(f"Primary backend: {d.performance_backend_name}/{d.performance_backend_model}")
     console.print(f"Candidate attempts requested/completed: {d.candidate_attempts_requested}/{d.candidate_attempts_completed}")
     console.print(f"Winner: {d.winning_attempt_id or 'none'}")
     console.print(f"Controller reason: {d.reason}")
