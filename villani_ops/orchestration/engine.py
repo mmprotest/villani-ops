@@ -3,7 +3,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 from collections import Counter
 from dataclasses import dataclass, field
-import json, secrets, time, subprocess, sys, os, threading
+import json, secrets, time, subprocess, sys, os, threading, shlex
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 from pydantic import BaseModel
@@ -19,7 +19,7 @@ from villani_ops.performance.investigator import Investigator
 from villani_ops.performance.selector import Selector, deterministic_fallback
 from villani_ops.performance.models import CandidateSummary, InvestigationResult
 from villani_ops.performance.report import write_performance_report
-from villani_ops.orchestration.planner import build_fixed_graph, Planner, validate_decomposition_plan, revise_decomposition_plan, semantic_validate_decomposition_plan
+from villani_ops.orchestration.planner import build_fixed_graph, Planner, validate_decomposition_plan, revise_decomposition_with_feedback, semantic_validate_decomposition_plan
 from villani_ops.orchestration.artifacts import write_json, write_json_utf8, write_text_utf8
 from villani_ops.orchestration.nodes import OrchestrationNode, NodeExecutionResult, NodeResult
 from villani_ops.orchestration.context import TaskContext
@@ -41,7 +41,7 @@ class EngineContext:
     classification:Any=None; investigation:Any=None; plan:Any=None; decomposition:Any=None; selection:Any=None; winner:dict|None=None; final_decision:Decision|None=None
     subtasks:list[dict]=field(default_factory=list); accepted_subtasks:list[dict]=field(default_factory=list); rejected_subtasks:list[dict]=field(default_factory=list)
     integration:dict[str,Any]=field(default_factory=dict); decomposed_active:bool=False
-    parallel_execution:dict[str,Any]=field(default_factory=dict); controller_step_lock:Any=field(default_factory=threading.Lock)
+    parallel_execution:dict[str,Any]=field(default_factory=dict); controller_step_lock:Any=field(default_factory=threading.Lock); state_lock:Any=field(default_factory=threading.Lock)
 
 def _now(): return datetime.now(timezone.utc).isoformat()
 def _candidate_prompt(task: Task, inv, n: int, total: int, decomposition=None) -> str:
@@ -224,6 +224,14 @@ class OrchestrationEngine:
         report=write_performance_report(run_dir, task, context.investigation, [a['candidate_summary'] for a in context.attempts], context.selection, decision, time.time()-context.start, mode=context.mode, runner=context.runner, graph=graph, selected_backend_per_node=decision.node_backend_assignments, routing_decisions=context.routing_decisions)
         return RunResult(run_id=run_id, run_dir=str(run_dir), decision=decision, report_path=str(report), attempts=context.attempts)
 
+    def _add_usage(self, context, bucket: str, input_tokens: int = 0, output_tokens: int = 0, cost: float = 0.0):
+        lock=getattr(context, 'state_lock', None) or getattr(context, 'controller_step_lock', None)
+        if lock:
+            with lock:
+                context.input_tokens += int(input_tokens or 0); context.output_tokens += int(output_tokens or 0); context.costs[bucket] += float(cost or 0.0)
+        else:
+            context.input_tokens += int(input_tokens or 0); context.output_tokens += int(output_tokens or 0); context.costs[bucket] += float(cost or 0.0)
+
     def build_task_context(self, *, context: EngineContext) -> TaskContext: return context.task_context
     def collect_prior_results(self, *, node: OrchestrationNode, context: EngineContext) -> list[NodeResult]:
         g=context.graph; out=[]
@@ -381,7 +389,7 @@ class OrchestrationEngine:
                 cls,call=TaskClassifier().classify(context.task,self.backends,context.run_dir/'classification.json',backend_override=self.backends[node.assigned_backend],estimate_cost=(context.mode!='performance'))
             except TypeError:
                 cls,call=TaskClassifier().classify(context.task,self.backends,context.run_dir/'classification.json',backend_override=self.backends[node.assigned_backend])
-            context.classification=cls; context.task_context.classification=cls.model_dump(mode='json'); context.task.classification=cls; self.storage.save_task(context.run_dir,context.task); context.input_tokens+=call.input_tokens; context.output_tokens+=call.output_tokens; context.costs['classification']+=0 if context.mode=='performance' else call.estimated_cost
+            context.classification=cls; context.task_context.classification=cls.model_dump(mode='json'); context.task.classification=cls; self.storage.save_task(context.run_dir,context.task); self._add_usage(context, 'classification', call.input_tokens, call.output_tokens, 0 if context.mode=='performance' else call.estimated_cost)
             return self._finish(context,node,NodeExecutionResult(node_id=node.id,status='succeeded',result_summary=getattr(cls,'summary','classification complete'),confidence=getattr(cls,'confidence',None),artifacts={'classification':str(context.run_dir/'classification.json')},data=context.task_context.classification),context.task_context.classification)
         except Exception as e:
             context.warnings.append(f'Classification failed: {e}'); return self._finish(context,node,NodeExecutionResult(node_id=node.id,status='succeeded',result_summary=f'Classification unavailable: {e}',confidence=0.0,data={'fallback_used':True,'error':str(e)}),{'fallback_used':True,'error':str(e)})
@@ -405,7 +413,7 @@ class OrchestrationEngine:
         if getattr(inv, 'investigation_normalized', False):
             for note in inv.investigation_normalization_notes: self.record_controller_step(context,node=node,action='investigation_normalized',status='normalized',summary=note)
         if getattr(inv, 'investigation_fallback_used', False): self.record_controller_step(context,node=node,action='investigation_fallback_used',status='fallback',summary=inv.investigation_fallback_reason or inv.summary)
-        if call: context.input_tokens+=call.input_tokens; context.output_tokens+=call.output_tokens; context.costs['investigation']+=0 if context.mode=='performance' else call.estimated_cost
+        if call: self._add_usage(context, 'investigation', call.input_tokens, call.output_tokens, 0 if context.mode=='performance' else call.estimated_cost)
         self._write_node_artifacts(context,node,raw=(call.raw_text if call else ''))
         return self._finish(context,node,NodeExecutionResult(node_id=node.id,status='succeeded',result_summary=inv.summary,confidence=inv.confidence,artifacts={'raw':'investigation.raw.txt','normalized':'investigation_normalized.json','output':'investigation.json','investigation':str(context.run_dir/'investigation.json')}),context.task_context.investigation)
 
@@ -419,7 +427,7 @@ class OrchestrationEngine:
             for note in plan.planner_repair_notes: self.record_controller_step(context,node=node,action='planner_repaired',status='repaired',summary=note)
             self.progress_reporter.step('[3/8] Plan repaired: strategy=decompose_then_execute, decompose=true, reason=multi-file/multi-subsystem context')
         if getattr(plan, 'planner_fallback_used', False) or getattr(plan, 'fallback_used', False): self.record_controller_step(context,node=node,action='planner_fallback_used',status='fallback',summary=plan.planner_fallback_reason or plan.summary)
-        if call: context.input_tokens+=call.input_tokens; context.output_tokens+=call.output_tokens
+        if call: self._add_usage(context, 'selection' if node.kind=='select' else 'investigation', call.input_tokens, call.output_tokens, 0)
         self._write_node_artifacts(context,node,raw=(call.raw_text if call else ''))
         return self._finish(context,node,NodeExecutionResult(node_id=node.id,status='succeeded',result_summary=plan.summary,confidence=plan.confidence,difficulty=plan.expected_difficulty,artifacts={'raw':'plan.raw.txt','normalized':'plan_normalized.json','output':'plan.json','plan':str(context.run_dir/'plan.json')}),context.task_context.plan)
 
@@ -439,14 +447,20 @@ class OrchestrationEngine:
         if not initial.accepted:
             decision='decomposition_rejected_fallback_to_candidates'
         if initial.accepted and (semantic is None or not semantic.accepted):
-            revised=revise_decomposition_plan(dec, semantic or initial)
-            det2=validate_decomposition_plan(revised, task=context.task.objective or context.task.instruction, success_criteria=context.task.success_criteria, backends=self.backends)
-            sem2, sem2_meta=semantic_validate_decomposition_plan(self.llm_client, revised, task=context.task.objective or context.task.instruction, success_criteria=context.task.success_criteria, deterministic=det2, backend=self.backends[node.assigned_backend])
-            validation=sem2 or det2
-            write_json_utf8(ddir/'plan_validation_revised.json', {'deterministic': det2.model_dump(mode='json'), 'semantic': sem2.model_dump(mode='json') if sem2 else None, 'semantic_status': sem2_meta})
-            if det2.accepted and sem2 is not None and sem2.accepted:
-                dec=revised; context.decomposition=dec; decision='decomposition_revised_and_accepted'
+            revised, rev_meta=revise_decomposition_with_feedback(task=context.task.objective or context.task.instruction, success_criteria=context.task.success_criteria, original_plan=dec, validation_result=semantic or initial, backend_registry=self.backends, policy_context=context.task_context.model_dump(mode='json') if hasattr(context.task_context, 'model_dump') else {}, client=self.llm_client, backend=self.backends[node.assigned_backend])
+            write_json_utf8(ddir/'plan_revision_request.json', rev_meta.get('revision_request') or {})
+            write_json_utf8(ddir/'plan_revision_result.json', {k:v for k,v in rev_meta.items() if k != 'revision_request'})
+            if revised is not None and rev_meta.get('parsed_cleanly'):
+                det2=validate_decomposition_plan(revised, task=context.task.objective or context.task.instruction, success_criteria=context.task.success_criteria, backends=self.backends)
+                sem2, sem2_meta=semantic_validate_decomposition_plan(self.llm_client, revised, task=context.task.objective or context.task.instruction, success_criteria=context.task.success_criteria, deterministic=det2, backend=self.backends[node.assigned_backend])
+                validation=sem2 or det2
+                write_json_utf8(ddir/'plan_validation_revised.json', {'deterministic': det2.model_dump(mode='json'), 'semantic': sem2.model_dump(mode='json') if sem2 else None, 'semantic_status': sem2_meta})
+                if det2.accepted and sem2 is not None and sem2.accepted:
+                    dec=revised; context.decomposition=dec; decision='decomposition_revised_and_accepted'
+                else:
+                    decision='decomposition_rejected_fallback_to_candidates'
             else:
+                write_json_utf8(ddir/'plan_validation_revised.json', {'deterministic': None, 'semantic': None, 'semantic_status': {'status':'skipped','reason':'revision did not parse cleanly'}})
                 decision='decomposition_rejected_fallback_to_candidates'
         write_json_utf8(ddir/'plan_validation_decision.json', {'decision':decision,'accepted':decision in {'decomposition_accepted','decomposition_revised_and_accepted'},'deterministic_accepted':initial.accepted,'semantic_available':semantic is not None,'required_revisions':validation.required_revisions, 'final_decision': 'accepted' if decision in {'decomposition_accepted','decomposition_revised_and_accepted'} else 'rejected'})
         validation.accepted = decision in {'decomposition_accepted','decomposition_revised_and_accepted'}
@@ -554,7 +568,7 @@ class OrchestrationEngine:
                 if dep_art.get('status') != 'ok':
                     raise RuntimeError('Failed to apply accepted dependency patches before runner execution')
             res=self.runner_adapter.run_task(repo_path=Path(wt['worktree_path']), task=prompt, success_criteria=context.task.success_criteria, backend_name=b.name, backend_config=b, timeout_seconds=context.timeout_seconds or b.timeout_seconds or 1200, context={'attempt_id':aid,'subtask_id':sid,'node_id':node.id}, artifacts_dir=adir)
-            write_text_utf8(adir/'stdout.txt', res.stdout); write_text_utf8(adir/'stderr.txt', res.stderr); context.input_tokens+=res.input_tokens; context.output_tokens+=res.output_tokens; context.costs['coding']+=0 if context.mode=='performance' else b.estimate_cost(res.input_tokens,res.output_tokens)
+            write_text_utf8(adir/'stdout.txt', res.stdout); write_text_utf8(adir/'stderr.txt', res.stderr); self._add_usage(context, 'coding', res.input_tokens, res.output_tokens, 0 if context.mode=='performance' else b.estimate_cost(res.input_tokens,res.output_tokens))
             meta.update({'exit_code':res.exit_code,'stdout_path':str(adir/'stdout.txt'),'stderr_path':str(adir/'stderr.txt'),'duration_ms':res.duration_ms,'input_tokens':res.input_tokens,'output_tokens':res.output_tokens,'token_accounting_status':res.token_accounting_status,'runner_telemetry':res.telemetry}); meta.update(capture_worktree(wt['worktree_path'],adir))
             if meta.get('patch_path'):
                 compat=adir/'patch.diff'; write_text_utf8(compat, Path(meta['patch_path']).read_text(encoding='utf-8', errors='replace') if Path(meta['patch_path']).exists() else ''); meta['patch_path']=str(compat)
@@ -568,7 +582,7 @@ class OrchestrationEngine:
         review_input={k:meta.get(k) for k in ['attempt_id','subtask_id','exit_code','stdout_path','stderr_path','changed_files','git_status','runner_telemetry']}; review_input.update({'review_prompt':_subtask_review_prompt(context.task,st,context.subtasks,attempt_idx,context.candidate_attempts),'subtask':st,'patch':_patch_text(meta.get('patch_path'),50000),'stdout_summary':_tail(meta.get('stdout_path'),4000),'stderr_summary':_tail(meta.get('stderr_path'),4000)})
         try:
             review,call=LLMReviewer().review(context.task,context.classification,rb,review_input,self.backends,adir/'review.json',backend_override=rb,estimate_cost=(context.mode!='performance'))
-            context.costs['review']+=0 if context.mode=='performance' else call.estimated_cost; context.input_tokens+=call.input_tokens; context.output_tokens+=call.output_tokens
+            self._add_usage(context, 'review', call.input_tokens, call.output_tokens, 0 if context.mode=='performance' else call.estimated_cost)
         except TypeError:
             review,call=LLMReviewer().review(context.task,context.classification,rb,review_input,self.backends,adir/'review.json',backend_override=rb)
         except Exception as e:
@@ -622,7 +636,7 @@ class OrchestrationEngine:
             if context.isolation!='worktree': raise ValueError('Only worktree isolation is supported')
             wt=GitWorktreeIsolation().create(context.repo,context.run_id,aid,self.storage.workspace); meta.update(wt)
             res=self.runner_adapter.run_task(repo_path=Path(wt['worktree_path']), task=prompt, success_criteria=context.task.success_criteria, backend_name=b.name, backend_config=b, timeout_seconds=context.timeout_seconds or b.timeout_seconds or 1200, context={'attempt_id':aid,'node_id':node.id}, artifacts_dir=adir)
-            write_text_utf8(adir/'stdout.txt', res.stdout); write_text_utf8(adir/'stderr.txt', res.stderr); write_text_utf8(adir/'stdout.log', res.stdout); write_text_utf8(adir/'stderr.log', res.stderr); context.input_tokens+=res.input_tokens; context.output_tokens+=res.output_tokens; context.costs['coding']+=0 if context.mode=='performance' else b.estimate_cost(res.input_tokens,res.output_tokens)
+            write_text_utf8(adir/'stdout.txt', res.stdout); write_text_utf8(adir/'stderr.txt', res.stderr); write_text_utf8(adir/'stdout.log', res.stdout); write_text_utf8(adir/'stderr.log', res.stderr); self._add_usage(context, 'coding', res.input_tokens, res.output_tokens, 0 if context.mode=='performance' else b.estimate_cost(res.input_tokens,res.output_tokens))
             meta.update({'exit_code':res.exit_code,'stdout_path':str(adir/'stdout.txt'),'stderr_path':str(adir/'stderr.txt'),'duration_ms':res.duration_ms,'input_tokens':res.input_tokens,'output_tokens':res.output_tokens,'token_accounting_status':res.token_accounting_status,'runner_telemetry':res.telemetry}); meta.update(capture_worktree(wt['worktree_path'],adir))
             if meta.get('patch_path'):
                 compat=adir/'patch.diff'; write_text_utf8(compat, Path(meta['patch_path']).read_text(encoding='utf-8', errors='replace') if Path(meta['patch_path']).exists() else ''); meta['patch_path']=str(compat)
@@ -653,7 +667,7 @@ class OrchestrationEngine:
                 review,call=LLMReviewer().review(context.task,context.classification,rb,review_input,self.backends,adir/'review.json',backend_override=rb,estimate_cost=(context.mode!='performance'))
             except TypeError:
                 review,call=LLMReviewer().review(context.task,context.classification,rb,review_input,self.backends,adir/'review.json',backend_override=rb)
-            context.costs['review']+=0 if context.mode=='performance' else call.estimated_cost; context.input_tokens+=call.input_tokens; context.output_tokens+=call.output_tokens; self._write_node_artifacts(context,node,raw=call.raw_text)
+            self._add_usage(context, 'review', call.input_tokens, call.output_tokens, 0 if context.mode=='performance' else call.estimated_cost); self._write_node_artifacts(context,node,raw=call.raw_text)
         except Exception as e: review=ReviewResult(decision='fail',summary=f'Reviewer failed: {e}',issues=[str(e)],recommended_action='fail'); write_json_utf8(adir/'review.json', review)
         rdata=review.model_dump(mode='json')
         if st:
@@ -689,15 +703,26 @@ class OrchestrationEngine:
         data={'has_review_blocker': review.decision!='pass' or review.recommended_action!='accept','has_acceptance_blocker': bool(blockers),'acceptance_blockers':blockers, **review.model_dump(mode='json')}
         return self._finish(context,node,NodeExecutionResult(node_id=node.id,status='succeeded',result_summary=review.summary,confidence=review.score or 0.0,artifacts={'review':str(adir/'review.json'),'attempt':str(adir/'attempt.json')},data=data),data)
 
-    def _run_cmd(self, args, cwd):
+    def _validation_argv(self, c):
+        shell=bool(c.get('shell', False))
+        if c.get('argv') is not None:
+            return [str(x) for x in c.get('argv')], False
+        cmd=c.get('cmd')
+        if isinstance(cmd, list):
+            return [str(x) for x in cmd], False
+        if shell:
+            return str(cmd or ''), True
+        return shlex.split(str(cmd or ''), posix=(os.name != 'nt')), False
+
+    def _run_cmd(self, args, cwd, shell: bool=False):
         env=os.environ.copy(); env.update({'GIT_TERMINAL_PROMPT':'0','GIT_EDITOR':'true','PYTHONIOENCODING':'utf-8'})
-        p=subprocess.run(args, cwd=cwd, text=True, capture_output=True, timeout=1200, env=env)
+        start=time.time(); p=subprocess.run(args, cwd=cwd, text=True, capture_output=True, timeout=1200, env=env, shell=shell)
         stderr=p.stderr
         failure_reason=None
         if p.returncode and 'No module named pytest' in (p.stdout + p.stderr):
             failure_reason='environment_failure: pytest is not installed for the active Python executable'
             stderr=(stderr or '') + ('\n' if stderr else '') + failure_reason
-        return {'command':args,'python_executable':args[0] if len(args) >= 3 and args[1:3] == ['-m','pytest'] else sys.executable,'exit_code':p.returncode,'stdout':p.stdout,'stderr':stderr,'passed':p.returncode==0,'failure_reason':failure_reason}
+        return {'command':args,'python_executable':args[0] if len(args) >= 3 and args[1:3] == ['-m','pytest'] else sys.executable,'exit_code':p.returncode,'stdout':p.stdout,'stderr':stderr,'passed':p.returncode==0,'failure_reason':failure_reason,'duration_seconds':time.time()-start}
 
 
     def _analyze_subtask_scope(self, accepted: list[dict], subtasks: list[dict]) -> dict[str, Any]:
@@ -769,13 +794,13 @@ class OrchestrationEngine:
         idir=context.run_dir/'integration'; plan=self._validation_plan(context); write_json_utf8(idir/'validation_plan.json', plan)
         results=[]; passed=True
         for i,c in enumerate(plan.get('commands') or [], 1):
-            argv=c.get('argv') or (c.get('cmd') if isinstance(c.get('cmd'), list) else str(c.get('cmd') or '').split())
+            argv, shell = self._validation_argv(c)
             required=bool(c.get('required', True))
             self.progress_reporter.step(f'[6/8] Running {phase} validation command {i}/{len(plan.get("commands") or [])}...')
-            res=self._run_cmd(argv, worktree_path)
+            res=self._run_cmd(argv if not shell else (c.get('cmd') or ''), worktree_path, shell=shell)
             outp=idir/f'{phase}_{i}_stdout.txt'; errp=idir/f'{phase}_{i}_stderr.txt'
             write_text_utf8(outp, res['stdout']); write_text_utf8(errp, res['stderr'])
-            row={'index':i,'cmd':c.get('cmd') or argv,'command':argv,'required':required,'reason':c.get('reason'),'exit_code':res['exit_code'],'passed':res['passed'],'stdout_path':str(outp),'stderr_path':str(errp),'failure_reason':res.get('failure_reason')}
+            row={'index':i,'cmd':c.get('cmd') or (' '.join(argv) if isinstance(argv, list) else str(argv)),'argv':argv if isinstance(argv, list) else None,'shell':shell,'command':argv,'required':required,'reason':c.get('reason'),'returncode':res['exit_code'],'exit_code':res['exit_code'],'passed':res['passed'],'stdout':res['stdout'],'stderr':res['stderr'],'stdout_path':str(outp),'stderr_path':str(errp),'duration_seconds':res.get('duration_seconds'),'failure_reason':res.get('failure_reason')}
             results.append(row)
             if required and not res['passed']: passed=False
         return {'passed':passed,'commands':results,'fallback':bool(plan.get('fallback')),'source':plan.get('source'),'exit_code':0 if passed else 1,'command':(results[0]['command'] if results else []),'failure_reason':None if passed else 'required validation command failed'}
