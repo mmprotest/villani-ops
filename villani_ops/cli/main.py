@@ -132,7 +132,13 @@ def run(ctx: typer.Context, repo: str|None=None, task: str|None=typer.Option(Non
                 console.print(f"Backend assignments graph: {graph_path}")
         else:
             console.print(f"Backend assignments: see {graph_path}")
-    console.print(f"Candidate attempts requested/completed: {d.candidate_attempts_requested}/{d.candidate_attempts_completed}")
+    if getattr(d, 'decomposition_executed', False):
+        console.print(f"Subtasks requested/completed: {d.subtask_count}/{len(d.subtasks_executed or [])}")
+        console.print(f"Attempts per subtask: {d.attempts_per_subtask}")
+        console.print(f"Subtask attempts completed: {d.subtask_attempts_completed}")
+        console.print(f"Accepted subtasks: {len(d.subtasks_accepted or [])}/{d.subtask_count}")
+    else:
+        console.print(f"Candidate attempts requested/completed: {d.candidate_attempts_requested}/{d.candidate_attempts_completed}")
     console.print(f"Winner: {d.winning_attempt_id or 'none'}")
     console.print(f"Controller reason: {d.reason}")
     console.print(f"Run directory: {result.run_dir}")
