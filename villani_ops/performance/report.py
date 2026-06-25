@@ -78,7 +78,22 @@ def write_performance_report(run_dir: str|Path, task: Any, investigation: Any, c
         for st in subtasks:
             files=', '.join(st.get('relevant_files') or [])
             lines.append(f"- {st.get('id')}: {st.get('title') or st.get('objective')}" + (f" Files: {files}" if files else ''))
+        if getattr(decision, 'decomposition_advisory_only', False):
+            lines += ['', 'Subtasks were generated but not executed separately. This was advisory-only and does not count as active decomposition.']
     else: lines.append('No decomposition was used.')
+    lines += ['', '## Decomposed Execution', f"Decomposition executed: {str(getattr(decision,'decomposition_executed',False)).lower()}", f"Advisory only: {str(getattr(decision,'decomposition_advisory_only',False)).lower()}", f"Subtask count: {getattr(decision,'subtask_count',0)}"]
+    if getattr(decision,'decomposition_executed',False):
+        attempts=getattr(decision,'attempts',[]) or []
+        lines += ['', '### Subtasks', '| Subtask | Status | Changed files | Review | Accepted | Patch |', '|---|---|---:|---|---|---|']
+        accepted=set(getattr(decision,'subtasks_accepted',[]) or [])
+        for a in attempts:
+            if not a.get('subtask_id'): continue
+            rv=a.get('review') or {}
+            lines.append(f"| {a.get('subtask_id')} | {a.get('status')} | {len(a.get('changed_files') or [])} | {rv.get('decision')}/{rv.get('recommended_action')} | {str(a.get('subtask_id') in accepted).lower()} | {a.get('patch_path') or ''} |")
+        val=getattr(decision,'integration_validation',None) or {}
+        lines += ['', '### Integration', f"Worktree: {getattr(decision,'integration_worktree_path',None) or ''}", f"Accepted subtask patches: {len(getattr(decision,'subtasks_accepted',[]) or [])}", f"Validation command: {' '.join(val.get('command') or [])}", f"Validation passed: {str(bool(val.get('passed'))).lower()}", f"Repair used: {str(bool(getattr(decision,'integration_repair_used',False))).lower()}", f"Final patch: {getattr(decision,'integration_patch_path',None) or ''}"]
+        fr=getattr(decision,'final_review',None) or {}
+        lines += ['', '### Final Review', f"Decision: {fr.get('decision','')}", f"Recommended action: {fr.get('recommended_action','')}", f"Score: {fr.get('score','')}"]
     lines += ['', '## Candidate Attempts', '| Attempt | Backend | Model | Status | Exit | Changed files | Review decision | Review score | Eligible | Blockers | Patch | Patch path |', '| --- | --- | --- | --- | ---: | --- | --- | ---: | --- | --- | --- | --- |']
     for c in candidates:
         lines.append(f"| {c.get('attempt_id')} | {c.get('backend_name')} | {c.get('model')} | {c.get('status')} | {c.get('exit_code')} | {', '.join(c.get('changed_files') or [])} | {c.get('review_decision')} | {c.get('review_score')} | {c.get('acceptance_eligible')} | {'; '.join(c.get('acceptance_blockers') or [])} | {'yes' if has_non_empty_patch(c.get('patch_path')) else 'no'} | {c.get('patch_path') or ''} |")

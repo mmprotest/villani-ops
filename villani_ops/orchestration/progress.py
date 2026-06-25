@@ -19,6 +19,7 @@ class ProgressReporter:
     def selector_completed(self, selection: Any, notes: list[str] | None = None) -> None: pass
     def fallback_used(self, reason: str, selected_attempt_id: str | None) -> None: pass
     def final_decision(self, accepted: bool, winner: str | None = None, reason: str | None = None) -> None: pass
+    def step(self, message: str) -> None: pass
 
 class NullProgressReporter(ProgressReporter):
     pass

@@ -30,6 +30,8 @@ class OrchestrationGraph(BaseModel):
             return True
         if dep.status == 'skipped' and dep.kind == 'decompose':
             return True
+        if dep.status == 'skipped' and dep.kind == 'integration_repair':
+            return True
         if node is not None and node.kind == 'review' and dep.kind == 'code' and dep.status in {'failed', 'skipped'}:
             return True
         if node is not None and node.kind == 'select' and dep.kind == 'review' and dep.status in {'succeeded', 'failed', 'skipped'}:
