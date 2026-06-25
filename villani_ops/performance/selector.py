@@ -48,14 +48,39 @@ def normalize_selector_payload(payload: Any, candidates: list[dict[str, Any]]) -
 
 
 
+def synthesize_reasons(selected_id: str | None, candidates: list[dict[str, Any]], *, decision: str = "select") -> tuple[str, list[str]]:
+    by_id={c.get('attempt_id'): c for c in candidates}
+    reasons: list[str]=[]
+    if decision == 'select' and selected_id:
+        c=by_id.get(selected_id, {})
+        parts=[f"Selected {selected_id} because it was acceptance-eligible" if c.get('acceptance_eligible') else f"Selected {selected_id}"]
+        if c.get('review_decision') or c.get('review_recommended_action'):
+            parts.append(f"reviewer returned {c.get('review_decision') or 'unknown'}/{c.get('review_recommended_action') or 'unknown'}")
+        if c.get('review_score') is not None: parts.append(f"with score {c.get('review_score')}")
+        if c.get('changed_files'): parts.append('it modified ' + ', '.join(c.get('changed_files') or []))
+        parts.append('no acceptance blockers were present' if not c.get('acceptance_blockers') else 'blockers: ' + '; '.join(c.get('acceptance_blockers') or []))
+        summary=', '.join(parts) + '.'
+        reasons.append(f"{selected_id} was acceptance-eligible; reviewer returned {c.get('review_decision') or 'unknown'}/{c.get('review_recommended_action') or 'unknown'}.")
+        if not c.get('acceptance_blockers'): reasons.append(f"{selected_id} had no acceptance blockers.")
+        for other in candidates:
+            aid=other.get('attempt_id')
+            if aid == selected_id: continue
+            if not other.get('acceptance_eligible'):
+                reasons.append(f"{aid} was ineligible because {('; '.join(other.get('acceptance_blockers') or [])) or 'acceptance gates failed'}.")
+            elif (other.get('review_score') or 0) < (c.get('review_score') or 0):
+                reasons.append(f"{aid} had a lower review score.")
+        return summary, reasons
+    for c in candidates:
+        aid=c.get('attempt_id')
+        if c.get('acceptance_blockers'):
+            reasons.append(f"{aid} was not selected because {'; '.join(c.get('acceptance_blockers') or [])}.")
+        elif not c.get('acceptance_eligible'):
+            reasons.append(f"{aid} was not acceptance-eligible.")
+    if not reasons: reasons=['No candidate passed acceptance gates.']
+    return 'No candidate was selected. ' + reasons[0], reasons
+
 def synthesize_reason(selected_id: str, candidates: list[dict[str, Any]]) -> str:
-    c=next((x for x in candidates if x.get('attempt_id')==selected_id), {})
-    bits=[f"Selected {selected_id} because it was acceptance-eligible" if c.get('acceptance_eligible') else f"Selected {selected_id}"]
-    if c.get('review_decision') or c.get('review_recommended_action'):
-        bits.append(f"reviewer returned {c.get('review_decision') or 'unknown'}/{c.get('review_recommended_action') or 'unknown'}")
-    if not c.get('acceptance_blockers'): bits.append('no acceptance blockers were present')
-    if c.get('changed_files'): bits.append('changed files were present')
-    return ', '.join(bits) + '.'
+    return synthesize_reasons(selected_id, candidates)[0]
 
 def deterministic_fallback(candidates: list[dict[str, Any]], reason: str | None = None) -> SelectionResult:
     eligible=[c for c in candidates if c.get('acceptance_eligible')]
@@ -88,12 +113,16 @@ def resolve_selection(payload: Any, candidates: list[dict[str, Any]], *, selecto
             return attach(deterministic_fallback(candidates, f'Selector selected ineligible candidate {sel.selected_attempt_id}.')), normalized, notes
         if not sel.summary.strip() and not sel.reasons:
             reason=synthesize_reason(sel.selected_attempt_id, candidates)
-            sel.summary=reason; sel.reasons=[reason]; sel.selector_reason_synthesized=True
+            sel.summary=reason; sel.reasons=synthesize_reasons(sel.selected_attempt_id, candidates)[1]; sel.selector_reason_synthesized=True; sel.selector_reason_synthesis_reason='Selector returned no meaningful summary or reasons.'
         sel.selector_normalized=bool(notes); sel.selector_normalization_notes=notes; sel.fallback_used=False; sel.fallback_reason=None; sel.selector_fallback_used=False; sel.selector_fallback_reason=None
         return attach(sel), normalized, notes
     if malformed or (not sel.selected_attempt_id and not sel.summary.strip() and not sel.reasons):
         return attach(deterministic_fallback(candidates, 'Selector rejected all without meaningful reasons despite eligible candidates.')), normalized, notes
-    sel.summary = sel.summary or 'Selector intentionally rejected all candidates despite eligibility.'
+
+    if not sel.summary.strip() and not sel.reasons:
+        sel.summary, sel.reasons = synthesize_reasons(None, candidates, decision='reject_all'); sel.selector_reason_synthesized=True; sel.selector_reason_synthesis_reason='Selector returned no meaningful summary or reasons.'
+    else:
+        sel.summary = sel.summary or 'Selector intentionally rejected all candidates despite eligibility.'
     sel.selector_normalized=bool(notes); sel.selector_normalization_notes=notes; sel.fallback_used=False; sel.fallback_reason=None; sel.selector_fallback_used=False; sel.selector_fallback_reason=None
     return attach(sel), normalized, notes
 

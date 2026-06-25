@@ -60,4 +60,4 @@ def test_normalization_and_fallback_progress(capsys):
     out=capsys.readouterr().out
     assert 'normalized=true' in out
     assert 'Selector reason synthesized from candidate evidence' in out
-    assert 'Plan complete using fallback' in out
+    assert 'Plan complete using planner fallback' in out

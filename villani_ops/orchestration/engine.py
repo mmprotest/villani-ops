@@ -158,14 +158,17 @@ class OrchestrationEngine:
                 inv,call=Investigator().investigate(context.task,context.classification,node.assigned_backend,self.backends[node.assigned_backend],context.run_dir,estimate_cost=(context.mode!='performance'))
             except TypeError:
                 inv,call=Investigator().investigate(context.task,context.classification,node.assigned_backend,self.backends[node.assigned_backend],context.run_dir)
-        except Exception as e: context.warnings.append(f'Investigation failed: {e}'); inv=InvestigationResult(summary=f'Investigation unavailable: {e}', investigation_fallback_used=True, investigation_fallback_reason=str(e)); call=None
+        except Exception as e:
+            context.warnings.append(f'Investigation failed: {e}'); inv=InvestigationResult(summary=f'Investigation unavailable: {e}', investigation_fallback_used=True, investigation_fallback_reason=str(e)); call=None
+            (context.run_dir/'investigation.raw.txt').write_text(f'ERROR: {e}')
+            (context.run_dir/'investigation_normalized.json').write_text(json.dumps({'normalized': False, 'payload': {}, 'notes': [], 'error': str(e)}, indent=2))
         (context.run_dir/'investigation.json').write_text(inv.model_dump_json(indent=2)); context.investigation=inv; context.task_context.investigation=inv.model_dump(mode='json')
         if getattr(inv, 'investigation_normalized', False):
             for note in inv.investigation_normalization_notes: self.record_controller_step(context,node=node,action='investigation_normalized',status='normalized',summary=note)
         if getattr(inv, 'investigation_fallback_used', False): self.record_controller_step(context,node=node,action='investigation_fallback_used',status='fallback',summary=inv.investigation_fallback_reason or inv.summary)
         if call: context.input_tokens+=call.input_tokens; context.output_tokens+=call.output_tokens; context.costs['investigation']+=0 if context.mode=='performance' else call.estimated_cost
         self._write_node_artifacts(context,node,raw=(call.raw_text if call else ''))
-        return self._finish(context,node,NodeExecutionResult(node_id=node.id,status='succeeded',result_summary=inv.summary,confidence=inv.confidence,artifacts={'investigation':str(context.run_dir/'investigation.json')}),context.task_context.investigation)
+        return self._finish(context,node,NodeExecutionResult(node_id=node.id,status='succeeded',result_summary=inv.summary,confidence=inv.confidence,artifacts={'raw':'investigation.raw.txt','normalized':'investigation_normalized.json','output':'investigation.json','investigation':str(context.run_dir/'investigation.json')}),context.task_context.investigation)
 
     def _execute_plan_node(self,node,context):
         context.graph.mark_running(node.id); self._write_node_artifacts(context,node,inp={'task':context.task_context.objective})
@@ -176,7 +179,7 @@ class OrchestrationEngine:
         if getattr(plan, 'planner_fallback_used', False) or getattr(plan, 'fallback_used', False): self.record_controller_step(context,node=node,action='planner_fallback_used',status='fallback',summary=plan.planner_fallback_reason or plan.summary)
         if call: context.input_tokens+=call.input_tokens; context.output_tokens+=call.output_tokens
         self._write_node_artifacts(context,node,raw=(call.raw_text if call else ''))
-        return self._finish(context,node,NodeExecutionResult(node_id=node.id,status='succeeded',result_summary=plan.summary,confidence=plan.confidence,difficulty=plan.expected_difficulty,artifacts={'plan':str(context.run_dir/'plan.json')}),context.task_context.plan)
+        return self._finish(context,node,NodeExecutionResult(node_id=node.id,status='succeeded',result_summary=plan.summary,confidence=plan.confidence,difficulty=plan.expected_difficulty,artifacts={'raw':'plan.raw.txt','normalized':'plan_normalized.json','output':'plan.json','plan':str(context.run_dir/'plan.json')}),context.task_context.plan)
 
     def _execute_decompose_node(self,node,context):
         context.graph.mark_running(node.id); self._write_node_artifacts(context,node,inp={'plan':context.task_context.plan})
@@ -246,13 +249,13 @@ class OrchestrationEngine:
             selection=deterministic_fallback(candidates, f'Selector selected invalid or ineligible candidate {selection.selected_attempt_id}.'); selection.selector_backend=node.assigned_backend; (context.run_dir/'selection.json').write_text(selection.model_dump_json(indent=2)); fallback=True
         for note in (normalization_notes or []): self.record_controller_step(context,node=node,action='selector_normalized',status='normalized',summary=note)
         if getattr(selection, 'selector_reason_synthesized', False): self.record_controller_step(context,node=node,action='selector_reason_synthesized',status='normalized',summary=(selection.reasons or [''])[0])
-        if fallback: self.record_controller_step(context,node=node,action='selector_fallback_used',status='fallback',summary=selection.selector_fallback_reason or selection.fallback_reason or selection.summary); self.progress_reporter.fallback_used(selection.selector_fallback_reason or selection.fallback_reason or selection.summary, selection.selected_attempt_id)
+        if fallback: self.record_controller_step(context,node=node,action='selector_fallback_used',status='fallback',summary=selection.selector_fallback_reason or selection.fallback_reason or selection.summary)
         self.progress_reporter.selector_completed(selection, normalization_notes)
         context.selection=selection; context.winner=next((a for a in context.attempts if a.get('attempt_id')==selection.selected_attempt_id and a.get('acceptance_eligible')),None) if selection.decision=='select' else None
         raw=Path(context.run_dir/'selection.raw.txt').read_text(errors='replace') if (context.run_dir/'selection.raw.txt').exists() else ''
         self._write_node_artifacts(context,node,raw=raw)
         data=selection.model_dump(mode='json')|{'selector_fallback_used':fallback}
-        return self._finish(context,node,NodeExecutionResult(node_id=node.id,status='succeeded',result_summary=selection.summary,confidence=selection.confidence,artifacts={'selection':str(context.run_dir/'selection.json'),'selection_input':str(context.run_dir/'selection_input.json')},data=data),data)
+        return self._finish(context,node,NodeExecutionResult(node_id=node.id,status='succeeded',result_summary=selection.summary,confidence=selection.confidence,artifacts={'raw':'selection.raw.txt','normalized':'selection_normalized.json','input':'selection_input.json','output':'selection.json','selection':str(context.run_dir/'selection.json'),'selection_input':str(context.run_dir/'selection_input.json')},data=data),data)
 
     def _execute_verify_node(self,node,context):
         context.graph.mark_running(node.id); accepted=bool(context.winner); data={'accepted':accepted,'winner':context.winner.get('attempt_id') if context.winner else None}; self._write_node_artifacts(context,node,inp={'selection':context.selection.model_dump(mode='json') if context.selection else None})

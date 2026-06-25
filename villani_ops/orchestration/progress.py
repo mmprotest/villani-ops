@@ -37,10 +37,14 @@ class ConsoleProgressReporter(ProgressReporter):
         if k=='classify': self._print(f'[{STEP[k]}] Classification complete: {data.get("category") or data.get("task_type") or "unknown"}, difficulty={data.get("difficulty")}, confidence={data.get("confidence","")}')
         elif k=='investigate':
             if data.get("investigation_fallback_used"): self._print(f'[{STEP[k]}] Investigation fallback used: reason={data.get("investigation_fallback_reason") or ""}')
-            else: self._print(f'[{STEP[k]}] Investigation complete: relevant_files={len(data.get("relevant_files") or [])}, confidence={data.get("confidence","")}, normalized={str(bool(data.get("investigation_normalized"))).lower()}')
+            else:
+                extra=', normalized=true' if data.get("investigation_normalized") else ''
+                self._print(f'[{STEP[k]}] Investigation complete: relevant_files={len(data.get("relevant_files") or [])}, confidence={data.get("confidence","")}{extra}')
         elif k=='plan':
-            if data.get("planner_fallback_used") or data.get("fallback_used"): self._print(f'[{STEP[k]}] Plan complete using fallback: strategy={data.get("strategy")}, candidates={data.get("candidate_attempts") or data.get("candidates")}, reason={data.get("planner_fallback_reason") or ""}')
-            else: self._print(f'[{STEP[k]}] Plan complete: strategy={data.get("strategy")}, candidates={data.get("candidate_attempts") or data.get("candidates")}, decompose={str(bool(data.get("should_decompose"))).lower()}, normalized={str(bool(data.get("planner_normalized"))).lower()}')
+            if data.get("planner_fallback_used") or data.get("fallback_used"): self._print(f'[{STEP[k]}] Plan complete using planner fallback: strategy={data.get("strategy")}, candidates={data.get("candidate_attempts") or data.get("candidates")}, reason={data.get("planner_fallback_reason") or ""}')
+            else:
+                extra=', normalized=true' if data.get("planner_normalized") else ''
+                self._print(f'[{STEP[k]}] Plan complete: strategy={data.get("strategy")}, candidates={data.get("candidate_attempts") or data.get("candidates")}, decompose={str(bool(data.get("should_decompose"))).lower()}{extra}')
         elif k=='decompose': self._print(f'[{STEP[k]}] Decomposition complete: subtask_count={len(data.get("subtasks") or [])}')
     def node_skipped(self, node: Any, reason: str) -> None:
         if node.kind=='decompose': self._print(f'[{STEP[node.kind]}] Decomposition skipped: {reason}')
@@ -53,7 +57,9 @@ class ConsoleProgressReporter(ProgressReporter):
     def selector_completed(self, selection: Any, notes: list[str] | None = None) -> None:
         for n in notes or []: self._print(f'[{STEP["select"]}] Selector output used alias/normalization: {n}')
         if getattr(selection,'selector_reason_synthesized',False): self._print(f'[{STEP["select"]}] Selector reason synthesized from candidate evidence')
-        if getattr(selection,'decision',None)=='select': self._print(f'[{STEP["select"]}] Selector chose {selection.selected_attempt_id}')
+        if getattr(selection,'selector_fallback_used',False) or getattr(selection,'fallback_used',False):
+            self._print(f'[{STEP["select"]}] Selector fallback selected {selection.selected_attempt_id}: {getattr(selection, "selector_fallback_reason", None) or getattr(selection, "fallback_reason", None) or getattr(selection, "summary", "")}')
+        elif getattr(selection,'decision',None)=='select': self._print(f'[{STEP["select"]}] Selector chose {selection.selected_attempt_id}')
         else: self._print(f'[{STEP["select"]}] Selector rejected all candidates')
     def fallback_used(self, reason: str, selected_attempt_id: str | None) -> None: self._print(f'[{STEP["select"]}] Selector fallback selected {selected_attempt_id}: {reason}')
     def final_decision(self, accepted: bool, winner: str | None = None, reason: str | None = None) -> None: self._print(f'[{STEP["verify"]}] Final decision: {"accepted" if accepted else "failed"}' + (f', winner={winner}' if winner else f', {reason}' if reason else ''))

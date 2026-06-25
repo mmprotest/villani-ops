@@ -34,7 +34,13 @@ def make_ops(tmp_path, monkeypatch, reviews, selection=None):
         if out_path: Path(out_path).write_text(c.model_dump_json(indent=2))
         return c, LLMCallResult(parsed_json={}, raw_text='{}', backend_name='code', model='m')
     monkeypatch.setattr('villani_ops.classification.classifier.TaskClassifier.classify', classify)
-    monkeypatch.setattr('villani_ops.performance.investigator.Investigator.investigate', lambda self, task, cls, backend_name, backend, run_dir: (__import__('villani_ops.performance.models', fromlist=['InvestigationResult']).InvestigationResult(summary='look'), LLMCallResult(parsed_json={}, raw_text='{}', backend_name='code', model='m')))
+    def investigate(self, task, cls, backend_name, backend, run_dir):
+        inv=__import__('villani_ops.performance.models', fromlist=['InvestigationResult']).InvestigationResult(summary='look')
+        Path(run_dir/'investigation.raw.txt').write_text('{}')
+        Path(run_dir/'investigation_normalized.json').write_text('{"normalized": false, "notes": [], "payload": {"summary": "look"}}')
+        Path(run_dir/'investigation.json').write_text(inv.model_dump_json(indent=2))
+        return inv, LLMCallResult(parsed_json={}, raw_text='{}', backend_name='code', model='m')
+    monkeypatch.setattr('villani_ops.performance.investigator.Investigator.investigate', investigate)
     q=list(reviews)
     def review(self, task, classification, coding_backend, attempt, backends, out_path=None, backend_override=None):
         r=q.pop(0)
@@ -118,3 +124,17 @@ def test_decision_mode_and_selector_input_no_cost(tmp_path, monkeypatch):
     report=(rd/'report.md').read_text().lower()
     for term in ['cheap','balanced','quality','cost savings','selected by cost']:
         assert term not in report
+
+
+def test_live_run_writes_normalized_node_artifacts(tmp_path, monkeypatch):
+    repo=tmp_path/'repo'; git_repo(repo)
+    ops, ws=make_ops(tmp_path, monkeypatch, [ReviewResult(passed=True,decision='pass',recommended_action='accept',score=.9)])
+    res=ops.run(repo, Task(repo_path=str(repo), objective='edit'), candidate_attempts=1, non_interactive=True)
+    rd=Path(res.run_dir)
+    for rel in ['investigation.raw.txt','investigation_normalized.json','investigation.json','plan.raw.txt','plan_normalized.json','plan.json','selection_normalized.json']:
+        assert (rd/rel).exists()
+    graph=json.loads((rd/'orchestration_graph.json').read_text())
+    by_id={n['id']: n for n in graph['nodes']}
+    assert by_id['investigate']['artifacts']['normalized'] == 'investigation_normalized.json'
+    assert by_id['plan']['artifacts']['normalized'] == 'plan_normalized.json'
+    assert by_id['select']['artifacts']['normalized'] == 'selection_normalized.json'

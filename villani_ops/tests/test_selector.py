@@ -139,3 +139,14 @@ def test_selector_fallback_explicit_field_for_ineligible():
     sel, _, _=resolve_selection({'selected_attempt_id':'attempt_002'}, [c('attempt_001'), c('attempt_002', eligible=False)])
     assert sel.selector_fallback_used is True
     assert 'ineligible' in sel.selector_fallback_reason
+
+
+def test_synthesized_selector_reason_metadata_and_ineligible_alternative():
+    cand = c('attempt_001') | {'review_decision':'pass','review_recommended_action':'accept','acceptance_blockers':[]}
+    bad = c('attempt_002', eligible=False) | {'acceptance_blockers':['changed files are missing']}
+    sel, _, _ = resolve_selection({'selected_attempt_id':'attempt_001'}, [cand, bad])
+    assert sel.selector_reason_synthesized is True
+    assert sel.selector_reason_synthesis_reason == 'Selector returned no meaningful summary or reasons.'
+    assert sel.summary
+    assert sel.reasons
+    assert any('attempt_002 was ineligible' in r for r in sel.reasons)

@@ -59,8 +59,8 @@ def normalize_plan_payload(payload: dict[str, Any], *, requested_candidate_attem
     def map_alias(alias, target):
         if target not in data and alias in data:
             data[target]=data[alias]; notes.append(f"Mapped {alias} to {target}")
-    map_alias('approach','summary'); map_alias('strategy_summary','summary'); map_alias('execution_strategy','strategy')
-    map_alias('requires_decomposition','should_decompose'); map_alias('num_candidates','candidate_attempts'); map_alias('candidates','candidate_attempts'); map_alias('attempts','candidate_attempts'); map_alias('difficulty','expected_difficulty')
+    map_alias('approach','summary'); map_alias('strategy_summary','summary'); map_alias('execution_strategy','strategy'); map_alias('strategy_name','strategy')
+    map_alias('requires_decomposition','should_decompose'); map_alias('num_candidates','candidate_attempts'); map_alias('candidates','candidate_attempts'); map_alias('attempts','candidate_attempts'); map_alias('candidate_count','candidate_attempts'); map_alias('difficulty','expected_difficulty')
     if 'risks' not in data:
         for a in ('risk_factors','warnings'):
             if a in data: data['risks']=data[a]; notes.append(f"Mapped {a} to risks"); break
@@ -73,7 +73,7 @@ def normalize_plan_payload(payload: dict[str, Any], *, requested_candidate_attem
     if not str(data.get('summary') or '').strip() and isinstance(data.get('steps'), list): data['summary']='; '.join(str(x) for x in data['steps'] if str(x).strip()); notes.append('Mapped steps to summary')
     if not str(data.get('summary') or '').strip(): return data, notes
     if not data.get('strategy'): data['strategy']='parallel_candidates'; notes.append('Defaulted strategy to parallel_candidates')
-    maps={'parallel':'parallel_candidates','multi_candidate':'parallel_candidates','single':'single_task','decompose':'decompose_then_execute'}
+    maps={'parallel':'parallel_candidates','multi_candidate':'parallel_candidates','multiple_candidates':'parallel_candidates','single':'single_task','decompose':'decompose_then_execute'}
     if data.get('strategy') in maps: data['strategy']=maps[data['strategy']]; notes.append('Mapped strategy alias')
     if data.get('strategy') not in {'single_task','parallel_candidates','decompose_then_execute'}: data['strategy']='parallel_candidates'; notes.append('Defaulted invalid strategy to parallel_candidates')
     if not data.get('candidate_attempts'): data['candidate_attempts']=requested_candidate_attempts; notes.append('Defaulted candidate_attempts to requested value')
@@ -117,16 +117,21 @@ class Planner:
             try:
                 plan=PlanResult.model_validate(call.parsed_json)
                 plan.candidate_attempts=max(1, min(8, int(plan.candidate_attempts or candidate_attempts)))
-            except Exception:
-                normalized_payload, notes = normalize_plan_payload(call.parsed_json if isinstance(call.parsed_json, dict) else {}, requested_candidate_attempts=candidate_attempts)
-                plan=PlanResult.model_validate(normalized_payload)
-                plan.planner_normalized=True; plan.planner_normalization_notes=notes
+                (run_dir/'plan_normalized.json').write_text(json.dumps({'normalized': False, 'notes': [], 'payload': plan.model_dump(mode='json')}, indent=2))
+            except Exception as original_error:
+                try:
+                    normalized_payload, notes = normalize_plan_payload(call.parsed_json if isinstance(call.parsed_json, dict) else {}, requested_candidate_attempts=candidate_attempts)
+                    plan=PlanResult.model_validate(normalized_payload)
+                    plan.planner_normalized=True; plan.planner_normalization_notes=notes; plan.planner_fallback_used=False; plan.planner_fallback_reason=None
+                    (run_dir/'plan_normalized.json').write_text(json.dumps({'normalized': True, 'payload': normalized_payload, 'notes': notes}, indent=2))
+                except Exception:
+                    raise original_error
         except Exception as e:
             call=locals().get('call')
             reason=str(e)
             plan=PlanResult(summary=f'Planner fallback used: {reason}', strategy='parallel_candidates', should_decompose=False, candidate_attempts=candidate_attempts, expected_difficulty='unknown', confidence=0.0, fallback_used=True, planner_fallback_used=True, planner_fallback_reason=reason)
-        (run_dir/'plan.raw.txt').write_text((call.raw_text if call else '') or '')
-        if normalized_payload is not None: (run_dir/'plan_normalized.json').write_text(json.dumps({'payload': normalized_payload, 'notes': notes}, indent=2))
+            (run_dir/'plan_normalized.json').write_text(json.dumps({'normalized': False, 'payload': getattr(call, 'parsed_json', {}) if call else {}, 'notes': [], 'error': reason}, indent=2, default=str))
+        (run_dir/'plan.raw.txt').write_text((call.raw_text if call else f'ERROR: {plan.planner_fallback_reason or ""}') or '')
         (run_dir/'plan.json').write_text(plan.model_dump_json(indent=2))
         return plan, call if 'call' in locals() else None
     def decompose(self, *, task, plan: PlanResult, investigation, backend: Backend, run_dir: Path, estimate_cost: bool = True) -> tuple[DecompositionResult, LLMCallResult|None]:
