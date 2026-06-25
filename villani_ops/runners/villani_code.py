@@ -61,3 +61,8 @@ class VillaniCodeRunner:
             r.telemetry.setdefault('token_accounting_warnings', []).append('Runner timed out; telemetry may be partial.')
             Path(telemetry_path).write_text(json.dumps(r.telemetry, indent=2))
             return r
+
+class VillaniCodeAdapter(VillaniCodeRunner):
+    name='villani-code'
+    def run_task(self, *, repo_path: Path, task: str, success_criteria: str | None, backend_name: str, backend_config, timeout_seconds: int | None, context: dict, artifacts_dir: Path) -> RunnerResult:
+        return self.run(RunnerContext(attempt_id=str(context.get('attempt_id') or 'attempt'), repo_path=str(repo_path), task_instruction=task, success_criteria=success_criteria, backend=backend_config, timeout_seconds=timeout_seconds or backend_config.timeout_seconds or 1200, run_dir=str(artifacts_dir)))

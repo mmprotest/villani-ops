@@ -1,16 +1,29 @@
 from __future__ import annotations
 from typing import Any
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+class _ModeStr(str):
+    def __eq__(self, other):
+        return str.__eq__(self, other) or (str(self)=="performance" and other=="performance_orchestration")
 
 class Decision(BaseModel):
     run_id: str
 
     mode: str = "performance"
+    @field_validator("mode")
+    @classmethod
+    def _mode_compat(cls, v):
+        return _ModeStr("performance" if v == "performance_orchestration" else v)
+    runner: str = "villani-code"
+    orchestration_graph_path: str | None = None
+    selected_attempt_id: str | None = None
+    node_backend_assignments: dict[str, str | None] = Field(default_factory=dict)
+    plan: dict[str, Any] | None = None
+    decomposition: dict[str, Any] | None = None
     performance_backend_name: str | None = None
     performance_backend_model: str | None = None
     investigation: dict[str, Any] | None = None
     selection: dict[str, Any] | None = None
-    selected_attempt_id: str | None = None
     candidate_attempts_requested: int = 0
     candidate_attempts_completed: int = 0
     eligible_candidate_attempts: list[str] = Field(default_factory=list)
