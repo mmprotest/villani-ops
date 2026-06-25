@@ -81,15 +81,20 @@ def write_performance_report(run_dir: str|Path, task: Any, investigation: Any, c
         if getattr(decision, 'decomposition_advisory_only', False):
             lines += ['', 'Subtasks were generated but not executed separately. This was advisory-only and does not count as active decomposition.']
     else: lines.append('No decomposition was used.')
-    lines += ['', '## Decomposed Execution', f"Decomposition executed: {str(getattr(decision,'decomposition_executed',False)).lower()}", f"Advisory only: {str(getattr(decision,'decomposition_advisory_only',False)).lower()}", f"Subtask count: {getattr(decision,'subtask_count',0)}"]
+    px=getattr(decision,'parallel_execution',None) or {}
+    lines += ['', '## Decomposed Execution', f"Decomposition executed: {str(getattr(decision,'decomposition_executed',False)).lower()}", f"Advisory only: {str(getattr(decision,'decomposition_advisory_only',False)).lower()}", f"Subtask count: {getattr(decision,'subtask_count',0)}", f"Parallel subtask execution: {'enabled' if px.get('enabled') else 'disabled'}"]
+    if px.get('backend_limits'):
+        lines += ['Backend limits:', *[f"- {name}: max_parallel={limit}" for name, limit in (px.get('backend_limits') or {}).items()], f"Max observed concurrency: {px.get('max_observed_concurrency',0)}"]
+    elif px.get('reason'):
+        lines.append(f"Reason: {px.get('reason')}")
     if getattr(decision,'decomposition_executed',False):
         attempts=getattr(decision,'attempts',[]) or []
-        lines += ['', '### Subtasks', '| Subtask | Status | Changed files | Review | Accepted | Patch |', '|---|---|---:|---|---|---|']
+        lines += ['', '### Subtasks', '| Subtask | Status | Started | Completed | Changed files | Review | Accepted | Patch |', '|---|---|---|---|---:|---|---|---|']
         accepted=set(getattr(decision,'subtasks_accepted',[]) or [])
         for a in attempts:
             if not a.get('subtask_id'): continue
             rv=a.get('review') or {}
-            lines.append(f"| {a.get('subtask_id')} | {a.get('status')} | {len(a.get('changed_files') or [])} | {rv.get('decision')}/{rv.get('recommended_action')} | {str(a.get('subtask_id') in accepted).lower()} | {a.get('patch_path') or ''} |")
+            lines.append(f"| {a.get('subtask_id')} | {a.get('status')} | {a.get('started_at') or ''} | {a.get('completed_at') or ''} | {len(a.get('changed_files') or [])} | {rv.get('decision')}/{rv.get('recommended_action')} | {str(a.get('subtask_id') in accepted).lower()} | {a.get('patch_path') or ''} |")
         val=getattr(decision,'integration_validation',None) or {}
         init=getattr(decision,'integration_validation_initial',None) or {}
         after=getattr(decision,'integration_validation_after_repair',None)

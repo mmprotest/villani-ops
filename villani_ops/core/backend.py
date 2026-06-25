@@ -17,6 +17,7 @@ class Backend(BaseModel):
     output_cost_per_million: float = 0.0
     roles: list[Role] = Field(default_factory=lambda: ["coding"])
     capability_score: int = 0
+    max_parallel: int = Field(default=1, ge=1, le=32)
     max_tokens: int | None = None
     timeout_seconds: int | None = None
     enabled: bool = True

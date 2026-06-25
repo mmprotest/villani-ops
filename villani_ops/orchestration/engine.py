@@ -3,7 +3,8 @@ from pathlib import Path
 from datetime import datetime, timezone
 from collections import Counter
 from dataclasses import dataclass, field
-import json, secrets, time, subprocess, sys, os
+import json, secrets, time, subprocess, sys, os, threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 from pydantic import BaseModel
 from villani_ops.core.task import Task
@@ -24,6 +25,7 @@ from villani_ops.orchestration.nodes import OrchestrationNode, NodeExecutionResu
 from villani_ops.orchestration.context import TaskContext
 from villani_ops.orchestration.scheduler import GraphScheduler
 from villani_ops.llm.client import LLMClient
+from villani_ops.core.concurrency import BackendConcurrencyLimiter
 
 class RunResult(BaseModel):
     run_id: str; run_dir: str; decision: Decision; report_path: str; attempts: list[dict]
@@ -39,6 +41,7 @@ class EngineContext:
     classification:Any=None; investigation:Any=None; plan:Any=None; decomposition:Any=None; selection:Any=None; winner:dict|None=None; final_decision:Decision|None=None
     subtasks:list[dict]=field(default_factory=list); accepted_subtasks:list[dict]=field(default_factory=list); rejected_subtasks:list[dict]=field(default_factory=list)
     integration:dict[str,Any]=field(default_factory=dict); decomposed_active:bool=False
+    parallel_execution:dict[str,Any]=field(default_factory=dict); controller_step_lock:Any=field(default_factory=threading.Lock)
 
 def _now(): return datetime.now(timezone.utc).isoformat()
 def _candidate_prompt(task: Task, inv, n: int, total: int, decomposition=None) -> str:
@@ -178,7 +181,7 @@ def _selector_candidate_payload(a: dict) -> dict:
 
 class OrchestrationEngine:
     def __init__(self, *, backends, execution_policy, runner_adapter, llm_client=None, workspace: Path, non_interactive: bool=False, progress_reporter=None, storage: FileStorage|None=None) -> None:
-        self.backends=backends; self.execution_policy=execution_policy; self.runner_adapter=runner_adapter; self.llm_client=llm_client or LLMClient(); self.workspace=Path(workspace); self.non_interactive=non_interactive; self.progress_reporter=progress_reporter or RunProgressReporter(False); self.storage=storage or FileStorage(self.workspace)
+        self.backends=backends; self.backend_limiter=BackendConcurrencyLimiter(backends); self.execution_policy=execution_policy; self.runner_adapter=runner_adapter; self.llm_client=llm_client or LLMClient(); self.workspace=Path(workspace); self.non_interactive=non_interactive; self.progress_reporter=progress_reporter or RunProgressReporter(False); self.storage=storage or FileStorage(self.workspace)
 
     def run(self, *, repo: str|Path, task: Task, candidate_attempts: int=3, timeout_seconds: int|None=None, classify: bool=True, isolation: str='worktree') -> RunResult:
         if candidate_attempts < 1 or candidate_attempts > 8: raise ValueError('candidate_attempts must be between 1 and 8')
@@ -193,6 +196,11 @@ class OrchestrationEngine:
                 self.record_controller_step(context, action='no_ready_nodes', status='blocked', summary='No scheduler-ready nodes remain.')
                 for n in graph.pending_nodes(): graph.mark_skipped(n.id, 'No scheduler-ready path remained.')
                 break
+            subtask_code=[n for n in ready_nodes if context.decomposed_active and n.kind=='code' and n.id.startswith('subtask_')]
+            if len(subtask_code) > 1:
+                self._execute_parallel_subtask_code_nodes(subtask_code, context)
+                graph.write(run_dir/'orchestration_graph.json')
+                continue
             for node in ready_nodes:
                 self.record_controller_step(context, node=node, action='node_ready', status=node.status)
                 self.execute_node(node=node, context=context)
@@ -242,6 +250,53 @@ class OrchestrationEngine:
         try: return dispatch[node.kind](node, context)
         except Exception as e:
             context.graph.mark_failed(node.id, str(e)); self._write_node_artifacts(context, node, out={'error':str(e)}); self.record_controller_step(context,node=node,action='node_failed',status='failed',summary=str(e)); self.progress_reporter.node_failed(node, str(e)); return NodeExecutionResult(node_id=node.id,status='failed',error=str(e))
+
+
+    def _execute_parallel_subtask_code_nodes(self, nodes, context):
+        for node in nodes:
+            self.assign_backend_for_node(node=node, context=context)
+            self.record_controller_step(context, node=node, action='subtask_scheduled', status='scheduled', details={'parallel_group':'decomposed_subtasks','max_parallel':self.backends[node.assigned_backend].max_parallel})
+        max_workers=max(1, min(len(nodes), sum(self.backends[n.assigned_backend].max_parallel for n in nodes if n.assigned_backend)))
+        self.record_controller_step(context, action='parallel_group_started', status='running', details={'parallel_group':'decomposed_subtasks','nodes':[n.id for n in nodes]})
+        active={'count':0,'max':0}; active_lock=threading.Lock()
+        def run_one(node):
+            b=self.backends[node.assigned_backend]
+            def body():
+                with active_lock:
+                    active['count'] += 1; active['max']=max(active['max'], active['count'])
+                self.record_controller_step(context, node=node, action='backend_parallel_slot_acquired', status='running', details={'parallel_group':'decomposed_subtasks','max_parallel':b.max_parallel})
+                self.record_controller_step(context, node=node, action='subtask_started', status='running', details={'parallel_group':'decomposed_subtasks','max_parallel':b.max_parallel})
+                try:
+                    return self._execute_code_node(node, context)
+                finally:
+                    with active_lock:
+                        active['count'] -= 1
+                    self.record_controller_step(context, node=node, action='backend_parallel_slot_released', status='released', details={'parallel_group':'decomposed_subtasks','max_parallel':b.max_parallel})
+            try:
+                return self.backend_limiter.run(node.assigned_backend, body)
+            except Exception as e:
+                context.graph.mark_failed(node.id, str(e)); return NodeExecutionResult(node_id=node.id,status='failed',error=str(e))
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures={pool.submit(run_one,n): n for n in nodes}
+            for fut in as_completed(futures):
+                node=futures[fut]
+                try: res=fut.result()
+                except Exception as e:
+                    context.graph.mark_failed(node.id, str(e)); res=NodeExecutionResult(node_id=node.id,status='failed',error=str(e))
+                self.record_controller_step(context, node=node, action='subtask_completed', status=res.status, details={'parallel_group':'decomposed_subtasks','max_parallel':self.backends[node.assigned_backend].max_parallel})
+                meta=node.result or {}
+                if context.parallel_execution:
+                    context.parallel_execution.setdefault('scheduled', []).append({'subtask_id': meta.get('subtask_id'), 'node_id': node.id, 'backend': node.assigned_backend, 'started_at': meta.get('started_at') or node.started_at, 'completed_at': meta.get('completed_at') or node.completed_at, 'status': res.status})
+                    context.parallel_execution['max_observed_concurrency']=max(context.parallel_execution.get('max_observed_concurrency',0), active['max'])
+                    self._write_parallel_execution_summary(context)
+                context.graph.write(context.run_dir/'orchestration_graph.json')
+        self.record_controller_step(context, action='parallel_group_completed', status='completed', details={'parallel_group':'decomposed_subtasks','max_observed_concurrency':active['max']})
+
+    def _write_parallel_execution_summary(self, context):
+        data=context.parallel_execution or {'enabled': False, 'reason': 'Backend max_parallel is 1'}
+        if not data.get('enabled'):
+            data=data | {'enabled': False, 'reason': data.get('reason') or 'Backend max_parallel is 1'}
+        write_json_utf8(context.run_dir/'decomposition'/'parallel_execution.json', data)
 
     def _write_node_artifacts(self, context, node, inp=None, out=None, raw=None):
         nd=context.run_dir/'nodes'/node.id; nd.mkdir(parents=True, exist_ok=True); node.artifacts['node_json']=str(nd/'node.json')
@@ -318,12 +373,12 @@ class OrchestrationEngine:
             context.decomposed_active=True; dec.advisory_only=False; context.task_context.decomposition=dec.model_dump(mode='json'); context.subtasks=usable
             keep=[n for n in context.graph.nodes if n.id in {'classify','investigate','plan','decompose'}]
             new=[]
-            prev='decompose'
+            ids={st['id'] for st in usable}
             for st in usable:
                 cid=f"subtask_{st['id']}_code"; rid=f"subtask_{st['id']}_review"
-                new.append(OrchestrationNode(id=cid, kind='code', objective=f"Execute decomposed subtask {st['id']}: {st.get('title')}", dependencies=[prev], parallel_group='subtask_code', runner=context.runner))
+                deps=[f"subtask_{d}_review" for d in (st.get('dependencies') or []) if d in ids] or ['decompose']
+                new.append(OrchestrationNode(id=cid, kind='code', objective=f"Execute decomposed subtask {st['id']}: {st.get('title')}", dependencies=deps, parallel_group='subtask_code', runner=context.runner))
                 new.append(OrchestrationNode(id=rid, kind='review', objective=f"Review decomposed subtask {st['id']}.", dependencies=[cid], parallel_group='subtask_review'))
-                prev=rid
             review_ids=[f"subtask_{st['id']}_review" for st in usable]
             new.append(OrchestrationNode(id='integrate_subtasks', kind='integrate', objective='Integrate accepted subtask patches.', dependencies=review_ids))
             new.append(OrchestrationNode(id='integration_validate', kind='integration_validate', objective='Validate integrated patch.', dependencies=['integrate_subtasks']))
@@ -331,7 +386,11 @@ class OrchestrationEngine:
             new.append(OrchestrationNode(id='final_review', kind='final_review', objective='Review final integrated patch.', dependencies=['integration_repair']))
             new.append(OrchestrationNode(id='verify', kind='verify', objective='Make final acceptance decision and write artifacts.', dependencies=['final_review']))
             context.graph.nodes=keep+new; context.graph.edges=[(d,n.id) for n in context.graph.nodes for d in n.dependencies]
-            self.progress_reporter.step('[5/8] Running decomposed subtasks...')
+            limits={n: b.max_parallel for n,b in self.backends.items()}
+            context.parallel_execution={'enabled': any(v>1 for v in limits.values()), 'backend_limits': limits, 'subtasks_total': len(usable), 'max_observed_concurrency': 0, 'scheduled': []}
+            selected=node.assigned_backend or next(iter(self.backends))
+            self.progress_reporter.step(f'[5/8] Running decomposed subtasks with {selected}, max_parallel={self.backends[selected].max_parallel}...')
+            self._write_parallel_execution_summary(context)
         elif usable:
             d=context.task_context.decomposition; d['advisory_only']=True; context.task_context.decomposition=d
         return self._finish(context,node,NodeExecutionResult(node_id=node.id,status='succeeded',result_summary=dec.reason,confidence=dec.confidence,artifacts={'raw':'decomposition.raw.txt','normalized':'decomposition_normalized.json','decomposition':'decomposition.json','output':str(context.run_dir/'nodes'/node.id/'output.json')}),context.task_context.decomposition)
@@ -362,7 +421,7 @@ class OrchestrationEngine:
             status='succeeded' if res.exit_code==0 else 'failed'
         except Exception as e:
             meta.update({'status':'failed','exit_code':meta.get('exit_code',1),'error':str(e),'changed_files':[],'patch_path':None,'has_patch':False}); write_text_utf8(adir/'stderr.txt', str(e)); status='failed'
-        write_json_utf8(adir/'attempt.json', meta); node.result=meta
+        meta['completed_at']=_now(); write_json_utf8(adir/'attempt.json', meta); node.result=meta
         if st: self.progress_reporter.step(f'[5/8] Subtask {sid} complete: exit={meta.get("exit_code")}, changed_files={len(meta.get("changed_files") or [])}, patch={"yes" if has_non_empty_patch(meta.get("patch_path")) else "no"}')
         else: self.progress_reporter.candidate_completed(aid, idx, total, meta)
         return self._finish(context,node,NodeExecutionResult(node_id=node.id,status=status,result_summary=meta.get('error') or f'Candidate {aid} completed',artifacts={'attempt':str(adir/'attempt.json'),'patch':str(meta.get('patch_path') or '')},data=meta,error=meta.get('error')),meta)
@@ -636,9 +695,13 @@ Current git status:
         if accepted: apply_opts={'apply_command':f'villani-ops apply {context.run_id}','branch_command':f'villani-ops branch {context.run_id} --name villani-ops/{context.run_id}','pr_command':f'villani-ops pr {context.run_id} --title "{(context.task.objective or "Villani Ops changes")[:60]}"'}
         dec_meta=context.task_context.decomposition or {}
         advisory=bool(dec_meta.get('subtasks')) and not context.decomposed_active
-        decision=Decision(run_id=context.run_id, mode=context.mode, runner=context.runner, orchestration_graph_path=str(context.run_dir/'orchestration_graph.json'), node_backend_assignments={n.id:n.assigned_backend for n in context.graph.nodes if n.assigned_backend}, plan=context.task_context.plan, decomposition=dec_meta, performance_backend_name=(next((n.assigned_backend for n in context.graph.nodes if n.assigned_backend),None) if context.mode=='performance' else None), performance_backend_model=(next((n.assigned_model for n in context.graph.nodes if n.assigned_model),None) if context.mode=='performance' else None), accepted=accepted, lifecycle_completed=True, final_state='accepted' if accepted else 'failed', final_action='accept' if accepted else 'fail', winning_attempt_id=context.winner.get('attempt_id') if context.winner else None, winning_worktree_path=context.winner.get('worktree_path') if context.winner else None, winning_patch_path=context.winner.get('patch_path') if context.winner else None, reviewer_decision=(context.winner.get('review') or {}).get('decision') if context.winner else None, reviewer_score=(context.winner.get('review') or {}).get('score') if context.winner else None, classification=context.task_context.classification, investigation=context.task_context.investigation, selection=context.selection.model_dump(mode='json') if context.selection else None, selected_attempt_id=('integrated_decomposition' if context.decomposed_active and accepted else (context.selection.selected_attempt_id if accepted and context.selection else None)), candidate_attempts_requested=context.candidate_attempts, candidate_attempts_completed=len(context.attempts) or len(context.accepted_subtasks)+len(context.rejected_subtasks), eligible_candidate_attempts=[a['attempt_id'] for a in context.attempts if a.get('acceptance_eligible')], orchestration_summary=json.dumps(context.graph.summary()), total_cost=0 if context.mode=='performance' else sum(context.costs.values()), coding_cost=0 if context.mode=='performance' else context.costs['coding'], classification_cost=0 if context.mode=='performance' else context.costs['classification'], review_cost=0 if context.mode=='performance' else context.costs['review'], total_input_tokens=context.input_tokens, total_output_tokens=context.output_tokens, total_coding_input_tokens=sum(a.get('input_tokens') or 0 for a in context.attempts+context.accepted_subtasks+context.rejected_subtasks), total_coding_output_tokens=sum(a.get('output_tokens') or 0 for a in context.attempts+context.accepted_subtasks+context.rejected_subtasks), token_accounting_statuses=dict(Counter(a.get('token_accounting_status') or 'missing' for a in context.attempts+context.accepted_subtasks+context.rejected_subtasks)), attempts=context.attempts or context.accepted_subtasks+context.rejected_subtasks, warnings=context.warnings, apply_options=apply_opts, controller_steps=self._compact_controller_steps(context), controller_steps_path='controller_steps.jsonl', acceptance_blockers=[] if accepted else [b for a in context.attempts+context.rejected_subtasks for b in (a.get('acceptance_blockers') or [])], attempts_used=len(context.attempts) or len(context.accepted_subtasks)+len(context.rejected_subtasks), all_attempted_backends=[a.get('backend_name') for a in context.attempts+context.accepted_subtasks+context.rejected_subtasks], failure_reason='' if accepted else self._failure_reason(context), reason='Selected eligible candidate.' if accepted and not context.decomposed_active else ('Accepted integrated decomposition.' if accepted else self._failure_reason(context)), total_attempts=len(context.attempts) or len(context.accepted_subtasks)+len(context.rejected_subtasks), decomposition_executed=context.decomposed_active, decomposition_advisory_only=advisory, subtask_count=len(context.subtasks), subtasks_executed=[s.get('id') for s in context.subtasks], subtasks_accepted=[a.get('subtask_id') for a in context.accepted_subtasks], subtasks_rejected=[a.get('subtask_id') for a in context.rejected_subtasks], integration_worktree_path=context.integration.get('worktree_path'), integration_patch_path=context.integration.get('final_patch_path'), integration_validation=context.integration.get('validation'), integration_validation_initial=context.integration.get('validation_initial'), integration_validation_after_repair=context.integration.get('validation_after_repair'), integration_scope_analysis=context.integration.get('scope_analysis'), integration_repair_used=bool(context.integration.get('repair_used')), final_review=context.integration.get('final_review'))
+        decision=Decision(run_id=context.run_id, mode=context.mode, runner=context.runner, orchestration_graph_path=str(context.run_dir/'orchestration_graph.json'), node_backend_assignments={n.id:n.assigned_backend for n in context.graph.nodes if n.assigned_backend}, plan=context.task_context.plan, decomposition=dec_meta, performance_backend_name=(next((n.assigned_backend for n in context.graph.nodes if n.assigned_backend),None) if context.mode=='performance' else None), performance_backend_model=(next((n.assigned_model for n in context.graph.nodes if n.assigned_model),None) if context.mode=='performance' else None), accepted=accepted, lifecycle_completed=True, final_state='accepted' if accepted else 'failed', final_action='accept' if accepted else 'fail', winning_attempt_id=context.winner.get('attempt_id') if context.winner else None, winning_worktree_path=context.winner.get('worktree_path') if context.winner else None, winning_patch_path=context.winner.get('patch_path') if context.winner else None, reviewer_decision=(context.winner.get('review') or {}).get('decision') if context.winner else None, reviewer_score=(context.winner.get('review') or {}).get('score') if context.winner else None, classification=context.task_context.classification, investigation=context.task_context.investigation, selection=context.selection.model_dump(mode='json') if context.selection else None, selected_attempt_id=('integrated_decomposition' if context.decomposed_active and accepted else (context.selection.selected_attempt_id if accepted and context.selection else None)), candidate_attempts_requested=context.candidate_attempts, candidate_attempts_completed=len(context.attempts) or len(context.accepted_subtasks)+len(context.rejected_subtasks), eligible_candidate_attempts=[a['attempt_id'] for a in context.attempts if a.get('acceptance_eligible')], orchestration_summary=json.dumps(context.graph.summary()), total_cost=0 if context.mode=='performance' else sum(context.costs.values()), coding_cost=0 if context.mode=='performance' else context.costs['coding'], classification_cost=0 if context.mode=='performance' else context.costs['classification'], review_cost=0 if context.mode=='performance' else context.costs['review'], total_input_tokens=context.input_tokens, total_output_tokens=context.output_tokens, total_coding_input_tokens=sum(a.get('input_tokens') or 0 for a in context.attempts+context.accepted_subtasks+context.rejected_subtasks), total_coding_output_tokens=sum(a.get('output_tokens') or 0 for a in context.attempts+context.accepted_subtasks+context.rejected_subtasks), token_accounting_statuses=dict(Counter(a.get('token_accounting_status') or 'missing' for a in context.attempts+context.accepted_subtasks+context.rejected_subtasks)), attempts=context.attempts or context.accepted_subtasks+context.rejected_subtasks, warnings=context.warnings, apply_options=apply_opts, controller_steps=self._compact_controller_steps(context), controller_steps_path='controller_steps.jsonl', acceptance_blockers=[] if accepted else [b for a in context.attempts+context.rejected_subtasks for b in (a.get('acceptance_blockers') or [])], attempts_used=len(context.attempts) or len(context.accepted_subtasks)+len(context.rejected_subtasks), all_attempted_backends=[a.get('backend_name') for a in context.attempts+context.accepted_subtasks+context.rejected_subtasks], failure_reason='' if accepted else self._failure_reason(context), reason='Selected eligible candidate.' if accepted and not context.decomposed_active else ('Accepted integrated decomposition.' if accepted else self._failure_reason(context)), total_attempts=len(context.attempts) or len(context.accepted_subtasks)+len(context.rejected_subtasks), decomposition_executed=context.decomposed_active, decomposition_advisory_only=advisory, subtask_count=len(context.subtasks), subtasks_executed=[s.get('id') for s in context.subtasks], subtasks_accepted=[a.get('subtask_id') for a in context.accepted_subtasks], subtasks_rejected=[a.get('subtask_id') for a in context.rejected_subtasks], integration_worktree_path=context.integration.get('worktree_path'), integration_patch_path=context.integration.get('final_patch_path'), integration_validation=context.integration.get('validation'), integration_validation_initial=context.integration.get('validation_initial'), integration_validation_after_repair=context.integration.get('validation_after_repair'), integration_scope_analysis=context.integration.get('scope_analysis'), integration_repair_used=bool(context.integration.get('repair_used')), final_review=context.integration.get('final_review'), parallel_execution=context.parallel_execution)
         write_json(context.run_dir/'decision.json', decision.model_dump(mode='json')); context.final_decision=decision; return decision
 
     def record_controller_step(self, context, *, node=None, action:str, status:str, summary:str|None=None, details:dict|None=None):
         p=context.run_dir/'controller_steps.jsonl'; rec={'timestamp':_now(),'run_id':context.run_id,'node_id':getattr(node,'id',None),'node_kind':getattr(node,'kind',None),'action':action,'status':status,'backend':getattr(node,'assigned_backend',None),'model':getattr(node,'assigned_model',None),'summary':summary,'details':details or {}}
-        p.parent.mkdir(parents=True,exist_ok=True); p.open('a', encoding='utf-8').write(json.dumps(rec, ensure_ascii=False, default=str)+'\n')
+        p.parent.mkdir(parents=True,exist_ok=True)
+        lock=getattr(context, 'controller_step_lock', None)
+        if lock:
+            with lock: p.open('a', encoding='utf-8').write(json.dumps(rec, ensure_ascii=False, default=str)+'\n')
+        else: p.open('a', encoding='utf-8').write(json.dumps(rec, ensure_ascii=False, default=str)+'\n')
