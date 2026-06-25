@@ -178,3 +178,88 @@ def test_runtime_semantic_rejection_twice_falls_back(tmp_path, monkeypatch):
     e._execute_decompose_node(node,ctx)
     assert ctx.decomposed_active is False and calls['rev']==1
     assert json.loads((ctx.run_dir/'decomposition'/'plan_validation_decision.json').read_text())['decision']=='decomposition_rejected_fallback_to_candidates'
+
+
+def _runtime_decompose_context(tmp_path):
+    import time
+    from villani_ops.orchestration.engine import OrchestrationEngine, EngineContext
+    from villani_ops.orchestration.graph import OrchestrationGraph
+    from villani_ops.orchestration.nodes import OrchestrationNode
+    from villani_ops.orchestration.context import TaskContext
+    from villani_ops.core.task import Task
+    from villani_ops.orchestration.planner import PlanResult
+    from villani_ops.execution_policies.base import BackendSelection
+    class Policy:
+        mode='performance'
+        def select_backend(self, **kw):
+            b=kw['backends']['b']; return BackendSelection(backend_name='b',backend=b,reason='x')
+    class Runner: name='villani-code'
+    e=OrchestrationEngine(backends={'b':Backend(name='b',provider='openai',model='m',roles=['policy','coding','review'])},execution_policy=Policy(),runner_adapter=Runner(),workspace=tmp_path/'ws')
+    g=OrchestrationGraph(run_id='r',nodes=[OrchestrationNode(id='decompose',kind='decompose',objective='d')])
+    ctx=EngineContext(repo=tmp_path,task=__import__('villani_ops.core.task', fromlist=['Task']).Task(repo_path=str(tmp_path),objective='x'),candidate_attempts=2,timeout_seconds=None,isolation='worktree',run_id='r',run_dir=tmp_path/'run',mode='performance',runner='villani-code',graph=g,scheduler=None,task_context=TaskContext(objective='x'),start=time.time())
+    ctx.run_dir.mkdir(); ctx.plan=PlanResult(summary='p',should_decompose=True,candidate_attempts=2); node=g.get('decompose'); node.assigned_backend='b'; node.assigned_model='m'
+    return e, ctx, node
+
+
+def _two_subtask_dec():
+    from villani_ops.orchestration.planner import DecompositionResult, Subtask
+    return DecompositionResult(should_use_decomposition=True, reason='r', subtasks=[Subtask(id='a',title='A',objective='oa',success_criteria='sa'),Subtask(id='b',title='B',objective='ob',success_criteria='sb')])
+
+
+def test_runtime_malformed_semantic_validation_falls_back_without_graph_rewrite(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from villani_ops.orchestration.planner import DecompositionPlanValidationResult
+    monkeypatch.setattr('villani_ops.orchestration.engine.Planner.decompose', lambda *a, **k: (_two_subtask_dec(), SimpleNamespace(raw_text='{}')))
+    monkeypatch.setattr('villani_ops.orchestration.engine.validate_decomposition_plan', lambda *a, **k: DecompositionPlanValidationResult(accepted=True))
+    monkeypatch.setattr('villani_ops.orchestration.engine.semantic_validate_decomposition_plan', lambda *a, **k: (None, {'status':'failed','malformed':True,'error':'schema invalid'}))
+    monkeypatch.setattr('villani_ops.orchestration.engine.revise_decomposition_with_feedback', lambda *a, **k: (None, {'parsed_cleanly':False,'error':'not parseable','revision_request':{}}))
+    e,ctx,node=_runtime_decompose_context(tmp_path)
+    e._execute_decompose_node(node,ctx)
+    assert ctx.decomposed_active is False
+    assert not any(n.id.startswith('subtask_') for n in ctx.graph.nodes)
+    decision=json.loads((ctx.run_dir/'decomposition'/'plan_validation_decision.json').read_text())
+    assert decision['decision']=='decomposition_rejected_fallback_to_candidates'
+    assert decision['semantic_status']['malformed'] is True
+    initial=json.loads((ctx.run_dir/'decomposition'/'plan_validation_semantic_initial.json').read_text())
+    assert initial['malformed'] is True and 'schema invalid' in initial['error']
+
+
+def test_runtime_malformed_revision_falls_back_and_reviser_called_once(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from villani_ops.orchestration.planner import DecompositionPlanValidationResult
+    calls={'rev':0}
+    monkeypatch.setattr('villani_ops.orchestration.engine.Planner.decompose', lambda *a, **k: (_two_subtask_dec(), SimpleNamespace(raw_text='{}')))
+    monkeypatch.setattr('villani_ops.orchestration.engine.validate_decomposition_plan', lambda *a, **k: DecompositionPlanValidationResult(accepted=True))
+    monkeypatch.setattr('villani_ops.orchestration.engine.semantic_validate_decomposition_plan', lambda *a, **k: (DecompositionPlanValidationResult(accepted=False, required_revisions=['fix']), {'status':'ok','malformed':False}))
+    def rev(*a, **k):
+        calls['rev']+=1; return None, {'parsed_cleanly':False,'error':'malformed revised decomposition','revision_request':{'required_revisions':['fix']}}
+    monkeypatch.setattr('villani_ops.orchestration.engine.revise_decomposition_with_feedback', rev)
+    e,ctx,node=_runtime_decompose_context(tmp_path)
+    e._execute_decompose_node(node,ctx)
+    assert calls['rev']==1 and ctx.decomposed_active is False
+    assert not any(n.id.startswith('subtask_') for n in ctx.graph.nodes)
+    rev_art=json.loads((ctx.run_dir/'decomposition'/'plan_revision_result.json').read_text())
+    assert rev_art['parsed_cleanly'] is False and 'malformed' in rev_art['error']
+    assert json.loads((ctx.run_dir/'decomposition'/'plan_validation_decision.json').read_text())['accepted'] is False
+
+
+def test_runtime_deterministic_guardrail_rejects_even_if_semantic_would_accept(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from villani_ops.orchestration.planner import DecompositionPlanValidationResult
+    calls={'sem':0}
+    det=DecompositionPlanValidationResult(accepted=False, required_revisions=['invalid dependency'])
+    det.dependency_validity.passed=False; det.dependency_validity.issues=['missing dependency']
+    monkeypatch.setattr('villani_ops.orchestration.engine.Planner.decompose', lambda *a, **k: (_two_subtask_dec(), SimpleNamespace(raw_text='{}')))
+    monkeypatch.setattr('villani_ops.orchestration.engine.validate_decomposition_plan', lambda *a, **k: det)
+    def sem(*a, **k):
+        calls['sem']+=1; return DecompositionPlanValidationResult(accepted=True), {'status':'ok'}
+    monkeypatch.setattr('villani_ops.orchestration.engine.semantic_validate_decomposition_plan', sem)
+    e,ctx,node=_runtime_decompose_context(tmp_path)
+    e._execute_decompose_node(node,ctx)
+    assert calls['sem']==0
+    assert ctx.decomposed_active is False
+    assert not any(n.id.startswith('subtask_') for n in ctx.graph.nodes)
+    decision=json.loads((ctx.run_dir/'decomposition'/'plan_validation_decision.json').read_text())
+    assert decision['accepted'] is False and decision['deterministic_accepted'] is False
+    assert decision['semantic_status']['reason']=='deterministic validation failed'
+    assert decision['deterministic_failures']['dependency_validity']['passed'] is False

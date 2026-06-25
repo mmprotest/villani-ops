@@ -271,7 +271,7 @@ class _E2EProbeEngine(OrchestrationEngine):
         self._event(node,'start')
         with self.lock:
             self.active+=1; self.max_seen=max(self.max_seen,self.active)
-        time.sleep(0.03)
+        time.sleep({'code_attempt_001':0.01,'code_attempt_002':0.01,'code_attempt_003':0.06}.get(node.id,0.03))
         aid=node.id.replace('code_',''); adir=context.run_dir/'attempts'/aid; adir.mkdir(parents=True,exist_ok=True)
         wt=context.run_dir/'worktrees'/aid; wt.mkdir(parents=True,exist_ok=True)
         patch=adir/'patch.diff'; status=self.outcomes.get(aid,'accept')
@@ -283,14 +283,14 @@ class _E2EProbeEngine(OrchestrationEngine):
         self._event(node,'end')
         return self._finish(context,node,NodeExecutionResult(node_id=node.id,status='failed' if status=='code_fail' else 'succeeded',data=meta,error='code failed' if status=='code_fail' else None),meta)
     def _execute_review_node(self,node,context):
-        self._event(node,'start'); aid=node.id.replace('review_',''); cn=context.graph.get(f'code_{aid}'); meta=dict(cn.result or {}); eligible=self.outcomes.get(aid,'accept')=='accept' and meta.get('exit_code')==0 and meta.get('patch_path')
+        self._event(node,'start'); aid=node.id.replace('review_',''); time.sleep({'attempt_001':0.01,'attempt_002':0.01,'attempt_003':0.08}.get(aid,0.01)); cn=context.graph.get(f'code_{aid}'); meta=dict(cn.result or {}); eligible=self.outcomes.get(aid,'accept')=='accept' and meta.get('exit_code')==0 and meta.get('patch_path')
         meta.update({'review':{'decision':'pass' if eligible else 'fail','recommended_action':'accept' if eligible else 'fail','summary':'r','score':0.9 if eligible else 0.1},'acceptance_eligible':bool(eligible),'acceptance_blockers':[] if eligible else ['rejected'],'candidate_summary':{'attempt_id':aid,'acceptance_eligible':bool(eligible)}})
         context.attempts.append(meta); self._add_usage(context,'review',1,2,0.05)
         if context.parallel_execution and context.parallel_execution.get('enabled'):
             for row in context.parallel_execution.get('results',[]):
                 if row.get('node_id')==f'code_{aid}': row['review_status']='accepted' if eligible else 'rejected'
             write_json_utf8(context.run_dir/'candidates'/'parallel_execution.json',context.parallel_execution)
-        return self._finish(context,node,NodeExecutionResult(node_id=node.id,status='succeeded',data=meta),meta)
+        res=self._finish(context,node,NodeExecutionResult(node_id=node.id,status='succeeded',data=meta),meta); self._event(node,'end'); return res
     def _execute_select_node(self,node,context):
         self._event(node,'start'); from villani_ops.performance.models import SelectionResult
         eligible=[a for a in context.attempts if a.get('acceptance_eligible')]; sel=eligible[-1]['attempt_id'] if eligible else None
@@ -325,7 +325,10 @@ def test_e2e_parallel_candidate_scheduler_max_two(tmp_path):
     for i in range(1,4):
         assert _event_time(e,f'review_attempt_{i:03d}','start') > _event_time(e,f'code_attempt_{i:03d}','end')
     select_t=_event_time(e,'select','start')
-    for i in range(1,4): assert select_t > _event_time(e,f'review_attempt_{i:03d}','start')
+    for i in range(1,4):
+        assert _event_time(e,f'review_attempt_{i:03d}','start') > _event_time(e,f'code_attempt_{i:03d}','end')
+        assert select_t > _event_time(e,f'review_attempt_{i:03d}','end')
+        assert rd.joinpath('orchestration_graph.json').exists()
     assert res.decision.accepted
     pe=json.loads((rd/'candidates'/'parallel_execution.json').read_text())
     assert pe['enabled'] is True and pe['candidate_attempts']==3 and pe['max_observed_parallelism']==2
@@ -348,8 +351,17 @@ def test_e2e_mixed_candidate_outcomes_selects_accepted_candidate_after_all_revie
     assert len(res.attempts)==3
     assert res.decision.winning_attempt_id == 'attempt_003'
     select_t=_event_time(e,'select','start')
-    for i in range(1,4): assert select_t > _event_time(e,f'review_attempt_{i:03d}','start')
-    assert json.loads((rd/'candidates'/'parallel_execution.json').read_text())['results'][2]['review_status'] == 'accepted'
+    for i in range(1,4):
+        assert _event_time(e,f'review_attempt_{i:03d}','start') > _event_time(e,f'code_attempt_{i:03d}','end')
+        assert select_t > _event_time(e,f'review_attempt_{i:03d}','end')
+        assert rd.joinpath('orchestration_graph.json').exists()
+    pe=json.loads((rd/'candidates'/'parallel_execution.json').read_text())
+    by_node={row['node_id']: row for row in pe['results']}
+    assert by_node['code_attempt_003']['review_status'] == 'accepted'
+    assert by_node['code_attempt_001']['review_status'] in {'rejected', None}
+    graph=json.loads((rd/'orchestration_graph.json').read_text())
+    statuses={n['id']: n['status'] for n in graph['nodes']}
+    assert all(statuses[f'review_attempt_{i:03d}'] in {'succeeded','failed','skipped'} for i in range(1,4))
 
 def test_parallel_candidate_shared_state_totals_and_json_artifacts(tmp_path):
     e,res,rd=_run_e2e(tmp_path,3,2)
