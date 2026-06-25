@@ -85,3 +85,22 @@ def test_decompose_live_path_normalizes_and_writes(tmp_path):
     norm=json.loads((tmp_path/"decomposition_normalized.json").read_text(encoding="utf-8"))
     assert norm["decomposition_normalized"] is True
     assert dec.subtasks[0].id == "fix_pricing_logic"
+
+
+def test_file_path_aliases_map_to_relevant_files():
+    for key in ['file_paths','affected_files','relevant_file_paths']:
+        norm, _ = normalize_decomposition_payload({'subtasks':[{'id':'a','description':'Do A', key:['a.py']} ]})
+        assert norm['subtasks'][0]['relevant_files'] == ['a.py']
+
+
+def test_string_file_path_becomes_one_item_list():
+    norm, _ = normalize_decomposition_payload({'subtasks':[{'id':'a','description':'Do A', 'files':'a.py'}]})
+    assert norm['subtasks'][0]['relevant_files'] == ['a.py']
+
+
+def test_normalized_decomposition_artifact_preserves_relevant_files(tmp_path):
+    raw={'subtasks':[{'id':'a','description':'Do A','affected_files':['a.py']}]}
+    norm, _ = normalize_decomposition_payload(raw)
+    write_json_utf8(tmp_path/'decomposition_normalized.json', {'normalized_payload': norm})
+    loaded=json.loads((tmp_path/'decomposition_normalized.json').read_text())
+    assert loaded['normalized_payload']['subtasks'][0]['relevant_files'] == ['a.py']

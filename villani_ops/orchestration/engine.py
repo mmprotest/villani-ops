@@ -3,7 +3,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 from collections import Counter
 from dataclasses import dataclass, field
-import json, secrets, time, subprocess
+import json, secrets, time, subprocess, sys, os
 from typing import Any
 from pydantic import BaseModel
 from villani_ops.core.task import Task
@@ -92,17 +92,52 @@ def _patch_text(path: str | None, limit: int = 60000) -> str:
     except Exception: return ''
 
 def _subtask_prompt(task: Task, decomposition, st: dict) -> str:
-    summary="\n".join(f"- {getattr(x,'id','')}: {getattr(x,'title','')} - {getattr(x,'objective','')}" for x in (getattr(decomposition,'subtasks',[]) or []))
-    return f"""Original task:
+    siblings=[]
+    summary=[]
+    for x in (getattr(decomposition,'subtasks',[]) or []):
+        sid=getattr(x,'id','')
+        title=getattr(x,'title','')
+        obj=getattr(x,'objective','')
+        summary.append(f"- {sid}: {title} - {obj}")
+        if sid and sid != st.get('id'):
+            siblings.append(f"- {sid}")
+    relevant=st.get('relevant_files') or []
+    return f"""You are executing exactly one decomposed subtask.
+
+Do not solve the full original task.
+
+Do not fix unrelated subtasks.
+
+Only modify files needed for this subtask.
+
+Prefer modifying the listed relevant files only.
+
+If you believe another file must be changed to complete this subtask, explain why in your final output.
+
+If this subtask depends on another unfixed subtask, make the smallest local change possible and leave broader integration to the integration stage.
+
+The final integration stage will combine subtask patches and run the full test suite.
+
+Original task:
 {task.objective or task.instruction or ''}
 
 Overall success criteria:
 {task.success_criteria or ''}
 
 Full decomposition summary:
-{summary}
+{chr(10).join(summary)}
 
-You are executing one decomposed subtask.
+Current subtask objective:
+{subtask_label(st)}
+
+Current subtask relevant files:
+{chr(10).join(relevant) if relevant else '(none listed)'}
+
+Out-of-scope sibling subtasks:
+{chr(10).join(siblings) if siblings else '(none)'}
+
+Integration stage responsibility:
+The final integration stage will combine subtask patches, resolve integration glue, and run the full test suite.
 
 Subtask id:
 {st.get('id')}
@@ -110,23 +145,32 @@ Subtask id:
 Subtask title:
 {st.get('title')}
 
-Subtask objective:
-{st.get('objective')}
-
-Relevant files:
-{chr(10).join(st.get('relevant_files') or [])}
-
 Subtask success criteria:
 {st.get('success_criteria') or ''}
 
 Dependencies:
 {', '.join(st.get('dependencies') or [])}
+"""
 
-Scope:
-Make the smallest patch that completes this subtask. Keep the patch scoped to the subtask. Do not solve unrelated subtasks unless necessary for compilation/tests.
+def subtask_label(st: dict) -> str:
+    return f"{st.get('id')}: {st.get('objective') or st.get('title') or ''}"
 
-Validation:
-Run relevant tests for this subtask if possible. The final integration stage will run the full suite.
+def _subtask_review_prompt(task: Task, st: dict, siblings: list[dict]) -> str:
+    return f"""Evaluate this patch only against the current subtask objective.
+
+Do not fail this patch because unrelated sibling subtasks remain unfixed.
+
+Do check whether the patch overreached into unrelated subtasks.
+
+Do check whether changed files are consistent with the subtask relevant files.
+
+Do check whether the patch creates integration risk.
+
+Original task: {task.objective or task.instruction or ''}
+Current subtask objective: {subtask_label(st)}
+Current subtask relevant files: {', '.join(st.get('relevant_files') or []) or '(none listed)'}
+Out-of-scope sibling subtasks: {', '.join(s.get('id','') for s in siblings if s.get('id') != st.get('id')) or '(none)'}
+Return review JSON with subtask_passed, scope_ok, integration_risk, recommended_action, score, summary, evidence, and issues.
 """
 def _selector_candidate_payload(a: dict) -> dict:
     review=a.get('review') or {}
@@ -331,7 +375,9 @@ class OrchestrationEngine:
         else:
             aid=node.id.replace('review_',''); idx=int(aid.split('_')[-1]); total=context.candidate_attempts; self.progress_reporter.review_started(aid, idx, total); cn=context.graph.get(f'code_{aid}'); adir=context.run_dir/'attempts'/aid; st=None
         meta=dict(cn.result or {}); rb=self.backends[node.assigned_backend]
-        review_input={k:meta.get(k) for k in ['attempt_id','exit_code','stdout_path','stderr_path','changed_files','git_status','runner_telemetry']}; review_input.update({'stdout_summary':_tail(meta.get('stdout_path'),4000),'stderr_summary':_tail(meta.get('stderr_path'),4000),'patch':_patch_text(meta.get('patch_path'),50000),'investigation':context.task_context.investigation}); self._write_node_artifacts(context,node,inp=review_input)
+        review_input={k:meta.get(k) for k in ['attempt_id','exit_code','stdout_path','stderr_path','changed_files','git_status','runner_telemetry']}; review_input.update({'stdout_summary':_tail(meta.get('stdout_path'),4000),'stderr_summary':_tail(meta.get('stderr_path'),4000),'patch':_patch_text(meta.get('patch_path'),50000),'investigation':context.task_context.investigation});
+        if st: review_input.update({'review_prompt': _subtask_review_prompt(context.task, st, context.subtasks), 'subtask': st, 'sibling_subtasks': [s for s in context.subtasks if s.get('id') != st.get('id')]})
+        self._write_node_artifacts(context,node,inp=review_input)
         try:
             try:
                 review,call=LLMReviewer().review(context.task,context.classification,rb,review_input,self.backends,adir/'review.json',backend_override=rb,estimate_cost=(context.mode!='performance'))
@@ -341,15 +387,22 @@ class OrchestrationEngine:
         except Exception as e: review=ReviewResult(decision='fail',summary=f'Reviewer failed: {e}',issues=[str(e)],recommended_action='fail'); write_json_utf8(adir/'review.json', review)
         rdata=review.model_dump(mode='json')
         if st:
-            rdata.setdefault('scope_ok', True); rdata.setdefault('integration_risk', 'unknown')
+            rdata.setdefault('subtask_passed', review.decision == 'pass'); rdata.setdefault('scope_ok', True); rdata.setdefault('integration_risk', 'unknown')
             review.summary=(review.summary or '') + f"\nscope_ok={rdata['scope_ok']} integration_risk={rdata['integration_risk']}"
-            rdata=review.model_dump(mode='json') | {'scope_ok': rdata['scope_ok'], 'integration_risk': rdata['integration_risk']}
+            rdata=review.model_dump(mode='json') | {'subtask_passed': rdata['subtask_passed'], 'scope_ok': rdata['scope_ok'], 'integration_risk': rdata['integration_risk']}
             write_json_utf8(adir/'review.json', rdata)
         meta['review']=rdata; meta['status']='validated' if meta.get('exit_code')==0 and review.decision=='pass' and review.recommended_action=='accept' else ('failed' if meta.get('exit_code') else 'completed')
         has_patch=has_non_empty_patch(meta.get('patch_path'))
         eligible,blockers=(False, ['patch is missing or empty'] if not has_patch else [])
         if has_patch and meta.get('changed_files'): eligible,blockers=is_attempt_acceptance_eligible(meta)
         elif not meta.get('changed_files'): blockers.append('changed files are missing')
+        if st:
+            if not bool((meta.get('review') or {}).get('scope_ok', True)):
+                eligible=False; blockers.append('subtask scope overreach was not approved')
+            if str((meta.get('review') or {}).get('integration_risk','unknown')).lower() == 'high':
+                eligible=False; blockers.append('subtask integration risk is high')
+            if not bool((meta.get('review') or {}).get('subtask_passed', review.decision == 'pass')):
+                eligible=False; blockers.append('subtask objective was not passed')
         meta['has_patch']=has_patch
         meta['acceptance_eligible']=eligible; meta['acceptance_blockers']=blockers
         summary=CandidateSummary(attempt_id=aid,backend_name=meta.get('backend_name'),model=meta.get('model'),status=meta['status'],exit_code=meta.get('exit_code'),changed_files=meta.get('changed_files') or [],patch_path=meta.get('patch_path'),review_decision=review.decision,review_score=review.score,review_recommended_action=review.recommended_action,review_summary=review.summary,review_issues=review.issues,acceptance_eligible=eligible,acceptance_blockers=blockers,has_patch=has_patch, telemetry=meta.get('runner_telemetry') or {})
@@ -363,14 +416,54 @@ class OrchestrationEngine:
         return self._finish(context,node,NodeExecutionResult(node_id=node.id,status='succeeded',result_summary=review.summary,confidence=review.score or 0.0,artifacts={'review':str(adir/'review.json'),'attempt':str(adir/'attempt.json')},data=data),data)
 
     def _run_cmd(self, args, cwd):
-        p=subprocess.run(args, cwd=cwd, text=True, capture_output=True, timeout=1200)
-        return {'command':args,'exit_code':p.returncode,'stdout':p.stdout,'stderr':p.stderr,'passed':p.returncode==0}
+        env=os.environ.copy(); env.update({'GIT_TERMINAL_PROMPT':'0','GIT_EDITOR':'true','PYTHONIOENCODING':'utf-8'})
+        p=subprocess.run(args, cwd=cwd, text=True, capture_output=True, timeout=1200, env=env)
+        stderr=p.stderr
+        failure_reason=None
+        if p.returncode and 'No module named pytest' in (p.stdout + p.stderr):
+            failure_reason='environment_failure: pytest is not installed for the active Python executable'
+            stderr=(stderr or '') + ('\n' if stderr else '') + failure_reason
+        return {'command':args,'python_executable':args[0] if len(args) >= 3 and args[1:3] == ['-m','pytest'] else sys.executable,'exit_code':p.returncode,'stdout':p.stdout,'stderr':stderr,'passed':p.returncode==0,'failure_reason':failure_reason}
+
+
+    def _analyze_subtask_scope(self, accepted: list[dict], subtasks: list[dict]) -> dict[str, Any]:
+        relevant_by_id={st.get('id'): set(st.get('relevant_files') or []) for st in subtasks}
+        file_to_subtasks={}
+        for st in subtasks:
+            for f in st.get('relevant_files') or []:
+                file_to_subtasks.setdefault(f,set()).add(st.get('id'))
+        changed_to_accepted={}
+        rows=[]
+        for a in accepted:
+            sid=a.get('subtask_id')
+            expected=relevant_by_id.get(sid,set())
+            changed=set(a.get('changed_files') or [])
+            unexpected=sorted(changed-expected) if expected else []
+            for f in changed:
+                changed_to_accepted.setdefault(f,[]).append(sid)
+            sibling_overlap=any((file_to_subtasks.get(f,set())-{sid}) for f in unexpected)
+            review=a.get('review') or {}
+            risk=str(review.get('integration_risk') or 'unknown').lower()
+            over=bool(unexpected)
+            approved=bool(review.get('scope_overreach_approved'))
+            decision='integrate'
+            reason='Patch is scoped to expected files.'
+            if over and not approved:
+                decision='skip'; reason='Patch changed unexpected files without scope approval.'
+            if over and sibling_overlap:
+                risk='high'; decision='skip'; reason='Patch changed sibling subtask file without scope approval.'
+            rows.append({'subtask_id':sid,'expected_files':sorted(expected),'changed_files':sorted(changed),'unexpected_files':unexpected,'scope_overreach':over,'overlaps_sibling_scope':sibling_overlap,'integration_risk':risk,'integration_decision':decision,'reason':reason})
+        overlapping={f:ids for f,ids in changed_to_accepted.items() if len(set(ids))>1}
+        return {'subtasks':rows,'overlapping_files':overlapping,'summary':{'accepted':len(accepted),'skipped_for_overreach':sum(1 for r in rows if r['integration_decision']=='skip'),'overlaps':len(overlapping)}}
 
     def _execute_integrate_node(self,node,context):
         context.graph.mark_running(node.id); idir=context.run_dir/'integration'; idir.mkdir(exist_ok=True)
         wt=GitWorktreeIsolation().create(context.repo,context.run_id,'integration',self.storage.workspace); context.integration={'worktree_path':wt['worktree_path']}
         accepted=list(context.accepted_subtasks); write_json_utf8(idir/'accepted_subtasks.json', accepted)
-        ordered=accepted; write_json_utf8(idir/'apply_order.json', [a.get('subtask_id') for a in ordered])
+        scope=self._analyze_subtask_scope(accepted, context.subtasks); write_json_utf8(idir/'scope_analysis.json', scope); context.integration['scope_analysis']=scope
+        self.progress_reporter.step(f'[6/8] Integration scope analysis: accepted={len(accepted)}, skipped_for_overreach={scope["summary"]["skipped_for_overreach"]}, overlaps={scope["summary"]["overlaps"]}')
+        skip_ids={r['subtask_id'] for r in scope['subtasks'] if r.get('integration_decision')=='skip'}
+        ordered=[a for a in accepted if a.get('subtask_id') not in skip_ids]; write_json_utf8(idir/'apply_order.json', [a.get('subtask_id') for a in ordered])
         results=[]; conflicts=0
         for a in ordered:
             pp=a.get('patch_path'); r={'subtask_id':a.get('subtask_id'),'patch_path':pp,'applied':False,'conflicted':False,'stdout':'','stderr':''}
@@ -381,21 +474,21 @@ class OrchestrationEngine:
         write_json_utf8(idir/'apply_results.json', results)
         cap=capture_worktree(wt['worktree_path'], idir); combined=idir/'combined.patch'; write_text_utf8(combined, Path(cap['patch_path']).read_text(errors='replace'))
         write_text_utf8(idir/'git_status.txt', cap.get('git_status',''))
-        context.integration.update({'accepted_subtasks':accepted,'apply_results':results,'conflicts':conflicts,'combined_patch_path':str(combined),'changed_files':cap.get('changed_files',[])})
+        context.integration.update({'accepted_subtasks':accepted,'integrated_subtasks':ordered,'skipped_subtasks':[a for a in accepted if a.get('subtask_id') in skip_ids],'apply_results':results,'conflicts':conflicts,'combined_patch_path':str(combined),'changed_files':cap.get('changed_files',[])})
         self.progress_reporter.step(f'[6/8] Integration apply complete: accepted={len(accepted)}, applied={sum(1 for r in results if r["applied"])}, conflicts={conflicts}')
         return self._finish(context,node,NodeExecutionResult(node_id=node.id,status='succeeded',result_summary='Integrated accepted subtask patches',data=context.integration),context.integration)
 
     def _validation_command(self, repo: Path) -> list[str]:
-        if (repo/'pytest.ini').exists() or (repo/'tests').exists() or any(repo.glob('test_*.py')): return ['python','-m','pytest','-q']
-        return ['python','-m','pytest','-q']
+        if (repo/'pytest.ini').exists() or (repo/'tests').exists() or any(repo.glob('test_*.py')): return [sys.executable,'-m','pytest','-q']
+        return [sys.executable,'-m','pytest','-q']
 
     def _execute_integration_validate_node(self,node,context):
         context.graph.mark_running(node.id); idir=context.run_dir/'integration'; cmd=self._validation_command(Path(context.integration['worktree_path']))
-        self.progress_reporter.step('[6/8] Running integration validation...')
+        self.progress_reporter.step(f'[6/8] Running integration validation with {cmd[0]}...')
         res=self._run_cmd(cmd, context.integration['worktree_path'])
-        write_text_utf8(idir/'validation_stdout.txt', res['stdout']); write_text_utf8(idir/'validation_stderr.txt', res['stderr'])
-        val={'exit_code':res['exit_code'],'passed':res['passed'],'command':cmd,'stdout_path':str(idir/'validation_stdout.txt'),'stderr_path':str(idir/'validation_stderr.txt')}
-        write_json_utf8(idir/'validation.json', val); context.integration['validation']=val
+        write_text_utf8(idir/'validation_initial_stdout.txt', res['stdout']); write_text_utf8(idir/'validation_initial_stderr.txt', res['stderr'])
+        val={'exit_code':res['exit_code'],'passed':res['passed'],'command':cmd,'python_executable':res.get('python_executable', sys.executable),'stdout_path':str(idir/'validation_initial_stdout.txt'),'stderr_path':str(idir/'validation_initial_stderr.txt'),'failure_reason':res.get('failure_reason')}
+        write_json_utf8(idir/'validation_initial.json', val); write_json_utf8(idir/'validation.json', val); context.integration['validation_initial']=val; context.integration['validation']=val
         self.progress_reporter.step(f'[6/8] Integration validation {"passed" if val["passed"] else "failed"}: command="{" ".join(cmd)}"')
         return self._finish(context,node,NodeExecutionResult(node_id=node.id,status='succeeded',result_summary='validation passed' if val['passed'] else 'validation failed',data=val),val)
 
@@ -403,16 +496,63 @@ class OrchestrationEngine:
         context.graph.mark_running(node.id); idir=context.run_dir/'integration'
         need=bool(context.integration.get('conflicts')) or not (context.integration.get('validation') or {}).get('passed')
         if not need:
-            return self._finish(context,node,NodeExecutionResult(node_id=node.id,status='skipped',result_summary='No repair needed',data={'repair_used':False}),{'repair_used':False})
-        b=self.backends[node.assigned_backend]; prompt=f"Repair the integrated result, not from scratch. Original task: {context.task.objective or context.task.instruction}\nSuccess criteria: {context.task.success_criteria}\nValidation: {context.integration.get('validation')}\nKeep diff minimal."
+            return self._finish(context,node,NodeExecutionResult(node_id=node.id,status='skipped',result_summary='No repair needed',data={'repair_used':False,'validation_after_repair':None}),{'repair_used':False})
+        b=self.backends[node.assigned_backend]
+        init=context.integration.get('validation_initial') or context.integration.get('validation') or {}
+        conflicts=context.integration.get('apply_results') or []
+        prompt=f"""You are repairing an integrated decomposition patch.
+
+Do not restart from scratch.
+
+The integration worktree already contains applied accepted subtask patches.
+
+Fix conflicts, validation failures, or missing integration glue.
+
+Keep the final diff minimal.
+
+Use the validation failure output below.
+
+Preserve successful subtask fixes where possible.
+
+Original task:
+{context.task.objective or context.task.instruction}
+
+Success criteria:
+{context.task.success_criteria}
+
+Accepted subtask summaries:
+{json.dumps([{'id': a.get('subtask_id'), 'changed_files': a.get('changed_files'), 'review': (a.get('review') or {}).get('summary')} for a in context.integration.get('integrated_subtasks', context.accepted_subtasks)], indent=2)}
+
+Skipped subtask patches and reasons:
+{json.dumps(context.integration.get('scope_analysis', {}).get('subtasks', []), indent=2)}
+
+Apply conflicts:
+{json.dumps([r for r in conflicts if r.get('conflicted')], indent=2)}
+
+Initial validation command/stdout/stderr:
+command={init.get('command')}
+stdout={_tail(init.get('stdout_path'), 12000)}
+stderr={_tail(init.get('stderr_path'), 12000)}
+
+Current git diff:
+{_patch_text(context.integration.get('combined_patch_path'), 60000)}
+
+Current git status:
+{_tail(str(idir/'git_status.txt'), 12000)}
+"""
+        write_text_utf8(idir/'repair_prompt.txt', prompt)
+        self.progress_reporter.step('[6/8] Running integration repair attempt 1/1...')
         res=self.runner_adapter.run_task(repo_path=Path(context.integration['worktree_path']), task=prompt, success_criteria=context.task.success_criteria, backend_name=b.name, backend_config=b, timeout_seconds=context.timeout_seconds or b.timeout_seconds or 1200, context={'attempt_id':'integrated_decomposition_repair','node_id':node.id}, artifacts_dir=idir)
         write_text_utf8(idir/'repair_stdout.txt', res.stdout); write_text_utf8(idir/'repair_stderr.txt', res.stderr); cap=capture_worktree(context.integration['worktree_path'], idir); write_text_utf8(idir/'repair.patch', Path(cap['patch_path']).read_text(errors='replace'))
         write_json_utf8(idir/'repair_attempt.json', {'exit_code':res.exit_code,'runner_telemetry':res.telemetry,'changed_files':cap.get('changed_files',[])})
         context.integration['repair_used']=True
-        val=self._run_cmd((context.integration.get('validation') or {}).get('command') or self._validation_command(Path(context.integration['worktree_path'])), context.integration['worktree_path'])
-        write_text_utf8(idir/'validation_stdout.txt', val['stdout']); write_text_utf8(idir/'validation_stderr.txt', val['stderr']); context.integration['validation']={'exit_code':val['exit_code'],'passed':val['passed'],'command':val['command'],'stdout_path':str(idir/'validation_stdout.txt'),'stderr_path':str(idir/'validation_stderr.txt')}
-        write_json_utf8(idir/'validation.json', context.integration['validation'])
-        return self._finish(context,node,NodeExecutionResult(node_id=node.id,status='succeeded',result_summary='repair attempted',data={'repair_used':True,'validation':context.integration['validation']}),{'repair_used':True,'validation':context.integration['validation']})
+        self.progress_reporter.step('[6/8] Running post-repair validation...')
+        val=self._run_cmd(init.get('command') or self._validation_command(Path(context.integration['worktree_path'])), context.integration['worktree_path'])
+        write_text_utf8(idir/'validation_after_repair_stdout.txt', val['stdout']); write_text_utf8(idir/'validation_after_repair_stderr.txt', val['stderr']); context.integration['validation_after_repair']={'exit_code':val['exit_code'],'passed':val['passed'],'command':val['command'],'python_executable':val.get('python_executable', sys.executable),'stdout_path':str(idir/'validation_after_repair_stdout.txt'),'stderr_path':str(idir/'validation_after_repair_stderr.txt'),'failure_reason':val.get('failure_reason')}
+        context.integration['validation']=context.integration['validation_after_repair']
+        write_json_utf8(idir/'validation_after_repair.json', context.integration['validation_after_repair']); write_json_utf8(idir/'validation.json', context.integration['validation'])
+        self.progress_reporter.step(f'[6/8] Post-repair validation {"passed" if context.integration["validation"]["passed"] else "failed"}')
+        return self._finish(context,node,NodeExecutionResult(node_id=node.id,status='succeeded',result_summary='repair attempted',data={'repair_used':True,'validation_after_repair':context.integration['validation_after_repair']}),{'repair_used':True,'validation_after_repair':context.integration['validation_after_repair']})
 
     def _execute_final_review_node(self,node,context):
         context.graph.mark_running(node.id); idir=context.run_dir/'integration'; cap=capture_worktree(context.integration['worktree_path'], idir)
@@ -455,7 +595,7 @@ class OrchestrationEngine:
         context.graph.mark_running(node.id)
         if context.decomposed_active:
             val=context.integration.get('validation') or {}; fr=context.integration.get('final_review') or {}; fp=context.integration.get('final_patch_path')
-            accepted=bool(val.get('passed') and has_non_empty_patch(fp) and context.accepted_subtasks and fr.get('decision')=='pass' and fr.get('recommended_action')=='accept')
+            accepted=bool(val.get('passed') and has_non_empty_patch(fp) and context.integration.get('integrated_subtasks', context.accepted_subtasks) and fr.get('decision')=='pass' and fr.get('recommended_action')=='accept')
             context.winner={'attempt_id':'integrated_decomposition','worktree_path':context.integration.get('worktree_path'),'patch_path':fp,'review':fr} if accepted else None
             data={'accepted':accepted,'winner':'integrated_decomposition' if accepted else None}
             self._write_node_artifacts(context,node,inp={'integration':context.integration})
@@ -496,7 +636,7 @@ class OrchestrationEngine:
         if accepted: apply_opts={'apply_command':f'villani-ops apply {context.run_id}','branch_command':f'villani-ops branch {context.run_id} --name villani-ops/{context.run_id}','pr_command':f'villani-ops pr {context.run_id} --title "{(context.task.objective or "Villani Ops changes")[:60]}"'}
         dec_meta=context.task_context.decomposition or {}
         advisory=bool(dec_meta.get('subtasks')) and not context.decomposed_active
-        decision=Decision(run_id=context.run_id, mode=context.mode, runner=context.runner, orchestration_graph_path=str(context.run_dir/'orchestration_graph.json'), node_backend_assignments={n.id:n.assigned_backend for n in context.graph.nodes if n.assigned_backend}, plan=context.task_context.plan, decomposition=dec_meta, performance_backend_name=(next((n.assigned_backend for n in context.graph.nodes if n.assigned_backend),None) if context.mode=='performance' else None), performance_backend_model=(next((n.assigned_model for n in context.graph.nodes if n.assigned_model),None) if context.mode=='performance' else None), accepted=accepted, lifecycle_completed=True, final_state='accepted' if accepted else 'failed', final_action='accept' if accepted else 'fail', winning_attempt_id=context.winner.get('attempt_id') if context.winner else None, winning_worktree_path=context.winner.get('worktree_path') if context.winner else None, winning_patch_path=context.winner.get('patch_path') if context.winner else None, reviewer_decision=(context.winner.get('review') or {}).get('decision') if context.winner else None, reviewer_score=(context.winner.get('review') or {}).get('score') if context.winner else None, classification=context.task_context.classification, investigation=context.task_context.investigation, selection=context.selection.model_dump(mode='json') if context.selection else None, selected_attempt_id=('integrated_decomposition' if context.decomposed_active and accepted else (context.selection.selected_attempt_id if accepted and context.selection else None)), candidate_attempts_requested=context.candidate_attempts, candidate_attempts_completed=len(context.attempts) or len(context.accepted_subtasks)+len(context.rejected_subtasks), eligible_candidate_attempts=[a['attempt_id'] for a in context.attempts if a.get('acceptance_eligible')], orchestration_summary=json.dumps(context.graph.summary()), total_cost=0 if context.mode=='performance' else sum(context.costs.values()), coding_cost=0 if context.mode=='performance' else context.costs['coding'], classification_cost=0 if context.mode=='performance' else context.costs['classification'], review_cost=0 if context.mode=='performance' else context.costs['review'], total_input_tokens=context.input_tokens, total_output_tokens=context.output_tokens, total_coding_input_tokens=sum(a.get('input_tokens') or 0 for a in context.attempts+context.accepted_subtasks+context.rejected_subtasks), total_coding_output_tokens=sum(a.get('output_tokens') or 0 for a in context.attempts+context.accepted_subtasks+context.rejected_subtasks), token_accounting_statuses=dict(Counter(a.get('token_accounting_status') or 'missing' for a in context.attempts+context.accepted_subtasks+context.rejected_subtasks)), attempts=context.attempts or context.accepted_subtasks+context.rejected_subtasks, warnings=context.warnings, apply_options=apply_opts, controller_steps=self._compact_controller_steps(context), controller_steps_path='controller_steps.jsonl', acceptance_blockers=[] if accepted else [b for a in context.attempts+context.rejected_subtasks for b in (a.get('acceptance_blockers') or [])], attempts_used=len(context.attempts) or len(context.accepted_subtasks)+len(context.rejected_subtasks), all_attempted_backends=[a.get('backend_name') for a in context.attempts+context.accepted_subtasks+context.rejected_subtasks], failure_reason='' if accepted else self._failure_reason(context), reason='Selected eligible candidate.' if accepted and not context.decomposed_active else ('Accepted integrated decomposition.' if accepted else self._failure_reason(context)), total_attempts=len(context.attempts) or len(context.accepted_subtasks)+len(context.rejected_subtasks), decomposition_executed=context.decomposed_active, decomposition_advisory_only=advisory, subtask_count=len(context.subtasks), subtasks_executed=[s.get('id') for s in context.subtasks], subtasks_accepted=[a.get('subtask_id') for a in context.accepted_subtasks], subtasks_rejected=[a.get('subtask_id') for a in context.rejected_subtasks], integration_worktree_path=context.integration.get('worktree_path'), integration_patch_path=context.integration.get('final_patch_path'), integration_validation=context.integration.get('validation'), integration_repair_used=bool(context.integration.get('repair_used')), final_review=context.integration.get('final_review'))
+        decision=Decision(run_id=context.run_id, mode=context.mode, runner=context.runner, orchestration_graph_path=str(context.run_dir/'orchestration_graph.json'), node_backend_assignments={n.id:n.assigned_backend for n in context.graph.nodes if n.assigned_backend}, plan=context.task_context.plan, decomposition=dec_meta, performance_backend_name=(next((n.assigned_backend for n in context.graph.nodes if n.assigned_backend),None) if context.mode=='performance' else None), performance_backend_model=(next((n.assigned_model for n in context.graph.nodes if n.assigned_model),None) if context.mode=='performance' else None), accepted=accepted, lifecycle_completed=True, final_state='accepted' if accepted else 'failed', final_action='accept' if accepted else 'fail', winning_attempt_id=context.winner.get('attempt_id') if context.winner else None, winning_worktree_path=context.winner.get('worktree_path') if context.winner else None, winning_patch_path=context.winner.get('patch_path') if context.winner else None, reviewer_decision=(context.winner.get('review') or {}).get('decision') if context.winner else None, reviewer_score=(context.winner.get('review') or {}).get('score') if context.winner else None, classification=context.task_context.classification, investigation=context.task_context.investigation, selection=context.selection.model_dump(mode='json') if context.selection else None, selected_attempt_id=('integrated_decomposition' if context.decomposed_active and accepted else (context.selection.selected_attempt_id if accepted and context.selection else None)), candidate_attempts_requested=context.candidate_attempts, candidate_attempts_completed=len(context.attempts) or len(context.accepted_subtasks)+len(context.rejected_subtasks), eligible_candidate_attempts=[a['attempt_id'] for a in context.attempts if a.get('acceptance_eligible')], orchestration_summary=json.dumps(context.graph.summary()), total_cost=0 if context.mode=='performance' else sum(context.costs.values()), coding_cost=0 if context.mode=='performance' else context.costs['coding'], classification_cost=0 if context.mode=='performance' else context.costs['classification'], review_cost=0 if context.mode=='performance' else context.costs['review'], total_input_tokens=context.input_tokens, total_output_tokens=context.output_tokens, total_coding_input_tokens=sum(a.get('input_tokens') or 0 for a in context.attempts+context.accepted_subtasks+context.rejected_subtasks), total_coding_output_tokens=sum(a.get('output_tokens') or 0 for a in context.attempts+context.accepted_subtasks+context.rejected_subtasks), token_accounting_statuses=dict(Counter(a.get('token_accounting_status') or 'missing' for a in context.attempts+context.accepted_subtasks+context.rejected_subtasks)), attempts=context.attempts or context.accepted_subtasks+context.rejected_subtasks, warnings=context.warnings, apply_options=apply_opts, controller_steps=self._compact_controller_steps(context), controller_steps_path='controller_steps.jsonl', acceptance_blockers=[] if accepted else [b for a in context.attempts+context.rejected_subtasks for b in (a.get('acceptance_blockers') or [])], attempts_used=len(context.attempts) or len(context.accepted_subtasks)+len(context.rejected_subtasks), all_attempted_backends=[a.get('backend_name') for a in context.attempts+context.accepted_subtasks+context.rejected_subtasks], failure_reason='' if accepted else self._failure_reason(context), reason='Selected eligible candidate.' if accepted and not context.decomposed_active else ('Accepted integrated decomposition.' if accepted else self._failure_reason(context)), total_attempts=len(context.attempts) or len(context.accepted_subtasks)+len(context.rejected_subtasks), decomposition_executed=context.decomposed_active, decomposition_advisory_only=advisory, subtask_count=len(context.subtasks), subtasks_executed=[s.get('id') for s in context.subtasks], subtasks_accepted=[a.get('subtask_id') for a in context.accepted_subtasks], subtasks_rejected=[a.get('subtask_id') for a in context.rejected_subtasks], integration_worktree_path=context.integration.get('worktree_path'), integration_patch_path=context.integration.get('final_patch_path'), integration_validation=context.integration.get('validation'), integration_validation_initial=context.integration.get('validation_initial'), integration_validation_after_repair=context.integration.get('validation_after_repair'), integration_scope_analysis=context.integration.get('scope_analysis'), integration_repair_used=bool(context.integration.get('repair_used')), final_review=context.integration.get('final_review'))
         write_json(context.run_dir/'decision.json', decision.model_dump(mode='json')); context.final_decision=decision; return decision
 
     def record_controller_step(self, context, *, node=None, action:str, status:str, summary:str|None=None, details:dict|None=None):
