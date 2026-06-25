@@ -19,7 +19,7 @@ from villani_ops.performance.investigator import Investigator
 from villani_ops.performance.selector import Selector, deterministic_fallback
 from villani_ops.performance.models import CandidateSummary, InvestigationResult
 from villani_ops.performance.report import write_performance_report
-from villani_ops.orchestration.planner import build_fixed_graph, Planner, validate_decomposition_plan, revise_decomposition_plan
+from villani_ops.orchestration.planner import build_fixed_graph, Planner, validate_decomposition_plan, revise_decomposition_plan, semantic_validate_decomposition_plan
 from villani_ops.orchestration.artifacts import write_json, write_json_utf8, write_text_utf8
 from villani_ops.orchestration.nodes import OrchestrationNode, NodeExecutionResult, NodeResult
 from villani_ops.orchestration.context import TaskContext
@@ -211,6 +211,11 @@ class OrchestrationEngine:
                 self._execute_parallel_subtask_code_nodes(subtask_code, context)
                 graph.write(run_dir/'orchestration_graph.json')
                 continue
+            candidate_code=[n for n in ready_nodes if not context.decomposed_active and n.kind=='code' and n.id.startswith('code_attempt_')]
+            if len(candidate_code) > 1 and context.candidate_attempts > 1:
+                self._execute_parallel_candidate_code_nodes(candidate_code, context)
+                graph.write(run_dir/'orchestration_graph.json')
+                continue
             for node in ready_nodes:
                 self.record_controller_step(context, node=node, action='node_ready', status=node.status)
                 self.execute_node(node=node, context=context)
@@ -261,6 +266,48 @@ class OrchestrationEngine:
         except Exception as e:
             context.graph.mark_failed(node.id, str(e)); self._write_node_artifacts(context, node, out={'error':str(e)}); self.record_controller_step(context,node=node,action='node_failed',status='failed',summary=str(e)); self.progress_reporter.node_failed(node, str(e)); return NodeExecutionResult(node_id=node.id,status='failed',error=str(e))
 
+
+
+    def _execute_parallel_candidate_code_nodes(self, nodes, context):
+        cdir=context.run_dir/'candidates'; cdir.mkdir(parents=True, exist_ok=True)
+        for node in nodes:
+            self.assign_backend_for_node(node=node, context=context)
+            self.record_controller_step(context, node=node, action='candidate_scheduled', status='scheduled', details={'parallel_group':'candidate_code','max_parallel':self.backends[node.assigned_backend].max_parallel})
+        context.parallel_execution={'enabled': True, 'candidate_attempts': context.candidate_attempts, 'max_parallel_by_backend': {n:self.backends[n].max_parallel for n in sorted({x.assigned_backend for x in nodes if x.assigned_backend})}, 'started_attempts': [], 'completed_attempts': [], 'max_observed_parallelism': 0, 'results': []}
+        write_json_utf8(cdir/'parallel_execution.json', context.parallel_execution)
+        max_workers=max(1, min(len(nodes), sum(self.backends[n.assigned_backend].max_parallel for n in nodes if n.assigned_backend)))
+        active={'count':0,'max':0}; active_lock=threading.Lock()
+        self.record_controller_step(context, action='parallel_group_started', status='running', details={'parallel_group':'candidate_code','nodes':[n.id for n in nodes]})
+        def run_one(node):
+            b=self.backends[node.assigned_backend]
+            def body():
+                with active_lock:
+                    active['count'] += 1; active['max']=max(active['max'], active['count'])
+                    context.parallel_execution['max_observed_parallelism']=max(context.parallel_execution.get('max_observed_parallelism',0), active['max'])
+                    context.parallel_execution.setdefault('started_attempts', []).append(node.id)
+                    write_json_utf8(cdir/'parallel_execution.json', context.parallel_execution)
+                self.record_controller_step(context, node=node, action='backend_parallel_slot_acquired', status='running', details={'parallel_group':'candidate_code','max_parallel':b.max_parallel})
+                try:
+                    return self._execute_code_node(node, context)
+                finally:
+                    with active_lock:
+                        active['count'] -= 1
+                    self.record_controller_step(context, node=node, action='backend_parallel_slot_released', status='released', details={'parallel_group':'candidate_code','max_parallel':b.max_parallel})
+            return self.backend_limiter.run(node.assigned_backend, body)
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures={pool.submit(run_one,n): n for n in nodes}
+            for fut in as_completed(futures):
+                node=futures[fut]
+                try: res=fut.result()
+                except Exception as e:
+                    context.graph.mark_failed(node.id, str(e)); res=NodeExecutionResult(node_id=node.id,status='failed',error=str(e))
+                meta=node.result or {}
+                context.parallel_execution.setdefault('completed_attempts', []).append(node.id)
+                context.parallel_execution.setdefault('results', []).append({'node_id': node.id, 'backend': node.assigned_backend, 'status': res.status, 'review_status': None, 'attempt_id': meta.get('attempt_id'), 'worktree_path': meta.get('worktree_path'), 'artifacts_dir': str(context.run_dir/'attempts'/(meta.get('attempt_id') or node.id.replace('code_',''))), 'started_at': meta.get('started_at') or node.started_at, 'completed_at': meta.get('completed_at') or node.completed_at})
+                context.parallel_execution['max_observed_parallelism']=max(context.parallel_execution.get('max_observed_parallelism',0), active['max'])
+                write_json_utf8(cdir/'parallel_execution.json', context.parallel_execution)
+                context.graph.write(context.run_dir/'orchestration_graph.json')
+        self.record_controller_step(context, action='parallel_group_completed', status='completed', details={'parallel_group':'candidate_code','max_observed_parallelism':active['max']})
 
     def _execute_parallel_subtask_code_nodes(self, nodes, context):
         for node in nodes:
@@ -350,7 +397,11 @@ class OrchestrationEngine:
             context.warnings.append(f'Investigation failed: {e}'); inv=InvestigationResult(summary=f'Investigation unavailable: {e}', investigation_fallback_used=True, investigation_fallback_reason=str(e)); call=None
             write_text_utf8(context.run_dir/'investigation.raw.txt', f'ERROR: {e}')
             write_json_utf8(context.run_dir/'investigation_normalized.json', {'normalized': False, 'payload': {}, 'notes': [], 'error': str(e)})
-        write_json_utf8(context.run_dir/'investigation.json', inv); context.investigation=inv; context.task_context.investigation=inv.model_dump(mode='json')
+        write_json_utf8(context.run_dir/'investigation.json', inv);
+        if getattr(inv, 'validation_plan', None):
+            (context.run_dir/'investigation').mkdir(exist_ok=True)
+            write_json_utf8(context.run_dir/'investigation'/'validation_plan.json', inv.validation_plan)
+        context.investigation=inv; context.task_context.investigation=inv.model_dump(mode='json')
         if getattr(inv, 'investigation_normalized', False):
             for note in inv.investigation_normalization_notes: self.record_controller_step(context,node=node,action='investigation_normalized',status='normalized',summary=note)
         if getattr(inv, 'investigation_fallback_used', False): self.record_controller_step(context,node=node,action='investigation_fallback_used',status='fallback',summary=inv.investigation_fallback_reason or inv.summary)
@@ -380,17 +431,25 @@ class OrchestrationEngine:
         context.decomposition=dec; context.task_context.decomposition=dec.model_dump(mode='json'); self._write_node_artifacts(context,node,raw=(call.raw_text if call else ''))
         ddir=context.run_dir/'decomposition'; ddir.mkdir(parents=True, exist_ok=True)
         initial=validate_decomposition_plan(dec, task=context.task.objective or context.task.instruction, success_criteria=context.task.success_criteria, backends=self.backends)
-        write_json_utf8(ddir/'plan_validation_initial.json', initial.model_dump(mode='json'))
-        decision='decomposition_accepted'; validation=initial
+        semantic, sem_meta=semantic_validate_decomposition_plan(self.llm_client, dec, task=context.task.objective or context.task.instruction, success_criteria=context.task.success_criteria, deterministic=initial, backend=self.backends[node.assigned_backend])
+        write_json_utf8(ddir/'plan_validation_initial.json', {'deterministic': initial.model_dump(mode='json'), 'semantic': semantic.model_dump(mode='json') if semantic else None, 'semantic_status': sem_meta})
+        write_json_utf8(ddir/'plan_validation_semantic_initial.json', sem_meta | ({'result': semantic.model_dump(mode='json')} if semantic else {}))
+        validation=semantic or initial
+        decision='decomposition_accepted' if (initial.accepted and semantic is not None and semantic.accepted) else 'decomposition_rejected_fallback_to_candidates'
         if not initial.accepted:
-            revised=revise_decomposition_plan(dec, initial)
-            validation=validate_decomposition_plan(revised, task=context.task.objective or context.task.instruction, success_criteria=context.task.success_criteria, backends=self.backends)
-            write_json_utf8(ddir/'plan_validation_revised.json', validation.model_dump(mode='json'))
-            if validation.accepted:
+            decision='decomposition_rejected_fallback_to_candidates'
+        if initial.accepted and (semantic is None or not semantic.accepted):
+            revised=revise_decomposition_plan(dec, semantic or initial)
+            det2=validate_decomposition_plan(revised, task=context.task.objective or context.task.instruction, success_criteria=context.task.success_criteria, backends=self.backends)
+            sem2, sem2_meta=semantic_validate_decomposition_plan(self.llm_client, revised, task=context.task.objective or context.task.instruction, success_criteria=context.task.success_criteria, deterministic=det2, backend=self.backends[node.assigned_backend])
+            validation=sem2 or det2
+            write_json_utf8(ddir/'plan_validation_revised.json', {'deterministic': det2.model_dump(mode='json'), 'semantic': sem2.model_dump(mode='json') if sem2 else None, 'semantic_status': sem2_meta})
+            if det2.accepted and sem2 is not None and sem2.accepted:
                 dec=revised; context.decomposition=dec; decision='decomposition_revised_and_accepted'
             else:
                 decision='decomposition_rejected_fallback_to_candidates'
-        write_json_utf8(ddir/'plan_validation_decision.json', {'decision':decision,'accepted':validation.accepted,'required_revisions':validation.required_revisions})
+        write_json_utf8(ddir/'plan_validation_decision.json', {'decision':decision,'accepted':decision in {'decomposition_accepted','decomposition_revised_and_accepted'},'deterministic_accepted':initial.accepted,'semantic_available':semantic is not None,'required_revisions':validation.required_revisions, 'final_decision': 'accepted' if decision in {'decomposition_accepted','decomposition_revised_and_accepted'} else 'rejected'})
+        validation.accepted = decision in {'decomposition_accepted','decomposition_revised_and_accepted'}
         context.task_context.decomposition=dec.model_dump(mode='json') | {'plan_validation': validation.model_dump(mode='json'), 'plan_validation_decision': decision}
         usable=[s.model_dump(mode='json') for s in (dec.subtasks or []) if getattr(s,'id',None) and getattr(s,'objective',None)]
         if getattr(dec,'should_use_decomposition',False) and len(usable) >= 2 and validation.accepted:
@@ -623,6 +682,10 @@ class OrchestrationEngine:
             self.progress_reporter.step(f'[5/8] Subtask review complete: {review.decision}/{review.recommended_action}, scope_ok={str(meta["review"].get("scope_ok", True)).lower()}, integration_risk={meta["review"].get("integration_risk","unknown")}')
         else:
             context.attempts.append(meta); self.progress_reporter.review_completed(aid, idx, total, {**review.model_dump(mode='json'), 'acceptance_eligible': eligible})
+            if context.parallel_execution and context.parallel_execution.get('enabled'):
+                for row in context.parallel_execution.get('results', []):
+                    if row.get('node_id') == f'code_{aid}': row['review_status']='accepted' if eligible else 'rejected'
+                write_json_utf8(context.run_dir/'candidates'/'parallel_execution.json', context.parallel_execution)
         data={'has_review_blocker': review.decision!='pass' or review.recommended_action!='accept','has_acceptance_blocker': bool(blockers),'acceptance_blockers':blockers, **review.model_dump(mode='json')}
         return self._finish(context,node,NodeExecutionResult(node_id=node.id,status='succeeded',result_summary=review.summary,confidence=review.score or 0.0,artifacts={'review':str(adir/'review.json'),'attempt':str(adir/'attempt.json')},data=data),data)
 
@@ -700,22 +763,26 @@ class OrchestrationEngine:
         if isinstance(vp, dict) and isinstance(vp.get('commands'), list) and vp.get('commands'):
             return vp | {'fallback': False}
         cmd=self._validation_command(Path(context.integration['worktree_path']))
-        return {'commands':[{'cmd':' '.join(cmd), 'argv':cmd, 'required':True, 'reason':'Conservative fallback validation command'}], 'notes':['fallback validation plan used'], 'success_criteria_mapping':[], 'fallback': True}
+        return {'commands':[{'cmd':' '.join(cmd), 'argv':cmd, 'required':True, 'reason':'Conservative fallback validation command'}], 'notes':['fallback validation plan used'], 'success_criteria_mapping':[], 'fallback': True, 'source': 'default'}
 
-    def _execute_integration_validate_node(self,node,context):
-        context.graph.mark_running(node.id); idir=context.run_dir/'integration'; plan=self._validation_plan(context); write_json_utf8(idir/'validation_plan.json', plan)
+    def _run_validation_plan(self, context, phase: str, worktree_path: str) -> dict:
+        idir=context.run_dir/'integration'; plan=self._validation_plan(context); write_json_utf8(idir/'validation_plan.json', plan)
         results=[]; passed=True
         for i,c in enumerate(plan.get('commands') or [], 1):
             argv=c.get('argv') or (c.get('cmd') if isinstance(c.get('cmd'), list) else str(c.get('cmd') or '').split())
             required=bool(c.get('required', True))
-            self.progress_reporter.step(f'[6/8] Running integration validation command {i}/{len(plan.get("commands") or [])}...')
-            res=self._run_cmd(argv, context.integration['worktree_path'])
-            outp=idir/f'validation_initial_{i}_stdout.txt'; errp=idir/f'validation_initial_{i}_stderr.txt'
+            self.progress_reporter.step(f'[6/8] Running {phase} validation command {i}/{len(plan.get("commands") or [])}...')
+            res=self._run_cmd(argv, worktree_path)
+            outp=idir/f'{phase}_{i}_stdout.txt'; errp=idir/f'{phase}_{i}_stderr.txt'
             write_text_utf8(outp, res['stdout']); write_text_utf8(errp, res['stderr'])
             row={'index':i,'cmd':c.get('cmd') or argv,'command':argv,'required':required,'reason':c.get('reason'),'exit_code':res['exit_code'],'passed':res['passed'],'stdout_path':str(outp),'stderr_path':str(errp),'failure_reason':res.get('failure_reason')}
             results.append(row)
             if required and not res['passed']: passed=False
-        val={'passed':passed,'commands':results,'fallback':bool(plan.get('fallback')),'exit_code':0 if passed else 1,'command':(results[0]['command'] if results else []),'failure_reason':None if passed else 'required validation command failed'}
+        return {'passed':passed,'commands':results,'fallback':bool(plan.get('fallback')),'source':plan.get('source'),'exit_code':0 if passed else 1,'command':(results[0]['command'] if results else []),'failure_reason':None if passed else 'required validation command failed'}
+
+    def _execute_integration_validate_node(self,node,context):
+        context.graph.mark_running(node.id); idir=context.run_dir/'integration'
+        val=self._run_validation_plan(context, 'validation_initial', context.integration['worktree_path'])
         write_json_utf8(idir/'validation_initial.json', val); write_json_utf8(idir/'validation.json', val); context.integration['validation_initial']=val; context.integration['validation']=val
         self.progress_reporter.step(f'[6/8] Integration validation {"passed" if val["passed"] else "failed"}')
         return self._finish(context,node,NodeExecutionResult(node_id=node.id,status='succeeded',result_summary='validation passed' if val['passed'] else 'validation failed',data=val),val)
@@ -775,8 +842,7 @@ Current git status:
         write_json_utf8(idir/'repair_attempt.json', {'exit_code':res.exit_code,'runner_telemetry':res.telemetry,'changed_files':cap.get('changed_files',[])})
         context.integration['repair_used']=True
         self.progress_reporter.step('[6/8] Running post-repair validation...')
-        val=self._run_cmd(init.get('command') or self._validation_command(Path(context.integration['worktree_path'])), context.integration['worktree_path'])
-        write_text_utf8(idir/'validation_after_repair_stdout.txt', val['stdout']); write_text_utf8(idir/'validation_after_repair_stderr.txt', val['stderr']); context.integration['validation_after_repair']={'exit_code':val['exit_code'],'passed':val['passed'],'command':val['command'],'python_executable':val.get('python_executable', sys.executable),'stdout_path':str(idir/'validation_after_repair_stdout.txt'),'stderr_path':str(idir/'validation_after_repair_stderr.txt'),'failure_reason':val.get('failure_reason')}
+        context.integration['validation_after_repair']=self._run_validation_plan(context, 'validation_after_repair', context.integration['worktree_path'])
         context.integration['validation']=context.integration['validation_after_repair']
         write_json_utf8(idir/'validation_after_repair.json', context.integration['validation_after_repair']); write_json_utf8(idir/'validation.json', context.integration['validation'])
         self.progress_reporter.step(f'[6/8] Post-repair validation {"passed" if context.integration["validation"]["passed"] else "failed"}')

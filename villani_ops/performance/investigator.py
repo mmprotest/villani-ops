@@ -85,7 +85,7 @@ def normalize_investigation_payload(payload: dict[str, Any]) -> tuple[dict[str, 
     aliases={
         'root_cause':'suspected_root_cause','suspected_cause':'suspected_root_cause','cause':'suspected_root_cause',
         'files':'relevant_files','file_paths':'relevant_files','files_to_modify':'relevant_files','affected_files':'relevant_files','modified_files':'relevant_files','target_files':'relevant_files','relevant_file_paths':'relevant_files',
-        'tests':'relevant_tests','test_files':'relevant_tests','test_validation':'relevant_tests','validation_plan':'relevant_tests','tests_to_run':'relevant_tests',
+        'tests':'relevant_tests','test_files':'relevant_tests','test_validation':'relevant_tests','tests_to_run':'relevant_tests',
         'plan':'implementation_plan','steps':'implementation_plan','actions':'implementation_plan','implementation_steps':'implementation_plan','fix_steps':'implementation_plan',
         'warnings':'risks','risk_factors':'risks',
     }
@@ -125,6 +125,26 @@ def normalize_investigation_payload(payload: dict[str, Any]) -> tuple[dict[str, 
                 data['summary']=v.strip(); notes.append(f"Mapped {k} to summary"); break
     if not _is_nonempty_str(data.get('summary')) and _is_nonempty_str(data.get('suspected_root_cause')):
         data['summary']=f"Suspected root cause: {data['suspected_root_cause']}"; notes.append('Derived summary from suspected_root_cause')
+    vp=data.get('validation_plan')
+    if isinstance(vp, list):
+        data['validation_plan']={'commands':[{'cmd': str(x), 'required': True, 'reason': 'Investigator suggested validation command'} for x in vp if str(x).strip()], 'notes': [], 'success_criteria_mapping': [], 'fallback': False, 'source': 'investigation'}
+        notes.append('Normalized validation_plan list to first-class command plan')
+    elif isinstance(vp, str) and vp.strip():
+        data['validation_plan']={'commands':[{'cmd': vp.strip(), 'required': True, 'reason': 'Investigator suggested validation command'}], 'notes': [], 'success_criteria_mapping': [], 'fallback': False, 'source': 'investigation'}
+        notes.append('Normalized validation_plan string to first-class command plan')
+    elif isinstance(vp, dict):
+        cmds=vp.get('commands') or vp.get('validation_commands') or []
+        if isinstance(cmds, list):
+            norm=[]
+            for c in cmds:
+                if isinstance(c, dict):
+                    cmd=c.get('cmd') or c.get('command') or c.get('argv')
+                    if isinstance(cmd, list): cmd=' '.join(str(x) for x in cmd)
+                    if str(cmd or '').strip(): norm.append({'cmd': str(cmd).strip(), 'required': bool(c.get('required', True)), 'reason': c.get('reason'), 'timeout_seconds': c.get('timeout_seconds')})
+                elif str(c).strip(): norm.append({'cmd': str(c).strip(), 'required': True, 'reason': 'Investigator suggested validation command'})
+            data['validation_plan']={'commands': norm, 'notes': _as_list(vp.get('notes')), 'success_criteria_mapping': vp.get('success_criteria_mapping') if isinstance(vp.get('success_criteria_mapping'), list) else [], 'fallback': bool(vp.get('fallback', False)), 'source': vp.get('source') or 'investigation'}
+            notes.append('Normalized validation_plan object')
+
     for key in ('implementation_plan','risks','relevant_files','relevant_tests'):
         if isinstance(data.get(key), str): notes.append(f"Converted {key} string to list")
         data[key]=_as_list(data.get(key))

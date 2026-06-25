@@ -27,7 +27,7 @@ def required_role_for_node(node: OrchestrationNode) -> str:
     if node.kind in {'review','final_review'}: return 'review'
     if node.kind in {'classify'}: return 'classification'
     if node.kind in {'investigate'}: return 'investigation'
-    if node.kind in {'plan','decompose'}: return 'planning'
+    if node.kind in {'plan','decompose'}: return 'policy'
     if node.kind in {'select','verify','integration_validate'}: return 'selection'
     if node.kind in {'integrate','integration_repair'}: return 'coding'
     return node.kind
@@ -37,17 +37,28 @@ def filter_backends_for_role(backends: Mapping[str, BackendConfig], role: str) -
     return vals
 
 def select_backend_for_role(role: str, policy: str, registry: Mapping[str, BackendConfig], task_context: TaskContext | None = None, *, preferred: str = 'highest') -> tuple[str, BackendConfig, str]:
+    requested_role=role
     candidates=filter_backends_for_role(registry, role)
-    fallback=False
+    fallback_role=None
+    reason_extra=''
+    if not candidates and role in {'selection', 'policy'}:
+        fallback_order=('review', 'policy') if role == 'selection' else ('review',)
+        for alt in fallback_order:
+            candidates=filter_backends_for_role(registry, alt)
+            if candidates:
+                fallback_role=alt
+                reason_extra=f' requested_role={requested_role}; fallback_role={alt}; reason=no enabled requested-role backend exists;'
+                break
     if not candidates:
-        candidates={n:b for n,b in registry.items() if getattr(b,'enabled',True)}
-        fallback=True
-    if not candidates: raise ValueError('No enabled backends configured')
+        raise ValueError(f"No enabled backends support required role {role!r}.")
     ordered=sort_by_capability(candidates)
     if preferred == 'lowest': n,b=ordered[0]
     elif preferred == 'middle': n,b=ordered[len(ordered)//2]
     else: n,b=sorted(candidates.items(), key=lambda x:(-x[1].capability_score, x[0]))[0]
-    reason=(f'Fallback: no enabled backend supports role {role}; selected by {preferred} capability.' if fallback else f'Filtered by required role {role} before {preferred} capability selection.')
+    if fallback_role:
+        reason=f'Fallback role selection:{reason_extra} selected_backend={n}; selected by {preferred} capability.'
+    else:
+        reason=f'Filtered by required role {role} before {preferred} capability selection.'
     return n,b,reason
 
 def sort_by_capability(backends: Mapping[str, BackendConfig]) -> list[tuple[str, BackendConfig]]:
