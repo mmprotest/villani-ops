@@ -48,6 +48,7 @@ class Decision(BaseModel):
     apply_options: dict[str, Any] = Field(default_factory=dict)
     decision_steps: list[dict[str, Any]] = Field(default_factory=list)
     controller_steps: list[dict[str, Any]] = Field(default_factory=list)
+    controller_steps_path: str | None = None
     failure_reason: str = ''
     acceptance_blockers: list[str] = Field(default_factory=list)
     retries_used: int = 0

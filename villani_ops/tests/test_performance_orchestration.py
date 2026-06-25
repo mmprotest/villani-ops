@@ -17,12 +17,16 @@ def git_repo(path):
     subprocess.run(['git','config','user.email','a@b.c'],cwd=path,check=True); subprocess.run(['git','config','user.name','A'],cwd=path,check=True)
     (path/'hello.txt').write_text('hello\n'); subprocess.run(['git','add','.'],cwd=path,check=True); subprocess.run(['git','commit','-m','init'],cwd=path,check=True,capture_output=True)
 
-def fake_villani(path):
+def fake_villani(path, monkeypatch=None):
     exe=path/'villani-code'; exe.write_text("#!/usr/bin/env python\nimport pathlib, sys\nrepo=pathlib.Path(sys.argv[sys.argv.index('--repo')+1])\n(repo/'hello.txt').write_text('changed\\n')\nsys.exit(0)\n")
-    exe.chmod(exe.stat().st_mode | stat.S_IXUSR); os.environ['PATH']=str(path)+os.pathsep+os.environ['PATH']
+    exe.chmod(exe.stat().st_mode | stat.S_IXUSR)
+    if monkeypatch is not None:
+        monkeypatch.setenv('PATH', str(path)+os.pathsep+os.environ['PATH'])
+    else:
+        os.environ['PATH']=str(path)+os.pathsep+os.environ['PATH']
 
 def make_ops(tmp_path, monkeypatch, reviews, selection=None):
-    ws=tmp_path/'.villani-ops'; s=FileStorage(ws); s.init_workspace(); fake_villani(tmp_path)
+    ws=tmp_path/'.villani-ops'; s=FileStorage(ws); s.init_workspace(); fake_villani(tmp_path, monkeypatch)
     s.save_backends({'code': Backend(name='code',provider='openai-compatible',base_url='http://x/v1',model='m',api_key='dummy',roles=['coding','classification','review','investigation','selection'])})
     
     def classify(self, task, backends, out_path=None, backend_override=None):

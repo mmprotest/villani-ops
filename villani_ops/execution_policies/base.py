@@ -51,4 +51,10 @@ def estimate_node_difficulty(node: OrchestrationNode, task_context: TaskContext)
     return difficulty, risk, float(confidence or 0.0)
 
 def prior_forces_escalation(prior_results: list[NodeResult] | None) -> bool:
-    return any((r.status in {'failed','uncertain'} or 'blocker' in str(r.data).lower()) for r in (prior_results or []))
+    return any(
+        r.has_failure
+        or r.has_review_blocker
+        or r.has_acceptance_blocker
+        or r.status in {'failed', 'uncertain'}
+        for r in (prior_results or [])
+    )
