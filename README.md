@@ -1,10 +1,35 @@
 # Villani Ops
 
-Villani Ops is a CLI-only multi-agent performance orchestrator for coding tasks. It uses investigation, independent candidate attempts, LLM review, and selector-based final decisioning to test whether small/local models can solve more tasks than naive single-agent runs.
+Villani Ops is a CLI-only multi-agent performance orchestrator for coding tasks. In performance mode, it uses the most capable configured backend for investigation, independent candidate attempts, LLM review, and selector-based final decisioning. Phase 1 is focused on solve-rate lift, not cost optimisation.
 
-Phase 1 is about **solve-rate lift**, not cost reduction. Cost and token telemetry are still captured in artifacts and reports, but the main `villani-ops run` path does not optimize for cost and does not use the old `cheap`, `balanced`, or `quality` profiles.
+## Performance orchestration
 
-There is **no UI** and **no web API**.
+`villani-ops run` is pure performance orchestration. It always chooses the enabled backend with the highest `capability_score` and uses that same backend for classification (when enabled), investigation, every candidate Villani Code attempt, every LLM review, and selector decisioning. Backend roles and prices are ignored in this path.
+
+The performance command does not support `--backend`, `--policy`, or `--human-approval`; passing them fails clearly before a run starts. Cost optimisation is intentionally out of scope for the main performance path. Cost metrics in old artifacts are legacy compatibility or telemetry only.
+
+```bash
+villani-ops run \
+  --repo ./repo \
+  --task "Fix the failing auth tests" \
+  --success-criteria "Tests pass and diff is minimal" \
+  --candidate-attempts 3 \
+  --non-interactive
+```
+
+## Legacy cost policy runs
+
+`villani-ops cost-run` contains the old cost-aware policy system, including policy profiles and legacy approval behavior where configured. Use this command for backend policy experiments.
+
+```bash
+villani-ops cost-run \
+  --repo ./repo \
+  --task "Fix the failing auth tests" \
+  --success-criteria "Tests pass and diff is minimal" \
+  --policy balanced \
+  --max-attempts 3 \
+  --non-interactive
+```
 
 ## Main performance path
 
@@ -14,7 +39,6 @@ villani-ops run \
   --task "Fix the failing auth tests" \
   --success-criteria "Tests pass and diff is minimal" \
   --candidate-attempts 3 \
-  --backend local-qwen \
   --non-interactive
 ```
 
@@ -31,7 +55,7 @@ The performance run lifecycle is:
 9. Write `decision.json`, `report.md`, `controller_steps.jsonl`, and per-attempt artifacts.
 10. Print apply/branch/PR commands only when there is an accepted winner.
 
-`--candidate-attempts` accepts 1 through 8. If one `--backend` is supplied, every candidate uses it. If multiple `--backend` values are supplied, candidates cycle through them. If no backend is supplied, Villani Ops uses the highest-capability enabled coding backend.
+`--candidate-attempts` accepts 1 through 8. All planned candidate attempts run independently, and every candidate uses the same selected performance backend. `villani-ops run` never cycles across backends, never applies a cost policy, and never routes by backend role.
 
 ## Legacy cost-policy path
 
@@ -49,7 +73,7 @@ villani-ops cost-run \
 
 Use `cost-run` for the old `cheap`, `balanced`, and `quality` policy profiles, `--max-attempts`, `--legacy-yaml-policy`, controller timeline, reports, human approval, apply, branch, PR, and cost-policy comparison workflows.
 
-Passing `--policy` to `villani-ops run` fails clearly because cost policies moved to `villani-ops cost-run`.
+Passing `--policy`, `--backend`, or `--human-approval` to `villani-ops run` fails clearly. Cost policies, manual backend experiments, and the legacy approval path live under `villani-ops cost-run`.
 
 ## Backend roles
 
@@ -66,7 +90,7 @@ villani-ops backend add local-qwen \
   --max-tokens 50000
 ```
 
-Existing backend configs remain valid. The old `policy` role is still used by `villani-ops cost-run`.
+Existing backend configs remain valid. Backend roles are ignored by `villani-ops run` and remain available for `villani-ops cost-run` and other legacy policy workflows.
 
 ## Safe git commands
 

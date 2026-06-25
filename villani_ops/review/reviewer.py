@@ -19,6 +19,7 @@ class ReviewResult(BaseModel):
     confidence: float=0.0
     requires_human_approval: bool=False
     reviewer_backend: str|None=None
+    performance_backend: dict[str, str]|None=None
 
 def _key(v: Any) -> str:
     return re.sub(r'[^a-z0-9]+', '_', str(v or '').strip().lower()).strip('_')
@@ -86,8 +87,8 @@ def normalize_review_payload(raw: dict) -> dict:
 
 class LLMReviewer:
     def __init__(self, client: LLMClient|None=None): self.client=client or LLMClient()
-    def review(self, task: Task, classification: TaskClassification|None, coding_backend: Backend, attempt: dict[str,Any], backends: dict[str, Backend], out_path: str|Path|None=None) -> tuple[ReviewResult, LLMCallResult]:
-        backend=select_backend(backends,'review')
+    def review(self, task: Task, classification: TaskClassification|None, coding_backend: Backend, attempt: dict[str,Any], backends: dict[str, Backend], out_path: str|Path|None=None, backend_override: Backend|None=None) -> tuple[ReviewResult, LLMCallResult]:
+        backend=backend_override or select_backend(backends,'review')
         ctx={"task":task.model_dump(mode='json'),"classification":classification.model_dump(mode='json') if classification else None,"coding_backend":coding_backend.redacted_dict(),"attempt":attempt}
         result=self.client.complete_json(backend, SYSTEM, USER.format(context=json.dumps(ctx, indent=2)[:60000]), 'ReviewResult')
         normalized=normalize_review_payload(result.parsed_json)
@@ -97,5 +98,7 @@ class LLMReviewer:
             setattr(e, 'llm_result', result); setattr(e, 'schema_name', 'ReviewResult'); setattr(e, 'backend', backend); setattr(e, 'normalized_payload', normalized)
             raise
         review.reviewer_backend=backend.name
+        if backend_override is not None:
+            review.performance_backend={'name': backend.name, 'model': backend.model}
         if out_path: Path(out_path).write_text(review.model_dump_json(indent=2))
         return review, result

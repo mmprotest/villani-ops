@@ -80,29 +80,40 @@ def policy_create_default(name: str=typer.Option('balanced'), workspace: str='.v
     pol=Policy(name=name, attempts=attempts); path=s.workspace/'policies'/f'{name}.yaml'; pol.save(path); console.print(f'Created policy at {path}')
 
 @app.command(context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
-def run(ctx: typer.Context, repo: str|None=None, task: str|None=typer.Option(None,'--task'), task_id: str|None=None, success_criteria: str|None=None, candidate_attempts: int=typer.Option(3, '--candidate-attempts', min=1, max=8), backend: list[str]|None=typer.Option(None, '--backend'), timeout_seconds: int|None=None, classify: bool=typer.Option(True, '--classify/--no-classify'), human_approval: bool=typer.Option(False, '--human-approval/--no-human-approval'), non_interactive: bool=False, workspace: str='.villani-ops'):
-    if '--policy' in ctx.args or any(a.startswith('--policy=') for a in ctx.args):
-        raise typer.BadParameter('Cost policies moved to villani-ops cost-run')
+def run(ctx: typer.Context, repo: str|None=None, task: str|None=typer.Option(None,'--task'), task_id: str|None=None, success_criteria: str|None=None, candidate_attempts: int=typer.Option(3, '--candidate-attempts', min=1, max=8), timeout_seconds: int|None=None, classify: bool=typer.Option(True, '--classify/--no-classify'), non_interactive: bool=False, workspace: str='.villani-ops'):
+    forbidden = {
+        '--policy': 'Cost policies moved to villani-ops cost-run',
+        '--backend': 'Performance orchestration always uses the most capable enabled backend. Use villani-ops cost-run for backend policy experiments.',
+        '--human-approval': 'Human approval is not supported in performance orchestration. Use villani-ops cost-run for the legacy approval path.',
+    }
+    for arg in ctx.args:
+        for opt, msg in forbidden.items():
+            if arg == opt or arg.startswith(opt + '='):
+                console.print(msg)
+                raise typer.Exit(2)
+        if arg.startswith('-'):
+            console.print(f'Unknown option: {arg}')
+            raise typer.Exit(2)
+    if ctx.args:
+        console.print(f'Unknown argument(s): {" ".join(ctx.args)}')
+        raise typer.Exit(2)
     s=storage(workspace)
     if task_id:
         data=json.loads((s.workspace/'tasks'/task_id/'task.json').read_text()); t=Task.model_validate(data); repo=t.repo_path
     else:
         if not repo or not task: raise typer.BadParameter('Provide --task-id or both --repo and --task')
         t=Task(repo_path=str(Path(repo).resolve()), objective=task, success_criteria=success_criteria)
-    result=VillaniOps(storage(workspace), progress_reporter=RunProgressReporter(True)).run(repo=repo, task=t, candidate_attempts=candidate_attempts, backend=backend, timeout_seconds=timeout_seconds, classify=classify, human_approval=human_approval, non_interactive=(non_interactive or not sys.stdin.isatty()))
+    result=VillaniOps(storage(workspace), progress_reporter=RunProgressReporter(True)).run(repo=repo, task=t, candidate_attempts=candidate_attempts, timeout_seconds=timeout_seconds, classify=classify, non_interactive=(non_interactive or not sys.stdin.isatty()))
     d=result.decision
     console.print(f"Result: {'ACCEPTED' if d.accepted else 'FAILED'}")
     console.print('Mode: performance_orchestration')
     console.print(f'Task: {t.objective}')
+    console.print(f"Performance backend: {d.performance_backend_name}/{d.performance_backend_model}")
     console.print(f"Candidate attempts requested/completed: {d.candidate_attempts_requested}/{d.candidate_attempts_completed}")
     console.print(f"Winner: {d.winning_attempt_id or 'none'}")
     console.print(f"Controller reason: {d.reason}")
-    console.print(f"Cost telemetry: total ${d.total_cost:.6f}")
-    if d.accepted:
-        console.print(f"Apply:\n  villani-ops apply {d.run_id}"); console.print(f"Branch:\n  villani-ops branch {d.run_id} --name villani-ops/{d.run_id}"); console.print(f"PR:\n  villani-ops pr {d.run_id} --title \"{(t.objective or 'Villani Ops changes')[:60]}\"")
-    else:
-        console.print(f"Failure reason: {d.failure_reason}")
-    console.print(f'Report: {result.report_path}')
+    console.print(f"Run directory: {result.run_dir}")
+
 
 @app.command('cost-run')
 def cost_run(repo: str|None=None, task: str|None=typer.Option(None,'--task'), task_id: str|None=None, policy: str='balanced', max_attempts: int|None=typer.Option(None, '--max-attempts', min=1, max=10), success_criteria: str|None=None, isolation: str='worktree', workspace: str='.villani-ops', legacy_yaml_policy: bool=False, human_approval: bool=typer.Option(False, '--human-approval/--no-human-approval'), non_interactive: bool=False):
