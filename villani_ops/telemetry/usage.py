@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
-import json, threading, uuid
+import json, threading, time, uuid
 
 from pydantic import BaseModel, Field, ConfigDict
 
@@ -113,16 +113,24 @@ def usage_record_from_runner(*, run_id: str, phase: str, role: str, backend: Any
 
 class UsageRecorder:
     def __init__(self, run_dir: Path, run_id: str):
-        self.run_dir=Path(run_dir); self.run_id=run_id; self.path=self.run_dir/'usage.jsonl'; self.run_dir.mkdir(parents=True, exist_ok=True); self._lock=threading.Lock(); self.records:list[UsageRecord]=[]
+        self.run_dir=Path(run_dir); self.run_id=run_id; self.path=self.run_dir/'usage.jsonl'; self.run_dir.mkdir(parents=True, exist_ok=True); self._lock=threading.Lock(); self.records:list[UsageRecord]=[]; self._summary_write_interval_seconds=0.5; self._last_summary_write_at=0.0
     def record(self, usage: UsageRecord) -> None:
         if usage.run_id is None: usage.run_id=self.run_id
         line=json.dumps(usage.model_dump(mode='json'), ensure_ascii=False, default=str)+'\n'
         with self._lock:
             self.records.append(usage)
             with self.path.open('a', encoding='utf-8', newline='\n') as f: f.write(line); f.flush()
+            now=time.monotonic()
+            if now - self._last_summary_write_at >= self._summary_write_interval_seconds:
+                self._write_artifacts_unlocked()
+                self._last_summary_write_at=now
     def summarize(self) -> UsageSummary:
+        with self._lock:
+            records=list(self.records)
+        return self._summarize_records(records)
+    def _summarize_records(self, records: list[UsageRecord]) -> UsageSummary:
         s=UsageSummary()
-        for r in self.records:
+        for r in records:
             _add(s,r)
             for key, val, attr in [('by_role',r.role,'by_role'),('by_backend',r.backend_name,'by_backend'),('by_model',r.model,'by_model'),('by_attempt',r.attempt_id,'by_attempt'),('by_phase',r.phase,'by_phase')]:
                 if val:
@@ -130,11 +138,14 @@ class UsageRecorder:
         return s
     def write_artifacts(self) -> None:
         with self._lock:
-            records=[r.model_dump(mode='json') for r in self.records]
-            summary=self.summarize().model_dump(mode='json')
+            self._write_artifacts_unlocked()
+            self._last_summary_write_at=time.monotonic()
+    def _write_artifacts_unlocked(self) -> None:
+        records=[r.model_dump(mode='json') for r in self.records]
+        summary=self._summarize_records(list(self.records)).model_dump(mode='json')
         _atomic_json(self.run_dir/'usage.json', {'records':records,'summary':summary})
         unavailable=[r for r in records if r.get('usage_source')=='unavailable']
-        compact={k:summary[k] for k in ['total_cost','input_cost','output_cost','total_tokens','input_tokens','output_tokens','by_role','by_backend','by_attempt']}
+        compact={k:summary[k] for k in ['total_cost','input_cost','output_cost','total_tokens','input_tokens','output_tokens','calls_count','by_role','by_backend','by_model','by_attempt']}
         compact['unavailable_usage']=unavailable
         compact['unavailable_calls_count']=summary['unavailable_calls_count']
         _atomic_json(self.run_dir/'cost_summary.json', compact)

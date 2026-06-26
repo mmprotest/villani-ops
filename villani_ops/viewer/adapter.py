@@ -105,14 +105,43 @@ def _num(d,*keys):
         if isinstance(v,(int,float)): return v
     return 0
 
+def _meaningful(src: Any) -> bool:
+    if not isinstance(src, dict): return False
+    for k in ('total_tokens','input_tokens','output_tokens','total_cost','calls_count','unavailable_calls_count'):
+        try:
+            if float(src.get(k) or 0) > 0: return True
+        except (TypeError, ValueError): pass
+    return False
+
+def aggregate_usage_jsonl(run_dir: Path) -> dict:
+    rows=_read_jsonl(Path(run_dir)/'usage.jsonl')
+    out={'input_tokens':0,'output_tokens':0,'total_tokens':0,'input_cost':0.0,'output_cost':0.0,'total_cost':0.0,'calls_count':0,'unavailable_calls_count':0,'by_role':{},'by_backend':{},'by_model':{}}
+    def add_bucket(bucket, r):
+        bucket['input_tokens']=bucket.get('input_tokens',0)+int(_num(r,'input_tokens','prompt_tokens'))
+        bucket['output_tokens']=bucket.get('output_tokens',0)+int(_num(r,'output_tokens','completion_tokens'))
+        tt=_num(r,'total_tokens') or int(_num(r,'input_tokens','prompt_tokens'))+int(_num(r,'output_tokens','completion_tokens'))
+        bucket['total_tokens']=bucket.get('total_tokens',0)+int(tt)
+        bucket['input_cost']=bucket.get('input_cost',0.0)+float(_num(r,'input_cost'))
+        bucket['output_cost']=bucket.get('output_cost',0.0)+float(_num(r,'output_cost'))
+        bucket['total_cost']=bucket.get('total_cost',0.0)+float(_num(r,'total_cost','cost','usd'))
+        bucket['calls_count']=bucket.get('calls_count',0)+1
+        if r.get('usage_source')=='unavailable' or r.get('cost_unavailable') or r.get('unavailable'):
+            bucket['unavailable_calls_count']=bucket.get('unavailable_calls_count',0)+1
+    for r in rows:
+        add_bucket(out,r)
+        for field, name in (('role','by_role'),('backend_name','by_backend'),('model','by_model')):
+            val=r.get(field)
+            if val:
+                out[name].setdefault(str(val),{})
+                add_bucket(out[name][str(val)],r)
+    return out
+
 def _usage(run_dir, state, digest):
     cost=_read_json(run_dir/'cost_summary.json', {}) or {}; uj=_read_json(run_dir/'usage.json', {}) or {}; summary=uj.get('summary') if isinstance(uj.get('summary'),dict) else uj
-    src=cost or summary or (state.get('usage_summary') if isinstance(state,dict) else {}) or (digest.get('usage') if isinstance(digest,dict) else {}) or {}
-    if not src:
-        rows=_read_jsonl(run_dir/'usage.jsonl');
-        src={'input_tokens':sum(_num(r,'input_tokens','prompt_tokens') for r in rows),'output_tokens':sum(_num(r,'output_tokens','completion_tokens') for r in rows),'total_cost':sum(_num(r,'total_cost','cost') for r in rows),'unavailable_calls_count':sum(1 for r in rows if r.get('cost_unavailable') or r.get('unavailable'))}
+    candidates=[cost, summary, state.get('usage_summary') if isinstance(state,dict) else {}, digest.get('usage') if isinstance(digest,dict) else {}, aggregate_usage_jsonl(run_dir)]
+    src=next((c for c in candidates if _meaningful(c)), {})
     inp=_num(src,'input_tokens','prompt_tokens'); out=_num(src,'output_tokens','completion_tokens'); total=_num(src,'total_tokens') or inp+out
-    return {'input_tokens':inp,'output_tokens':out,'total_tokens':total,'total_cost':_num(src,'total_cost','cost','usd'),'unavailable_calls_count':int(_num(src,'unavailable_calls_count','unavailable_calls'))}
+    return {'input_tokens':inp,'output_tokens':out,'total_tokens':total,'input_cost':_num(src,'input_cost'),'output_cost':_num(src,'output_cost'),'total_cost':_num(src,'total_cost','cost','usd'),'calls_count':int(_num(src,'calls_count')),'unavailable_calls_count':int(_num(src,'unavailable_calls_count','unavailable_calls')),'by_role':src.get('by_role',{}) if isinstance(src,dict) else {},'by_backend':src.get('by_backend',{}) if isinstance(src,dict) else {},'by_model':src.get('by_model',{}) if isinstance(src,dict) else {}}
 
 def _model(state, usage, events):
     for k in ('selected_model','orchestrator_model','backend_model','model'):

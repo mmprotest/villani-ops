@@ -215,6 +215,9 @@ def run(ctx: typer.Context, repo: str|None=None, task: str|None=typer.Option(Non
             from villani_ops.viewer.builder import write_offline_viewer
             viewer_path=write_offline_viewer(Path(result.run_dir))
             console.print(f'Run viewer saved: {viewer_path}')
+            if viewer_server:
+                console.print('Live dashboard remains available for 30 seconds for final refresh.')
+                import time; time.sleep(30); viewer_server.stop()
         except Exception as e:
             console.print(f'Warning: offline viewer could not be written: {e}')
 
