@@ -19,6 +19,11 @@ def _attempts(state):
 
 def _aid(a): return a.get('attempt_id') if isinstance(a,dict) else a.attempt_id
 def _validation(a): return a.get('validation') if isinstance(a,dict) else a.validation
+def _review(a): return a.get('review') if isinstance(a,dict) else a.review
+def _patch(a): return a.get('patch_path') if isinstance(a,dict) else a.patch_path
+def _changed(a): return a.get('changed_files') if isinstance(a,dict) else a.changed_files
+def _failure(a): return a.get('failure_reason') if isinstance(a,dict) else a.failure_reason
+def _status(a): return a.get('status') if isinstance(a,dict) else a.status
 def _review_passed(a):
     r=(a.get('review') if isinstance(a,dict) else a.review) or {}
     return r.get('decision')=='pass' and r.get('recommended_action')=='accept' and not r.get('blockers')
@@ -40,8 +45,11 @@ def recommend_next_agentic_action(state):
         if eligible:
             return RecoveryRecommendation(action='select_winner',tool_name='ops_select_winner',tool_input={'decision':'select','selected_attempt_id':aid,'summary':'Candidate passed review and validation and is centrally acceptance eligible.','reasons':['central acceptance gate passed'],'confidence':0.95},reason='eligible candidate/integration exists',can_execute_deterministically=True)
     for a in state.candidates:
+        if _status(a) in {'completed','reviewed'} and not _review(a) and not _failure(a) and _patch(a) and _changed(a):
+            return RecoveryRecommendation(action='review_candidate',tool_name='ops_review_attempt',tool_input={'attempt_id':a.attempt_id,'scope':'candidate'},reason='completed candidate has patch evidence but no review',can_execute_deterministically=True)
+    for a in state.candidates:
         if _review_passed(a) and not _validation(a):
-            return RecoveryRecommendation(action='run_validation',tool_name='ops_run_validation',tool_input={'target':'candidate','target_id':a.attempt_id,'commands':[{'cmd':'python -m pytest --tb=short -v','purpose':'cross-platform validation'}]},reason='reviewed candidate is missing validation',can_execute_deterministically=False)
+            return RecoveryRecommendation(action='run_validation',tool_name='ops_run_validation',tool_input={'target':'candidate','target_id':a.attempt_id,'commands':[{'cmd':'python -m pytest --tb=short -v','purpose':'Validate reviewed candidate in its worktree','timeout_seconds':900}]},reason='reviewed candidate is missing validation',can_execute_deterministically=False)
         val=_validation(a) or {}
         if val.get('status')=='command_rejected':
             return RecoveryRecommendation(action='retry_validation',tool_name='ops_run_validation',tool_input={'target':'candidate','target_id':a.attempt_id,'commands':[{'cmd':'python -m pytest --tb=short -v','purpose':'cross-platform validation retry'}]},reason='validation command was rejected and should be retried safely',can_execute_deterministically=False)

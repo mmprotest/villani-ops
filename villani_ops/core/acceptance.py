@@ -162,6 +162,9 @@ def is_attempt_acceptance_eligible(attempt: Any, human_approval: Any | None = No
                 blockers.append("patch_contains_internal_artifacts")
             if hygiene.get("format_valid") is False and patch_path:
                 blockers.append("invalid_patch_format")
+        scope_assessment = _get(attempt, "scope_assessment") or {}
+        if isinstance(scope_assessment, dict):
+            blockers.extend(scope_assessment.get("blockers") or [])
 
     review = _get(attempt, "review")
     if not review:
