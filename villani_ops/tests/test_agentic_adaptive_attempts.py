@@ -68,3 +68,39 @@ def test_backend_name_selects_actual_backend_and_unknown_errors(tmp_path):
     assert not ok.is_error, ok.content
     assert runner.calls[-1]['backend_name']=='b2'
     assert runner.calls[-1]['backend_config'].name=='b2'
+
+
+def test_next_candidate_attempt_rejects_after_budget_exhausted(tmp_path):
+    s=make_state(tmp_path); s.candidate_attempts=1; runner=TelemetryRunner(); c=make_ctx(tmp_path, runner)
+    first=execute_tool_with_policy(s,'ops_run_next_candidate_attempt',{'reason':'only try'},'a1',c)
+    assert not first.is_error, first.content
+    assert 'ops_run_next_candidate_attempt' not in s.allowed_next_actions()
+    second=execute_tool_with_policy(s,'ops_run_next_candidate_attempt',{'reason':'too many'},'a2',c)
+    assert second.is_error
+    assert 'budget exhausted' in second.content
+
+
+def test_observation_refreshes_after_later_validation_and_review_without_duplicates(tmp_path):
+    from villani_ops.agentic.tools import h_observe_completed_attempt, OpsObserveCompletedAttemptInput, h_validation, OpsRunValidationInput, ValidationCommand, h_review_attempt, OpsReviewAttemptInput
+    s=make_state(tmp_path); runner=TelemetryRunner(); c=make_ctx(tmp_path, runner)
+    res=execute_tool_with_policy(s,'ops_run_next_candidate_attempt',{'reason':'first try'},'a1',c)
+    assert not res.is_error, res.content
+    aid=s.candidates[0].attempt_id
+    original=s.attempt_observations[0]
+    s.candidates[0].review=None; s.candidates[0].review_status='not_run'; s.candidates[0].review_retry_count=0
+    h_observe_completed_attempt(s, OpsObserveCompletedAttemptInput(attempt_id=aid, reason='clear review snapshot'), c)
+    original=s.attempt_observations[0]
+    assert len(s.attempt_observations)==1
+    h_observe_completed_attempt(s, OpsObserveCompletedAttemptInput(attempt_id=aid, reason='again'), c)
+    assert len(s.attempt_observations)==1
+    assert s.attempt_observations[0].attempt_id == aid
+    # Add a later validation result; existing observation should be replaced with a fresh snapshot.
+    h_validation(s, OpsRunValidationInput(target='candidate', target_id=aid, commands=[ValidationCommand(cmd='python -c "import sys; sys.exit(0)"', purpose='later pass')]), c)
+    assert len(s.attempt_observations)==1
+    after_validation=s.attempt_observations[0]
+    assert after_validation.validation_snapshot_id != original.validation_snapshot_id
+    # Add a later review; existing observation should again be replaced, not duplicated.
+    before_review=after_validation.review_snapshot_id
+    h_review_attempt(s, OpsReviewAttemptInput(attempt_id=aid, scope='candidate'), c)
+    assert len(s.attempt_observations)==1
+    assert s.attempt_observations[0].review_snapshot_id != before_review
