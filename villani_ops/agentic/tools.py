@@ -7,6 +7,7 @@ from .state import CandidateAttemptState, SubtaskState, AttemptObservation, dete
 from .git_artifacts import capture_git_patch, ensure_git_baseline, clean_runner_artifacts_from_worktree, DEFAULT_PATCH_EXCLUDES, is_git_compatible_patch, patch_contains_internal_artifacts, clean_untracked_scratch_artifacts, is_scratch_artifact_path
 from villani_ops.core.acceptance import is_attempt_acceptance_eligible, attempt_requires_patch
 import subprocess, json, time, shutil, os, re
+from datetime import datetime, timezone
 from .artifacts import read_text_utf8, write_text_utf8, write_json_utf8
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from villani_ops.telemetry.usage import usage_record_from_runner, usage_record_from_response
@@ -387,6 +388,15 @@ def _brief_validation(validation):
             break
     return lines
 
+def _attempt_observation_snapshots(attempt):
+    return (f"{attempt.validation_status}:{len(attempt.validation_results or [])}", f"{attempt.review_status}:{attempt.review_retry_count}:{bool(attempt.review)}")
+
+def _attempt_observed_stage(attempt):
+    parts=['completed']
+    if attempt.validation: parts.append('validated')
+    if attempt.review: parts.append('reviewed')
+    return '+'.join(parts)
+
 def create_attempt_observation(state, attempt):
     eligible, blockers=is_attempt_acceptance_eligible(attempt,state=state)
     telemetry=attempt.runner_telemetry or {}
@@ -414,7 +424,8 @@ def create_attempt_observation(state, attempt):
     prev_same=[o for o in state.attempt_observations if o.backend_name==attempt.backend_name and o.outcome in {'no_patch','runner_failed'}]
     should_escalate=len(prev_same)>=1 and outcome in {'no_patch','runner_failed'}
     if should_escalate: directives.append('Consider a different coding backend because this backend shows repeated no-progress or runner failure.')
-    obs=AttemptObservation(attempt_id=attempt.attempt_id,scope=attempt.scope,subtask_id=attempt.subtask_id,backend_name=attempt.backend_name,model=attempt.model,outcome=outcome,progress_score=(1.0 if eligible else 0.4 if attempt.changed_files else 0.0),failure_class=failure_class,evidence=evidence[:8],blockers=sorted(set(blockers)),changed_files=attempt.changed_files,validation_status=attempt.validation_status,review_status=attempt.review_status,runner_signals=telemetry,backend_signals={},next_attempt_directives=list(dict.fromkeys(directives))[:8],should_retry_same_plan=outcome in {'validation_failed','review_failed','partial_progress','no_patch'},should_repair=outcome in {'validation_failed','review_failed','patch_failed'},should_decompose=outcome=='partial_progress' and len(state.attempt_observations)>=1,should_escalate_backend=should_escalate)
+    val_snap, review_snap=_attempt_observation_snapshots(attempt)
+    obs=AttemptObservation(attempt_id=attempt.attempt_id,scope=attempt.scope,subtask_id=attempt.subtask_id,backend_name=attempt.backend_name,model=attempt.model,outcome=outcome,progress_score=(1.0 if eligible else 0.4 if attempt.changed_files else 0.0),failure_class=failure_class,evidence=evidence[:8],blockers=sorted(set(blockers)),changed_files=attempt.changed_files,validation_status=attempt.validation_status,review_status=attempt.review_status,runner_signals=telemetry,backend_signals={},next_attempt_directives=list(dict.fromkeys(directives))[:8],should_retry_same_plan=outcome in {'validation_failed','review_failed','partial_progress','no_patch'},should_repair=outcome in {'validation_failed','review_failed','patch_failed'},should_decompose=outcome=='partial_progress' and len(state.attempt_observations)>=1,should_escalate_backend=should_escalate,observed_at_stage=_attempt_observed_stage(attempt),validation_snapshot_id=val_snap,review_snapshot_id=review_snap,updated_at=datetime.now(timezone.utc).isoformat())
     state.attempt_observations=[o for o in state.attempt_observations if o.attempt_id!=attempt.attempt_id]+[obs]
     return obs
 
@@ -831,6 +842,8 @@ def h_review_attempt(state, inp, ctx):
     if not eligible and blockers:
         state.blockers=sorted(set(state.blockers+blockers))
     ctx.recorder.record(f'{inp.scope}_attempt_reviewed', payload={'attempt_id':inp.attempt_id,'review_decision':res.decision,'review_recommended_action':res.recommended_action,'central_acceptance_eligible':eligible,'acceptance_eligible':eligible,'acceptance_blockers':blockers,'execution_path':state.execution_path,'validation_blocked':any(b.startswith('validation_') for b in blockers),'artifact_blocked':any(b in {'missing_patch','empty_changed_files','patch_unreadable'} for b in blockers), **(({k:getattr(usage_record,k) for k in ['input_tokens','output_tokens','total_tokens','total_cost','usage_source']} if 'usage_record' in locals() and usage_record is not None else {}))})
+    if inp.scope=='candidate' and any(o.attempt_id==inp.attempt_id for o in state.attempt_observations) and not isinstance(a,dict):
+        _observe_completed_attempt(state,a,ctx)
     return {**res.model_dump(),'acceptance_eligible':eligible,'acceptance_blockers':blockers,'review_payload_included':['patch_excerpt','stdout_tail','stderr_tail','validation']}
 def _accepted_subtask_attempt(state, st):
     for a in st.attempts:
@@ -1048,6 +1061,8 @@ def h_validation(state, inp, ctx):
     res={'passed':all_pass,'status':overall_status if not all_pass else 'passed','commands':results,'target':inp.target,'target_id':inp.target_id,'cwd':first_cwd or str(base_cwd.resolve())}
     _attach_validation(state,target_obj,inp.target,res)
     ctx.recorder.record('validation_attached', payload={'target':inp.target,'target_id':inp.target_id,'passed':all_pass,'status':res['status'],'command_count':len(inp.commands),'cwd':res['cwd'],'artifact_paths':[p for r in results for p in [r.get('stdout_path'),r.get('stderr_path')] if p]})
+    if inp.target=='candidate' and target_obj is not None and any(o.attempt_id==inp.target_id for o in state.attempt_observations):
+        _observe_completed_attempt(state,target_obj,ctx)
     return res
 
 def h_select_winner(state, inp, ctx):

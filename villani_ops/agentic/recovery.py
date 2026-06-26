@@ -27,6 +27,39 @@ def _changed(a): return a.get('changed_files') if isinstance(a,dict) else a.chan
 def _failure(a): return a.get('failure_reason') if isinstance(a,dict) else a.failure_reason
 def _status(a): return a.get('status') if isinstance(a,dict) else a.status
 
+
+def _complete(a): return _status(a) in {'completed','failed','reviewed','rejected','accepted'}
+def _validation_missing(a): return _complete(a) and bool(_patch(a)) and bool(_changed(a)) and not _validation(a)
+def _review_missing(a): return _complete(a) and bool(_patch(a)) and bool(_changed(a)) and not _review(a) and not _failure(a)
+def _obs_for(state, aid): return next((o for o in getattr(state,'attempt_observations',[]) or [] if getattr(o,'attempt_id',None)==aid), None)
+def _obs_fresh(a, o):
+    if not o: return False
+    val=f"{getattr(a,'validation_status',None)}:{len(getattr(a,'validation_results',[]) or [])}"
+    rev=f"{getattr(a,'review_status',None)}:{getattr(a,'review_retry_count',0)}:{bool(getattr(a,'review',None))}"
+    return getattr(o,'validation_snapshot_id',None)==val and getattr(o,'review_snapshot_id',None)==rev
+
+def _exhausted_failure_summary(state, observations):
+    latest=observations[-1] if observations else None
+    latest_attempt=_find_attempt_by_id(state, latest.attempt_id) if latest else (state.candidates[-1] if state.candidates else None)
+    validation=[]; review=[]; patch=[]
+    for o in observations:
+        if o.validation_status not in {None,'passed','not_run'}: validation += list(o.evidence or []) or [o.validation_status]
+        if o.review_status not in {None,'passed','not_run'}: review += list(o.blockers or [])
+        patch += [b for b in (o.blockers or []) if 'patch' in b or 'scope' in b or 'changed_files' in b]
+    backend={k:v.get('capability_signal') for k,v in (getattr(state,'backend_assessments',{}) or {}).items() if isinstance(v,dict)}
+    manual='Inspect the latest attempt worktree/patch, address listed validation or review blockers, then rerun a focused manual validation command.'
+    return {
+        'attempt_count':len(state.candidates),
+        'latest_outcome':getattr(latest,'outcome',None),
+        'changed_files':sorted({f for o in observations for f in (o.changed_files or [])} or set(_changed(latest_attempt) or [])),
+        'validation_failure_summary':validation[:6],
+        'review_blocker_summary':review[:6],
+        'patch_scope_blockers':sorted(set(patch))[:6],
+        'backend_runner_capability_signal':backend or getattr(state,'runner_assessment',{}),
+        'recommended_next_manual_action':manual,
+        'attempt_observations':[o.model_dump() for o in observations],
+    }
+
 def _find_attempt_by_id(state, aid):
     for a in _attempts(state):
         if _aid(a)==aid: return a
@@ -83,9 +116,17 @@ def recommend_next_agentic_action(state):
     if state.fallback_execution_path=='parallel_candidates_after_decomposition_deadlock' and not state.candidates:
         return RecoveryRecommendation(action='launch_fallback_candidates',tool_name='ops_launch_candidates',tool_input={'attempts':state.candidate_attempts,'reason':'fallback after decomposition deadlock'},reason='candidate fallback is started but no fallback candidates have launched',can_execute_deterministically=False)
     if state.execution_path=='single_task':
+        # Evidence-first recovery: never retry until current completed attempts have
+        # validation/review and a fresh idempotent observation when those are possible.
         for a in state.candidates:
-            if not any(getattr(o,'attempt_id',None)==a.attempt_id for o in getattr(state,'attempt_observations',[]) or []) and _status(a) in {'completed','failed','reviewed','rejected'}:
-                return RecoveryRecommendation(action='create_missing_observation',tool_name='ops_observe_completed_attempt',tool_input={'attempt_id':a.attempt_id,'reason':'Create AttemptObservation for completed attempt before deciding whether to retry.'},reason='completed attempt lacks an observation; create observation before any retry',can_execute_deterministically=True)
+            if _validation_missing(a):
+                return RecoveryRecommendation(action='run_validation',tool_name='ops_run_validation',tool_input={'target':'candidate','target_id':_aid(a),'commands':[{'cmd':'python -m pytest --tb=short -v','purpose':'Validate completed candidate before observation/retry','timeout_seconds':900}]},reason='completed candidate needs validation before observation or retry',can_execute_deterministically=False)
+        for a in state.candidates:
+            if _review_missing(a):
+                return RecoveryRecommendation(action='review_candidate',tool_name='ops_review_attempt',tool_input={'attempt_id':_aid(a),'scope':'candidate'},reason='completed candidate needs review before observation or retry',can_execute_deterministically=True)
+        for a in state.candidates:
+            if _complete(a) and not _obs_fresh(a, _obs_for(state,_aid(a))):
+                return RecoveryRecommendation(action='create_or_refresh_observation',tool_name='ops_observe_completed_attempt',tool_input={'attempt_id':_aid(a),'reason':'Create or refresh AttemptObservation from current validation/review evidence before deciding whether to retry.'},reason='completed attempt lacks a current observation',can_execute_deterministically=True)
     for a in _attempts(state):
         aid=_aid(a)
         if not aid: continue
@@ -118,9 +159,10 @@ def recommend_next_agentic_action(state):
             if last.should_decompose:
                 state.adaptive_context['decomposition_warranted']=True
             return RecoveryRecommendation(action=f'focused_retry_{last.outcome}',tool_name='ops_run_next_candidate_attempt',tool_input=inp,reason=f'latest observation outcome={last.outcome}; run one focused adaptive retry with feedback',can_execute_deterministically=True)
-        if last and len(state.candidates) >= budget and last.outcome!='accepted':
-            blockers=sorted(set(sum([list(o.blockers or [])+list(o.evidence or [])+list(o.next_attempt_directives or []) for o in observations], [])))[:12]
-            return RecoveryRecommendation(action='reject_all',tool_name='ops_select_winner',tool_input={'decision':'reject_all','summary':'Candidate attempt budget exhausted. No accepted adaptive attempt is available.','reasons':blockers or ['candidate_attempt_budget_exhausted'],'rejected_attempts':[c.attempt_id for c in state.candidates],'confidence':0.8},reason='budget exhausted; report observations and blockers',can_execute_deterministically=True)
+        if len(state.candidates) >= budget:
+            structured=_exhausted_failure_summary(state, observations)
+            reasons=sorted(set(sum([list(o.blockers or [])+list(o.evidence or [])+list(o.next_attempt_directives or []) for o in observations], [])))[:12]
+            return RecoveryRecommendation(action='reject_all',tool_name='ops_select_winner',tool_input={'decision':'reject_all','summary':'Candidate attempt budget exhausted. No accepted adaptive attempt is available.','reasons':reasons or ['candidate_attempt_budget_exhausted'],'rejected_attempts':[c.attempt_id for c in state.candidates],'confidence':0.8,'failure_observations':structured},reason='budget exhausted; report observations and blockers',can_execute_deterministically=True)
     for a in state.candidates:
         val=_validation(a) or {}
         if val.get('passed') is True and _patch(a) and _changed(a) and _review_status(a) in {'unavailable','malformed','provider_error'} and _review_retry_count(a) < 3:

@@ -14,6 +14,7 @@ class OpsToolResult(BaseModel):
 def _allowed(state, name, data):
     if name in {'ops_get_state','ops_inspect_repo','ops_submit_classification'}: return True, None
     if name=='ops_observe_completed_attempt': return True, None
+    if name=='ops_run_next_candidate_attempt' and state.execution_path=='single_task': return True, None
     if name not in state.allowed_next_actions() and name!='ops_finalize_run': return False, f'{name} is not allowed in phase {state.phase}; allowed={state.allowed_next_actions()}'
     if name=='ops_submit_decomposition' and not (state.plan or {}).get('should_decompose'): return False,'plan did not request decomposition'
     if name=='ops_validate_decomposition' and not state.decomposition: return False,'no decomposition exists'
