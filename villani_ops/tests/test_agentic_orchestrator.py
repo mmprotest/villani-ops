@@ -75,3 +75,38 @@ def test_decomposed_smoke_with_explicit_nonproduction_fakes(tmp_path):
     assert r.state.status=='completed'
     assert r.state.integration['applied_subtask_order'] == ['s0','s1']
     assert r.state.subtask_concurrency['wave_count'] == 2
+
+def decomposed_prefix_blocks():
+    return [
+        tc('ops_submit_investigation',{'summary':'s','confidence':1.0}),
+        tc('ops_submit_plan',{'summary':'p','strategy':'decompose_then_execute','should_decompose':True,'decomposition_reason':'independent files','candidate_attempts':1,'expected_difficulty':'medium','confidence':1.0}),
+        tc('ops_submit_decomposition',{'should_use_decomposition':True,'reason':'split','confidence':1.0,'subtasks':[
+            {'id':'s0','title':'s0','objective':'make s0','success_criteria':'s0 file','relevant_files':[],'dependencies':[],'expected_difficulty':'easy','risk':'low','confidence':1.0,'can_run_parallel':True},
+            {'id':'s1','title':'s1','objective':'make s1','success_criteria':'s1 file','relevant_files':[],'dependencies':['s0'],'expected_difficulty':'easy','risk':'low','confidence':1.0,'can_run_parallel':False}], 'merge_strategy':'dependency order'}),
+        tc('ops_validate_decomposition',{'decomposition_id':'current','semantic':False}),
+    ]
+
+def test_no_tool_call_after_accepted_decomposition_selects_path_deterministically(tmp_path):
+    repo=tmp_path/'repo'; repo.mkdir()
+    r=OpsRunner(client=FakeClient(decomposed_prefix_blocks()+[[]]), max_turns=5, max_recovery_attempts=0).run(req(tmp_path,candidate_attempts=1,repo_path=str(repo),runner_adapter=FakeSubtaskRunner()))
+    assert r.state.execution_path == 'decomposed_subtasks'
+    assert (r.state.final_decision or {}).get('blockers') != ['agentic_orchestrator_no_progress']
+    events=(Path(r.run_dir)/'runtime_events.jsonl').read_text()
+    assert 'recovery_deterministic_action_executed' in events
+    assert 'agentic_orchestrator_no_progress' not in events
+    assert r.state.recovery_count == 0
+
+def test_no_tool_call_after_decomposed_path_launches_ready_subtasks(tmp_path):
+    repo=tmp_path/'repo'; repo.mkdir()
+    blocks=decomposed_prefix_blocks()+[
+        tc('ops_select_execution_path',{'path':'decomposed_subtasks','reason':'validated'}),
+        [],
+    ]
+    r=OpsRunner(client=FakeClient(blocks), max_turns=6, max_recovery_attempts=0).run(req(tmp_path,candidate_attempts=1,repo_path=str(repo),runner_adapter=FakeSubtaskRunner()))
+    assert r.state.subtasks[0].attempts
+    assert [s.subtask_id for s in r.state.subtasks if s.attempts] == ['s0']
+    assert r.state.subtasks[1].status == 'pending'
+    assert (r.state.final_decision or {}).get('blockers') != ['agentic_orchestrator_no_progress']
+    events=(Path(r.run_dir)/'runtime_events.jsonl').read_text()
+    assert 'ops_launch_subtasks' in events
+    assert 'agentic_orchestrator_no_progress' not in events

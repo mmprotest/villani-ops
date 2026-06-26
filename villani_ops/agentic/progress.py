@@ -24,6 +24,16 @@ class AgenticProgressReporter:
         elif t=='decomposition_submitted': self._print(f"[agentic] Decomposition submitted: {p.get('subtask_count') or len(p.get('subtasks') or [])} subtasks")
         elif t=='decomposition_validation_completed': self._print(f"[agentic] Decomposition validated: {'accepted' if p.get('accepted') else 'rejected'}")
         elif t=='execution_path_selected': self._print(f"[agentic] Execution path selected: {p.get('execution_path') or p.get('path')}")
+        elif t=='recovery_deterministic_action_executed':
+            tool=p.get('tool_name') or p.get('recommendation',{}).get('tool_name') or ''
+            reason=p.get('reason') or p.get('recommendation',{}).get('reason') or ''
+            if tool=='ops_select_execution_path':
+                path=(p.get('tool_input') or {}).get('path') or (p.get('recommendation',{}).get('tool_input') or {}).get('path')
+                self._print(f"[agentic] Recovery selected execution path: {path or reason}".rstrip())
+            elif tool=='ops_launch_subtasks':
+                self._print(f"[agentic] Recovery launching accepted decomposition subtasks: {reason}".rstrip())
+            else:
+                self._print(f"[agentic] Recovery executed {tool}: {reason}".rstrip())
         elif t in {'candidate_attempt_started','subtask_attempt_started'}:
             kind=('Fallback candidate' if t.startswith('candidate') and p.get('fallback') else ('Candidate' if t.startswith('candidate') else f"Subtask {p.get('subtask_id') or ''}".strip()))
             self._print(f"[agentic] {kind} attempt {p.get('attempt_id')} started" + (f": backend={p.get('backend_name')}" if self.verbose and p.get('backend_name') else '') + detail)
