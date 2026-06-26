@@ -7,6 +7,7 @@ from .state import CandidateAttemptState, SubtaskState
 from villani_ops.storage.files import capture_diff
 from villani_ops.core.acceptance import is_attempt_acceptance_eligible, attempt_requires_patch
 import subprocess, json, time, shutil
+from .artifacts import read_text_utf8, write_text_utf8, write_json_utf8
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
@@ -85,7 +86,7 @@ def _read_text_tail(path, max_chars=12000):
     if not path:
         return None
     try:
-        text=Path(path).read_text(errors='replace')
+        text=read_text_utf8(Path(path), default='')
         return text[-max_chars:]
     except Exception as e:
         return {'error':f'unreadable: {type(e).__name__}: {e}', 'path':str(path)}
@@ -247,10 +248,10 @@ def _run_attempt(state, ctx, aid, scope, task, success, subtask_id=None, backend
     try:
         _copy_worktree(Path(state.repo_path), wtree)
         res=ctx.runner_adapter.run_task(repo_path=wtree,task=task,success_criteria=success,backend_name=a.backend_name or '',backend_config=backend,timeout_seconds=ctx.timeout_seconds,context={'attempt_id':aid,'subtask_id':subtask_id,'parent_task':state.task},artifacts_dir=adir)
-        (adir/'stdout.log').write_text(getattr(res,'stdout','') or ''); (adir/'stderr.log').write_text(getattr(res,'stderr','') or '')
+        write_text_utf8(adir/'stdout.log', getattr(res,'stdout','') or ''); write_text_utf8(adir/'stderr.log', getattr(res,'stderr','') or '')
         diff=capture_diff(Path(state.repo_path), wtree, adir/'diff.patch')
         a.stdout_path=str(adir/'stdout.log'); a.stderr_path=str(adir/'stderr.log'); a.patch_path=str(diff); a.transcript_path=getattr(res,'telemetry_path',None)
-        meta=extract_changed_file_metadata(diff.read_text(errors='replace'))
+        meta=extract_changed_file_metadata(read_text_utf8(diff, default=''))
         a.changed_files=meta['changed_files']; a.added_files=meta['added_files']; a.deleted_files=meta['deleted_files']; a.modified_files=meta['modified_files']; a.renamed_files=meta['renamed_files']
         a.model=getattr(backend,'model',None); a.completed_at=str(time.time())
         ok=getattr(res,'exit_code',1)==0
@@ -263,8 +264,8 @@ def _run_attempt(state, ctx, aid, scope, task, success, subtask_id=None, backend
     except Exception as e:
         a.status='failed'; a.completed_at=str(time.time()); a.duration_seconds=float(a.completed_at)-float(a.started_at or a.completed_at); a.failure_reason=f'{type(e).__name__}: {e}'; a.runner_error_type=type(e).__name__; a.runner_status='exception'; a.acceptance_eligible=False; a.acceptance_blockers=['runner_exception', f'runner_exception: {type(e).__name__}: {e}']
         a.stdout_path=str(adir/'stdout.log'); a.stderr_path=str(adir/'stderr.log')
-        if not Path(a.stdout_path).exists(): Path(a.stdout_path).write_text('')
-        Path(a.stderr_path).write_text(f'{type(e).__name__}: {e}\n')
+        if not Path(a.stdout_path).exists(): write_text_utf8(Path(a.stdout_path), '')
+        write_text_utf8(Path(a.stderr_path), f'{type(e).__name__}: {e}\n')
         if record_events:
             ctx.recorder.record(f'{scope}_attempt_failed', payload={'attempt_id':aid,'subtask_id':subtask_id,'status':'failed','failure_reason':a.acceptance_blockers[0],'artifact_paths':{'stdout':a.stdout_path,'stderr':a.stderr_path,'artifacts_dir':str(adir)}})
     if a.completed_at and a.started_at and a.duration_seconds is None:
@@ -337,7 +338,7 @@ def h_launch_subtasks(state, inp, ctx):
                 with ThreadPoolExecutor(max_workers=len(batch)) as ex:
                     for sid in batch:
                         st=by[sid]; aid=f'{sid}_attempt_{len(st.attempts)+1:03d}'
-                        task=f"Parent task:\n{state.task}\n\nParent success criteria:\n{state.success_criteria or ''}\n\nSubtask title:\n{st.title}\n\nSubtask objective:\n{st.objective}\n\nSubtask success criteria:\n{st.success_criteria or ''}\n\nRelevant files:\n{json.dumps(st.relevant_files)}\n\nDependency context:\n{json.dumps(st.dependencies)}\n\nMerge contract:\n{(state.decomposition or {}).get('merge_strategy') or ''}\n\nSolve only this subtask scope. Avoid unrelated broad changes. Do not perform the entire parent task unless this subtask explicitly requires it."
+                        task=f"Parent task:\n{state.task}\n\nParent success criteria:\n{state.success_criteria or ''}\n\nSubtask title:\n{st.title}\n\nSubtask objective:\n{st.objective}\n\nSubtask success criteria:\n{st.success_criteria or ''}\n\nRelevant files:\n{json.dumps(st.relevant_files, ensure_ascii=False)}\n\nDependency context:\n{json.dumps(st.dependencies, ensure_ascii=False)}\n\nMerge contract:\n{(state.decomposition or {}).get('merge_strategy') or ''}\n\nSolve only this subtask scope. Avoid unrelated broad changes. Do not perform the entire parent task unless this subtask explicitly requires it."
                         scheduled=_attempt(aid,'subtask',subtask_id=sid,backend=inp.backend_name or ctx.coding_backend_name or ctx.backend_name,artifacts=Path(state.run_dir)/'attempts'/aid)
                         scheduled.status='running'; scheduled.started_at=str(time.time()); scheduled.worktree_path=str(Path(state.run_dir)/'attempts'/aid/'worktree')
                         st.attempts.append(scheduled); launched.setdefault(sid,[]).append(aid); ids[aid]=sid
@@ -404,7 +405,7 @@ def h_review_attempt(state, inp, ctx):
         res=OpsReviewResult(decision='fail',recommended_action='reject',score=0.0,summary='structured review failed',evidence=[],issues=[f'{type(e).__name__}: {e}'],blockers=['review_malformed'],confidence=0.0)
         rdir=Path(state.run_dir)/'reviews'; rdir.mkdir(parents=True,exist_ok=True)
         raw_path=rdir/f'{inp.attempt_id}_malformed_review.json'
-        raw_path.write_text(json.dumps({'raw_response':raw,'error':f'{type(e).__name__}: {e}'},indent=2,default=str))
+        write_json_utf8(raw_path, {'raw_response':raw,'error':f'{type(e).__name__}: {e}'})
         if isinstance(a, dict): a.setdefault('review_artifacts',[]).append(str(raw_path))
         else: a.acceptance_blockers=sorted(set(a.acceptance_blockers+['review_malformed']))
     if isinstance(a, dict):
@@ -443,24 +444,24 @@ def _subtasks_dependency_order(subtasks):
     return order
 
 def _git_apply_patch_path(patch_path, idir, subtask_id):
-    text=Path(patch_path).read_text(errors='replace')
+    text=read_text_utf8(Path(patch_path), default='')
     if any(line.startswith(('Added file: ','Deleted file: ','Modified file: ','Binary files differ:')) for line in text.splitlines()):
         cleaned='\n'.join(line for line in text.splitlines() if not line.startswith(('Added file: ','Deleted file: ','Modified file: ')))+'\n'
-        tmp=idir/f'git_apply_input_{subtask_id}.patch'; tmp.write_text(cleaned); return str(tmp)
+        tmp=idir/f'git_apply_input_{subtask_id}.patch'; write_text_utf8(tmp, cleaned); return str(tmp)
     return patch_path
 
 def _write_integration_failure_artifacts(idir, subtask_id, patch_path, check=None, apply=None):
     arts={}
     if patch_path:
         dst=idir/f'failed_patch_{subtask_id}.patch'
-        try: dst.write_text(Path(patch_path).read_text(errors='replace'))
-        except Exception as e: dst.write_text(f'unreadable patch {patch_path}: {type(e).__name__}: {e}\n')
+        try: write_text_utf8(dst, read_text_utf8(Path(patch_path)))
+        except Exception as e: write_text_utf8(dst, f'unreadable patch {patch_path}: {type(e).__name__}: {e}\n')
         arts['failed_patch']=str(dst)
     if check is not None:
-        so=idir/'git_apply_check_stdout.log'; se=idir/'git_apply_check_stderr.log'; so.write_text(check.stdout or ''); se.write_text(check.stderr or '')
+        so=idir/'git_apply_check_stdout.log'; se=idir/'git_apply_check_stderr.log'; write_text_utf8(so, check.stdout or ''); write_text_utf8(se, check.stderr or '')
         arts['git_apply_check_stdout']=str(so); arts['git_apply_check_stderr']=str(se)
     if apply is not None:
-        so=idir/'git_apply_stdout.log'; se=idir/'git_apply_stderr.log'; so.write_text(apply.stdout or ''); se.write_text(apply.stderr or '')
+        so=idir/'git_apply_stdout.log'; se=idir/'git_apply_stderr.log'; write_text_utf8(so, apply.stdout or ''); write_text_utf8(se, apply.stderr or '')
         arts['git_apply_stdout']=str(so); arts['git_apply_stderr']=str(se)
     return arts
 
@@ -473,6 +474,7 @@ def h_integrate(state, inp, ctx):
     if unaccepted:
         state.integration={'attempt_id':'integration_001','scope':'integration','status':'failed','reason':inp.reason,'failure_reason':'subtasks_incomplete','failed_subtasks':unaccepted,'acceptance_eligible':False,'acceptance_blockers':['subtasks_incomplete']}
         ctx.recorder.record('integration_failed', payload=state.integration); return state.integration
+    ctx.recorder.record('integration_started', payload={'accepted_subtasks':sum(1 for s in state.subtasks if s.status=='accepted')})
     iid='integration_001'; idir=Path(state.run_dir)/'integration'/iid; idir.mkdir(parents=True,exist_ok=True)
     wtree=idir/'worktree'; started=str(time.time()); conflicts=[]; applied=[]; failed=[]
     _copy_worktree(Path(state.repo_path), wtree)
@@ -480,8 +482,7 @@ def h_integrate(state, inp, ctx):
         ordered_subtasks=_subtasks_dependency_order(state.subtasks)
     except ValueError as e:
         state.integration={'attempt_id':iid,'scope':'integration','status':'failed','reason':inp.reason,'failure_reason':str(e),'failed_subtasks':[{'reason':str(e)}],'acceptance_eligible':False,'acceptance_blockers':['integration_ordering_failed'], 'conflict_artifacts':[]}
-        write_json_utf8 = lambda path, data: Path(path).write_text(json.dumps(data,indent=2))
-        write_json_utf8(idir/'integration_failure.json', state.integration)
+        write_json_utf8(idir/'integration_failure.json', state.integration, atomic=True)
         ctx.recorder.record('integration_failed', payload=state.integration); return state.integration
     for st in ordered_subtasks:
         if st.status=='skipped': continue
@@ -501,7 +502,7 @@ def h_integrate(state, inp, ctx):
             conflicts.append(item); failed.append({**item,'reason':'patch_apply_failed'}); continue
         applied.append({'subtask_id':st.subtask_id,'attempt_id':a.attempt_id,'patch_path':a.patch_path})
     patch=capture_diff(Path(state.repo_path), wtree, idir/'diff.patch')
-    meta=extract_changed_file_metadata(patch.read_text(errors='replace'))
+    meta=extract_changed_file_metadata(read_text_utf8(patch, default=''))
     status='failed' if failed or conflicts else 'completed'
     blockers=[]
     if failed: blockers.append('integration_failed')
@@ -509,8 +510,8 @@ def h_integrate(state, inp, ctx):
     integ={'attempt_id':iid,'scope':'integration','status':status,'reason':inp.reason,'worktree_path':str(wtree),'artifacts_dir':str(idir),'patch_path':str(patch),'changed_files':meta['changed_files'],'added_files':meta['added_files'],'deleted_files':meta['deleted_files'],'modified_files':meta['modified_files'],'renamed_files':meta['renamed_files'],'merge_conflicts':conflicts,'conflict_artifacts':[p for c in conflicts for p in ((c.get('artifact_paths') or {}).values())],'applied_subtasks':applied,'applied_subtask_order':[x['subtask_id'] for x in applied],'failed_subtasks':failed,'failure_reason':'integration_failed' if status=='failed' else None,'started_at':started,'completed_at':str(time.time()),'acceptance_eligible':False,'acceptance_blockers':blockers or ['review_missing'],'review':None,'validation':None}
     state.integration=integ; _set_acceptance_from_gate(state, state.integration)
     if status=='failed':
-        (idir/'integration_failure.json').write_text(json.dumps(state.integration,indent=2))
-        (idir/'integration_conflicts.txt').write_text('\n'.join((c.get('stderr_tail') or c.get('stderr') or '') for c in conflicts))
+        write_json_utf8(idir/'integration_failure.json', state.integration, atomic=True)
+        write_text_utf8(idir/'integration_conflicts.txt', '\n'.join((c.get('stderr_tail') or c.get('stderr') or '') for c in conflicts))
     state.phase='selecting' if status=='completed' else 'failed'
     if status=='failed': state.last_error=state.integration.get('failure_reason')
     ctx.recorder.record('integration_completed' if status=='completed' else 'integration_failed', payload=state.integration)
@@ -531,9 +532,9 @@ def h_validation(state, inp, ctx):
         outdir=Path(state.run_dir)/'validation'; outdir.mkdir(exist_ok=True); so=outdir/f'{inp.target}_{inp.target_id or "repo"}_{i}.stdout.log'; se=outdir/f'{inp.target}_{inp.target_id or "repo"}_{i}.stderr.log'
         try:
             p=subprocess.run(c.cmd,shell=True,cwd=c.cwd or cwd,text=True,capture_output=True,timeout=c.timeout_seconds or 300)
-            so.write_text(p.stdout or ''); se.write_text(p.stderr or ''); passed=p.returncode==0; status='passed' if passed else 'failed'
+            write_text_utf8(so, p.stdout or ''); write_text_utf8(se, p.stderr or ''); passed=p.returncode==0; status='passed' if passed else 'failed'
         except subprocess.TimeoutExpired as e:
-            so.write_text(e.stdout or ''); se.write_text((e.stderr or '')+'\ntimeout'); passed=False; status='timeout'
+            write_text_utf8(so, e.stdout or ''); write_text_utf8(se, (e.stderr or '')+'\ntimeout'); passed=False; status='timeout'
         all_pass=all_pass and passed; item={'cmd':c.cmd,'passed':passed,'status':status,'stdout_path':str(so),'stderr_path':str(se)}; results.append(item)
         ctx.recorder.record('validation_completed' if passed else 'validation_failed', payload={'target':inp.target,'target_id':inp.target_id,'validation_result':item})
     res={'passed':all_pass,'commands':results}

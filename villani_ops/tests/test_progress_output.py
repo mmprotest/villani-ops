@@ -61,3 +61,52 @@ def test_normalization_and_fallback_progress(capsys):
     assert 'normalized=true' in out
     assert 'Selector reason synthesized from candidate evidence' in out
     assert 'Plan complete using planner fallback' in out
+
+from villani_ops.agentic.progress import AgenticProgressReporter
+from villani_ops.agentic.events import OpsEvent
+
+
+def _ev(type, payload=None):
+    return OpsEvent(event_id='e', run_id='r', timestamp='now', type=type, payload=payload or {})
+
+
+def test_agentic_progress_prints_key_events(capsys):
+    r=AgenticProgressReporter()
+    for ev in [
+        _ev('run_started', {'run_dir':'runs/r'}),
+        _ev('investigation_submitted'),
+        _ev('plan_submitted', {'strategy':'decompose_then_execute'}),
+        _ev('decomposition_submitted', {'subtasks':[{},{}]}),
+        _ev('execution_path_selected', {'execution_path':'decomposed_subtasks'}),
+        _ev('subtask_attempt_started', {'attempt_id':'pricing_attempt_001','subtask_id':'pricing'}),
+        _ev('subtask_attempt_completed', {'attempt_id':'pricing_attempt_001','subtask_id':'pricing','exit_code':0}),
+        _ev('subtask_attempt_reviewed', {'attempt_id':'pricing_attempt_001','review_decision':'pass','review_recommended_action':'accept'}),
+        _ev('run_finalized', {'decision':'accepted'}),
+    ]:
+        r.on_event(ev)
+    out=capsys.readouterr().out
+    assert 'Villani Ops agentic run started' in out
+    assert 'Run directory: runs/r' in out
+    assert '[agentic] Investigation submitted' in out
+    assert '[agentic] Plan submitted: decompose_then_execute' in out
+    assert '[agentic] Decomposition submitted: 2 subtasks' in out
+    assert '[agentic] Execution path selected: decomposed_subtasks' in out
+    assert '[agentic] Subtask pricing attempt pricing_attempt_001 started' in out
+    assert '[agentic] Subtask pricing attempt pricing_attempt_001 completed: exit_code=0' in out
+    assert '[agentic] Subtask review pricing_attempt_001: pass, accept' in out
+    assert '[agentic] Final decision: accepted' in out
+
+
+def test_agentic_progress_quiet_suppresses(capsys):
+    AgenticProgressReporter(enabled=False).on_event(_ev('run_started', {'run_dir':'runs/r'}))
+    assert capsys.readouterr().out == ''
+
+
+def test_agentic_progress_verbose_and_unicode(capsys):
+    r=AgenticProgressReporter(verbose=True)
+    r.on_event(_ev('tool_failed', {'message':'bad ✅'}))
+    r.on_event(_ev('candidate_attempt_started', {'attempt_id':'candidate_001','backend_name':'qwen35b','artifact_paths':{'stdout':'✅.log'}}))
+    out=capsys.readouterr().out
+    assert 'tool_failed' in out
+    assert 'backend=qwen35b' in out
+    assert '✅.log' in out

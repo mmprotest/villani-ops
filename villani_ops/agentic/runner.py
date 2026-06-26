@@ -56,12 +56,12 @@ class OpsRunResult(BaseModel):
     model_config=ConfigDict(arbitrary_types_allowed=True)
     run_id:str; run_dir:str; state:OpsRunState; decision:Decision
 class OpsRunner:
-    def __init__(self, storage=None, client=None, backend=None, backends=None, runner_adapter=None, reviewer=None, max_turns:int=60, max_recovery_attempts:int=2): self.storage=storage; self.client=client or ToolCallingLLMClient(); self.backend=backend; self.backends=backends; self.runner_adapter=runner_adapter; self.reviewer=reviewer; self.max_turns=max_turns; self.max_recovery_attempts=max_recovery_attempts
+    def __init__(self, storage=None, client=None, backend=None, backends=None, runner_adapter=None, reviewer=None, max_turns:int=60, max_recovery_attempts:int=2, progress_reporter=None): self.storage=storage; self.client=client or ToolCallingLLMClient(); self.backend=backend; self.backends=backends; self.runner_adapter=runner_adapter; self.reviewer=reviewer; self.max_turns=max_turns; self.max_recovery_attempts=max_recovery_attempts; self.progress_reporter=progress_reporter
     def run(self, request:OpsRunRequest)->OpsRunResult:
         rid=datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')+'-'+secrets.token_hex(3)
         run_dir=(self.storage.create_run_dir(rid) if self.storage else Path(request.workspace)/'runs'/rid); run_dir.mkdir(parents=True,exist_ok=True)
         state=OpsRunState(run_id=rid,run_dir=str(run_dir),repo_path=request.repo_path,task=request.task,success_criteria=request.success_criteria,mode=request.mode,runner=request.runner,candidate_attempts=request.candidate_attempts)
-        rec=OpsEventRecorder(run_dir,rid); transcript=[]; state.save(run_dir/'state.json'); rec.record('run_started',phase=state.phase)
+        rec=OpsEventRecorder(run_dir,rid,on_event=(self.progress_reporter.on_event if self.progress_reporter else None)); transcript=[]; state.save(run_dir/'state.json'); rec.record('run_started',payload={'run_dir':str(run_dir)},phase=state.phase)
         backends=request.backends or self.backends
         backend=request.backend or self.backend
         role_backends={}
