@@ -110,3 +110,68 @@ def test_malformed_review_fails_closed(tmp_path):
     assert not res.is_error
     assert s.candidates[0].review['decision'] == 'fail'
     assert 'review_malformed' in s.candidates[0].acceptance_blockers
+
+class CountingRunner(FakeRunner):
+    def __init__(self): self.calls=[]
+    def run_task(self, **kwargs):
+        self.calls.append(kwargs['context']['attempt_id'])
+        return super().run_task(**kwargs)
+
+class FailingThenPassingReviewer:
+    name='fake-reviewer'
+    def __init__(self): self.calls=[]
+    def review(self, *, state, attempt, scope):
+        aid=attempt['attempt']['attempt_id']; self.calls.append(aid)
+        if aid == 'candidate_001':
+            return {'decision':'fail','recommended_action':'retry','score':0.1,'summary':'retry','evidence':['bad'],'issues':['bad'],'blockers':['review_failed']}
+        return {'decision':'pass','recommended_action':'accept','score':1.0,'summary':'ok','evidence':['reviewed patch'],'issues':[]}
+
+
+def test_single_task_path_rejects_parallel_and_allows_sequential_tool(tmp_path):
+    s=state(tmp_path); c=ctx(tmp_path)
+    s.investigation={'summary':'i'}
+    execute_tool_with_policy(s,'ops_submit_plan',{'summary':'p','strategy':'single_task','should_decompose':False,'candidate_attempts':3,'expected_difficulty':'easy','confidence':1},'p',c)
+    bad=execute_tool_with_policy(s,'ops_select_execution_path',{'path':'parallel_candidates','reason':'bad'},'x',c)
+    assert bad.is_error
+    assert 'use execution_path=single_task' in bad.content
+    ok=execute_tool_with_policy(s,'ops_select_execution_path',{'path':'single_task','reason':'ok'},'s',c)
+    assert not ok.is_error
+    assert s.execution_path == 'single_task'
+    assert 'ops_run_single_task_attempts' in s.allowed_next_actions()
+    assert 'ops_launch_candidates' not in s.allowed_next_actions()
+    launch=execute_tool_with_policy(s,'ops_launch_candidates',{'attempts':3,'reason':'bad'},'l',c)
+    assert launch.is_error
+    assert 'ops_run_single_task_attempts' in launch.content
+
+
+def test_single_task_attempts_retry_sequentially_and_stop_once_accepted(tmp_path):
+    s=state(tmp_path); c=ctx(tmp_path)
+    runner=CountingRunner(); reviewer=FailingThenPassingReviewer()
+    c.runner_adapter=runner; c.reviewer=reviewer
+    s.investigation={'summary':'i','validation_plan':{'commands':[{'cmd':'python -c "import sys; sys.exit(0)"','purpose':'ok'}]}}
+    s.plan={'summary':'p','strategy':'single_task','candidate_attempts':3}
+    s.execution_path='single_task'
+    res=execute_tool_with_policy(s,'ops_run_single_task_attempts',{'attempts':3,'reason':'go'},'seq',c)
+    assert not res.is_error, res.content
+    assert runner.calls == ['candidate_001','candidate_002']
+    assert len(s.candidates) == 2
+    assert s.candidates[0].acceptance_eligible is False
+    assert s.candidates[1].acceptance_eligible is True
+    assert s.selection and s.selection['selected_attempt_id'] == 'candidate_002'
+    assert s.attempts_requested == 3
+    assert s.attempts_started == 2
+    assert s.stopped_early is True
+    assert s.stop_reason == 'accepted_attempt'
+    events=(tmp_path/'run'/'runtime_events.jsonl').read_text()
+    assert events.index('candidate_001') < events.index('candidate_002')
+
+
+def test_recovery_recommends_single_task_path_and_runner(tmp_path):
+    from villani_ops.agentic.recovery import recommend_next_agentic_action
+    s=state(tmp_path); s.investigation={'summary':'i'}; s.plan={'strategy':'single_task'}
+    rec=recommend_next_agentic_action(s)
+    assert rec.tool_name == 'ops_select_execution_path'
+    assert rec.tool_input['path'] == 'single_task'
+    s.execution_path='single_task'
+    rec=recommend_next_agentic_action(s)
+    assert rec.tool_name == 'ops_run_single_task_attempts'

@@ -20,9 +20,12 @@ def _allowed(state, name, data):
         p=data.get('path')
         if p=='decomposed_subtasks' and not (state.decomposition_validated and state.decomposition_accepted and len(state.subtasks)>=2): return False,'decomposed_subtasks requires accepted validation and at least 2 subtasks'
         if p=='parallel_candidates' and not state.plan: return False,'parallel_candidates requires plan'
+        if p=='parallel_candidates' and (state.plan or {}).get('strategy')=='single_task': return False,'plan strategy is single_task; use execution_path=single_task for sequential attempts, not parallel_candidates'
     if name=='ops_start_candidate_fallback':
         if state.decomposed_execution_status not in {'blocked','failed'} or not detect_decomposition_deadlock(state): return False,'fallback requires decomposition deadlock'
+    if name=='ops_launch_candidates' and state.execution_path=='single_task': return False,'single_task execution uses sequential attempts; call ops_run_single_task_attempts'
     if name=='ops_launch_candidates' and state.execution_path!='parallel_candidates' and state.fallback_execution_path!='parallel_candidates_after_decomposition_deadlock': return False,'candidates require parallel_candidates execution path or fallback'
+    if name=='ops_run_single_task_attempts' and state.execution_path!='single_task': return False,'ops_run_single_task_attempts requires execution_path=single_task'
     if name=='ops_launch_subtasks' and state.execution_path!='decomposed_subtasks': return False,'subtasks require decomposed_subtasks execution path'
     if name=='ops_integrate_subtasks':
         if state.decomposed_execution_status in {'blocked','failed'}: return False,'cannot integrate blocked decomposed execution'

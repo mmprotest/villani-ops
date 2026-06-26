@@ -35,16 +35,17 @@ class AgenticProgressReporter:
             else:
                 self._print(f"[agentic] Recovery executed {tool}: {reason}".rstrip())
         elif t in {'candidate_attempt_started','subtask_attempt_started'}:
-            kind=('Fallback candidate' if t.startswith('candidate') and p.get('fallback') else ('Candidate' if t.startswith('candidate') else f"Subtask {p.get('subtask_id') or ''}".strip()))
+            kind=('Single-task' if t.startswith('candidate') and p.get('execution_path')=='single_task' else ('Fallback candidate' if t.startswith('candidate') and p.get('fallback') else ('Candidate' if t.startswith('candidate') else f"Subtask {p.get('subtask_id') or ''}".strip())))
             self._print(f"[agentic] {kind} attempt {p.get('attempt_id')} started" + (f": backend={p.get('backend_name')}" if self.verbose and p.get('backend_name') else '') + detail)
         elif t in {'candidate_attempt_completed','subtask_attempt_completed','candidate_attempt_failed','subtask_attempt_failed'}:
-            kind=('Fallback candidate' if t.startswith('candidate') and p.get('fallback') else ('Candidate' if t.startswith('candidate') else f"Subtask {p.get('subtask_id') or ''}".strip()))
+            kind=('Single-task' if t.startswith('candidate') and p.get('execution_path')=='single_task' else ('Fallback candidate' if t.startswith('candidate') and p.get('fallback') else ('Candidate' if t.startswith('candidate') else f"Subtask {p.get('subtask_id') or ''}".strip())))
             status='completed' if t.endswith('completed') else 'failed'
             extra=f"exit_code={p.get('exit_code')}" if p.get('exit_code') is not None else (p.get('failure_reason') or '')
             self._print(f"[agentic] {kind} attempt {p.get('attempt_id')} {status}: {extra}".rstrip()+detail)
         elif t in {'candidate_attempt_reviewed','subtask_attempt_reviewed'}:
-            kind='Candidate' if t.startswith('candidate') else 'Subtask'
+            kind='Single-task' if t.startswith('candidate') and p.get('execution_path')=='single_task' else ('Candidate' if t.startswith('candidate') else 'Subtask')
             self._print(f"[agentic] {kind} review {p.get('attempt_id')}: {p.get('review_decision')}, {p.get('review_recommended_action')}")
+        elif t=='single_task_attempt_accepted': self._print(f"[agentic] Single-task attempt {p.get('attempt_id')} accepted; stopping retries")
         elif t=='subtask_accepted': self._print(f"[agentic] Subtask {p.get('subtask_id')} accepted")
         elif t=='subtask_failed': self._print(f"[agentic] Subtask {p.get('subtask_id')} failed: {p.get('reason')}")
         elif t=='decomposition_deadlock_detected':

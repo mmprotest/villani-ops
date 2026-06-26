@@ -69,7 +69,8 @@ class OpsRunState(BaseModel):
     status:Literal['active','completed','failed','interrupted']='active'
     phase:Literal['started','investigating','planning','decomposing','choosing_execution_path','running_candidates','running_subtasks','integrating','validating','selecting','finalizing','completed','failed']='started'
     classification:dict|None=None; investigation:dict|None=None; plan:dict|None=None; decomposition:dict|None=None
-    execution_path:Literal['unknown','parallel_candidates','decomposed_subtasks']='unknown'
+    execution_path:Literal['unknown','single_task','parallel_candidates','decomposed_subtasks']='unknown'
+    candidate_execution_mode:Literal['unknown','sequential','parallel']='unknown'; attempts_requested:int|None=None; attempts_started:int=0; stopped_early:bool=False; stop_reason:str|None=None
     decomposition_requested:bool=False; decomposition_validated:bool=False; decomposition_accepted:bool|None=None; decomposition_executed:bool=False
     decomposition_fallback_used:bool=False; decomposition_fallback_reason:str|None=None
     decomposed_execution_status:Literal['not_started','running','completed','blocked','failed']='not_started'
@@ -96,6 +97,9 @@ class OpsRunState(BaseModel):
         if self.decomposition_requested and not self.decomposition: a.append('ops_submit_decomposition'); return a
         if self.decomposition and not self.decomposition_validated: a.append('ops_validate_decomposition'); return a
         if self.execution_path=='unknown': a.append('ops_select_execution_path'); return a
+        if self.execution_path=='single_task' and not self.candidates: a.append('ops_run_single_task_attempts'); return a
+        if self.execution_path=='single_task':
+            a += ['ops_review_attempt','ops_run_validation','ops_select_winner','ops_finalize_run']; return list(dict.fromkeys(a))
         if self.execution_path=='parallel_candidates' and not self.candidates: a.append('ops_launch_candidates'); return a
         if self.fallback_execution_path=='parallel_candidates_after_decomposition_deadlock' and not self.candidates: a.append('ops_launch_candidates'); return a
         if self.fallback_execution_path=='parallel_candidates_after_decomposition_deadlock' and self.candidates:
