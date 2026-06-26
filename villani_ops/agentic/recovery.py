@@ -82,15 +82,45 @@ def recommend_next_agentic_action(state):
         return RecoveryRecommendation(action='start_candidate_fallback',tool_name='ops_start_candidate_fallback',tool_input={'reason':'required subtask failed and dependent subtasks are blocked'},reason='decomposition deadlock detected; full-task candidate fallback is available',can_execute_deterministically=True)
     if state.fallback_execution_path=='parallel_candidates_after_decomposition_deadlock' and not state.candidates:
         return RecoveryRecommendation(action='launch_fallback_candidates',tool_name='ops_launch_candidates',tool_input={'attempts':state.candidate_attempts,'reason':'fallback after decomposition deadlock'},reason='candidate fallback is started but no fallback candidates have launched',can_execute_deterministically=False)
+    if state.execution_path=='single_task':
+        for a in state.candidates:
+            if not any(getattr(o,'attempt_id',None)==a.attempt_id for o in getattr(state,'attempt_observations',[]) or []) and _status(a) in {'completed','failed','reviewed','rejected'}:
+                return RecoveryRecommendation(action='create_missing_observation',tool_name='ops_observe_completed_attempt',tool_input={'attempt_id':a.attempt_id,'reason':'Create AttemptObservation for completed attempt before deciding whether to retry.'},reason='completed attempt lacks an observation; create observation before any retry',can_execute_deterministically=True)
     for a in _attempts(state):
         aid=_aid(a)
         if not aid: continue
         eligible, blockers=is_attempt_acceptance_eligible(a,state=state)
         if eligible:
             return RecoveryRecommendation(action='select_winner',tool_name='ops_select_winner',tool_input={'decision':'select','selected_attempt_id':aid,'summary':'Candidate passed review and validation and is centrally acceptance eligible.','reasons':['central acceptance gate passed'],'confidence':0.95},reason='eligible candidate/integration exists',can_execute_deterministically=True)
-    for a in state.candidates:
-        if not any(getattr(o,'attempt_id',None)==a.attempt_id for o in getattr(state,'attempt_observations',[]) or []) and _status(a) in {'completed','failed','reviewed','rejected'}:
-            return RecoveryRecommendation(action='create_missing_observation',tool_name='ops_run_next_candidate_attempt' if len(state.candidates)<state.candidate_attempts else None,tool_input={'reason':'Use observations from prior attempt before retrying.'} if len(state.candidates)<state.candidate_attempts else None,reason='completed attempt lacks an observation; next adaptive attempt tool will observe before retrying',can_execute_deterministically=bool(len(state.candidates)<state.candidate_attempts))
+    if state.execution_path=='single_task' and state.candidates:
+        budget=max(1,int(state.candidate_attempts or 1))
+        observations=[o for o in getattr(state,'attempt_observations',[]) or [] if getattr(o,'scope',None)=='candidate']
+        last=observations[-1] if observations else None
+        if last and last.outcome=='accepted':
+            return RecoveryRecommendation(action='select_winner',tool_name='ops_select_winner',tool_input={'decision':'select','selected_attempt_id':last.attempt_id,'summary':'Observed accepted candidate is eligible for selection.','reasons':['attempt observation accepted'],'confidence':0.95},reason='latest observation is accepted',can_execute_deterministically=True)
+        if last and len(state.candidates) < budget:
+            reason_map={
+                'validation_failed':'Focused retry: fix failing validation using prior AttemptObservation evidence and rerun known failing commands.',
+                'review_failed':'Focused retry: address review blockers from prior AttemptObservation and avoid repeating rejected strategy.',
+                'partial_progress':'Focused retry/repair: build on changed files and address remaining blockers narrowly.',
+                'no_patch':'Focused retry: inspect and edit relevant repository files; do not finish without a product-code patch.',
+                'runner_failed':'Retry after runner failure only if safe; inspect repo and produce a concrete patch.',
+                'infra_failed':'Retry infrastructure failure once if safe; otherwise escalate backend or fail clearly.',
+                'patch_failed':'Focused retry: produce a clean git-applicable patch and do not repeat patch hygiene mistakes.',
+                'scope_failed':'Focused retry: stay in scope and avoid unrelated files.',
+                'unknown':'Focused retry using previous attempt evidence.'}
+            backend_names=list((getattr(state,'backend_assessments',{}) or {}).keys())
+            other=next((b for b in backend_names if b and b!=(last.backend_name or 'unknown')), None)
+            inp={'reason':reason_map.get(last.outcome, reason_map['unknown']), 'base_attempt_id':last.attempt_id, 'repair':bool(last.should_repair or last.outcome in {'validation_failed','review_failed','patch_failed','scope_failed'})}
+            if last.should_escalate_backend and other:
+                inp['backend_name']=other
+                return RecoveryRecommendation(action='escalate_backend_retry',tool_name='ops_run_next_candidate_attempt',tool_input=inp,reason='observation recommends backend escalation and an alternate backend is available',can_execute_deterministically=True)
+            if last.should_decompose:
+                state.adaptive_context['decomposition_warranted']=True
+            return RecoveryRecommendation(action=f'focused_retry_{last.outcome}',tool_name='ops_run_next_candidate_attempt',tool_input=inp,reason=f'latest observation outcome={last.outcome}; run one focused adaptive retry with feedback',can_execute_deterministically=True)
+        if last and len(state.candidates) >= budget and last.outcome!='accepted':
+            blockers=sorted(set(sum([list(o.blockers or [])+list(o.evidence or [])+list(o.next_attempt_directives or []) for o in observations], [])))[:12]
+            return RecoveryRecommendation(action='reject_all',tool_name='ops_select_winner',tool_input={'decision':'reject_all','summary':'Candidate attempt budget exhausted. No accepted adaptive attempt is available.','reasons':blockers or ['candidate_attempt_budget_exhausted'],'rejected_attempts':[c.attempt_id for c in state.candidates],'confidence':0.8},reason='budget exhausted; report observations and blockers',can_execute_deterministically=True)
     for a in state.candidates:
         val=_validation(a) or {}
         if val.get('passed') is True and _patch(a) and _changed(a) and _review_status(a) in {'unavailable','malformed','provider_error'} and _review_retry_count(a) < 3:
