@@ -42,7 +42,7 @@ def test_prose_only_model_response_triggers_recovery_and_no_progress_fails(tmp_p
     assert 'recovery_injected' in events
 
 def test_artifacts_written(tmp_path):
-    blocks=[tc('ops_submit_investigation',{'summary':'s','confidence':1.0}),tc('ops_submit_plan',{'summary':'p','strategy':'parallel_candidates','should_decompose':False,'candidate_attempts':1,'expected_difficulty':'easy','confidence':1.0}),tc('ops_select_execution_path',{'path':'parallel_candidates','reason':'r'}),tc('ops_launch_candidates',{'attempts':1,'reason':'r'}),tc('ops_review_attempt',{'attempt_id':'candidate_001','scope':'candidate'}),tc('ops_select_winner',{'selected_attempt_id':'candidate_001','decision':'select','summary':'s','confidence':1.0}),tc('ops_finalize_run',{'decision':'accepted','summary':'done','selected_attempt_id':'candidate_001'})]
+    blocks=[tc('ops_submit_investigation',{'summary':'s','confidence':1.0}),tc('ops_submit_plan',{'summary':'p','strategy':'parallel_candidates','should_decompose':False,'candidate_attempts':1,'expected_difficulty':'easy','confidence':1.0}),tc('ops_select_execution_path',{'path':'parallel_candidates','reason':'r'}),tc('ops_launch_candidates',{'attempts':1,'reason':'r'}),tc('ops_review_attempt',{'attempt_id':'candidate_001','scope':'candidate'}),tc('ops_run_validation',{'target':'candidate','target_id':'candidate_001','commands':[{'cmd':'python -c "print(1)"'}]}),tc('ops_select_winner',{'selected_attempt_id':'candidate_001','decision':'select','summary':'s','confidence':1.0}),tc('ops_finalize_run',{'decision':'accepted','summary':'done','selected_attempt_id':'candidate_001'})]
     r=OpsRunner(client=FakeClient(blocks)).run(req(tmp_path,candidate_attempts=1))
     for f in ['state.json','runtime_events.jsonl','event_digest.json','transcript.json','orchestration_graph.json']:
         assert (Path(r.run_dir)/f).exists()
@@ -66,6 +66,7 @@ def test_decomposed_smoke_with_explicit_nonproduction_fakes(tmp_path):
         tc('ops_launch_subtasks',{'subtask_ids':['s0','s1'],'attempts_per_subtask':1,'reason':'go'}),
         tc('ops_integrate_subtasks',{'reason':'merge accepted subtasks'}),
         tc('ops_review_attempt',{'attempt_id':'integration_001','scope':'integration'}),
+        tc('ops_run_validation',{'target':'integration','commands':[{'cmd':'python -c \"print(1)\"'}]}),
         tc('ops_select_winner',{'selected_attempt_id':'integration_001','decision':'select','summary':'integrated','confidence':1.0}),
         tc('ops_finalize_run',{'decision':'accepted','summary':'done','selected_attempt_id':'integration_001'}),
     ]

@@ -61,21 +61,27 @@ def attempt_requires_patch(state: Any | None, attempt: Any) -> bool:
 def _validation_blockers(validation: Any) -> list[str]:
     blockers: list[str] = []
     if not validation:
-        return blockers
+        return ["validation_missing"]
     if not isinstance(validation, dict):
         validation = getattr(validation, "model_dump", lambda **_: {})()
-    if validation.get("passed") is False:
+    overall_status = str(validation.get("status") or "").lower()
+    if overall_status == "command_rejected":
+        blockers.append("validation_command_rejected")
+    elif validation.get("passed") is False:
         blockers.append("validation_failed")
     for item in validation.get("commands") or []:
         if not isinstance(item, dict):
             item = getattr(item, "model_dump", lambda **_: {})()
         status = str(item.get("status") or "").lower()
+        if status == "command_rejected":
+            blockers.append("validation_command_rejected")
+            continue
         if item.get("passed") is False or status == "failed":
             blockers.append("validation_failed")
-        if status == "timeout":
+        if status in {"timeout", "timed_out"}:
             blockers.append("validation_timed_out")
-        if status == "error":
-            blockers.append("validation_error")
+        if status in {"error", "infrastructure_error"}:
+            blockers.append("validation_infrastructure_error")
     return sorted(set(blockers))
 
 
@@ -173,7 +179,8 @@ def is_attempt_acceptance_eligible(attempt: Any, human_approval: Any | None = No
         if review.get("issues"):
             blockers.append("review_blocking_issues")
 
-    blockers.extend(_validation_blockers(_get(attempt, "validation")))
+    if state is not None and scope != "subtask":
+        blockers.extend(_validation_blockers(_get(attempt, "validation")))
     return (not blockers), sorted(set(blockers))
 
 

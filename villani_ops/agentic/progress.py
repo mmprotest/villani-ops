@@ -40,7 +40,13 @@ class AgenticProgressReporter:
         elif t=='integration_started': self._print(f"[agentic] Integrating {p.get('accepted_subtasks', '')} accepted subtasks".rstrip())
         elif t=='integration_completed': self._print(f"[agentic] Integration completed: changed_files={len(p.get('changed_files') or [])}")
         elif t=='integration_failed': self._print(f"[agentic] Integration failed: {p.get('failure_reason') or p.get('reason')}")
-        elif t=='validation_started': self._print(f"[agentic] Validation started: {p.get('cmd')}")
+        elif t=='validation_started':
+            label=p.get('target_label') or p.get('target_id') or p.get('target')
+            loc='repo' if p.get('target')=='repo' else 'worktree'
+            self._print(f"[agentic] Validation started for {label} in {loc}: {p.get('cmd')}")
+        elif t=='validation_command_rejected':
+            label=p.get('target_id') or p.get('target')
+            self._print(f"[agentic] Validation command rejected for {label}: {p.get('message') or p.get('reason')}")
         elif t in {'validation_completed','validation_failed'}: self._print(f"[agentic] Validation {'completed' if t.endswith('completed') else 'failed'}")
         elif t in {'winner_selected','selection_completed'}: self._print(f"[agentic] Selection completed: {p.get('selected_attempt_id')}")
         elif t=='run_finalized': self._print(f"[agentic] Final decision: {p.get('decision') or p.get('status') or p.get('summary')}")
