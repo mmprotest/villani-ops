@@ -15,8 +15,8 @@ class CandidateAttemptState(BaseModel):
     started_at:str|None=None; completed_at:str|None=None
     exit_code:int|None=None; exit_reason:str|None=None; failure_reason:str|None=None; runner_status:str|None=None; runner_error_type:str|None=None; duration_seconds:float|None=None
     added_files:list[str]=Field(default_factory=list); deleted_files:list[str]=Field(default_factory=list); modified_files:list[str]=Field(default_factory=list); renamed_files:list[str]=Field(default_factory=list)
-    validation:dict|None=None; validation_results:list[dict]=Field(default_factory=list); validation_status:Literal['not_run','passed','failed','command_rejected','error','timed_out']='not_run'; token_usage:dict|None=None; cost:float|None=None
-    patch_hygiene:dict|None=None
+    validation:dict|None=None; validation_results:list[dict]=Field(default_factory=list); validation_status:Literal['not_run','passed','failed','command_rejected','error','timed_out']='not_run'; validation_source:str|None=None; token_usage:dict|None=None; cost:float|None=None
+    patch_hygiene:dict|None=None; scope_assessment:dict|None=None
 
 class SubtaskState(BaseModel):
     model_config=ConfigDict(extra='forbid')
@@ -98,8 +98,10 @@ class OpsRunState(BaseModel):
         if self.execution_path=='unknown': a.append('ops_select_execution_path'); return a
         if self.execution_path=='parallel_candidates' and not self.candidates: a.append('ops_launch_candidates'); return a
         if self.fallback_execution_path=='parallel_candidates_after_decomposition_deadlock' and not self.candidates: a.append('ops_launch_candidates'); return a
+        if self.fallback_execution_path=='parallel_candidates_after_decomposition_deadlock' and self.candidates:
+            a += ['ops_review_attempt','ops_run_validation','ops_select_winner','ops_finalize_run']; return list(dict.fromkeys(a))
         if self.execution_path=='decomposed_subtasks' and self.decomposed_execution_status in {'blocked','failed'}:
-            a += ['ops_start_candidate_fallback','ops_launch_candidates','ops_select_winner','ops_finalize_run']; return list(dict.fromkeys(a))
+            a += ['ops_start_candidate_fallback','ops_launch_candidates','ops_review_attempt','ops_run_validation','ops_select_winner','ops_finalize_run']; return list(dict.fromkeys(a))
         if self.execution_path=='decomposed_subtasks':
             if any(s.status=='pending' for s in self.subtasks): a.append('ops_launch_subtasks'); return a
             if all(s.status in {'accepted','skipped'} for s in self.subtasks) and not self.integration: a.append('ops_integrate_subtasks'); return a

@@ -115,6 +115,8 @@ def build_agentic_review_payload(state, attempt, scope, subtask=None):
         'stderr_tail':_read_text_tail(data.get('stderr_path')),
         'transcript_tail':_read_text_tail(data.get('transcript_path')),
         'validation':{**validation, 'commands':validation_tails},
+        'imported_debug_validation': [r for r in (data.get('validation_results') or []) if r.get('validation_source')=='villani_code_debug_trace'],
+        'scope_assessment': data.get('scope_assessment'),
         'failure_reason':data.get('failure_reason') or data.get('error'),
         'exit_code':data.get('exit_code'),
         'artifact_paths':{k:data.get(k) for k in ['artifacts_dir','worktree_path','patch_path','stdout_path','stderr_path','transcript_path']},
@@ -126,6 +128,99 @@ def build_agentic_review_payload(state, attempt, scope, subtask=None):
     if subtask is not None:
         payload['subtask']={'id':subtask.subtask_id,'title':subtask.title,'objective':subtask.objective,'success_criteria':subtask.success_criteria,'relevant_files':subtask.relevant_files}
     return payload
+
+class ScopeAssessment(BaseModel):
+    compliant: bool
+    extra_files: list[str]=Field(default_factory=list)
+    allowed_files: list[str]=Field(default_factory=list)
+    scope_exception_used: bool=False
+    scope_exception_adequate: bool=False
+    blockers: list[str]=Field(default_factory=list)
+    warnings: list[str]=Field(default_factory=list)
+
+def _validation_like_command(cmd:str)->bool:
+    return bool(re.search(r'(?i)(\bpytest\b|python\s+-m\s+pytest|\bnpm\s+test\b|\bpnpm\s+test\b|\byarn\s+test\b|\bgo\s+test\b|\bcargo\s+test\b|\bmvn\s+test\b|\bgradle\s+test\b)', cmd or ''))
+
+def assess_scope_compliance(*, scope:Literal['candidate','subtask','integration'], changed_files:list[str], allowed_files:list[str], scope_exception_text:str|None, subtask:SubtaskState|None)->ScopeAssessment:
+    changed=[str(f).replace('\\','/') for f in (changed_files or [])]
+    allowed=[str(f).replace('\\','/') for f in (allowed_files or [])]
+    blockers=[]; warnings=[]
+    internal=[f for f in changed if f.startswith(('.villani/','.villani_code/')) or f in {'.villani','.villani_code'}]
+    if internal: blockers.append('internal_artifacts_modified')
+    if scope=='candidate':
+        return ScopeAssessment(compliant=not blockers, allowed_files=allowed, blockers=blockers, warnings=warnings)
+    extra=[f for f in changed if allowed and f not in allowed]
+    used=bool(scope_exception_text and 'SCOPE_EXCEPTION' in scope_exception_text)
+    adequate=bool(used and re.search(r'(?is)Extra files modified:.*Why each extra file was necessary:.*Why the change is minimal:', scope_exception_text or ''))
+    if scope=='subtask':
+        if not allowed: warnings.append('allowed_files_unknown')
+        if extra and not adequate: blockers.append('subtask_scope_overreach')
+        elif extra and adequate: warnings.append('scope_exception_used')
+    return ScopeAssessment(compliant=not blockers, extra_files=extra, allowed_files=allowed, scope_exception_used=used, scope_exception_adequate=adequate, blockers=blockers, warnings=warnings)
+
+def _scope_exception_text(attempt)->str|None:
+    parts=[]
+    for path in [getattr(attempt,'stdout_path',None), getattr(attempt,'stderr_path',None), getattr(attempt,'transcript_path',None)]:
+        t=_read_text_tail(path, max_chars=20000)
+        if isinstance(t,str) and 'SCOPE_EXCEPTION' in t: parts.append(t[t.find('SCOPE_EXCEPTION'):])
+    return '\n'.join(parts) or None
+
+def _validation_plan_commands(state, subtask=None):
+    cmds=[]
+    if state.investigation and (state.investigation.get('validation_plan') or {}).get('commands'):
+        cmds=[c.get('cmd') for c in state.investigation['validation_plan']['commands'] if c.get('cmd')]
+    return cmds or ['python -m pytest --tb=short -v']
+
+def build_subtask_runner_prompt(*, parent_task:str, parent_success_criteria:str|None, subtask:SubtaskState, allowed_files:list[str], forbidden_files:list[str]|None, validation_commands:list[ValidationCommand]|list[str], dependency_context:str|None, merge_contract:str|None)->str:
+    cmds=[c.cmd if hasattr(c,'cmd') else str(c) for c in (validation_commands or [])] or ['python -m pytest --tb=short -v']
+    allowed='\n'.join(f'- {f}' for f in allowed_files) if allowed_files else 'Allowed files were not confidently identified. Make the smallest possible change and explain changed files.'
+    forbidden='\n'.join(f'- {f}' for f in (forbidden_files or ['.villani','.villani_code']))
+    return ("You are executing ONE Villani Ops subtask, not the whole parent task.\n\n"
+        "Your job is to complete only the subtask below.\nDo not solve unrelated parts of the parent task.\nDo not broaden scope unless the subtask is impossible without a minimal cross-file change.\n\n"
+        f"PARENT TASK CONTEXT\nThis is background only. Do not solve the whole parent task unless required by the subtask.\n{parent_task}\n\n"
+        "Parent success criteria are provided only so you understand the larger system. Your acceptance is based on the subtask objective and subtask validation, not solving the entire parent task.\n"
+        f"{parent_success_criteria or ''}\n\nSUBTASK OBJECTIVE\n{subtask.title}\n{subtask.objective}\n\nSUBTASK SUCCESS CRITERIA\n{subtask.success_criteria or subtask.objective}\n\n"
+        f"ALLOWED FILES\n{allowed}\n\nFORBIDDEN FILES / ARTIFACTS\n{forbidden}\nDo not create helper scripts, scratch files, logs, checkpoints, or temporary fix files in the repo.\nDo not modify or create Villani internal directories such as .villani or .villani_code.\nOnly product code and necessary tests should change.\n\n"
+        f"DEPENDENCY CONTEXT\n{dependency_context or 'No accepted dependency context was provided.'}\n\nMERGE CONTRACT\n{merge_contract or 'Keep changes minimal and merge-friendly.'}\n\n"
+        "EXPECTED VALIDATION\nRun the narrowest relevant tests for this subtask first. Then, if cheap enough, run broader parent validation.\nSuggested commands:\n" + '\n'.join(f'- {c}' for c in cmds) +
+        "\n\nSCOPE RULES\nDo not modify files outside the allowed list unless absolutely required.\n\nSCOPE EXCEPTION\nIf the subtask cannot be completed without modifying a file outside the allowed list, you may make the smallest necessary cross-file change.\nIf you do this, your final response must include a section:\nSCOPE_EXCEPTION:\n- Extra files modified:\n- Why each extra file was necessary:\n- Why the change is minimal:\n- Why this does not solve unrelated subtasks:\n\nAt the end of your run, report:\nSUBTASK_RESULT:\n- Status: completed / blocked / impossible_in_isolation\n- Files changed:\n- Tests run:\n- Test results:\n- Scope exception used: yes/no\n- If blocked or impossible, explain why:\n")
+
+def import_villani_code_debug_evidence(attempt: CandidateAttemptState)->list[dict]:
+    root=Path(attempt.artifacts_dir or '')
+    if not root.exists(): return []
+    files=[]
+    for name in ['commands.jsonl','events.jsonl','trace.jsonl','tool_calls.jsonl','debug.jsonl','transcript.json']:
+        files += list(root.rglob(name))
+    out=[]
+    def walk(x):
+        if isinstance(x,dict):
+            cmd=x.get('cmd') or x.get('command') or x.get('input')
+            if isinstance(cmd,dict): cmd=cmd.get('cmd') or cmd.get('command')
+            if isinstance(cmd,str) and _validation_like_command(cmd):
+                code=x.get('exit_code', x.get('returncode', x.get('return_code')))
+                status=str(x.get('status') or ('passed' if code==0 else 'failed' if code is not None else 'error')).lower()
+                passed=(code==0) if code is not None else status in {'passed','success','completed'}
+                out.append({'cmd':cmd,'cwd':x.get('cwd'),'exit_code':code,'passed':passed,'status':'passed' if passed else ('timed_out' if 'timeout' in status else 'failed'),'duration_seconds':x.get('duration_seconds') or x.get('duration'),'timestamp':x.get('timestamp'),'source':'villani_code_debug_trace','scope':'subtask' if attempt.scope=='subtask' else 'candidate','stdout_tail':str(x.get('stdout') or '')[-4000:],'stderr_tail':str(x.get('stderr') or '')[-4000:]})
+            for v in x.values(): walk(v)
+        elif isinstance(x,list):
+            for v in x: walk(v)
+    for f in files:
+        try:
+            txt=read_text_utf8(f, default='')
+            if f.suffix=='.jsonl':
+                for line in txt.splitlines():
+                    if line.strip(): walk(json.loads(line))
+            else: walk(json.loads(txt))
+        except Exception: continue
+    return out
+
+def _attach_imported_validation(state, attempt:CandidateAttemptState):
+    ev=import_villani_code_debug_evidence(attempt)
+    if not ev: return []
+    passed=any(e.get('passed') for e in ev) and not any(not e.get('passed') for e in ev)
+    result={'passed':passed,'status':'passed' if passed else 'failed','commands':ev,'target':attempt.scope,'target_id':attempt.attempt_id,'validation_source':'villani_code_debug_trace'}
+    attempt.validation=result; attempt.validation_results=list(attempt.validation_results or [])+[result]; attempt.validation_status=result['status']; attempt.validation_source='villani_code_debug_trace'
+    return ev
 
 def _set_acceptance_from_gate(state, attempt):
     eligible, blockers=is_attempt_acceptance_eligible(attempt, state=state)
@@ -243,6 +338,7 @@ def _run_attempt(state, ctx, aid, scope, task, success, subtask_id=None, backend
     if ctx.runner_adapter is None: raise ValueError('agentic_runner_adapter_missing')
     if backend is None: raise ValueError('agentic_backend_role_unavailable: coding')
     adir=Path(state.run_dir)/'attempts'/aid; adir.mkdir(parents=True,exist_ok=True)
+    write_text_utf8(adir/'attempt_prompt.txt', task or '')
     wtree=adir/'worktree'
     a=_attempt(aid,scope,subtask_id=subtask_id,backend=backend_name or ctx.coding_backend_name or getattr(backend,'name',None),artifacts=adir)
     a.status='running'; a.worktree_path=str(wtree); a.started_at=str(time.time())
@@ -263,6 +359,16 @@ def _run_attempt(state, ctx, aid, scope, task, success, subtask_id=None, backend
             if chk.returncode!=0:
                 a.acceptance_blockers=sorted(set(a.acceptance_blockers+['patch_apply_check_failed']))
                 write_text_utf8(adir/'patch_apply_check_stderr.log', chk.stderr or '')
+        if scope=='subtask':
+            st_obj=next((s for s in state.subtasks if s.subtask_id==subtask_id), None)
+            a.scope_assessment=assess_scope_compliance(scope='subtask', changed_files=a.changed_files, allowed_files=(st_obj.relevant_files if st_obj else []), scope_exception_text=_scope_exception_text(a), subtask=st_obj).model_dump()
+            if a.scope_assessment.get('blockers'):
+                a.acceptance_blockers=sorted(set(a.acceptance_blockers+a.scope_assessment.get('blockers',[])))
+        else:
+            a.scope_assessment=assess_scope_compliance(scope='candidate', changed_files=a.changed_files, allowed_files=[], scope_exception_text=None, subtask=None).model_dump()
+        imported=_attach_imported_validation(state,a)
+        if imported and record_events:
+            ctx.recorder.record('debug_validation_imported', payload={'attempt_id':aid,'imported_validation_count':len(imported),'validation_source':'villani_code_debug_trace'})
         a.model=getattr(backend,'model',None); a.completed_at=str(time.time())
         ok=getattr(res,'exit_code',1)==0
         a.exit_code=getattr(res,'exit_code',None); a.exit_reason=getattr(res,'exit_reason',None); a.runner_status=getattr(res,'status',None)
@@ -324,7 +430,7 @@ def h_launch_candidates(state, inp, ctx):
     state.concurrency_mode=final_mode; state.batch_count=batch_count
     state.candidate_concurrency={'concurrency_mode':final_mode,'max_parallel':maxp,'batch_count':batch_count,'worker_state_mutation':'disabled'}
     state.execution_concurrency={'candidate_concurrency_mode':final_mode,'max_parallel':maxp,'candidate_batch_count':batch_count}
-    state.phase='selecting'; return {'launched':made,'max_parallel':maxp,'batch_count':batch_count,'concurrency_mode':final_mode,'semantics':'attempts execute in isolated worktrees; main thread mutates OpsRunState; batches never exceed max_parallel'}
+    state.phase='validating'; return {'launched':made,'max_parallel':maxp,'batch_count':batch_count,'concurrency_mode':final_mode,'semantics':'attempts execute in isolated worktrees; main thread mutates OpsRunState; batches never exceed max_parallel'}
 
 def _update_decomposed_execution_state(state, ctx=None):
     if state.execution_path!='decomposed_subtasks': return None
@@ -376,7 +482,7 @@ def h_launch_subtasks(state, inp, ctx):
                 with ThreadPoolExecutor(max_workers=len(batch)) as ex:
                     for sid in batch:
                         st=by[sid]; aid=f'{sid}_attempt_{len(st.attempts)+1:03d}'
-                        task=f"Parent task:\n{state.task}\n\nParent success criteria:\n{state.success_criteria or ''}\n\nSubtask title:\n{st.title}\n\nSubtask objective:\n{st.objective}\n\nSubtask success criteria:\n{st.success_criteria or ''}\n\nRelevant files:\n{json.dumps(st.relevant_files, ensure_ascii=False)}\n\nDependency context:\n{json.dumps(st.dependencies, ensure_ascii=False)}\n\nMerge contract:\n{(state.decomposition or {}).get('merge_strategy') or ''}\n\nSolve only this subtask scope. Avoid unrelated broad changes. Do not perform the entire parent task unless this subtask explicitly requires it."
+                        task=build_subtask_runner_prompt(parent_task=state.task,parent_success_criteria=state.success_criteria,subtask=st,allowed_files=st.relevant_files,forbidden_files=['.villani','.villani_code'],validation_commands=_validation_plan_commands(state, st),dependency_context=json.dumps(st.dependencies, ensure_ascii=False),merge_contract=(state.decomposition or {}).get('merge_strategy') or '')
                         scheduled=_attempt(aid,'subtask',subtask_id=sid,backend=inp.backend_name or ctx.coding_backend_name or ctx.backend_name,artifacts=Path(state.run_dir)/'attempts'/aid)
                         scheduled.status='running'; scheduled.started_at=str(time.time()); scheduled.worktree_path=str(Path(state.run_dir)/'attempts'/aid/'worktree')
                         st.attempts.append(scheduled); launched.setdefault(sid,[]).append(aid); ids[aid]=sid
@@ -454,6 +560,10 @@ def h_review_attempt(state, inp, ctx):
             blockers=sorted(set(blockers+res.blockers)); a['acceptance_blockers']=blockers; eligible=False; a['acceptance_eligible']=False
     else:
         a.review=res.model_dump(); a.status='reviewed' if a.status!='failed' else 'rejected'
+        evidence_text=' '.join(str(x) for x in [res.summary, res.evidence, res.issues, _read_text_tail(a.stdout_path), _read_text_tail(a.stderr_path)])
+        if inp.scope=='subtask' and 'impossible_in_isolation' in evidence_text:
+            a.acceptance_blockers=sorted(set(a.acceptance_blockers+['subtask_impossible_in_isolation']))
+            res.blockers=sorted(set(res.blockers+['subtask_impossible_in_isolation']))
         eligible, blockers=_set_acceptance_from_gate(state, a)
         if res.blockers:
             blockers=sorted(set(blockers+res.blockers)); a.acceptance_blockers=blockers; eligible=False; a.acceptance_eligible=False
@@ -709,11 +819,26 @@ def h_select_winner(state, inp, ctx):
     state.phase='finalizing'; ctx.recorder.record('winner_selected', payload=state.selection); return state.selection
 
 def h_finalize(state, inp, ctx):
+    if inp.decision!='accepted':
+        pending=[]
+        for c in state.candidates:
+            if c.status=='completed' and c.patch_path and c.changed_files and not c.review:
+                pending.append(f'{c.attempt_id}:candidate completed but review missing')
+            if c.review and (c.validation is None) and ((c.review or {}).get('decision')=='pass'):
+                pending.append(f'{c.attempt_id}:candidate reviewed but validation missing')
+            eligible, _bs=is_attempt_acceptance_eligible(c,state=state)
+            if eligible:
+                pending.append(f'{c.attempt_id}:candidate is acceptance eligible')
+        if pending and not (inp.blockers and any('fatal' in b for b in inp.blockers)):
+            raise ValueError('cannot finalize failed while candidates remain reviewable/validatable: '+', '.join(pending))
     final_payload=inp.model_dump()
     if inp.decision!='accepted' and inp.selected_attempt_id:
         a0, st0=_find_attempt(state, inp.selected_attempt_id)
+        final_payload['selected_attempt_id']=None
         if st0 is not None:
-            final_payload['best_partial_attempt_id']=inp.selected_attempt_id; final_payload['selected_attempt_id']=None
+            final_payload['best_partial_attempt_id']=inp.selected_attempt_id
+        elif a0 is not None:
+            final_payload['best_candidate_attempt_id']=inp.selected_attempt_id
     if state.partial_progress: final_payload['partial_progress']=state.partial_progress
     if inp.decision!='accepted' and state.decomposed_execution_status in {'blocked','failed'}:
         fs=', '.join(state.decomposed_execution_failed_subtasks); bs=', '.join(state.decomposed_execution_blocked_subtasks)
