@@ -60,3 +60,12 @@ villani-ops pr <run-id> --title "Villani Ops changes"
 - `--policy` has been replaced by `--mode`.
 - `--backend` is not accepted because backend assignment is controlled by execution policy.
 - `--human-approval` is not supported in the primary orchestration path.
+
+
+## Orchestrator default
+
+`villani-ops run ...` now uses the agentic orchestrator by default. The agentic path starts simple, runs one candidate attempt at a time, automatically validates/reviews/observes each attempt, and feeds Villani Code a compact learning brief on later retries instead of dumping raw logs. `--candidate-attempts 3` means up to three adaptive attempts, with the controller regaining control after every attempt.
+
+Use `--orchestrator agentic` to select this default explicitly. Use `--orchestrator graph` only for the explicit legacy graph path; the graph orchestrator remains available but is not the default.
+
+Adaptive retries include what changed, validation/review blockers, patch hygiene/scope issues, do-not-repeat directives, and suggested commands to rerun. Decomposition remains available when evidence warrants it, but is not expanded or used eagerly by default. Villani Ops also tracks runner telemetry and backend capability signals during a run so recovery can prefer focused repair or backend escalation when there is repeated no-progress.

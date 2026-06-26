@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Literal
 from pydantic import BaseModel, Field, ConfigDict, model_validator
-from .state import CandidateAttemptState, SubtaskState, detect_decomposition_deadlock
+from .state import CandidateAttemptState, SubtaskState, AttemptObservation, detect_decomposition_deadlock
 from .git_artifacts import capture_git_patch, ensure_git_baseline, clean_runner_artifacts_from_worktree, DEFAULT_PATCH_EXCLUDES, is_git_compatible_patch, patch_contains_internal_artifacts, clean_untracked_scratch_artifacts, is_scratch_artifact_path
 from villani_ops.core.acceptance import is_attempt_acceptance_eligible, attempt_requires_patch
 import subprocess, json, time, shutil, os, re
@@ -267,6 +267,7 @@ class DecompositionValidationResult(StrictModel): accepted:bool; deterministic_a
 class OpsSelectExecutionPathInput(StrictModel): path:Literal['single_task','parallel_candidates','decomposed_subtasks']; reason:str
 class OpsLaunchCandidatesInput(StrictModel): attempts:int; backend_name:str|None=None; reason:str
 class OpsRunSingleTaskAttemptsInput(StrictModel): attempts:int; backend_name:str|None=None; reason:str
+class OpsRunNextCandidateAttemptInput(StrictModel): backend_name:str|None=None; base_attempt_id:str|None=None; repair:bool=False; reason:str
 class OpsStartCandidateFallbackInput(StrictModel): reason:str; attempts:int|None=None
 class OpsLaunchSubtasksInput(StrictModel): subtask_ids:list[str]; backend_name:str|None=None; attempts_per_subtask:int; reason:str
 class OpsReviewAttemptInput(StrictModel): attempt_id:str; scope:Literal['candidate','subtask','integration']
@@ -351,15 +352,115 @@ def _require_real_execution(ctx):
         if ctx.coding_backend is None and ctx.backend is None: raise ValueError('agentic_backend_role_unavailable: coding')
         if _is_fake_dependency(ctx.coding_backend or ctx.backend): raise ValueError('fake coding backend forbidden in production agentic mode')
 
+def resolve_coding_backend(ctx, backend_name:str|None):
+    if backend_name:
+        registry=getattr(ctx,'backends',None) or {}
+        current=ctx.coding_backend or ctx.backend
+        current_name=ctx.coding_backend_name or ctx.backend_name or getattr(current,'name',None)
+        if backend_name==current_name and current is not None:
+            return current_name, current
+        if backend_name not in registry:
+            raise ValueError(f"unknown coding backend '{backend_name}'")
+        backend=registry[backend_name]
+        if not getattr(backend,'enabled',True):
+            raise ValueError(f"coding backend '{backend_name}' is disabled")
+        if 'coding' not in (getattr(backend,'roles',[]) or ['coding']):
+            raise ValueError(f"backend '{backend_name}' is not usable for coding")
+        return backend_name, backend
+    backend=ctx.coding_backend or ctx.backend
+    name=ctx.coding_backend_name or ctx.backend_name or getattr(backend,'name',None)
+    if backend is None: raise ValueError('agentic_backend_role_unavailable: coding')
+    return name, backend
+
+def _capture_runner_telemetry(res):
+    fields=['model_requests','model_failures','total_tool_calls','tool_calls_by_name','total_file_reads','total_file_writes','commands_executed','commands_failed','first_substantive_file_read_tool_index','first_substantive_file_read_seconds','first_file_mutation_tool_index','first_file_mutation_seconds','first_command_tool_index','first_command_seconds','token_accounting_status','token_accounting_warnings','telemetry','debug_artifact_dir','resolved_trace_dir','duration_ms','input_tokens','output_tokens','total_tokens','total_cost']
+    return {f:getattr(res,f) for f in fields if hasattr(res,f)}
+
+def _brief_validation(validation):
+    lines=[]
+    for c in (validation or {}).get('commands') or []:
+        if not c.get('passed'):
+            lines.append(f"{c.get('cmd')} -> {c.get('status')}")
+            tail=_read_text_tail(c.get('stderr_path'), max_chars=600)
+            if isinstance(tail,str) and tail.strip(): lines.append(tail.strip()[-600:])
+            break
+    return lines
+
+def create_attempt_observation(state, attempt):
+    eligible, blockers=is_attempt_acceptance_eligible(attempt,state=state)
+    telemetry=attempt.runner_telemetry or {}
+    val=attempt.validation or {}; review=attempt.review or {}; hygiene=attempt.patch_hygiene or {}; scope=attempt.scope_assessment or {}
+    evidence=[]; directives=[]; outcome='unknown'; failure_class=None
+    if attempt.failure_reason or attempt.runner_status=='exception':
+        outcome='runner_failed'; failure_class='runner'; evidence.append((attempt.failure_reason or 'runner failed')[:300]); directives.append('Inspect the repository and make a concrete product-code patch before finishing.')
+    elif not attempt.patch_path or not attempt.changed_files:
+        outcome='no_patch'; failure_class='no_progress'; directives.append('Do not finish without editing the relevant repository files.')
+    elif hygiene.get('contains_internal_artifacts') or hygiene.get('scratch_artifacts_in_patch') or hygiene.get('apply_check_passed') is False:
+        outcome='patch_failed'; failure_class='patch_hygiene'; directives.append('Do not create scratch files or internal artifacts; produce a clean git-applicable patch.')
+    elif scope.get('blockers'):
+        outcome='scope_failed'; failure_class='scope'; directives.append('Stay within the allowed scope and avoid unrelated files.')
+    elif val and val.get('passed') is False:
+        outcome='validation_failed'; failure_class='validation'; evidence += _brief_validation(val); directives.append('Focus on the failing validation command/test before changing unrelated code.')
+    elif review and (review.get('decision')!='pass' or review.get('blockers')):
+        outcome='review_failed'; failure_class='review'; evidence.append(str(review.get('summary') or 'review failed')[:400]); directives.append('Address the review blocker directly and avoid repeating the rejected strategy.')
+    elif eligible:
+        outcome='accepted'; evidence.append('central acceptance gate passed')
+    elif attempt.changed_files:
+        outcome='partial_progress'; failure_class='partial'; directives.append('Build on useful changed files but target the remaining blockers narrowly.')
+    reads=telemetry.get('total_file_reads') or 0; writes=telemetry.get('total_file_writes') or len(attempt.changed_files or [])
+    if reads==0 and writes==0:
+        directives.append('Previous attempt showed no substantive repo reads or writes; inspect source files first.')
+    prev_same=[o for o in state.attempt_observations if o.backend_name==attempt.backend_name and o.outcome in {'no_patch','runner_failed'}]
+    should_escalate=len(prev_same)>=1 and outcome in {'no_patch','runner_failed'}
+    if should_escalate: directives.append('Consider a different coding backend because this backend shows repeated no-progress or runner failure.')
+    obs=AttemptObservation(attempt_id=attempt.attempt_id,scope=attempt.scope,subtask_id=attempt.subtask_id,backend_name=attempt.backend_name,model=attempt.model,outcome=outcome,progress_score=(1.0 if eligible else 0.4 if attempt.changed_files else 0.0),failure_class=failure_class,evidence=evidence[:8],blockers=sorted(set(blockers)),changed_files=attempt.changed_files,validation_status=attempt.validation_status,review_status=attempt.review_status,runner_signals=telemetry,backend_signals={},next_attempt_directives=list(dict.fromkeys(directives))[:8],should_retry_same_plan=outcome in {'validation_failed','review_failed','partial_progress','no_patch'},should_repair=outcome in {'validation_failed','review_failed','patch_failed'},should_decompose=outcome=='partial_progress' and len(state.attempt_observations)>=1,should_escalate_backend=should_escalate)
+    state.attempt_observations=[o for o in state.attempt_observations if o.attempt_id!=attempt.attempt_id]+[obs]
+    return obs
+
+def update_backend_runner_assessments(state, obs, attempt):
+    name=obs.backend_name or 'unknown'; b=state.backend_assessments.setdefault(name, {'attempts':0,'runner_successes':0,'validation_passes':0,'review_passes':0,'accepted_candidates':0,'no_progress_attempts':0,'total_cost':0.0,'total_tokens':0})
+    b['attempts']+=1; b['runner_successes']+= int(attempt.status in {'completed','reviewed','accepted'}); b['validation_passes']+=int(obs.validation_status=='passed'); b['review_passes']+=int(obs.review_status=='passed'); b['accepted_candidates']+=int(obs.outcome=='accepted'); b['no_progress_attempts']+=int(obs.outcome in {'no_patch','runner_failed'}); b['total_cost']+=float(attempt.cost or 0.0); b['total_tokens']+=int((attempt.token_usage or {}).get('total_tokens') or 0)
+    b['average_cost']=b['total_cost']/max(1,b['attempts']); b['average_tokens']=b['total_tokens']/max(1,b['attempts'])
+    b['capability_signal']='strong' if b['accepted_candidates'] else ('adequate' if b['validation_passes'] or b['review_passes'] else ('weak' if b['no_progress_attempts']>=2 else 'unknown'))
+    state.runner_assessment={'attempts':sum(x['attempts'] for x in state.backend_assessments.values()),'no_progress_attempts':sum(x['no_progress_attempts'] for x in state.backend_assessments.values())}
+
+
+def build_attempt_learning_brief(state):
+    failed=[o for o in state.attempt_observations if o.scope=='candidate' and o.outcome!='accepted'][-2:]
+    if not failed: return ''
+    parts=['PREVIOUS ATTEMPT LEARNING']
+    for o in failed:
+        parts += [f'\nAttempt {o.attempt_id} failed.', 'What changed:']
+        parts += [f'- Edited {", ".join(o.changed_files)}.' if o.changed_files else '- No product files were changed.']
+        if o.evidence:
+            parts += ['Still failing:'] + [f'- {e}' for e in o.evidence[:3]]
+        if o.blockers:
+            parts += ['Review/acceptance blockers:'] + [f'- {b}' for b in o.blockers[:4]]
+        if o.next_attempt_directives:
+            parts += ['Do differently:'] + [f'- {d}' for d in o.next_attempt_directives[:5]]
+    return '\n'.join(parts)
+
+def build_candidate_runner_prompt(state, *, reason, repair=False, base_attempt_id=None):
+    cmds=_validation_plan_commands(state)
+    changed=sorted({f for o in state.attempt_observations for f in o.changed_files})
+    brief=build_attempt_learning_brief(state)
+    sections=[f'TASK\n{state.task}', f'SUCCESS CRITERIA\n{state.success_criteria or "Complete the task with a minimal correct patch."}', f'CURRENT EXECUTION PATH\n{state.execution_path or "single_task"}. Run exactly this one adaptive candidate attempt.']
+    if state.investigation: sections.append('INVESTIGATION SUMMARY\n'+str({k:state.investigation.get(k) for k in ['summary','suspected_root_cause','relevant_files','relevant_tests','implementation_plan'] if k in state.investigation}))
+    if changed: sections.append('CHANGED FILES FROM PREVIOUS ATTEMPTS\n'+'\n'.join(f'- {f}' for f in changed))
+    if brief: sections.append(brief)
+    sections.append('NEXT ATTEMPT DIRECTIVES\n- Make a focused product-code change; do not create scratch/internal artifacts.\n- Do not repeat previously rejected broad rewrites.\n- Rerun relevant validation before finishing when possible.\n'+'\n'.join(f'- Rerun: {c}' for c in cmds))
+    if repair and base_attempt_id: sections.append(f'REPAIR MODE\nRepair the previous attempt {base_attempt_id} by addressing the blockers above.')
+    sections.append(f'REASON FOR THIS ATTEMPT\n{reason}')
+    return '\n\n'.join(sections)
+
 def _run_attempt(state, ctx, aid, scope, task, success, subtask_id=None, backend_name=None, record_events=True):
     _require_real_execution(ctx)
-    backend=ctx.coding_backend or ctx.backend
+    backend_name_resolved, backend=resolve_coding_backend(ctx, backend_name)
     if ctx.runner_adapter is None: raise ValueError('agentic_runner_adapter_missing')
-    if backend is None: raise ValueError('agentic_backend_role_unavailable: coding')
     adir=Path(state.run_dir)/'attempts'/aid; adir.mkdir(parents=True,exist_ok=True)
     write_text_utf8(adir/'attempt_prompt.txt', task or '')
     wtree=adir/'worktree'
-    a=_attempt(aid,scope,subtask_id=subtask_id,backend=backend_name or ctx.coding_backend_name or getattr(backend,'name',None),artifacts=adir)
+    a=_attempt(aid,scope,subtask_id=subtask_id,backend=backend_name_resolved,artifacts=adir)
     a.status='running'; a.worktree_path=str(wtree); a.started_at=str(time.time())
     if record_events:
         ctx.recorder.record(f'{scope}_attempt_started', payload={'attempt_id':aid,'subtask_id':subtask_id,'status':'running','execution_path':state.execution_path,'artifact_paths':{'artifacts_dir':str(adir)}})
@@ -399,7 +500,7 @@ def _run_attempt(state, ctx, aid, scope, task, success, subtask_id=None, backend
         imported=_attach_imported_validation(state,a)
         if imported and record_events:
             ctx.recorder.record('debug_validation_imported', payload={'attempt_id':aid,'imported_validation_count':len(imported),'validation_source':'villani_code_debug_trace'})
-        a.model=getattr(backend,'model',None); a.completed_at=str(time.time())
+        a.model=getattr(backend,'model',None); a.runner_telemetry=_capture_runner_telemetry(res); a.completed_at=str(time.time())
         ok=getattr(res,'exit_code',1)==0
         a.exit_code=getattr(res,'exit_code',None); a.exit_reason=getattr(res,'exit_reason',None); a.runner_status=getattr(res,'status',None)
         if usage_record is not None:
@@ -499,6 +600,33 @@ def h_run_single_task_attempts(state, inp, ctx):
         ctx.recorder.record('single_task_attempt_rejected', payload={'attempt_id':aid,'attempts_started':state.attempts_started,'acceptance_blockers':blockers,'retry':i<int(inp.attempts)})
     state.stopped_early=False; state.stop_reason='attempts_exhausted'; state.phase='selecting'
     return {'launched':made,'accepted_attempt_id':None,'attempts_requested':state.attempts_requested,'attempts_started':state.attempts_started,'stopped_early':False,'stop_reason':'attempts_exhausted','candidate_execution_mode':'sequential'}
+
+def h_run_next_candidate_attempt(state, inp, ctx):
+    if state.execution_path!='single_task':
+        raise ValueError('ops_run_next_candidate_attempt requires execution_path=single_task')
+    budget=max(1,int(state.candidate_attempts or 1))
+    if len(state.candidates) >= budget:
+        raise ValueError(f'candidate attempt budget exhausted ({len(state.candidates)}/{budget})')
+    state.candidate_execution_mode='sequential'; state.attempts_requested=budget; state.phase='running_candidates'
+    aid=f'candidate_{len(state.candidates)+1:03d}'
+    prompt=build_candidate_runner_prompt(state, reason=inp.reason, repair=inp.repair, base_attempt_id=inp.base_attempt_id)
+    a=_run_attempt(state,ctx,aid,'candidate',prompt,state.success_criteria,None,inp.backend_name,True)
+    state.candidates.append(a); state.attempts_started=len(state.candidates)
+    if a.status=='completed':
+        cmds=_default_validation_commands(state)
+        if cmds: h_validation(state, OpsRunValidationInput(target='candidate', target_id=aid, commands=cmds), ctx)
+    if ctx.reviewer is not None and a.status in {'completed','reviewed'} and not a.review:
+        h_review_attempt(state, OpsReviewAttemptInput(attempt_id=aid, scope='candidate'), ctx)
+    eligible, blockers=_set_acceptance_from_gate(state,a)
+    obs=create_attempt_observation(state,a); update_backend_runner_assessments(state,obs,a)
+    if eligible:
+        state.stopped_early=True; state.stop_reason='accepted_attempt'; state.phase='selecting'
+    elif len(state.candidates)>=budget:
+        state.stopped_early=False; state.stop_reason='attempts_exhausted'; state.phase='selecting'
+    else:
+        state.phase='running_candidates'
+    ctx.recorder.record('attempt_observation_created', payload=obs.model_dump())
+    return {'launched':[aid],'attempt_id':aid,'attempts_started':state.attempts_started,'attempts_requested':budget,'observation':obs.model_dump(),'backend_assessment':state.backend_assessments.get(a.backend_name or 'unknown'),'next_allowed_actions':state.allowed_next_actions()}
 
 def _update_decomposed_execution_state(state, ctx=None):
     if state.execution_path!='decomposed_subtasks': return None
@@ -1028,7 +1156,8 @@ OPS_TOOLS={
 'ops_validate_decomposition':ToolSpec('ops_validate_decomposition','Validate decomposition',OpsValidateDecompositionInput,h_validate_decomposition),
 'ops_select_execution_path':ToolSpec('ops_select_execution_path','Select execution path',OpsSelectExecutionPathInput,h_select_path),
 'ops_launch_candidates':ToolSpec('ops_launch_candidates','Launch full-task candidates in parallel/batches. Only valid for execution_path=parallel_candidates or explicit decomposition-deadlock fallback; never for single_task.',OpsLaunchCandidatesInput,h_launch_candidates),
-'ops_run_single_task_attempts':ToolSpec('ops_run_single_task_attempts','Run full-task attempts sequentially for execution_path=single_task. candidate_attempts is a retry budget; validate/review each attempt and stop immediately once centrally accepted.',OpsRunSingleTaskAttemptsInput,h_run_single_task_attempts),
+'ops_run_next_candidate_attempt':ToolSpec('ops_run_next_candidate_attempt','Run exactly one adaptive full-task candidate attempt, then validate/review/observe it automatically.',OpsRunNextCandidateAttemptInput,h_run_next_candidate_attempt),
+'ops_run_single_task_attempts':ToolSpec('ops_run_single_task_attempts','Compatibility legacy bulk sequential attempts. Agentic controllers should prefer ops_run_next_candidate_attempt.',OpsRunSingleTaskAttemptsInput,h_run_single_task_attempts),
 'ops_start_candidate_fallback':ToolSpec('ops_start_candidate_fallback','Start full-task candidate fallback after decomposition deadlock',OpsStartCandidateFallbackInput,h_start_candidate_fallback),
 'ops_launch_subtasks':ToolSpec('ops_launch_subtasks','Launch subtasks',OpsLaunchSubtasksInput,h_launch_subtasks),
 'ops_review_attempt':ToolSpec('ops_review_attempt','Review attempt',OpsReviewAttemptInput,h_review_attempt),

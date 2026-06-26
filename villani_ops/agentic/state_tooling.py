@@ -6,7 +6,7 @@ from .tools import OPS_TOOLS
 from .state import detect_decomposition_deadlock
 @dataclass
 class OpsToolContext:
-    run_dir:Path; recorder:any; transcript:list[dict]; recent_events:list[dict]|None=None; runner_adapter:any=None; reviewer:any=None; backend:any=None; backend_name:str|None=None; coding_backend:any=None; coding_backend_name:str|None=None; review_backend:any=None; review_backend_name:str|None=None; usage_recorder:any=None; timeout_seconds:int|None=None; max_parallel:int=1; production:bool=True; allow_fake_dependencies:bool=False
+    run_dir:Path; recorder:any; transcript:list[dict]; recent_events:list[dict]|None=None; runner_adapter:any=None; reviewer:any=None; backend:any=None; backend_name:str|None=None; coding_backend:any=None; coding_backend_name:str|None=None; review_backend:any=None; review_backend_name:str|None=None; backends:any=None; usage_recorder:any=None; timeout_seconds:int|None=None; max_parallel:int=1; production:bool=True; allow_fake_dependencies:bool=False
 class OpsToolResult(BaseModel):
     model_config=ConfigDict(extra='forbid')
     tool_use_id:str; tool_name:str; content:dict|str; is_error:bool=False
@@ -25,6 +25,7 @@ def _allowed(state, name, data):
         if state.decomposed_execution_status not in {'blocked','failed'} or not detect_decomposition_deadlock(state): return False,'fallback requires decomposition deadlock'
     if name=='ops_launch_candidates' and state.execution_path=='single_task': return False,'single_task execution uses sequential attempts; call ops_run_single_task_attempts'
     if name=='ops_launch_candidates' and state.execution_path!='parallel_candidates' and state.fallback_execution_path!='parallel_candidates_after_decomposition_deadlock': return False,'candidates require parallel_candidates execution path or fallback'
+    if name=='ops_run_next_candidate_attempt' and state.execution_path!='single_task': return False,'ops_run_next_candidate_attempt requires execution_path=single_task'
     if name=='ops_run_single_task_attempts' and state.execution_path!='single_task': return False,'ops_run_single_task_attempts requires execution_path=single_task'
     if name=='ops_launch_subtasks' and state.execution_path!='decomposed_subtasks': return False,'subtasks require decomposed_subtasks execution path'
     if name=='ops_integrate_subtasks':

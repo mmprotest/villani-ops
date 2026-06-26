@@ -52,7 +52,7 @@ def test_cli_non_performance_backend_output(monkeypatch, tmp_path):
     def fake_run(self, **kwargs): return Result(kwargs['mode'])
     monkeypatch.setattr('villani_ops.controller.executor.VillaniOps.run', fake_run)
     for mode in ['cheap','balanced','quality']:
-        res=runner.invoke(app, ['run','--repo',str(tmp_path),'--task','x','--mode',mode])
+        res=runner.invoke(app, ['run','--repo',str(tmp_path),'--task','x','--mode',mode,'--orchestrator','graph'])
         assert res.exit_code == 0, res.output
         assert f'Mode: {mode}' in res.output
         assert 'Primary backend: None/None' not in res.output
@@ -61,7 +61,7 @@ def test_cli_non_performance_backend_output(monkeypatch, tmp_path):
     def perf_run(self, **kwargs):
         r=Result('performance'); r.decision.performance_backend_name='large'; r.decision.performance_backend_model='l'; return r
     monkeypatch.setattr('villani_ops.controller.executor.VillaniOps.run', perf_run)
-    res=runner.invoke(app, ['run','--repo',str(tmp_path),'--task','x','--mode','performance'])
+    res=runner.invoke(app, ['run','--repo',str(tmp_path),'--task','x','--mode','performance','--orchestrator','graph'])
     assert 'Performance backend: large/l' in res.output
 
 
