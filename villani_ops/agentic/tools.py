@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any, Callable, Literal
 from pydantic import BaseModel, Field, ConfigDict, model_validator
 from .state import CandidateAttemptState, SubtaskState
-from villani_ops.storage.files import capture_diff
+from .git_artifacts import capture_git_patch, ensure_git_baseline, clean_runner_artifacts_from_worktree, DEFAULT_PATCH_EXCLUDES, is_git_compatible_patch, patch_contains_internal_artifacts
 from villani_ops.core.acceptance import is_attempt_acceptance_eligible, attempt_requires_patch
 import subprocess, json, time, shutil
 from .artifacts import read_text_utf8, write_text_utf8, write_json_utf8
@@ -120,6 +120,7 @@ def build_agentic_review_payload(state, attempt, scope, subtask=None):
         'artifact_paths':{k:data.get(k) for k in ['artifacts_dir','worktree_path','patch_path','stdout_path','stderr_path','transcript_path']},
         'known_blockers':data.get('acceptance_blockers') or [],
         'requires_patch':attempt_requires_patch(state, attempt),
+        'patch_hygiene':data.get('patch_hygiene') or {},
         'investigation_relevant_files':(state.investigation or {}).get('relevant_files') if state.investigation else [],
     }
     if subtask is not None:
@@ -247,12 +248,19 @@ def _run_attempt(state, ctx, aid, scope, task, success, subtask_id=None, backend
         ctx.recorder.record(f'{scope}_attempt_started', payload={'attempt_id':aid,'subtask_id':subtask_id,'status':'running','artifact_paths':{'artifacts_dir':str(adir)}})
     try:
         _copy_worktree(Path(state.repo_path), wtree)
+        ensure_git_baseline(wtree)
         res=ctx.runner_adapter.run_task(repo_path=wtree,task=task,success_criteria=success,backend_name=a.backend_name or '',backend_config=backend,timeout_seconds=ctx.timeout_seconds,context={'attempt_id':aid,'subtask_id':subtask_id,'parent_task':state.task},artifacts_dir=adir)
         write_text_utf8(adir/'stdout.log', getattr(res,'stdout','') or ''); write_text_utf8(adir/'stderr.log', getattr(res,'stderr','') or '')
-        diff=capture_diff(Path(state.repo_path), wtree, adir/'diff.patch')
-        a.stdout_path=str(adir/'stdout.log'); a.stderr_path=str(adir/'stderr.log'); a.patch_path=str(diff); a.transcript_path=getattr(res,'telemetry_path',None)
-        meta=extract_changed_file_metadata(read_text_utf8(diff, default=''))
-        a.changed_files=meta['changed_files']; a.added_files=meta['added_files']; a.deleted_files=meta['deleted_files']; a.modified_files=meta['modified_files']; a.renamed_files=meta['renamed_files']
+        cap=capture_git_patch(wtree, adir/'diff.patch', exclude_patterns=DEFAULT_PATCH_EXCLUDES)
+        a.stdout_path=str(adir/'stdout.log'); a.stderr_path=str(adir/'stderr.log'); a.patch_path=cap.patch_path; a.transcript_path=getattr(res,'telemetry_path',None)
+        a.changed_files=cap.changed_files; a.added_files=cap.added_files; a.deleted_files=cap.deleted_files; a.modified_files=cap.modified_files; a.renamed_files=cap.renamed_files
+        a.patch_hygiene={'format_valid': bool(cap.patch_path and is_git_compatible_patch(cap.patch_path)), 'contains_internal_artifacts': bool(cap.patch_path and patch_contains_internal_artifacts(cap.patch_path)), 'apply_check_passed': None, 'capture_failure_reason': cap.failure_reason, 'changed_files_after_filtering': cap.changed_files}
+        if cap.patch_path:
+            chk=subprocess.run(['git','apply','--check','--cached',cap.patch_path],cwd=wtree,text=True,capture_output=True)
+            a.patch_hygiene['apply_check_passed']=chk.returncode==0
+            if chk.returncode!=0:
+                a.acceptance_blockers=sorted(set(a.acceptance_blockers+['patch_apply_check_failed']))
+                write_text_utf8(adir/'patch_apply_check_stderr.log', chk.stderr or '')
         a.model=getattr(backend,'model',None); a.completed_at=str(time.time())
         ok=getattr(res,'exit_code',1)==0
         a.exit_code=getattr(res,'exit_code',None); a.exit_reason=getattr(res,'exit_reason',None); a.runner_status=getattr(res,'status',None)
@@ -465,6 +473,17 @@ def _write_integration_failure_artifacts(idir, subtask_id, patch_path, check=Non
         arts['git_apply_stdout']=str(so); arts['git_apply_stderr']=str(se)
     return arts
 
+def _integration_failure_reason(failed, conflicts):
+    items=failed or conflicts or []
+    if not items: return 'integration_failed'
+    first=items[0]
+    reason=first.get('reason') or 'integration_failed'
+    aid=first.get('attempt_id') or first.get('subtask_id') or ''
+    if reason=='patch_apply_check_failed': return f'patch apply failed for {aid}'.strip()
+    if reason=='invalid_patch_format': return f'invalid patch format in {aid}'.strip()
+    if reason=='patch_contains_internal_artifacts': return 'patch contains internal artifacts'
+    return reason
+
 def h_integrate(state, inp, ctx):
     if state.execution_path!='decomposed_subtasks': raise ValueError('integration requires decomposed_subtasks execution path')
     if state.decomposition_accepted is not True: raise ValueError('integration requires accepted decomposition')
@@ -478,6 +497,7 @@ def h_integrate(state, inp, ctx):
     iid='integration_001'; idir=Path(state.run_dir)/'integration'/iid; idir.mkdir(parents=True,exist_ok=True)
     wtree=idir/'worktree'; started=str(time.time()); conflicts=[]; applied=[]; failed=[]
     _copy_worktree(Path(state.repo_path), wtree)
+    ensure_git_baseline(wtree)
     try:
         ordered_subtasks=_subtasks_dependency_order(state.subtasks)
     except ValueError as e:
@@ -489,25 +509,36 @@ def h_integrate(state, inp, ctx):
         a=_accepted_subtask_attempt(state, st)
         if not a or not a.patch_path:
             failed.append({'subtask_id':st.subtask_id,'reason':'missing accepted patch'}); continue
-        apply_path=_git_apply_patch_path(a.patch_path, idir, st.subtask_id)
-        check=subprocess.run(['git','apply','--check',apply_path],cwd=wtree,text=True,capture_output=True)
+        apply_path=a.patch_path
+        if not Path(apply_path).exists():
+            failed.append({'subtask_id':st.subtask_id,'attempt_id':a.attempt_id,'patch_path':a.patch_path,'reason':'missing_patch'}); continue
+        if patch_contains_internal_artifacts(apply_path):
+            arts=_write_integration_failure_artifacts(idir, st.subtask_id, a.patch_path)
+            item={'subtask_id':st.subtask_id,'attempt_id':a.attempt_id,'patch_path':a.patch_path,'reason':'patch_contains_internal_artifacts','artifact_paths':arts}
+            conflicts.append(item); failed.append(item); continue
+        if not is_git_compatible_patch(apply_path):
+            arts=_write_integration_failure_artifacts(idir, st.subtask_id, a.patch_path)
+            item={'subtask_id':st.subtask_id,'attempt_id':a.attempt_id,'patch_path':a.patch_path,'reason':'invalid_patch_format','artifact_paths':arts}
+            conflicts.append(item); failed.append(item); continue
+        check=subprocess.run(['git','apply','--check','--whitespace=nowarn',apply_path],cwd=wtree,text=True,capture_output=True)
         if check.returncode!=0:
             arts=_write_integration_failure_artifacts(idir, st.subtask_id, a.patch_path, check=check)
             item={'subtask_id':st.subtask_id,'attempt_id':a.attempt_id,'patch_path':a.patch_path,'exit_code':check.returncode,'stderr_tail':(check.stderr or '')[-4000:],'artifact_paths':arts}
             conflicts.append(item); failed.append({**item,'reason':'patch_apply_check_failed'}); continue
-        apply=subprocess.run(['git','apply',apply_path],cwd=wtree,text=True,capture_output=True)
+        apply=subprocess.run(['git','apply','--whitespace=nowarn',apply_path],cwd=wtree,text=True,capture_output=True)
         if apply.returncode!=0:
             arts=_write_integration_failure_artifacts(idir, st.subtask_id, a.patch_path, check=check, apply=apply)
             item={'subtask_id':st.subtask_id,'attempt_id':a.attempt_id,'patch_path':a.patch_path,'exit_code':apply.returncode,'stderr_tail':(apply.stderr or '')[-4000:],'artifact_paths':arts}
             conflicts.append(item); failed.append({**item,'reason':'patch_apply_failed'}); continue
         applied.append({'subtask_id':st.subtask_id,'attempt_id':a.attempt_id,'patch_path':a.patch_path})
-    patch=capture_diff(Path(state.repo_path), wtree, idir/'diff.patch')
-    meta=extract_changed_file_metadata(read_text_utf8(patch, default=''))
+    cap=capture_git_patch(wtree, idir/'diff.patch', exclude_patterns=DEFAULT_PATCH_EXCLUDES)
+    patch=cap.patch_path or str(idir/'diff.patch')
+    meta={'changed_files':cap.changed_files,'added_files':cap.added_files,'deleted_files':cap.deleted_files,'modified_files':cap.modified_files,'renamed_files':cap.renamed_files}
     status='failed' if failed or conflicts else 'completed'
     blockers=[]
     if failed: blockers.append('integration_failed')
     if conflicts: blockers.append('merge_conflicts')
-    integ={'attempt_id':iid,'scope':'integration','status':status,'reason':inp.reason,'worktree_path':str(wtree),'artifacts_dir':str(idir),'patch_path':str(patch),'changed_files':meta['changed_files'],'added_files':meta['added_files'],'deleted_files':meta['deleted_files'],'modified_files':meta['modified_files'],'renamed_files':meta['renamed_files'],'merge_conflicts':conflicts,'conflict_artifacts':[p for c in conflicts for p in ((c.get('artifact_paths') or {}).values())],'applied_subtasks':applied,'applied_subtask_order':[x['subtask_id'] for x in applied],'failed_subtasks':failed,'failure_reason':'integration_failed' if status=='failed' else None,'started_at':started,'completed_at':str(time.time()),'acceptance_eligible':False,'acceptance_blockers':blockers or ['review_missing'],'review':None,'validation':None}
+    integ={'attempt_id':iid,'scope':'integration','status':status,'reason':inp.reason,'worktree_path':str(wtree),'artifacts_dir':str(idir),'patch_path':str(patch),'changed_files':meta['changed_files'],'added_files':meta['added_files'],'deleted_files':meta['deleted_files'],'modified_files':meta['modified_files'],'renamed_files':meta['renamed_files'],'merge_conflicts':conflicts,'conflict_artifacts':[p for c in conflicts for p in ((c.get('artifact_paths') or {}).values())],'applied_subtasks':applied,'applied_subtask_order':[x['subtask_id'] for x in applied],'failed_subtasks':failed,'failure_reason':(_integration_failure_reason(failed, conflicts) if status=='failed' else None),'started_at':started,'completed_at':str(time.time()),'acceptance_eligible':False,'acceptance_blockers':blockers or ['review_missing'],'review':None,'validation':None}
     state.integration=integ; _set_acceptance_from_gate(state, state.integration)
     if status=='failed':
         write_json_utf8(idir/'integration_failure.json', state.integration, atomic=True)
@@ -577,6 +608,10 @@ def h_select_winner(state, inp, ctx):
     state.phase='finalizing'; ctx.recorder.record('winner_selected', payload=state.selection); return state.selection
 
 def h_finalize(state, inp, ctx):
+    final_payload=inp.model_dump()
+    if inp.decision!='accepted' and state.execution_path=='decomposed_subtasks' and state.integration and state.integration.get('status')=='failed':
+        final_payload['summary']='Subtasks were individually accepted by scoped review, but Villani Ops did not produce an integrated patch. Final validation failed, so no accepted solution was produced.'
+        final_payload['blockers']=sorted(set((final_payload.get('blockers') or []) + ['integration_failed']))
     if inp.decision=='accepted':
         sel=state.selection or {}; aid=inp.selected_attempt_id or sel.get('selected_attempt_id')
         if sel.get('decision')!='select': raise ValueError('accepted finalization requires select decision')
@@ -601,7 +636,7 @@ def h_finalize(state, inp, ctx):
             raise ValueError('selected attempt is not acceptance eligible: '+', '.join(blockers))
         if inp.selected_patch_path and (a.get('patch_path') if isinstance(a,dict) else a.patch_path) != inp.selected_patch_path:
             raise ValueError('final selected patch does not match selected attempt')
-    state.final_decision=inp.model_dump(); state.status='completed' if inp.decision=='accepted' else 'failed'; state.phase='completed' if state.status=='completed' else 'failed'; ctx.recorder.record('run_finalized', payload=state.final_decision); return state.final_decision
+    state.final_decision=final_payload; state.status='completed' if inp.decision=='accepted' else 'failed'; state.phase='completed' if state.status=='completed' else 'failed'; ctx.recorder.record('run_finalized', payload=state.final_decision); return state.final_decision
 OPS_TOOLS={
 'ops_get_state':ToolSpec('ops_get_state','Inspect canonical run state',OpsGetStateInput,h_get_state,True),
 'ops_inspect_repo':ToolSpec('ops_inspect_repo','Inspect repository',OpsInspectRepoInput,h_inspect_repo,True),

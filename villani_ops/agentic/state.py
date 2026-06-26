@@ -16,6 +16,7 @@ class CandidateAttemptState(BaseModel):
     exit_code:int|None=None; exit_reason:str|None=None; failure_reason:str|None=None; runner_status:str|None=None; runner_error_type:str|None=None; duration_seconds:float|None=None
     added_files:list[str]=Field(default_factory=list); deleted_files:list[str]=Field(default_factory=list); modified_files:list[str]=Field(default_factory=list); renamed_files:list[str]=Field(default_factory=list)
     validation:dict|None=None; token_usage:dict|None=None; cost:float|None=None
+    patch_hygiene:dict|None=None
 
 class SubtaskState(BaseModel):
     model_config=ConfigDict(extra='forbid')
