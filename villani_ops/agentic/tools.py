@@ -429,12 +429,60 @@ def create_attempt_observation(state, attempt):
     state.attempt_observations=[o for o in state.attempt_observations if o.attempt_id!=attempt.attempt_id]+[obs]
     return obs
 
-def update_backend_runner_assessments(state, obs, attempt):
-    name=obs.backend_name or 'unknown'; b=state.backend_assessments.setdefault(name, {'attempts':0,'runner_successes':0,'validation_passes':0,'review_passes':0,'accepted_candidates':0,'no_progress_attempts':0,'total_cost':0.0,'total_tokens':0})
-    b['attempts']+=1; b['runner_successes']+= int(attempt.status in {'completed','reviewed','accepted'}); b['validation_passes']+=int(obs.validation_status=='passed'); b['review_passes']+=int(obs.review_status=='passed'); b['accepted_candidates']+=int(obs.outcome=='accepted'); b['no_progress_attempts']+=int(obs.outcome in {'no_patch','runner_failed'}); b['total_cost']+=float(attempt.cost or 0.0); b['total_tokens']+=int((attempt.token_usage or {}).get('total_tokens') or 0)
-    b['average_cost']=b['total_cost']/max(1,b['attempts']); b['average_tokens']=b['total_tokens']/max(1,b['attempts'])
-    b['capability_signal']='strong' if b['accepted_candidates'] else ('adequate' if b['validation_passes'] or b['review_passes'] else ('weak' if b['no_progress_attempts']>=2 else 'unknown'))
-    state.runner_assessment={'attempts':sum(x['attempts'] for x in state.backend_assessments.values()),'no_progress_attempts':sum(x['no_progress_attempts'] for x in state.backend_assessments.values())}
+def _adaptive_capability_signal(a):
+    if not a.get('attempts'):
+        return 'unknown'
+    if a.get('accepted_candidates') or a.get('validation_passes',0) >= 2 or a.get('review_passes',0) >= 2:
+        return 'strong'
+    if a.get('validation_passes') or a.get('review_passes') or a.get('runner_successes') or a.get('progress_attempts'):
+        return 'adequate'
+    if a.get('no_progress_attempts',0) >= 2 or a.get('runner_failures',0) >= 2 or not a.get('progress_attempts'):
+        return 'weak'
+    return 'unknown'
+
+def recompute_adaptive_assessments(state):
+    attempts={}
+    for c in getattr(state,'candidates',[]) or []:
+        attempts[c.attempt_id]=c
+    for st in getattr(state,'subtasks',[]) or []:
+        for a in getattr(st,'attempts',[]) or []:
+            attempts[a.attempt_id]=a
+    observations={}
+    for o in getattr(state,'attempt_observations',[]) or []:
+        observations[o.attempt_id]=o
+    if len(observations) != len(getattr(state,'attempt_observations',[]) or []):
+        state.attempt_observations=list(observations.values())
+    backend_assessments={}
+    runner={'attempts':0,'runner_successes':0,'validation_passes':0,'review_passes':0,'accepted_candidates':0,'no_progress_attempts':0,'runner_failures':0,'progress_attempts':0,'total_cost':0.0,'total_tokens':0}
+    for aid, obs in observations.items():
+        attempt=attempts.get(aid)
+        name=obs.backend_name or (getattr(attempt,'backend_name',None) if attempt is not None else None) or 'unknown'
+        b=backend_assessments.setdefault(name, {'attempts':0,'runner_successes':0,'validation_passes':0,'review_passes':0,'accepted_candidates':0,'no_progress_attempts':0,'runner_failures':0,'progress_attempts':0,'total_cost':0.0,'total_tokens':0})
+        runner_success=bool(attempt is not None and getattr(attempt,'status',None) in {'completed','reviewed','accepted'})
+        runner_failure=obs.outcome in {'runner_failed','infra_failed'} or bool(attempt is not None and (getattr(attempt,'status',None)=='failed' or getattr(attempt,'runner_status',None)=='exception'))
+        progress=bool(obs.changed_files or (obs.progress_score or 0) > 0 or obs.outcome in {'accepted','validation_failed','review_failed','partial_progress','scope_failed','patch_failed'})
+        cost=float(getattr(attempt,'cost',None) or 0.0) if attempt is not None else 0.0
+        tokens=int(((getattr(attempt,'token_usage',None) or {}).get('total_tokens')) or 0) if attempt is not None else 0
+        for d in (b, runner):
+            d['attempts']+=1
+            d['runner_successes']+=int(runner_success)
+            d['validation_passes']+=int(obs.validation_status=='passed')
+            d['review_passes']+=int(obs.review_status=='passed')
+            d['accepted_candidates']+=int(obs.outcome=='accepted')
+            d['no_progress_attempts']+=int(obs.outcome in {'no_patch','runner_failed','infra_failed'})
+            d['runner_failures']+=int(runner_failure)
+            d['progress_attempts']+=int(progress)
+            d['total_cost']+=cost
+            d['total_tokens']+=tokens
+    for d in list(backend_assessments.values())+[runner]:
+        d['average_cost']=d['total_cost']/max(1,d['attempts'])
+        d['average_tokens']=d['total_tokens']/max(1,d['attempts'])
+        d['capability_signal']=_adaptive_capability_signal(d)
+    state.backend_assessments=backend_assessments
+    state.runner_assessment=runner if runner['attempts'] else {}
+
+def update_backend_runner_assessments(state, obs=None, attempt=None):
+    recompute_adaptive_assessments(state)
 
 
 def build_attempt_learning_brief(state):
