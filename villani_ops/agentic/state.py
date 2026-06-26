@@ -37,7 +37,7 @@ class OpsRunState(BaseModel):
     integration:dict|None=None; reviews:list[dict]=Field(default_factory=list); selection:dict|None=None; final_decision:dict|None=None
     active_nodes:list[str]=Field(default_factory=list); completed_nodes:list[str]=Field(default_factory=list); failed_nodes:list[str]=Field(default_factory=list)
     costs:dict[str,float]=Field(default_factory=dict); input_tokens:int=0; output_tokens:int=0
-    warnings:list[str]=Field(default_factory=list); blockers:list[str]=Field(default_factory=list); concurrency_mode:str|None=None; max_parallel:int|None=None; recovery_count:int=0; last_error:str|None=None; last_tool_name:str|None=None; last_tool_input:dict|None=None
+    warnings:list[str]=Field(default_factory=list); blockers:list[str]=Field(default_factory=list); concurrency_mode:str|None=None; max_parallel:int|None=None; execution_concurrency:dict=Field(default_factory=dict); candidate_concurrency:dict=Field(default_factory=dict); subtask_concurrency:dict=Field(default_factory=dict); batch_count:int|None=None; wave_count:int|None=None; recovery_count:int=0; last_error:str|None=None; last_tool_name:str|None=None; last_tool_input:dict|None=None
     last_invalid_tool_name:str|None=None; last_invalid_tool_input_hash:str|None=None; repeat_invalid_count:int=0; last_progress_event_id:str|None=None; turns_since_progress:int=0
     def is_terminal(self)->bool: return self.status in {'completed','failed','interrupted'}
     def allowed_next_actions(self)->list[str]:

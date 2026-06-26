@@ -60,3 +60,20 @@ def test_integration_result_requires_review_and_subtasks(tmp_path):
     ok, blockers = is_attempt_acceptance_eligible(integration, state=state)
     assert not ok
     assert "review_missing" in blockers
+
+def test_binary_git_diff_extracts_only_real_path():
+    diff = """diff --git a/path.bin b/path.bin
+index 111..222 100644
+Binary files a/path.bin and b/path.bin differ
+"""
+    meta = extract_changed_file_metadata(diff)
+    assert meta["changed_files"] == ["path.bin"]
+    assert meta["modified_files"] == ["path.bin"]
+    for bad in ["differ:", "files", "a/path.bin", "b/path.bin"]:
+        assert bad not in meta["changed_files"]
+
+
+def test_legacy_binary_internal_format_extracts_path():
+    meta = extract_changed_file_metadata("Binary files differ: rel\n")
+    assert meta["changed_files"] == ["rel"]
+    assert "differ:" not in meta["changed_files"]
