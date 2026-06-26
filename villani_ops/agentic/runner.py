@@ -9,7 +9,7 @@ from .event_recorder import OpsEventRecorder
 from .tools import openai_tool_specs
 from .state_tooling import execute_tool_with_policy, OpsToolContext
 from .prompts import SYSTEM_PROMPT, initial_user_message
-from .recovery import handle_no_tool_call
+from .recovery import handle_no_tool_call, recommend_next_agentic_action
 from .artifacts import write_artifacts
 from .client import ToolCallingLLMClient
 from villani_ops.runners import runner_for_name
@@ -102,6 +102,13 @@ class OpsRunner:
         reviewer=request.reviewer or self.reviewer or (AgenticLLMReviewer(role_backends['review'][1]) if role_backends.get('review') else None)
         coding_name,coding_backend=role_backends.get('coding',(getattr(backend,'name',None),backend))
         review_name,review_backend=role_backends.get('review',(None,None))
+        def _ctx():
+            return OpsToolContext(run_dir=run_dir,recorder=rec,transcript=transcript,runner_adapter=runner_adapter,reviewer=reviewer,backend=backend,backend_name=getattr(backend,'name',None),coding_backend=coding_backend,coding_backend_name=coding_name,review_backend=review_backend,review_backend_name=review_name,usage_recorder=usage_rec,timeout_seconds=request.timeout_seconds,max_parallel=getattr(coding_backend,'max_parallel',1),production=request.production,allow_fake_dependencies=request.allow_fake_dependencies)
+        def _execute_recommendation(recobj, tool_use_id='recovery'):
+            rec.record('recovery_deterministic_action_executed', payload=recobj.model_dump())
+            res=execute_tool_with_policy(state,recobj.tool_name,recobj.tool_input or {},tool_use_id,_ctx())
+            block={'type':'tool_result','tool_use_id':res.tool_use_id,'content':res.content,'is_error':res.is_error}; transcript.append(block); messages.append({'role':'tool','tool_call_id':res.tool_use_id,'content':str(res.content)}); rec.record('tool_result_appended',tool_name=res.tool_name,payload=block)
+            return res
         messages=[initial_user_message(task=request.task,success_criteria=request.success_criteria,mode=request.mode,runner=request.runner,candidate_attempts=request.candidate_attempts,repo_path=request.repo_path)]
         for _ in range(self.max_turns):
             if state.is_terminal(): break
@@ -119,9 +126,7 @@ class OpsRunner:
                 rr=handle_no_tool_call(state,max_recovery_attempts=self.max_recovery_attempts)
                 rec.record('recovery_injected',payload={'message':rr.message,'recommendation':rr.recommendation.model_dump() if rr.recommendation else None})
                 if rr.recommendation and rr.recommendation.can_execute_deterministically and rr.recommendation.tool_name:
-                    rec.record('recovery_deterministic_action_executed', payload=rr.recommendation.model_dump())
-                    res=execute_tool_with_policy(state,rr.recommendation.tool_name,rr.recommendation.tool_input or {},'recovery',OpsToolContext(run_dir=run_dir,recorder=rec,transcript=transcript,runner_adapter=runner_adapter,reviewer=reviewer,backend=backend,backend_name=getattr(backend,'name',None),coding_backend=coding_backend,coding_backend_name=coding_name,review_backend=review_backend,review_backend_name=review_name,usage_recorder=usage_rec,timeout_seconds=request.timeout_seconds,max_parallel=getattr(coding_backend,'max_parallel',1),production=request.production,allow_fake_dependencies=request.allow_fake_dependencies))
-                    block={'type':'tool_result','tool_use_id':res.tool_use_id,'content':res.content,'is_error':res.is_error}; transcript.append(block); messages.append({'role':'tool','tool_call_id':res.tool_use_id,'content':str(res.content)}); rec.record('tool_result_appended',tool_name=res.tool_name,payload=block)
+                    res=_execute_recommendation(rr.recommendation, 'recovery')
                     if not res.is_error:
                         state.recovery_count=0
                         state.turns_since_progress=0
@@ -129,14 +134,35 @@ class OpsRunner:
                     continue
                 messages.append(rr.message); state.save(run_dir/'state.json')
                 if rr.should_fail:
+                    rec2=recommend_next_agentic_action(state)
+                    if rec2.can_execute_deterministically and rec2.tool_name:
+                        res=_execute_recommendation(rec2, 'no_progress_finalization')
+                        if not res.is_error:
+                            break
                     summary=_state_aware_no_progress_summary(state)
                     state.status='failed'; state.phase='failed'; state.final_decision={'decision':'failed','summary':summary,'blockers':['agentic_orchestrator_no_progress']}; rec.record('run_finalized',payload=state.final_decision); break
                 continue
             for tc in tool_calls:
-                res=execute_tool_with_policy(state,tc['name'],tc.get('input') or {},tc.get('id','tool'),OpsToolContext(run_dir=run_dir,recorder=rec,transcript=transcript,runner_adapter=runner_adapter,reviewer=reviewer,backend=backend,backend_name=getattr(backend,'name',None),coding_backend=coding_backend,coding_backend_name=coding_name,review_backend=review_backend,review_backend_name=review_name,usage_recorder=usage_rec,timeout_seconds=request.timeout_seconds,max_parallel=getattr(coding_backend,'max_parallel',1),production=request.production,allow_fake_dependencies=request.allow_fake_dependencies))
+                res=execute_tool_with_policy(state,tc['name'],tc.get('input') or {},tc.get('id','tool'),_ctx())
                 block={'type':'tool_result','tool_use_id':res.tool_use_id,'content':res.content,'is_error':res.is_error}; transcript.append(block); messages.append({'role':'tool','tool_call_id':res.tool_use_id,'content':str(res.content)}); rec.record('tool_result_appended',tool_name=res.tool_name,payload=block)
         if not state.is_terminal():
-            state.status='failed'; state.phase='failed'; state.final_decision={'decision':'failed','summary':'max orchestration turns reached'}; rec.record('run_finalized',payload=state.final_decision)
-        _update_usage_state(); usage_rec.write_artifacts(); state.save(run_dir/'state.json'); rec.write_digest(state); write_artifacts(run_dir,state,rec.events(),transcript)
+            rec2=recommend_next_agentic_action(state)
+            if rec2.can_execute_deterministically and rec2.tool_name:
+                _execute_recommendation(rec2, 'max_turn_finalization')
+            if not state.is_terminal():
+                state.status='failed'; state.phase='failed'; state.final_decision={'decision':'failed','summary':'max orchestration turns reached','blockers':['max_orchestration_turns_reached']}; rec.record('run_finalized',payload=state.final_decision)
+        _update_usage_state()
+        try:
+            usage_rec.write_artifacts()
+        except Exception as e:
+            state.warnings.append(f'usage_summary_write_failed: {e}')
+            rec.record('artifact_write_failed', payload={'path':str(run_dir/'usage.json'),'artifact_type':'usage_summary','error':str(e),'attempts':8})
+            print('[agentic] Warning: usage summary write failed; usage.jsonl remains available')
+        try:
+            state.save(run_dir/'state.json'); rec.write_digest(state); write_artifacts(run_dir,state,rec.events(),transcript)
+        except Exception as e:
+            state.warnings.append(f'artifact_finalization_error: {e}')
+            rec.record('artifact_write_failed', payload={'path':str(run_dir),'artifact_type':'final_artifacts','error':str(e),'attempts':8})
+            print(f'[agentic] Warning: final artifact write failed: {e}')
         d=Decision(run_id=rid,accepted=state.status=='completed',mode=state.mode,runner=state.runner,orchestration_graph_path=str(run_dir/'orchestration_graph.json'),candidate_attempts_requested=state.candidate_attempts,candidate_attempts_completed=len(state.candidates),winning_attempt_id=(state.selection or {}).get('selected_attempt_id'),reason=(state.final_decision or {}).get('summary',''),decomposition_executed=state.decomposition_executed,subtask_count=len(state.subtasks),subtasks_executed=[s.subtask_id for s in state.subtasks if s.attempts],subtasks_accepted=[s.subtask_id for s in state.subtasks if s.status=='accepted'],attempts_per_subtask=state.candidate_attempts,subtask_attempts_completed=sum(len(s.attempts) for s in state.subtasks),failure_reason='' if state.status=='completed' else (state.final_decision or {}).get('summary','failed'))
         return OpsRunResult(run_id=rid,run_dir=str(run_dir),state=state,decision=d)

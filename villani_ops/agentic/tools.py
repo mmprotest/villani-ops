@@ -932,13 +932,25 @@ def h_select_winner(state, inp, ctx):
         raise ValueError('selected attempt is not acceptance eligible: '+', '.join(blockers))
     new_selection={**inp.model_dump(),'selection_evidence':{'stored_acceptance_eligible':stored,'recomputed_acceptance_eligible':eligible,'acceptance_blockers':blockers}}
     if state.selection and state.selection.get('decision')=='select' and state.selection.get('selected_attempt_id')==inp.selected_attempt_id:
-        state.phase='finalizing'; return state.selection
+        state.phase='finalizing'; return {**state.selection, 'already_selected': True}
     state.selection=new_selection
     state.phase='finalizing'; ctx.recorder.record('selection_completed', payload=state.selection); return state.selection
 
+def validate_final_state_consistency(state) -> list[str]:
+    warnings=[]
+    fd=state.final_decision or {}
+    if not state.is_terminal(): warnings.append('state_status_not_terminal')
+    if state.phase not in {'completed','failed'}: warnings.append('state_phase_not_terminal')
+    if fd.get('decision') not in {'accepted','rejected','failed'}: warnings.append('final_decision_missing_or_invalid')
+    if fd.get('decision')=='accepted':
+        sel=state.selection or {}
+        if sel.get('decision')!='select' or not sel.get('selected_attempt_id'): warnings.append('accepted_without_selection')
+        if not fd.get('selected_patch_path'): warnings.append('accepted_without_selected_patch_path')
+    return warnings
+
 def h_finalize(state, inp, ctx):
-    if state.is_terminal() and state.final_decision and state.final_decision.get('decision')==inp.decision:
-        return state.final_decision
+    if state.is_terminal():
+        return {**(state.final_decision or {}), 'already_finalized': True}
     if inp.decision!='accepted':
         pending=[]
         for c in state.candidates:
@@ -1001,7 +1013,11 @@ def h_finalize(state, inp, ctx):
         changed=a.get('changed_files') if isinstance(a,dict) else a.changed_files
         val=a.get('validation') if isinstance(a,dict) else a.validation
         final_payload['summary']=f"Selected {aid} changed {', '.join(changed or []) or 'no files'}; current validation {((val or {}).get('status') or 'not_run')}." + ((' '+final_payload.get('summary','')) if final_payload.get('summary') else '')
-    state.final_decision=final_payload; state.status='completed' if inp.decision=='accepted' else 'failed'; state.phase='completed' if state.status=='completed' else 'failed'; ctx.recorder.record('run_finalized', payload=state.final_decision); return state.final_decision
+    state.final_decision=final_payload; state.status='completed' if inp.decision=='accepted' else 'failed'; state.phase='completed' if state.status=='completed' else 'failed';
+    consistency_warnings=validate_final_state_consistency(state)
+    if consistency_warnings:
+        state.warnings=sorted(set(state.warnings+consistency_warnings)); state.final_decision['consistency_warnings']=consistency_warnings
+    ctx.recorder.record('run_finalized', payload=state.final_decision); return state.final_decision
 OPS_TOOLS={
 'ops_get_state':ToolSpec('ops_get_state','Inspect canonical run state',OpsGetStateInput,h_get_state,True),
 'ops_inspect_repo':ToolSpec('ops_inspect_repo','Inspect repository',OpsInspectRepoInput,h_inspect_repo,True),

@@ -9,9 +9,16 @@ from .artifacts import read_text_utf8, write_json_utf8
 
 class OpsEventRecorder:
     def __init__(self, run_dir:Path, run_id:str, on_event:Callable[[OpsEvent],None]|None=None):
-        self.run_dir=Path(run_dir); self.run_id=run_id; self.path=self.run_dir/'runtime_events.jsonl'; self.run_dir.mkdir(parents=True,exist_ok=True); self._lock=threading.Lock(); self.on_event=on_event
+        self.run_dir=Path(run_dir); self.run_id=run_id; self.path=self.run_dir/'runtime_events.jsonl'; self.run_dir.mkdir(parents=True,exist_ok=True); self._lock=threading.Lock(); self.on_event=on_event; self._dedupe_keys=set()
     def record(self,type:str,payload:dict|None=None,**fields)->None:
-        ev=OpsEvent(event_id=str(uuid.uuid4()),run_id=self.run_id,timestamp=datetime.now(timezone.utc).isoformat(),type=type,payload=payload or {},**fields)
+        payload = payload or {}
+        if type in {'selection_completed','run_finalized'}:
+            key=(type, payload.get('selected_attempt_id'), payload.get('decision'))
+            with self._lock:
+                if key in self._dedupe_keys:
+                    return
+                self._dedupe_keys.add(key)
+        ev=OpsEvent(event_id=str(uuid.uuid4()),run_id=self.run_id,timestamp=datetime.now(timezone.utc).isoformat(),type=type,payload=payload,**fields)
         line=json.dumps(ev.model_dump(mode='json'), ensure_ascii=False, default=str)+"\n"
         with self._lock:
             with self.path.open('a', encoding='utf-8', newline='\n') as f:

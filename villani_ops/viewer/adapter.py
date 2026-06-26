@@ -162,36 +162,59 @@ def _model(state, usage, events):
     return str(state.get('backend_name') or '')
 
 def build_viewer_graph_layout(snapshot_or_state: dict[str,Any], events: list[dict[str,Any]]) -> dict[str,Any]:
-    types=_event_types(events); decomposed=bool(types & {'decomposition_submitted','subtask_attempt_started','integration_started'}); fallback='decomposition_deadlock_detected' in types or 'candidate_fallback_started' in types
-    nodes={}; edges=[]
-    def node(id,label,type,row,col,status='pending',subtitle=''):
-        old=nodes.get(id,{}); nodes[id]={**old,'id':id,'label':label,'type':type,'status':status or old.get('status','pending'),'row':row,'col':col,'subtitle':subtitle or old.get('subtitle',''),'metrics':old.get('metrics',{})}
+    state=snapshot_or_state or {}; types=_event_types(events)
+    decomposed=bool(state.get('decomposition') or state.get('decomposition_requested') or types & {'decomposition_submitted','subtask_attempt_started','integration_started'})
+    fallback=bool(state.get('fallback_used') or 'candidate_fallback_started' in types)
+    dead=bool(state.get('decomposed_execution_status') in {'blocked','failed'} or 'decomposition_deadlock_detected' in types)
+    nodes=[]; edges=[]
+    def counts(prefix):
+        return sum(1 for e in events if (e.get('type') or '').startswith(prefix))
+    def add(id,label,type,row,col,status='pending',summary='',details=None,children=None):
+        nodes.append({'id':id,'label':label,'type':type,'row':row,'col':col,'status':status,'subtitle':summary,'summary':summary,'details':details or {},'children':children or []})
     def edge(a,b,status='active'):
-        if a in nodes and b in nodes and not any(e['source']==a and e['target']==b for e in edges): edges.append({'id':f'edge_{a}_{b}','source':a,'target':b,'status':status})
-    base=[('investigate','Investigate','investigate'),('classify','Classify','classify'),('plan','Plan','plan')]
-    if decomposed or fallback: base += [('decompose','Decompose','decompose')]
-    base += [('select_path','Select Path','select_path')]
-    completed={'investigate':'investigation_submitted','classify':'classification_submitted','plan':'plan_submitted','decompose':'decomposition_submitted','select_path':'execution_path_selected'}
-    for i,(id,lab,typ) in enumerate(base,1): node(id,lab,typ,1,i,'completed' if completed.get(id) in types else ('running' if id=='investigate' and 'run_started' in types else 'pending'))
-    for a,b in zip([x[0] for x in base],[x[0] for x in base][1:]): edge(a,b)
-    mids=[]
-    ids=sorted({_subtask_id(e) for e in events if _subtask_id(e)} or {_attempt_id(e) for e in events if _attempt_id(e) and 'candidate' in (e.get('type') or '')})
-    kind='subtask' if any(_subtask_id(e) for e in events) else 'candidate'
-    if kind=='subtask' and len(ids)>3: node('subtasks_group','Subtasks','group',2,1,'running' if 'subtask_attempt_started' in types else 'pending',f'{len(ids)} items'); edge('select_path','subtasks_group')
-    for idx,idv in enumerate(ids):
-        evs=[e for e in events if _subtask_id(e)==idv or _attempt_id(e)==idv]; last=evs[-1] if evs else {}; st=STATUS_BY_EVENT.get(last.get('type'),'pending')
-        col=(idx%4)+ (2 if kind=='subtask' and len(ids)>3 else 1); row=2+(idx//4)
-        node(idv,humanize_id(idv),kind,row,col,st,_subtitle(last)); mids.append(idv)
-        edge('subtasks_group' if kind=='subtask' and len(ids)>3 else 'select_path', idv)
-    final_row=4 if ids and len(ids)>4 else 3
-    finals=[('integrate','Integrate','integration_completed'),('validate','Validate','validation_completed'),('review','Review','candidate_attempt_reviewed'),('winner','Winner','selection_completed'),('finalize','Finalize','run_finalized')]
-    for i,(id,lab,typ) in enumerate(finals,1): node(id,lab,id,final_row,i,'completed' if typ in types else ('selected' if id=='winner' and typ in types else 'pending'))
-    for m in (mids[-1:] or ['select_path']): edge(m,'integrate' if decomposed else 'validate')
-    for a,b in [('integrate','validate'),('validate','review'),('review','winner'),('winner','finalize')]: edge(a,b)
-    return {'nodes':list(nodes.values()),'edges':edges}
+        edges.append({'id':f'edge_{a}_{b}','source':a,'target':b,'status':status})
+    add('investigation_group','Investigation','group',1,1,'completed' if 'investigation_submitted' in types else ('running' if 'run_started' in types else 'pending'),'Inspect and classify')
+    add('planning_group','Planning','group',1,2,'completed' if 'plan_submitted' in types else 'pending','Plan orchestration')
+    prev='planning_group'; edge('investigation_group','planning_group')
+    if decomposed:
+        subs=state.get('subtasks') or []
+        child=[{'id':x.get('subtask_id'),'status':x.get('status'),'attempts':[{'id':a.get('attempt_id'),'status':a.get('status')} for a in x.get('attempts',[])]} for x in subs if isinstance(x,dict)]
+        status='failed' if dead else ('completed' if state.get('decomposition_accepted') is True or 'decomposition_validation_completed' in types else 'pending')
+        add('decomposition_group','Decomposition','group',1,3,status,f"{len(child)} subtasks",{'blockers':state.get('decomposed_execution_blockers') or []},child)
+        edge(prev,'decomposition_group'); prev='decomposition_group'
+        if dead:
+            add('deadlock','Deadlock','deadlock',2,3,'blocked','Required subtask failed',{'failed_subtasks':state.get('decomposed_execution_failed_subtasks') or [],'blocked_subtasks':state.get('decomposed_execution_blocked_subtasks') or []})
+            edge('decomposition_group','deadlock','failed'); prev='deadlock'
+    sub_ids=sorted({_subtask_id(e) for e in events if _subtask_id(e)})
+    if sub_ids:
+        add('subtasks_group','Subtasks','group',2,4,'completed',f'{len(sub_ids)} subtasks',{},[{'id':sid,'attempts':[]} for sid in sub_ids])
+        for i,sid in enumerate(sub_ids[:3],1):
+            add(sid,humanize_id(sid),'subtask',2,4+i,'completed','summarized in subtasks group')
+            edge('subtasks_group',sid)
+    cand_ids=sorted({_attempt_id(e) for e in events if _attempt_id(e) and ('candidate' in (e.get('type') or '') or e.get('type')=='selection_completed')})
+    candidates=[c for c in state.get('candidates',[]) if isinstance(c,dict)]
+    if candidates:
+        cand_ids=sorted(set(cand_ids)|{c.get('attempt_id') for c in candidates if c.get('attempt_id')})
+    group_id='fallback_group' if fallback else 'candidate_group'
+    sel=(state.get('selection') or {}).get('selected_attempt_id')
+    cand_row = 3 if sub_ids else (1 if not dead else 2)
+    cand_col = 4 if not sub_ids else 4
+    add(group_id,'Fallback candidates' if fallback else 'Candidates','group',cand_row,cand_col,'completed' if cand_ids else 'pending',f"{len(cand_ids)} candidates",{},[{'id':cid,'status':next((c.get('status') for c in candidates if c.get('attempt_id')==cid),None),'validations':sum(1 for e in events if _attempt_id(e)==cid and (e.get('type') or '').startswith('validation_')),'reviews':sum(1 for e in events if _attempt_id(e)==cid and e.get('type')=='candidate_attempt_reviewed')} for cid in cand_ids])
+    edge(prev,group_id)
+    for i,cid in enumerate(cand_ids[:3],1):
+        add(cid,humanize_id(cid),'candidate',cand_row,cand_col+i,'selected' if cid==sel else 'completed','summarized in candidates group')
+        edge(group_id,cid)
+    final_row = 4 if sub_ids else 3
+    add('validation_group','Validation','group',final_row,5,'completed' if 'validation_completed' in types else ('failed' if 'validation_failed' in types else 'pending'),f"{counts('validation_')} validation events")
+    add('review_group','Review','group',final_row,6,'completed' if 'candidate_attempt_reviewed' in types or 'subtask_attempt_reviewed' in types else 'pending',f"{counts('review_')} retries")
+    add('selection_group','Selection','group',final_row,7,'selected' if sel or 'selection_completed' in types else 'pending',humanize_id(sel or 'winner'),{'selected_attempt_id':sel})
+    final_status='completed' if 'run_finalized' in types or state.get('status') in {'completed','failed'} else 'pending'
+    add('finalization_group','Finalization','group',final_row,8,final_status,state.get('status') or '',{'final_decision':state.get('final_decision')})
+    for a,b in [(group_id,'validation_group'),('validation_group','review_group'),('review_group','selection_group'),('selection_group','finalization_group')]: edge(a,b)
+    return {'nodes':nodes,'edges':edges}
 
 def build_viewer_snapshot(run_dir: Path) -> dict[str, Any]:
     run_dir=Path(run_dir); state=_read_json(run_dir/'state.json', {}) or {}; digest=_read_json(run_dir/'event_digest.json', {}) or {}; events=_read_jsonl(run_dir/'runtime_events.jsonl'); usage_rows=_read_jsonl(run_dir/'usage.jsonl')
     usage=_usage(run_dir,state,digest); rid=state.get('run_id') or digest.get('run_id') or run_dir.name; started=state.get('started_at') or (events[0].get('timestamp') if events else None); finalized=state.get('completed_at') or (events[-1].get('timestamp') if events and events[-1].get('type')=='run_finalized' else None); pct,label=_progress(state,events)
     status=state.get('status') or digest.get('status') or ('running' if events else 'unknown')
-    return _redact({'run':{'run_id':rid,'run_id_short':rid[:18]+('…' if len(rid)>18 else ''),'task':state.get('task') or state.get('objective') or digest.get('task') or '', 'status':status, 'mode':state.get('mode') or digest.get('mode') or 'performance','runner':state.get('runner') or digest.get('runner') or 'villani-code','model':_model(state, usage_rows, events), 'started_at':started, 'completed_at':finalized, 'duration_seconds':_duration(started, finalized),'progress_percent':pct,'progress_label':label,'result':state.get('final_decision') or digest.get('final_decision'),'run_dir':str(run_dir),'run_dir_short':'…/'+run_dir.name}, 'usage':usage, 'timeline':_timeline(events), 'graph':build_viewer_graph_layout(state,events), 'artifacts':{'state':'state.json','events':'runtime_events.jsonl','graph':'orchestration_graph.json','usage':'usage.json'}})
+    return _redact({'run':{'run_id':rid,'run_id_short':rid[:18]+('…' if len(rid)>18 else ''),'task':state.get('task') or state.get('objective') or digest.get('task') or '', 'status':status, 'mode':state.get('mode') or digest.get('mode') or 'performance','runner':state.get('runner') or digest.get('runner') or 'villani-code','model':_model(state, usage_rows, events), 'started_at':started, 'completed_at':finalized, 'duration_seconds':_duration(started, finalized),'progress_percent':pct,'progress_label':label,'result':state.get('final_decision') or digest.get('final_decision'),'run_dir':str(run_dir),'run_dir_short':'…/'+run_dir.name}, 'usage':usage, 'timeline':_timeline(events), 'graph':build_viewer_graph_layout(state,events), 'warnings':state.get('warnings') or digest.get('warnings') or [], 'errors':state.get('errors') or digest.get('errors') or [], 'artifacts':{'state':'state.json','events':'runtime_events.jsonl','graph':'orchestration_graph.json','usage':'usage.json'}})
