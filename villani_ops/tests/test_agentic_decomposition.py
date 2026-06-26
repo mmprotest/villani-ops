@@ -34,3 +34,45 @@ def test_rejected_decomposition_falls_back_then_launches_candidates(tmp_path):
     assert not execute_tool_with_policy(s,'ops_select_execution_path',{'path':'parallel_candidates','reason':'fallback'},'p',c).is_error
     assert not execute_tool_with_policy(s,'ops_launch_candidates',{'attempts':3,'reason':'go'},'l',c).is_error
     assert len(s.candidates)==3
+
+def test_recovery_recommends_select_path_after_accepted_decomposition(tmp_path):
+    from villani_ops.agentic.recovery import recommend_next_agentic_action
+    from villani_ops.agentic.state import SubtaskState
+    from villani_ops.tests.test_agentic_tools import state
+    s=state(tmp_path)
+    s.investigation={'summary':'i'}; s.plan={'summary':'p','should_decompose':True}
+    s.decomposition={'should_use_decomposition':True}
+    s.decomposition_validated=True; s.decomposition_accepted=True; s.execution_path='unknown'
+    s.subtasks=[SubtaskState(subtask_id='s0',title='s0',objective='o'),SubtaskState(subtask_id='s1',title='s1',objective='o')]
+    rec=recommend_next_agentic_action(s)
+    assert rec.tool_name == 'ops_select_execution_path'
+    assert rec.tool_input['path'] == 'decomposed_subtasks'
+    assert rec.can_execute_deterministically is True
+
+def test_recovery_recommends_ready_subtask_launch_after_path_selected(tmp_path):
+    from villani_ops.agentic.recovery import recommend_next_agentic_action
+    from villani_ops.agentic.state import SubtaskState
+    from villani_ops.tests.test_agentic_tools import state
+    s=state(tmp_path)
+    s.investigation={'summary':'i'}; s.plan={'summary':'p','should_decompose':True}
+    s.decomposition_validated=True; s.decomposition_accepted=True; s.execution_path='decomposed_subtasks'
+    s.subtasks=[SubtaskState(subtask_id='s0',title='s0',objective='o'),SubtaskState(subtask_id='s1',title='s1',objective='o',dependencies=['s0'])]
+    rec=recommend_next_agentic_action(s)
+    assert rec.tool_name == 'ops_launch_subtasks'
+    assert rec.tool_input['subtask_ids'] == ['s0']
+    assert rec.can_execute_deterministically is True
+
+def test_failed_finalize_blocked_while_accepted_decomposition_can_continue(tmp_path):
+    from villani_ops.agentic.state import SubtaskState
+    from villani_ops.tests.test_agentic_tools import state, ctx
+    from villani_ops.agentic.state_tooling import execute_tool_with_policy
+    s=state(tmp_path)
+    s.investigation={'summary':'i'}; s.plan={'summary':'p','should_decompose':True}
+    s.decomposition_validated=True; s.decomposition_accepted=True; s.execution_path='unknown'; s.recovery_count=1
+    s.subtasks=[SubtaskState(subtask_id='s0',title='s0',objective='o'),SubtaskState(subtask_id='s1',title='s1',objective='o')]
+    res=execute_tool_with_policy(s,'ops_finalize_run',{'decision':'failed','summary':'failed','blockers':['agentic_orchestrator_no_progress']},'fin',ctx(tmp_path))
+    assert res.is_error
+    assert 'deterministic next action' in str(res.content)
+    s.execution_path='decomposed_subtasks'
+    res=execute_tool_with_policy(s,'ops_finalize_run',{'decision':'failed','summary':'failed','blockers':['agentic_orchestrator_no_progress']},'fin2',ctx(tmp_path))
+    assert res.is_error

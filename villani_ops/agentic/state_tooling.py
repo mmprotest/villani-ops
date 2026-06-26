@@ -13,7 +13,7 @@ class OpsToolResult(BaseModel):
 
 def _allowed(state, name, data):
     if name in {'ops_get_state','ops_inspect_repo','ops_submit_classification'}: return True, None
-    if name not in state.allowed_next_actions(): return False, f'{name} is not allowed in phase {state.phase}; allowed={state.allowed_next_actions()}'
+    if name not in state.allowed_next_actions() and name!='ops_finalize_run': return False, f'{name} is not allowed in phase {state.phase}; allowed={state.allowed_next_actions()}'
     if name=='ops_submit_decomposition' and not (state.plan or {}).get('should_decompose'): return False,'plan did not request decomposition'
     if name=='ops_validate_decomposition' and not state.decomposition: return False,'no decomposition exists'
     if name=='ops_select_execution_path':
@@ -37,8 +37,14 @@ def _allowed(state, name, data):
             return False,'accepted finalization requires valid selection'
         if data.get('decision')=='rejected' and not (state.candidates or any(s.attempts for s in state.subtasks) or state.last_error or data.get('blockers')):
             return False,'rejected finalization requires attempted work or hard blocker'
-        if data.get('decision')=='failed' and not (state.last_error or state.recovery_count>0 or data.get('blockers')):
-            return False,'failed finalization requires fatal error or blocker'
+        if data.get('decision')=='failed':
+            accepted_pending=state.decomposition_validated and state.decomposition_accepted is True and state.execution_path=='unknown' and any(s.status=='pending' for s in state.subtasks)
+            selected_pending=state.execution_path=='decomposed_subtasks' and state.decomposition_accepted is True and any(s.status=='pending' and not s.attempts for s in state.subtasks) and not any(a.status in {'scheduled','running'} for s in state.subtasks for a in s.attempts)
+            fatal=bool(data.get('blockers') and any('fatal' in str(b) or 'deadlock' in str(b) or 'required_subtask_failed' in str(b) for b in data.get('blockers')))
+            if (accepted_pending or selected_pending) and not fatal:
+                return False,'failed finalization blocked while accepted decomposition has a deterministic next action'
+            if not (state.last_error or state.recovery_count>0 or data.get('blockers')):
+                return False,'failed finalization requires fatal error or blocker'
     return True,None
 
 def execute_tool_with_policy(state, tool_name:str, tool_input:dict, tool_use_id:str, context:OpsToolContext)->OpsToolResult:

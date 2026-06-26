@@ -28,7 +28,21 @@ def _review_passed(a):
     r=(a.get('review') if isinstance(a,dict) else a.review) or {}
     return r.get('decision')=='pass' and r.get('recommended_action')=='accept' and not r.get('blockers')
 
+
+def _ready_subtask_ids(state):
+    by={s.subtask_id:s for s in state.subtasks}
+    return [s.subtask_id for s in state.subtasks if s.status=='pending' and all(by[d].status=='accepted' for d in s.dependencies)]
+
+def _has_active_subtask_attempts(state):
+    return any(a.status in {'scheduled','running'} for s in state.subtasks for a in s.attempts)
+
 def recommend_next_agentic_action(state):
+    if state.decomposition_validated and state.decomposition_accepted is True and state.execution_path=='unknown' and state.subtasks:
+        return RecoveryRecommendation(action='select_decomposed_execution_path',tool_name='ops_select_execution_path',tool_input={'path':'decomposed_subtasks','reason':'Decomposition has been validated and accepted.'},reason='Accepted decomposition has no selected execution path.',can_execute_deterministically=True)
+    if state.execution_path=='decomposed_subtasks' and state.decomposition_accepted is True and state.subtasks and not _has_active_subtask_attempts(state) and all(s.status=='pending' and not s.attempts for s in state.subtasks):
+        ready=_ready_subtask_ids(state)
+        if ready:
+            return RecoveryRecommendation(action='launch_decomposition_subtasks',tool_name='ops_launch_subtasks',tool_input={'subtask_ids':ready,'attempts_per_subtask':state.candidate_attempts,'reason':'Launch accepted decomposition subtasks.'},reason='Accepted decomposition execution path selected but no subtasks have launched.',can_execute_deterministically=True)
     dead=detect_decomposition_deadlock(state)
     if dead and state.fallback_execution_path!='parallel_candidates_after_decomposition_deadlock' and not state.candidates:
         return RecoveryRecommendation(action='start_candidate_fallback',tool_name='ops_start_candidate_fallback',tool_input={'reason':'required subtask failed and dependent subtasks are blocked'},reason='decomposition deadlock detected; full-task candidate fallback is available',can_execute_deterministically=True)
@@ -60,16 +74,21 @@ def recommend_next_agentic_action(state):
         return RecoveryRecommendation(action='finalize_failed' if detect_decomposition_deadlock(state) else 'reject_all',tool_name=('ops_finalize_run' if detect_decomposition_deadlock(state) else 'ops_select_winner'),tool_input=({'decision':'failed','summary':'Decomposed execution deadlocked and no centrally eligible fallback candidate is available.','blockers':['required_subtask_failed','decomposition_deadlocked','candidate_fallback_unavailable']} if detect_decomposition_deadlock(state) else {'decision':'reject_all','summary':'No centrally eligible result is available.','reasons':sorted(set(blockers)),'rejected_attempts':[_aid(a) for a in _attempts(state) if _aid(a)],'confidence':0.8}),reason='all attempted results are ineligible',can_execute_deterministically=True)
     return RecoveryRecommendation(action='ask_model',reason='no deterministic recovery action available')
 
+def _recovery_prompt(content):
+    return {'role':'user','content':"You returned no real tool call.\n\nDo not write XML-style tool calls such as <tool_call> or <function=...>. Use the provider's actual tool-calling interface.\n\n"+content+"\n\nCall exactly one available tool."}
+
 def handle_no_tool_call(state, reason='no_tool_call', max_recovery_attempts:int=2):
-    state.recovery_count += 1
     rec=recommend_next_agentic_action(state)
     if rec.tool_name:
-        content=f"RECOVERY MODE:\nCall {rec.tool_name} with this input: {rec.tool_input}. Reason: {rec.reason}"
+        content=f"Call {rec.tool_name} with this input: {rec.tool_input}. Reason: {rec.reason}"
+        if rec.tool_name=='ops_select_execution_path' and rec.tool_input and rec.tool_input.get('path')=='decomposed_subtasks':
+            content='Call ops_select_execution_path with path="decomposed_subtasks".'
         if rec.tool_name=='ops_select_winner' and rec.tool_input and rec.tool_input.get('selected_attempt_id'):
             content=f"There is a reviewed and validated eligible candidate: {rec.tool_input['selected_attempt_id']}. Call ops_select_winner."
         if rec.tool_name=='ops_run_validation' and rec.tool_input:
             content=f"Validation is needed or was rejected. Call ops_run_validation with target=\"candidate\", target_id=\"{rec.tool_input.get('target_id')}\", command \"python -m pytest --tb=short -v\"."
-        return RecoveryResult(message={'role':'user','content':content}, recommendation=rec)
+        return RecoveryResult(message=_recovery_prompt(content), recommendation=rec)
+    state.recovery_count += 1
     if state.recovery_count>max_recovery_attempts:
         return RecoveryResult(should_fail=True,message={'role':'user','content':'RECOVERY FAILED: agentic_orchestrator_no_progress'},recommendation=rec)
-    return RecoveryResult(message={'role':'user','content':'RECOVERY MODE:\nThe run is active but no valid progress occurred. You must call exactly one valid tool. Call ops_get_state if unsure. Do not respond in prose.'},recommendation=rec)
+    return RecoveryResult(message=_recovery_prompt('The run is active but no valid progress occurred. Call ops_get_state if unsure. Do not respond in prose.'),recommendation=rec)

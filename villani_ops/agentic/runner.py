@@ -116,6 +116,10 @@ class OpsRunner:
                     rec.record('recovery_deterministic_action_executed', payload=rr.recommendation.model_dump())
                     res=execute_tool_with_policy(state,rr.recommendation.tool_name,rr.recommendation.tool_input or {},'recovery',OpsToolContext(run_dir=run_dir,recorder=rec,transcript=transcript,runner_adapter=runner_adapter,reviewer=reviewer,backend=backend,backend_name=getattr(backend,'name',None),coding_backend=coding_backend,coding_backend_name=coding_name,review_backend=review_backend,review_backend_name=review_name,timeout_seconds=request.timeout_seconds,max_parallel=getattr(coding_backend,'max_parallel',1),production=request.production,allow_fake_dependencies=request.allow_fake_dependencies))
                     block={'type':'tool_result','tool_use_id':res.tool_use_id,'content':res.content,'is_error':res.is_error}; transcript.append(block); messages.append({'role':'tool','tool_call_id':res.tool_use_id,'content':str(res.content)}); rec.record('tool_result_appended',tool_name=res.tool_name,payload=block)
+                    if not res.is_error:
+                        state.recovery_count=0
+                        state.turns_since_progress=0
+                        state.save(run_dir/'state.json')
                     continue
                 messages.append(rr.message); state.save(run_dir/'state.json')
                 if rr.should_fail:
