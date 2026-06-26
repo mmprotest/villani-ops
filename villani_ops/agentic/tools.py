@@ -11,31 +11,74 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 def extract_changed_file_metadata(diff_text:str)->dict[str,list[str]]:
-    changed=[]; added=[]; deleted=[]; modified=[]; renamed=[]; old=None
+    """Extract stable changed-file metadata from unified/git/binary diffs.
+
+    Prefer ``diff --git a/old b/new`` headers because binary hunks often only
+    contain ``Binary files a/foo and b/foo differ`` and older internal formats
+    may include ``Binary files differ: rel``.  Never treat grammar words such as
+    "files" or "differ:" as paths.
+    """
+    changed=[]; added=[]; deleted=[]; modified=[]; renamed=[]
+    current_old=None; current_new=None; current_status=None; pending_old=None
     def norm(p):
-        p=p.strip()
+        if not p: return None
+        p=p.strip().strip('"')
         if p=='/dev/null': return None
-        return p[2:] if p.startswith(('a/','b/')) else p
-    def add(lst, v):
+        if p.startswith(('a/','b/')): p=p[2:]
+        return p or None
+    def add(lst,v):
+        v=norm(v)
         if v and v not in lst: lst.append(v)
-    for line in diff_text.splitlines():
-        if line.startswith('rename from '):
-            old=norm('a/'+line[len('rename from '):].strip()); continue
-        if line.startswith('rename to '):
-            new=norm('b/'+line[len('rename to '):].strip()); add(renamed,new); add(changed,new); old=None; continue
-        if line.startswith('Binary files ') and ' differ' in line:
-            parts=line.split();
-            for token in parts[2:4]: add(changed,norm(token))
+    def finalize():
+        nonlocal current_old,current_new,current_status
+        path=current_new or current_old
+        if not path: return
+        add(changed,path)
+        if current_status=='added': add(added,path)
+        elif current_status=='deleted': add(deleted,path)
+        elif current_status=='renamed': add(renamed,path)
+        else: add(modified,path)
+    for raw in diff_text.splitlines():
+        line=raw.rstrip('\n')
+        if line.startswith('diff --git '):
+            finalize(); current_status=None
+            parts=line.split()
+            current_old=norm(parts[2]) if len(parts)>2 else None
+            current_new=norm(parts[3]) if len(parts)>3 else current_old
             continue
+        if line.startswith('new file mode '): current_status='added'; continue
+        if line.startswith('deleted file mode '): current_status='deleted'; continue
+        if line.startswith('rename from '):
+            current_old=norm(line[len('rename from '):].strip()); current_status='renamed'; continue
+        if line.startswith('rename to '):
+            current_new=norm(line[len('rename to '):].strip()); current_status='renamed'; add(renamed,current_new); add(changed,current_new); continue
         if line.startswith('--- '):
-            old=norm(line[4:].split('	',1)[0]); continue
+            pending_old=norm(line[4:].split('\t',1)[0]); continue
         if line.startswith('+++ '):
-            new=norm(line[4:].split('	',1)[0])
-            if old and not new: add(deleted,old); add(changed,old)
-            elif new and not old: add(added,new); add(changed,new)
-            elif new: add(modified,new); add(changed,new)
+            new=norm(line[4:].split('\t',1)[0]); old=pending_old; pending_old=None
+            if current_old is None: current_old=old
+            if current_new is None: current_new=new or old
+            if old and not new: current_status=current_status or 'deleted'; add(deleted,old); add(changed,old)
+            elif new and not old: current_status=current_status or 'added'; add(added,new); add(changed,new)
+            elif new: add(changed,new); add(modified,new)
             elif old: add(changed,old)
-            old=None
+            continue
+        if line.startswith('Binary files '):
+            # Git format: Binary files a/path and b/path differ.  Internal
+            # legacy format: Binary files differ: path.
+            body=line[len('Binary files '):]
+            if ' and ' in body and body.endswith(' differ'):
+                left,right=body[:-len(' differ')].split(' and ',1)
+                current_old=current_old or norm(left); current_new=current_new or norm(right)
+                add(changed,current_new or current_old)
+                if current_status=='added': add(added,current_new)
+                elif current_status=='deleted': add(deleted,current_old)
+                elif current_status=='renamed': add(renamed,current_new)
+                else: add(modified,current_new or current_old)
+            elif body.startswith('differ:'):
+                add(changed, body[len('differ:'):].strip()); add(modified, body[len('differ:'):].strip())
+            continue
+    finalize()
     return {'changed_files':changed,'added_files':added,'deleted_files':deleted,'modified_files':modified,'renamed_files':renamed}
 
 def _read_text_tail(path, max_chars=12000):
@@ -190,7 +233,7 @@ def _require_real_execution(ctx):
         if ctx.coding_backend is None and ctx.backend is None: raise ValueError('agentic_backend_role_unavailable: coding')
         if _is_fake_dependency(ctx.coding_backend or ctx.backend): raise ValueError('fake coding backend forbidden in production agentic mode')
 
-def _run_attempt(state, ctx, aid, scope, task, success, subtask_id=None, backend_name=None):
+def _run_attempt(state, ctx, aid, scope, task, success, subtask_id=None, backend_name=None, record_events=True):
     _require_real_execution(ctx)
     backend=ctx.coding_backend or ctx.backend
     if ctx.runner_adapter is None: raise ValueError('agentic_runner_adapter_missing')
@@ -199,7 +242,8 @@ def _run_attempt(state, ctx, aid, scope, task, success, subtask_id=None, backend
     wtree=adir/'worktree'
     a=_attempt(aid,scope,subtask_id=subtask_id,backend=backend_name or ctx.coding_backend_name or getattr(backend,'name',None),artifacts=adir)
     a.status='running'; a.worktree_path=str(wtree); a.started_at=str(time.time())
-    ctx.recorder.record(f'{scope}_attempt_started', payload={'attempt_id':aid,'subtask_id':subtask_id,'status':'running','artifact_paths':{'artifacts_dir':str(adir)}})
+    if record_events:
+        ctx.recorder.record(f'{scope}_attempt_started', payload={'attempt_id':aid,'subtask_id':subtask_id,'status':'running','artifact_paths':{'artifacts_dir':str(adir)}})
     try:
         _copy_worktree(Path(state.repo_path), wtree)
         res=ctx.runner_adapter.run_task(repo_path=wtree,task=task,success_criteria=success,backend_name=a.backend_name or '',backend_config=backend,timeout_seconds=ctx.timeout_seconds,context={'attempt_id':aid,'subtask_id':subtask_id,'parent_task':state.task},artifacts_dir=adir)
@@ -214,13 +258,15 @@ def _run_attempt(state, ctx, aid, scope, task, success, subtask_id=None, backend
         a.status='completed' if ok else 'failed'
         if not ok: a.failure_reason=(getattr(res,'stderr','') or getattr(res,'status',None) or f'runner exit code is {a.exit_code}')[:1000]
         ev=f'{scope}_attempt_completed' if ok else f'{scope}_attempt_failed'
-        ctx.recorder.record(ev, payload={'attempt_id':aid,'subtask_id':subtask_id,'status':a.status,'exit_code':getattr(res,'exit_code',None),'failure_reason':getattr(res,'stderr','') if not ok else None,'artifact_paths':{'stdout':a.stdout_path,'stderr':a.stderr_path,'patch':a.patch_path}})
+        if record_events:
+            ctx.recorder.record(ev, payload={'attempt_id':aid,'subtask_id':subtask_id,'status':a.status,'exit_code':getattr(res,'exit_code',None),'failure_reason':getattr(res,'stderr','') if not ok else None,'artifact_paths':{'stdout':a.stdout_path,'stderr':a.stderr_path,'patch':a.patch_path}})
     except Exception as e:
         a.status='failed'; a.completed_at=str(time.time()); a.duration_seconds=float(a.completed_at)-float(a.started_at or a.completed_at); a.failure_reason=f'{type(e).__name__}: {e}'; a.runner_error_type=type(e).__name__; a.runner_status='exception'; a.acceptance_eligible=False; a.acceptance_blockers=['runner_exception', f'runner_exception: {type(e).__name__}: {e}']
         a.stdout_path=str(adir/'stdout.log'); a.stderr_path=str(adir/'stderr.log')
         if not Path(a.stdout_path).exists(): Path(a.stdout_path).write_text('')
         Path(a.stderr_path).write_text(f'{type(e).__name__}: {e}\n')
-        ctx.recorder.record(f'{scope}_attempt_failed', payload={'attempt_id':aid,'subtask_id':subtask_id,'status':'failed','failure_reason':a.acceptance_blockers[0],'artifact_paths':{'stdout':a.stdout_path,'stderr':a.stderr_path,'artifacts_dir':str(adir)}})
+        if record_events:
+            ctx.recorder.record(f'{scope}_attempt_failed', payload={'attempt_id':aid,'subtask_id':subtask_id,'status':'failed','failure_reason':a.acceptance_blockers[0],'artifact_paths':{'stdout':a.stdout_path,'stderr':a.stderr_path,'artifacts_dir':str(adir)}})
     if a.completed_at and a.started_at and a.duration_seconds is None:
         a.duration_seconds=float(a.completed_at)-float(a.started_at)
     _set_acceptance_from_gate(state,a)
@@ -230,47 +276,106 @@ def h_launch_candidates(state, inp, ctx):
     if state.execution_path!='parallel_candidates': raise ValueError('candidates require parallel_candidates execution path')
     made=[]; maxp=max(1, int(getattr(ctx.coding_backend or ctx.backend,'max_parallel',None) or ctx.max_parallel or 1))
     state.max_parallel=maxp
-    total=int(inp.attempts)
+    total=int(inp.attempts); batch_count=0; final_mode='sequential_due_max_parallel_1' if maxp<=1 or total<=1 else 'parallel_candidates'
     for off in range(0,total,maxp):
-        batch=list(range(off, min(off+maxp,total)))
-        mode='parallel' if len(batch)>1 else 'sequential'
-        state.concurrency_mode=mode
+        batch=list(range(off, min(off+maxp,total))); batch_count+=1
+        ids=[]; futs=[]
         with ThreadPoolExecutor(max_workers=len(batch)) as ex:
-            futs=[]
-            ids=[]
-            for i in batch:
+            for _i in batch:
                 aid=f'candidate_{len(state.candidates)+len(ids)+1:03d}'
                 ids.append(aid); made.append(aid)
-                futs.append(ex.submit(_run_attempt,state,ctx,aid,'candidate',state.task,state.success_criteria,None,inp.backend_name or ctx.coding_backend_name or ctx.backend_name))
-            results=[]
+                scheduled=_attempt(aid,'candidate',backend=inp.backend_name or ctx.coding_backend_name or ctx.backend_name,artifacts=Path(state.run_dir)/'attempts'/aid)
+                scheduled.status='running'; scheduled.started_at=str(time.time()); scheduled.worktree_path=str(Path(state.run_dir)/'attempts'/aid/'worktree')
+                state.candidates.append(scheduled)
+                ctx.recorder.record('candidate_attempt_started', payload={'attempt_id':aid,'status':'running','batch_index':batch_count,'artifact_paths':{'artifacts_dir':scheduled.artifacts_dir}})
+                futs.append(ex.submit(_run_attempt,state,ctx,aid,'candidate',state.task,state.success_criteria,None,inp.backend_name or ctx.coding_backend_name or ctx.backend_name,False))
+            byid={}
             for fut in as_completed(futs):
-                results.append(fut.result())
-        byid={a.attempt_id:a for a in results}
+                res=fut.result(); byid[res.attempt_id]=res
         for aid in ids:
-            state.candidates.append(byid[aid])
-    state.phase='selecting'; return {'launched':made,'max_parallel':maxp,'batch_count':(len(made)+maxp-1)//maxp,'concurrency_mode':state.concurrency_mode,'semantics':'attempts execute in isolated worktrees; batches never exceed max_parallel'}
+            res=byid[aid]
+            for idx,c in enumerate(state.candidates):
+                if c.attempt_id==aid:
+                    state.candidates[idx]=res; break
+            ev='candidate_attempt_completed' if res.status=='completed' else 'candidate_attempt_failed'
+            ctx.recorder.record(ev, payload={'attempt_id':aid,'status':res.status,'exit_code':res.exit_code,'failure_reason':res.failure_reason,'batch_index':batch_count,'artifact_paths':{'stdout':res.stdout_path,'stderr':res.stderr_path,'patch':res.patch_path}})
+        state.save(Path(state.run_dir)/'state.json')
+    state.concurrency_mode=final_mode; state.batch_count=batch_count
+    state.candidate_concurrency={'concurrency_mode':final_mode,'max_parallel':maxp,'batch_count':batch_count,'worker_state_mutation':'disabled'}
+    state.execution_concurrency={'candidate_concurrency_mode':final_mode,'max_parallel':maxp,'candidate_batch_count':batch_count}
+    state.phase='selecting'; return {'launched':made,'max_parallel':maxp,'batch_count':batch_count,'concurrency_mode':final_mode,'semantics':'attempts execute in isolated worktrees; main thread mutates OpsRunState; batches never exceed max_parallel'}
 
 def h_launch_subtasks(state, inp, ctx):
-    launched={}; by={s.subtask_id:s for s in state.subtasks}; state.max_parallel=max(1,int(getattr(ctx.coding_backend or ctx.backend,'max_parallel',None) or ctx.max_parallel or 1)); state.concurrency_mode='sequential_due_dependency_review_loop'
+    by={s.subtask_id:s for s in state.subtasks}
     for sid in inp.subtask_ids:
         if sid not in by: raise ValueError(f'unknown subtask {sid}')
-        st=by[sid]
-        if st.status=='accepted': continue
-        unmet=[d for d in st.dependencies if by[d].status!='accepted']
-        if unmet: continue
-        st.status='running'
-        for i in range(inp.attempts_per_subtask):
-            aid=f'{sid}_attempt_{len(st.attempts)+1:03d}'
-            task=f"Parent task:\n{state.task}\n\nParent success criteria:\n{state.success_criteria or ''}\n\nSubtask title:\n{st.title}\n\nSubtask objective:\n{st.objective}\n\nSubtask success criteria:\n{st.success_criteria or ''}\n\nRelevant files:\n{json.dumps(st.relevant_files)}\n\nDependency context:\n{json.dumps(st.dependencies)}\n\nMerge contract:\n{(state.decomposition or {}).get('merge_strategy') or ''}\n\nSolve only this subtask scope. Avoid unrelated broad changes. Do not perform the entire parent task unless this subtask explicitly requires it."
-            a=_run_attempt(state,ctx,aid,'subtask',task,st.success_criteria or state.success_criteria,subtask_id=sid,backend_name=inp.backend_name or ctx.coding_backend_name or ctx.backend_name)
-            st.attempts.append(a); launched.setdefault(sid,[]).append(aid)
-            if a.status=='completed':
-                if ctx.reviewer is not None and not a.review:
-                    h_review_attempt(state, OpsReviewAttemptInput(attempt_id=aid,scope='subtask'), ctx)
-                if a.acceptance_eligible:
-                    st.status='accepted'; st.accepted_attempt_id=aid; ctx.recorder.record('subtask_accepted', payload={'subtask_id':sid,'attempt_id':aid}); break
-        if st.status!='accepted': st.status='failed'; ctx.recorder.record('subtask_failed', payload={'subtask_id':sid,'attempts':len(st.attempts)})
-    state.phase='integrating' if all(s.status in {'accepted','skipped'} for s in state.subtasks) else 'running_subtasks'; return {'launched':launched,'max_parallel':state.max_parallel,'concurrency_mode':state.concurrency_mode,'warnings':['subtask execution remains sequential because each attempt is immediately reviewed before dependent subtasks unblock'],'semantics':'attempts_per_subtask controls attempts per subtask with early stop'}
+    maxp=max(1,int(getattr(ctx.coding_backend or ctx.backend,'max_parallel',None) or ctx.max_parallel or 1)); state.max_parallel=maxp
+    pending={sid for sid in inp.subtask_ids if by[sid].status not in {'accepted','failed','skipped'}}
+    launched={}; waves=[]; wave_index=0
+    mode='sequential_due_max_parallel_1' if maxp<=1 else 'parallel_runner_sequential_review'
+    while pending:
+        ready=[sid for sid in inp.subtask_ids if sid in pending and all(by[d].status=='accepted' for d in by[sid].dependencies)]
+        blocked=[sid for sid in pending if sid not in ready]
+        if not ready:
+            for sid in list(pending):
+                st=by[sid]; st.status='skipped'
+                ctx.recorder.record('subtask_blocked', payload={'subtask_id':sid,'reason':'unmet_dependencies','dependencies':st.dependencies,'blocked_dependencies':[d for d in st.dependencies if by[d].status!='accepted']})
+            waves.append({'wave_index':wave_index+1,'ready_subtasks':[],'blocked_subtasks':sorted(blocked),'batch_size':0})
+            break
+        # Attempt loop for this dependency wave.  A subtask remains in the wave
+        # until accepted or attempts are exhausted; reviews are serialized on
+        # the main thread while runner attempts in a batch are concurrent.
+        wave_active=list(ready); wave_index+=1
+        for sid in wave_active: by[sid].status='running'
+        for attempt_round in range(inp.attempts_per_subtask):
+            runnable=[sid for sid in wave_active if by[sid].status=='running']
+            if not runnable: break
+            for off in range(0,len(runnable),maxp):
+                batch=runnable[off:off+maxp]
+                waves.append({'wave_index':wave_index,'ready_subtasks':batch,'blocked_subtasks':sorted(blocked),'batch_size':len(batch),'attempt_round':attempt_round+1})
+                futs={}; ids={}
+                with ThreadPoolExecutor(max_workers=len(batch)) as ex:
+                    for sid in batch:
+                        st=by[sid]; aid=f'{sid}_attempt_{len(st.attempts)+1:03d}'
+                        task=f"Parent task:\n{state.task}\n\nParent success criteria:\n{state.success_criteria or ''}\n\nSubtask title:\n{st.title}\n\nSubtask objective:\n{st.objective}\n\nSubtask success criteria:\n{st.success_criteria or ''}\n\nRelevant files:\n{json.dumps(st.relevant_files)}\n\nDependency context:\n{json.dumps(st.dependencies)}\n\nMerge contract:\n{(state.decomposition or {}).get('merge_strategy') or ''}\n\nSolve only this subtask scope. Avoid unrelated broad changes. Do not perform the entire parent task unless this subtask explicitly requires it."
+                        scheduled=_attempt(aid,'subtask',subtask_id=sid,backend=inp.backend_name or ctx.coding_backend_name or ctx.backend_name,artifacts=Path(state.run_dir)/'attempts'/aid)
+                        scheduled.status='running'; scheduled.started_at=str(time.time()); scheduled.worktree_path=str(Path(state.run_dir)/'attempts'/aid/'worktree')
+                        st.attempts.append(scheduled); launched.setdefault(sid,[]).append(aid); ids[aid]=sid
+                        ctx.recorder.record('subtask_attempt_started', payload={'attempt_id':aid,'subtask_id':sid,'wave_index':wave_index,'attempt_round':attempt_round+1})
+                        futs[ex.submit(_run_attempt,state,ctx,aid,'subtask',task,st.success_criteria or state.success_criteria,subtask_id=sid,backend_name=inp.backend_name or ctx.coding_backend_name or ctx.backend_name,record_events=False)]=aid
+                    results={}
+                    for fut in as_completed(futs):
+                        res=fut.result(); results[res.attempt_id]=res
+                for aid,res in results.items():
+                    sid=ids[aid]; st=by[sid]
+                    for i,a in enumerate(st.attempts):
+                        if a.attempt_id==aid: st.attempts[i]=res; break
+                    ctx.recorder.record('subtask_attempt_completed' if res.status=='completed' else 'subtask_attempt_failed', payload={'attempt_id':aid,'subtask_id':sid,'status':res.status,'exit_code':res.exit_code,'failure_reason':res.failure_reason,'wave_index':wave_index})
+                # Serialized review on main thread.
+                for aid in [a for a in ids if a in results]:
+                    sid=ids[aid]; st=by[sid]
+                    a,_=_find_attempt(state, aid)
+                    if a and not isinstance(a,dict) and a.status=='completed' and ctx.reviewer is not None and not a.review:
+                        h_review_attempt(state, OpsReviewAttemptInput(attempt_id=aid,scope='subtask'), ctx)
+                    if st.accepted_attempt_id:
+                        st.status='accepted'; ctx.recorder.record('subtask_accepted', payload={'subtask_id':sid,'attempt_id':st.accepted_attempt_id,'wave_index':wave_index})
+                state.save(Path(state.run_dir)/'state.json')
+        for sid in wave_active:
+            st=by[sid]
+            if st.status!='accepted':
+                st.status='failed'; ctx.recorder.record('subtask_failed', payload={'subtask_id':sid,'attempts':len(st.attempts),'reason':'attempts_exhausted'})
+            pending.discard(sid)
+        # Block dependents immediately if any dependency failed.
+        for sid in list(pending):
+            failed_deps=[d for d in by[sid].dependencies if by[d].status in {'failed','skipped'}]
+            if failed_deps:
+                by[sid].status='skipped'; pending.remove(sid); ctx.recorder.record('subtask_blocked', payload={'subtask_id':sid,'reason':'failed_dependencies','blocked_dependencies':failed_deps})
+    state.wave_count=wave_index; state.concurrency_mode=mode
+    state.subtask_concurrency={'concurrency_mode':mode,'max_parallel':maxp,'wave_count':wave_index,'waves':waves,'review':'sequential_main_thread'}
+    state.execution_concurrency={**(state.execution_concurrency or {}),'subtask_concurrency_mode':mode,'subtask_wave_count':wave_index,'max_parallel':maxp}
+    state.phase='integrating' if all(s.status in {'accepted','skipped'} for s in state.subtasks) else 'running_subtasks'
+    return {'launched':launched,'max_parallel':maxp,'wave_count':wave_index,'concurrency_mode':mode,'waves':waves,'semantics':'dependency waves; runner attempts concurrent up to max_parallel; reviews serialized on main thread'}
+
 def _find_attempt(state, aid):
     for c in state.candidates:
         if c.attempt_id==aid: return c, None
@@ -288,17 +393,30 @@ def h_review_attempt(state, inp, ctx):
     if ctx.reviewer is None: raise ValueError('agentic_real_reviewer_not_configured')
     if ctx.production and not ctx.allow_fake_dependencies and _is_fake_dependency(ctx.reviewer): raise ValueError('fake reviewer dependency forbidden in production agentic mode')
     payload=build_agentic_review_payload(state, a, inp.scope, st)
+    raw=None
     try:
-        raw=ctx.reviewer.review(state=state, attempt=payload, scope=inp.scope) if hasattr(ctx.reviewer,'review') else ctx.reviewer(state,payload,inp.scope)
-    except TypeError:
-        raw=ctx.reviewer.review(state=state, attempt=a, scope=inp.scope) if hasattr(ctx.reviewer,'review') else ctx.reviewer(state,a,inp.scope)
-    res=OpsReviewResult.model_validate(raw)
+        try:
+            raw=ctx.reviewer.review(state=state, attempt=payload, scope=inp.scope) if hasattr(ctx.reviewer,'review') else ctx.reviewer(state,payload,inp.scope)
+        except TypeError:
+            raw=ctx.reviewer.review(state=state, attempt=a, scope=inp.scope) if hasattr(ctx.reviewer,'review') else ctx.reviewer(state,a,inp.scope)
+        res=OpsReviewResult.model_validate(raw)
+    except Exception as e:
+        res=OpsReviewResult(decision='fail',recommended_action='reject',score=0.0,summary='structured review failed',evidence=[],issues=[f'{type(e).__name__}: {e}'],blockers=['review_malformed'],confidence=0.0)
+        rdir=Path(state.run_dir)/'reviews'; rdir.mkdir(parents=True,exist_ok=True)
+        raw_path=rdir/f'{inp.attempt_id}_malformed_review.json'
+        raw_path.write_text(json.dumps({'raw_response':raw,'error':f'{type(e).__name__}: {e}'},indent=2,default=str))
+        if isinstance(a, dict): a.setdefault('review_artifacts',[]).append(str(raw_path))
+        else: a.acceptance_blockers=sorted(set(a.acceptance_blockers+['review_malformed']))
     if isinstance(a, dict):
         a['review']=res.model_dump(); a['status']='reviewed' if a.get('status') not in {'failed','completed'} else a.get('status')
         eligible, blockers=_set_acceptance_from_gate(state, a)
+        if res.blockers:
+            blockers=sorted(set(blockers+res.blockers)); a['acceptance_blockers']=blockers; eligible=False; a['acceptance_eligible']=False
     else:
         a.review=res.model_dump(); a.status='reviewed' if a.status!='failed' else 'rejected'
         eligible, blockers=_set_acceptance_from_gate(state, a)
+        if res.blockers:
+            blockers=sorted(set(blockers+res.blockers)); a.acceptance_blockers=blockers; eligible=False; a.acceptance_eligible=False
         if st and eligible:
             st.status='accepted'; st.accepted_attempt_id=a.attempt_id
     state.reviews.append({'attempt_id':inp.attempt_id,**res.model_dump(),'acceptance_eligible':eligible,'acceptance_blockers':blockers})
@@ -312,6 +430,40 @@ def _accepted_subtask_attempt(state, st):
             return a
     return None
 
+def _subtasks_dependency_order(subtasks):
+    by={s.subtask_id:s for s in subtasks}; order=[]; temp=set(); perm=set()
+    def visit(sid):
+        if sid in perm: return
+        if sid in temp: raise ValueError('dependency cycle detected during integration ordering')
+        temp.add(sid)
+        for dep in by[sid].dependencies:
+            if dep in by: visit(dep)
+        temp.remove(sid); perm.add(sid); order.append(by[sid])
+    for s in subtasks: visit(s.subtask_id)
+    return order
+
+def _git_apply_patch_path(patch_path, idir, subtask_id):
+    text=Path(patch_path).read_text(errors='replace')
+    if any(line.startswith(('Added file: ','Deleted file: ','Modified file: ','Binary files differ:')) for line in text.splitlines()):
+        cleaned='\n'.join(line for line in text.splitlines() if not line.startswith(('Added file: ','Deleted file: ','Modified file: ')))+'\n'
+        tmp=idir/f'git_apply_input_{subtask_id}.patch'; tmp.write_text(cleaned); return str(tmp)
+    return patch_path
+
+def _write_integration_failure_artifacts(idir, subtask_id, patch_path, check=None, apply=None):
+    arts={}
+    if patch_path:
+        dst=idir/f'failed_patch_{subtask_id}.patch'
+        try: dst.write_text(Path(patch_path).read_text(errors='replace'))
+        except Exception as e: dst.write_text(f'unreadable patch {patch_path}: {type(e).__name__}: {e}\n')
+        arts['failed_patch']=str(dst)
+    if check is not None:
+        so=idir/'git_apply_check_stdout.log'; se=idir/'git_apply_check_stderr.log'; so.write_text(check.stdout or ''); se.write_text(check.stderr or '')
+        arts['git_apply_check_stdout']=str(so); arts['git_apply_check_stderr']=str(se)
+    if apply is not None:
+        so=idir/'git_apply_stdout.log'; se=idir/'git_apply_stderr.log'; so.write_text(apply.stdout or ''); se.write_text(apply.stderr or '')
+        arts['git_apply_stdout']=str(so); arts['git_apply_stderr']=str(se)
+    return arts
+
 def h_integrate(state, inp, ctx):
     if state.execution_path!='decomposed_subtasks': raise ValueError('integration requires decomposed_subtasks execution path')
     if state.decomposition_accepted is not True: raise ValueError('integration requires accepted decomposition')
@@ -324,17 +476,29 @@ def h_integrate(state, inp, ctx):
     iid='integration_001'; idir=Path(state.run_dir)/'integration'/iid; idir.mkdir(parents=True,exist_ok=True)
     wtree=idir/'worktree'; started=str(time.time()); conflicts=[]; applied=[]; failed=[]
     _copy_worktree(Path(state.repo_path), wtree)
-    for st in state.subtasks:
+    try:
+        ordered_subtasks=_subtasks_dependency_order(state.subtasks)
+    except ValueError as e:
+        state.integration={'attempt_id':iid,'scope':'integration','status':'failed','reason':inp.reason,'failure_reason':str(e),'failed_subtasks':[{'reason':str(e)}],'acceptance_eligible':False,'acceptance_blockers':['integration_ordering_failed'], 'conflict_artifacts':[]}
+        write_json_utf8 = lambda path, data: Path(path).write_text(json.dumps(data,indent=2))
+        write_json_utf8(idir/'integration_failure.json', state.integration)
+        ctx.recorder.record('integration_failed', payload=state.integration); return state.integration
+    for st in ordered_subtasks:
         if st.status=='skipped': continue
         a=_accepted_subtask_attempt(state, st)
         if not a or not a.patch_path:
             failed.append({'subtask_id':st.subtask_id,'reason':'missing accepted patch'}); continue
-        check=subprocess.run(['git','apply','--check',a.patch_path],cwd=wtree,text=True,capture_output=True)
+        apply_path=_git_apply_patch_path(a.patch_path, idir, st.subtask_id)
+        check=subprocess.run(['git','apply','--check',apply_path],cwd=wtree,text=True,capture_output=True)
         if check.returncode!=0:
-            conflicts.append({'subtask_id':st.subtask_id,'attempt_id':a.attempt_id,'stderr':check.stderr[-4000:]}); failed.append({'subtask_id':st.subtask_id,'attempt_id':a.attempt_id,'reason':'patch_apply_check_failed'}); continue
-        apply=subprocess.run(['git','apply',a.patch_path],cwd=wtree,text=True,capture_output=True)
+            arts=_write_integration_failure_artifacts(idir, st.subtask_id, a.patch_path, check=check)
+            item={'subtask_id':st.subtask_id,'attempt_id':a.attempt_id,'patch_path':a.patch_path,'exit_code':check.returncode,'stderr_tail':(check.stderr or '')[-4000:],'artifact_paths':arts}
+            conflicts.append(item); failed.append({**item,'reason':'patch_apply_check_failed'}); continue
+        apply=subprocess.run(['git','apply',apply_path],cwd=wtree,text=True,capture_output=True)
         if apply.returncode!=0:
-            conflicts.append({'subtask_id':st.subtask_id,'attempt_id':a.attempt_id,'stderr':apply.stderr[-4000:]}); failed.append({'subtask_id':st.subtask_id,'attempt_id':a.attempt_id,'reason':'patch_apply_failed'}); continue
+            arts=_write_integration_failure_artifacts(idir, st.subtask_id, a.patch_path, check=check, apply=apply)
+            item={'subtask_id':st.subtask_id,'attempt_id':a.attempt_id,'patch_path':a.patch_path,'exit_code':apply.returncode,'stderr_tail':(apply.stderr or '')[-4000:],'artifact_paths':arts}
+            conflicts.append(item); failed.append({**item,'reason':'patch_apply_failed'}); continue
         applied.append({'subtask_id':st.subtask_id,'attempt_id':a.attempt_id,'patch_path':a.patch_path})
     patch=capture_diff(Path(state.repo_path), wtree, idir/'diff.patch')
     meta=extract_changed_file_metadata(patch.read_text(errors='replace'))
@@ -342,8 +506,11 @@ def h_integrate(state, inp, ctx):
     blockers=[]
     if failed: blockers.append('integration_failed')
     if conflicts: blockers.append('merge_conflicts')
-    integ={'attempt_id':iid,'scope':'integration','status':status,'reason':inp.reason,'worktree_path':str(wtree),'artifacts_dir':str(idir),'patch_path':str(patch),'changed_files':meta['changed_files'],'added_files':meta['added_files'],'deleted_files':meta['deleted_files'],'modified_files':meta['modified_files'],'renamed_files':meta['renamed_files'],'merge_conflicts':conflicts,'applied_subtasks':applied,'failed_subtasks':failed,'failure_reason':'integration_failed' if status=='failed' else None,'started_at':started,'completed_at':str(time.time()),'acceptance_eligible':False,'acceptance_blockers':blockers or ['review_missing'],'review':None,'validation':None}
+    integ={'attempt_id':iid,'scope':'integration','status':status,'reason':inp.reason,'worktree_path':str(wtree),'artifacts_dir':str(idir),'patch_path':str(patch),'changed_files':meta['changed_files'],'added_files':meta['added_files'],'deleted_files':meta['deleted_files'],'modified_files':meta['modified_files'],'renamed_files':meta['renamed_files'],'merge_conflicts':conflicts,'conflict_artifacts':[p for c in conflicts for p in ((c.get('artifact_paths') or {}).values())],'applied_subtasks':applied,'applied_subtask_order':[x['subtask_id'] for x in applied],'failed_subtasks':failed,'failure_reason':'integration_failed' if status=='failed' else None,'started_at':started,'completed_at':str(time.time()),'acceptance_eligible':False,'acceptance_blockers':blockers or ['review_missing'],'review':None,'validation':None}
     state.integration=integ; _set_acceptance_from_gate(state, state.integration)
+    if status=='failed':
+        (idir/'integration_failure.json').write_text(json.dumps(state.integration,indent=2))
+        (idir/'integration_conflicts.txt').write_text('\n'.join((c.get('stderr_tail') or c.get('stderr') or '') for c in conflicts))
     state.phase='selecting' if status=='completed' else 'failed'
     if status=='failed': state.last_error=state.integration.get('failure_reason')
     ctx.recorder.record('integration_completed' if status=='completed' else 'integration_failed', payload=state.integration)
