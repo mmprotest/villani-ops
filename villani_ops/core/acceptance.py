@@ -89,6 +89,18 @@ def is_attempt_acceptance_eligible(attempt: Any, human_approval: Any | None = No
     scope = _get(attempt, "scope")
     if scope == "subtask" and not _get(attempt, "subtask_id"):
         blockers.append("subtask_id_missing")
+    if scope == "integration":
+        if _get(attempt, "failure_reason") == "agentic_subtask_integration_not_implemented":
+            blockers.append("integration_not_implemented")
+        if _get(attempt, "merge_conflicts"):
+            blockers.append("merge_conflicts")
+        if state is not None:
+            for st in getattr(state, "subtasks", []) or []:
+                st_status = _get(st, "status")
+                if st_status in {"pending", "running"}:
+                    blockers.append("subtasks_incomplete")
+                elif st_status == "failed":
+                    blockers.append("subtask_failed")
     if status in {None, "scheduled", "running"}:
         blockers.append("attempt_not_completed")
     elif status in {"failed", "rejected"}:
@@ -99,8 +111,10 @@ def is_attempt_acceptance_eligible(attempt: Any, human_approval: Any | None = No
     exit_code = _get(attempt, "exit_code")
     if exit_code is not None and exit_code != 0:
         blockers.append(f"runner exit code is {exit_code}")
+    if _get(attempt, "runner_error_type"):
+        blockers.append("runner_exception")
     if _get(attempt, "error") or _get(attempt, "failure_reason"):
-        blockers.append("runner_failed")
+        blockers.append("integration_failed" if scope == "integration" else "runner_failed")
 
     if attempt_requires_patch(state, attempt):
         patch_path = _get(attempt, "patch_path")
@@ -123,6 +137,8 @@ def is_attempt_acceptance_eligible(attempt: Any, human_approval: Any | None = No
         if "passed" in review and review.get("passed") is not True:
             blockers.append("review_failed")
         if review.get("recommended_action") != "accept":
+            blockers.append("review_failed")
+        if review.get("blockers"):
             blockers.append("review_failed")
         if review.get("issues"):
             blockers.append("review_blocking_issues")
