@@ -65,7 +65,7 @@ def execute_tool_with_policy(state, tool_name:str, tool_input:dict, tool_use_id:
         state.last_tool_name=tool_name; state.last_tool_input=tool_input; state.last_error=None
         state.save(Path(state.run_dir)/'state.json')
         rec.record('state_saved',tool_name=tool_name); rec.record('state_updated',tool_name=tool_name)
-        event_map={'ops_submit_classification':'classification_submitted','ops_submit_investigation':'investigation_submitted','ops_submit_plan':'plan_submitted','ops_submit_decomposition':'decomposition_submitted','ops_validate_decomposition':'decomposition_validation_completed','ops_select_execution_path':'execution_path_selected','ops_select_winner':'selection_completed','ops_finalize_run':'run_finalized'}
+        event_map={'ops_submit_classification':'classification_submitted','ops_submit_investigation':'investigation_submitted','ops_submit_plan':'plan_submitted','ops_submit_decomposition':'decomposition_submitted','ops_validate_decomposition':'decomposition_validation_completed','ops_select_execution_path':'execution_path_selected'}
         if tool_name in event_map: rec.record(event_map[tool_name],tool_name=tool_name,payload=out if isinstance(out,dict) else {'result':out})
         if tool_name=='ops_integrate_subtasks': rec.record('integration_completed' if isinstance(out,dict) and out.get('status')=='completed' else 'integration_failed', tool_name=tool_name, payload=out if isinstance(out,dict) else {'result':out})
         rec.record('tool_finished',tool_name=tool_name,payload={'result':out})

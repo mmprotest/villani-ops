@@ -17,6 +17,7 @@ class CandidateAttemptState(BaseModel):
     added_files:list[str]=Field(default_factory=list); deleted_files:list[str]=Field(default_factory=list); modified_files:list[str]=Field(default_factory=list); renamed_files:list[str]=Field(default_factory=list)
     validation:dict|None=None; validation_results:list[dict]=Field(default_factory=list); validation_status:Literal['not_run','passed','failed','command_rejected','error','timed_out']='not_run'; validation_source:str|None=None; token_usage:dict|None=None; cost:float|None=None
     patch_hygiene:dict|None=None; scope_assessment:dict|None=None
+    review_status:Literal['not_run','passed','failed','unavailable','malformed','provider_error']='not_run'; review_error_type:str|None=None; review_error_message:str|None=None; review_retry_count:int=0
 
 class SubtaskState(BaseModel):
     model_config=ConfigDict(extra='forbid')

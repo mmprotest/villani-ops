@@ -3,7 +3,7 @@ from rich.console import Console
 
 class AgenticProgressReporter:
     def __init__(self, enabled: bool = True, verbose: bool = False, console: Console | None = None):
-        self.enabled=enabled; self.verbose=verbose; self.console=console or Console()
+        self.enabled=enabled; self.verbose=verbose; self.console=console or Console(); self._seen_terminal_events=set()
     def _print(self, msg: str) -> None:
         if not self.enabled: return
         try: self.console.print(msg, soft_wrap=True, markup=False)
@@ -62,8 +62,18 @@ class AgenticProgressReporter:
         elif t=='validation_command_rejected':
             label=p.get('target_id') or p.get('target')
             self._print(f"[agentic] Validation command rejected for {label}: {p.get('message') or p.get('reason')}")
-        elif t in {'validation_completed','validation_failed'}: self._print(f"[agentic] Validation {'completed' if t.endswith('completed') else 'failed'}")
-        elif t in {'winner_selected','selection_completed'}: self._print(f"[agentic] Selection completed: {p.get('selected_attempt_id')}")
-        elif t=='run_finalized': self._print(f"[agentic] Final decision: {p.get('decision') or p.get('status') or p.get('summary')}")
+        elif t in {'validation_completed','validation_failed'}:
+            label=p.get('target_id') or p.get('target') or ''
+            self._print(f"[agentic] Validation {'completed' if t.endswith('completed') else 'failed'} for {label}".rstrip())
+        elif t=='review_retrying':
+            self._print(f"[agentic] Review {p.get('attempt_id')} failed due {p.get('review_error_type')}; retrying with {p.get('next_payload')} payload")
+        elif t in {'winner_selected','selection_completed'}:
+            key=('selection_completed',p.get('selected_attempt_id'),p.get('decision'))
+            if key not in self._seen_terminal_events:
+                self._seen_terminal_events.add(key); self._print(f"[agentic] Selection completed: {p.get('selected_attempt_id')}")
+        elif t=='run_finalized':
+            key=('run_finalized',p.get('decision') or p.get('status'),p.get('selected_attempt_id'))
+            if key not in self._seen_terminal_events:
+                self._seen_terminal_events.add(key); self._print(f"[agentic] Final decision: {p.get('decision') or p.get('status') or p.get('summary')}")
         elif self.verbose and t in {'model_request_started','model_response_received','tool_result_appended','recovery_injected','tool_failed'}:
             self._print(f"[agentic] {t}: {p.get('message') or p.get('finish_reason') or p.get('tool_name') or ''}".rstrip())

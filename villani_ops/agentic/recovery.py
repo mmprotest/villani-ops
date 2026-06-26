@@ -20,6 +20,8 @@ def _attempts(state):
 def _aid(a): return a.get('attempt_id') if isinstance(a,dict) else a.attempt_id
 def _validation(a): return a.get('validation') if isinstance(a,dict) else a.validation
 def _review(a): return a.get('review') if isinstance(a,dict) else a.review
+def _review_status(a): return a.get('review_status') if isinstance(a,dict) else getattr(a,'review_status',None)
+def _review_retry_count(a): return a.get('review_retry_count',0) if isinstance(a,dict) else getattr(a,'review_retry_count',0)
 def _patch(a): return a.get('patch_path') if isinstance(a,dict) else a.patch_path
 def _changed(a): return a.get('changed_files') if isinstance(a,dict) else a.changed_files
 def _failure(a): return a.get('failure_reason') if isinstance(a,dict) else a.failure_reason
@@ -63,6 +65,9 @@ def recommend_next_agentic_action(state):
         if eligible:
             return RecoveryRecommendation(action='select_winner',tool_name='ops_select_winner',tool_input={'decision':'select','selected_attempt_id':aid,'summary':'Candidate passed review and validation and is centrally acceptance eligible.','reasons':['central acceptance gate passed'],'confidence':0.95},reason='eligible candidate/integration exists',can_execute_deterministically=True)
     for a in state.candidates:
+        val=_validation(a) or {}
+        if val.get('passed') is True and _patch(a) and _changed(a) and _review_status(a) in {'unavailable','malformed','provider_error'} and _review_retry_count(a) < 3:
+            return RecoveryRecommendation(action='retry_review_infrastructure',tool_name='ops_review_attempt',tool_input={'attempt_id':_aid(a),'scope':'candidate'},reason='candidate passed validation and patch checks but structured review infrastructure failed; retry review with compact/minimal payload',can_execute_deterministically=True)
         if _status(a) in {'completed','reviewed'} and not _review(a) and not _failure(a) and _patch(a) and _changed(a):
             return RecoveryRecommendation(action='review_candidate',tool_name='ops_review_attempt',tool_input={'attempt_id':a.attempt_id,'scope':'candidate'},reason='completed candidate has patch evidence but no review',can_execute_deterministically=True)
     for a in state.candidates:

@@ -10,6 +10,12 @@ DEFAULT_PATCH_EXCLUDES = [
     '.ruff_cache','.ruff_cache/**','.coverage','coverage.xml','htmlcov','htmlcov/**',
     '.venv','.venv/**','venv','venv/**','node_modules','node_modules/**','*.pyc','*.pyo','*.log',
 ]
+SCRATCH_ARTIFACT_PATTERNS = [
+    '_fix.py','*_fix.py','fix_*.py','*_debug.py','debug*.txt','debug*.log',
+    'test_debug.py','test_result.txt','test_output.txt','tmp_*.py',
+    'scratch*.py','scratch*.txt','notes.txt','size.txt','stash_list.txt',
+    'scripts/fix_*.py','scripts/*_fix.py',
+]
 
 class GitPatchCaptureResult(BaseModel):
     patch_path: str | None
@@ -38,6 +44,24 @@ def _is_excluded(path: str, patterns: list[str] | None = None) -> bool:
         elif '/' not in q and (p == q or p.startswith(q + '/') or fnmatch.fnmatch(Path(p).name, q)): return True
         elif fnmatch.fnmatch(p, q): return True
     return False
+
+def is_scratch_artifact_path(path: str) -> bool:
+    p = path.replace('\\','/').lstrip('./')
+    name = Path(p).name
+    return any(fnmatch.fnmatch(p, pat) or fnmatch.fnmatch(name, pat) for pat in SCRATCH_ARTIFACT_PATTERNS)
+
+def clean_untracked_scratch_artifacts(worktree_path: Path) -> list[str]:
+    status = _run(['git','status','--porcelain','--untracked-files=all'], worktree_path)
+    if status.returncode != 0: return []
+    removed=[]
+    for line in status.stdout.splitlines():
+        if not line.startswith('?? '): continue
+        rel=line[3:].strip()
+        if rel and is_scratch_artifact_path(rel):
+            p=worktree_path/rel
+            if p.exists() and p.is_file():
+                p.unlink(); removed.append(rel)
+    return removed
 
 def patch_contains_internal_artifacts(patch_path: str | Path | None) -> bool:
     if not patch_path: return False
@@ -96,6 +120,7 @@ def capture_git_patch(worktree_path: Path, patch_path: Path, *, exclude_patterns
     excludes=exclude_patterns or DEFAULT_PATCH_EXCLUDES
     try:
         clean_runner_artifacts_from_worktree(worktree_path)
+        clean_untracked_scratch_artifacts(worktree_path)
         status=_run(['git','status','--porcelain'], worktree_path)
         if status.returncode != 0: return GitPatchCaptureResult(patch_path=None,changed_files=[],added_files=[],deleted_files=[],modified_files=[],renamed_files=[],has_changes=False,failure_reason=status.stderr.strip())
         # Stage non-excluded paths explicitly so untracked files are included and internals are never staged.

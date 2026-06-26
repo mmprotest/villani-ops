@@ -1,10 +1,17 @@
 from __future__ import annotations
 from typing import Any
 from pathlib import Path
+import fnmatch
 def _is_excluded(path: str) -> bool:
     p=str(path).replace('\\','/')
     if p.startswith('./'): p=p[2:]
     return p.startswith(('.villani/', '.villani_code/')) or p in {'.villani','.villani_code'}
+
+def _is_scratch(path: str) -> bool:
+    p=str(path).replace('\\','/').lstrip('./')
+    name=Path(p).name
+    pats=['_fix.py','*_fix.py','fix_*.py','*_debug.py','debug*.txt','debug*.log','test_debug.py','test_result.txt','test_output.txt','tmp_*.py','scratch*.py','scratch*.txt','notes.txt','size.txt','stash_list.txt','scripts/fix_*.py','scripts/*_fix.py']
+    return any(fnmatch.fnmatch(p, pat) or fnmatch.fnmatch(name, pat) for pat in pats)
 
 def patch_contains_internal_artifacts(patch_path: Any) -> bool:
     try: text=Path(patch_path).read_text(errors='replace')
@@ -149,6 +156,8 @@ def is_attempt_acceptance_eligible(attempt: Any, human_approval: Any | None = No
             blockers.append("empty_changed_files")
         elif all(_is_excluded(str(f)) for f in changed_files):
             blockers.append("internal_artifacts_only")
+        if any(_is_scratch(str(f)) for f in changed_files):
+            blockers.extend(["scratch_artifact_in_patch","patch_hygiene_failed"])
         if patch_path and _patch_readable(patch_path):
             if patch_contains_internal_artifacts(patch_path):
                 blockers.append("patch_contains_internal_artifacts")
@@ -162,11 +171,16 @@ def is_attempt_acceptance_eligible(attempt: Any, human_approval: Any | None = No
                 blockers.append("patch_contains_internal_artifacts")
             if hygiene.get("format_valid") is False and patch_path:
                 blockers.append("invalid_patch_format")
+            if hygiene.get("scratch_artifacts_in_patch"):
+                blockers.extend(["scratch_artifact_in_patch","patch_hygiene_failed"])
         scope_assessment = _get(attempt, "scope_assessment") or {}
         if isinstance(scope_assessment, dict):
             blockers.extend(scope_assessment.get("blockers") or [])
 
     review = _get(attempt, "review")
+    review_status = _get(attempt, "review_status")
+    if review_status in {"unavailable","malformed","provider_error"}:
+        blockers.append("review_infrastructure_failed")
     if not review:
         blockers.append("review_missing")
         review = {}
