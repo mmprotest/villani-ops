@@ -25,10 +25,10 @@ class AgenticProgressReporter:
         elif t=='decomposition_validation_completed': self._print(f"[agentic] Decomposition validated: {'accepted' if p.get('accepted') else 'rejected'}")
         elif t=='execution_path_selected': self._print(f"[agentic] Execution path selected: {p.get('execution_path') or p.get('path')}")
         elif t in {'candidate_attempt_started','subtask_attempt_started'}:
-            kind='Candidate' if t.startswith('candidate') else f"Subtask {p.get('subtask_id') or ''}".strip()
+            kind=('Fallback candidate' if t.startswith('candidate') and p.get('fallback') else ('Candidate' if t.startswith('candidate') else f"Subtask {p.get('subtask_id') or ''}".strip()))
             self._print(f"[agentic] {kind} attempt {p.get('attempt_id')} started" + (f": backend={p.get('backend_name')}" if self.verbose and p.get('backend_name') else '') + detail)
         elif t in {'candidate_attempt_completed','subtask_attempt_completed','candidate_attempt_failed','subtask_attempt_failed'}:
-            kind='Candidate' if t.startswith('candidate') else f"Subtask {p.get('subtask_id') or ''}".strip()
+            kind=('Fallback candidate' if t.startswith('candidate') and p.get('fallback') else ('Candidate' if t.startswith('candidate') else f"Subtask {p.get('subtask_id') or ''}".strip()))
             status='completed' if t.endswith('completed') else 'failed'
             extra=f"exit_code={p.get('exit_code')}" if p.get('exit_code') is not None else (p.get('failure_reason') or '')
             self._print(f"[agentic] {kind} attempt {p.get('attempt_id')} {status}: {extra}".rstrip()+detail)
@@ -37,6 +37,10 @@ class AgenticProgressReporter:
             self._print(f"[agentic] {kind} review {p.get('attempt_id')}: {p.get('review_decision')}, {p.get('review_recommended_action')}")
         elif t=='subtask_accepted': self._print(f"[agentic] Subtask {p.get('subtask_id')} accepted")
         elif t=='subtask_failed': self._print(f"[agentic] Subtask {p.get('subtask_id')} failed: {p.get('reason')}")
+        elif t=='decomposition_deadlock_detected':
+            fs=', '.join(p.get('failed_subtasks') or []) or 'unknown'; bc=len(p.get('blocked_subtasks') or [])
+            self._print(f'[agentic] Decomposition deadlock detected: {fs} failed, {bc} dependents blocked')
+        elif t=='candidate_fallback_started': self._print('[agentic] Falling back to full-task candidates after decomposition deadlock')
         elif t=='integration_started': self._print(f"[agentic] Integrating {p.get('accepted_subtasks', '')} accepted subtasks".rstrip())
         elif t=='integration_completed': self._print(f"[agentic] Integration completed: changed_files={len(p.get('changed_files') or [])}")
         elif t=='integration_failed': self._print(f"[agentic] Integration failed: {p.get('failure_reason') or p.get('reason')}")

@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Literal
 from pydantic import BaseModel, Field, ConfigDict, model_validator
-from .state import CandidateAttemptState, SubtaskState
+from .state import CandidateAttemptState, SubtaskState, detect_decomposition_deadlock
 from .git_artifacts import capture_git_patch, ensure_git_baseline, clean_runner_artifacts_from_worktree, DEFAULT_PATCH_EXCLUDES, is_git_compatible_patch, patch_contains_internal_artifacts
 from villani_ops.core.acceptance import is_attempt_acceptance_eligible, attempt_requires_patch
 import subprocess, json, time, shutil, os, re
@@ -159,6 +159,7 @@ class OpsValidateDecompositionInput(StrictModel): decomposition_id:str='current'
 class DecompositionValidationResult(StrictModel): accepted:bool; deterministic_accepted:bool; semantic_accepted:bool|None=None; failures:list[str]=Field(default_factory=list); required_revisions:list[str]=Field(default_factory=list); warnings:list[str]=Field(default_factory=list); computed_acceptance_reason:str
 class OpsSelectExecutionPathInput(StrictModel): path:Literal['parallel_candidates','decomposed_subtasks']; reason:str
 class OpsLaunchCandidatesInput(StrictModel): attempts:int; backend_name:str|None=None; reason:str
+class OpsStartCandidateFallbackInput(StrictModel): reason:str; attempts:int|None=None
 class OpsLaunchSubtasksInput(StrictModel): subtask_ids:list[str]; backend_name:str|None=None; attempts_per_subtask:int; reason:str
 class OpsReviewAttemptInput(StrictModel): attempt_id:str; scope:Literal['candidate','subtask','integration']
 class OpsReviewResult(StrictModel): decision:Literal['pass','fail']; recommended_action:Literal['accept','reject','retry','repair']; score:float; summary:str; evidence:list[str]=Field(default_factory=list); issues:list[str]=Field(default_factory=list); blockers:list[str]=Field(default_factory=list); confidence:float=0.0; subtask_passed:bool|None=None; scope_ok:bool|None=None; integration_risk:Literal['low','medium','high','unknown']|None=None
@@ -169,7 +170,7 @@ class OpsFinalizeRunInput(StrictModel): decision:Literal['accepted','rejected','
 @dataclass
 class ToolSpec: name:str; description:str; input_model:type[BaseModel]; handler:Callable; read_only:bool=False
 
-def h_get_state(state, inp, ctx): return {'status':state.status,'phase':state.phase,'execution_path':state.execution_path,'allowed_next_actions':state.allowed_next_actions(),'decomposition_accepted':state.decomposition_accepted,'subtasks':[s.model_dump() for s in state.subtasks],'candidates':[c.model_dump() for c in state.candidates],'warnings':state.warnings,'recovery_count':state.recovery_count}
+def h_get_state(state, inp, ctx): return {'status':state.status,'phase':state.phase,'execution_path':state.execution_path,'fallback_execution_path':state.fallback_execution_path,'fallback_used':state.fallback_used,'decomposed_execution_status':state.decomposed_execution_status,'decomposed_execution_blockers':state.decomposed_execution_blockers,'allowed_next_actions':state.allowed_next_actions(),'decomposition_accepted':state.decomposition_accepted,'subtasks':[s.model_dump() for s in state.subtasks],'candidates':[c.model_dump() for c in state.candidates],'warnings':state.warnings,'recovery_count':state.recovery_count}
 def h_inspect_repo(state, inp, ctx):
     root=Path(state.repo_path); files=[str(p.relative_to(root)) for p in root.rglob('*') if p.is_file() and '.git' not in p.parts][:inp.max_files]
     cfg=[f for f in files if Path(f).name in {'pyproject.toml','package.json','Cargo.toml','go.mod','Makefile'}]
@@ -215,6 +216,7 @@ def h_select_path(state, inp, ctx):
     state.execution_path=inp.path
     state.phase='running_subtasks' if inp.path=='decomposed_subtasks' else 'running_candidates'
     state.decomposition_executed=inp.path=='decomposed_subtasks'
+    if inp.path=='decomposed_subtasks': state.decomposed_execution_status='running'
     if inp.path=='parallel_candidates' and state.decomposition is not None and state.decomposition_accepted is not True:
         state.decomposition_fallback_used=True; state.decomposition_fallback_reason=inp.reason; state.decomposition_executed=False
     return {'execution_path':state.execution_path,'reason':inp.reason,'decomposition_fallback_used':state.decomposition_fallback_used}
@@ -281,8 +283,17 @@ def _run_attempt(state, ctx, aid, scope, task, success, subtask_id=None, backend
     _set_acceptance_from_gate(state,a)
     return a
 
+def h_start_candidate_fallback(state, inp, ctx):
+    if state.execution_path!='decomposed_subtasks' or state.decomposed_execution_status not in {'blocked','failed'}:
+        raise ValueError('candidate fallback requires blocked or failed decomposed execution')
+    state.fallback_used=True; state.fallback_from_execution_path='decomposed_subtasks'; state.fallback_execution_path='parallel_candidates_after_decomposition_deadlock'
+    state.fallback_reason=inp.reason or 'required subtask failed and dependent subtasks are blocked'; state.fallback_started_at=str(time.time()); state.phase='running_candidates'
+    ctx.recorder.record('candidate_fallback_started', payload={'reason':state.fallback_reason,'fallback_from_execution_path':state.fallback_from_execution_path,'fallback_execution_path':state.fallback_execution_path})
+    return {'fallback_used':state.fallback_used,'fallback_execution_path':state.fallback_execution_path,'fallback_reason':state.fallback_reason,'attempts':inp.attempts}
+
 def h_launch_candidates(state, inp, ctx):
-    if state.execution_path!='parallel_candidates': raise ValueError('candidates require parallel_candidates execution path')
+    fallback_active=state.fallback_execution_path=='parallel_candidates_after_decomposition_deadlock'
+    if state.execution_path!='parallel_candidates' and not fallback_active: raise ValueError('candidates require parallel_candidates execution path or explicit decomposition-deadlock fallback')
     made=[]; maxp=max(1, int(getattr(ctx.coding_backend or ctx.backend,'max_parallel',None) or ctx.max_parallel or 1))
     state.max_parallel=maxp
     total=int(inp.attempts); batch_count=0; final_mode='sequential_due_max_parallel_1' if maxp<=1 or total<=1 else 'parallel_candidates'
@@ -297,7 +308,7 @@ def h_launch_candidates(state, inp, ctx):
                 scheduled=_attempt(aid,'candidate',backend=inp.backend_name or ctx.coding_backend_name or ctx.backend_name,artifacts=Path(state.run_dir)/'attempts'/aid)
                 scheduled.status='running'; scheduled.started_at=str(time.time()); scheduled.worktree_path=str(Path(state.run_dir)/'attempts'/aid/'worktree')
                 state.candidates.append(scheduled)
-                ctx.recorder.record('candidate_attempt_started', payload={'attempt_id':aid,'status':'running','batch_index':batch_count,'artifact_paths':{'artifacts_dir':scheduled.artifacts_dir}})
+                ctx.recorder.record('candidate_attempt_started', payload={'attempt_id':aid,'status':'running','batch_index':batch_count,'fallback':fallback_active,'artifact_paths':{'artifacts_dir':scheduled.artifacts_dir}})
                 futs.append(ex.submit(_run_attempt,state,ctx,aid,'candidate',state.task,state.success_criteria,None,inp.backend_name or ctx.coding_backend_name or ctx.backend_name,False))
             byid={}
             for fut in as_completed(futs):
@@ -308,12 +319,30 @@ def h_launch_candidates(state, inp, ctx):
                 if c.attempt_id==aid:
                     state.candidates[idx]=res; break
             ev='candidate_attempt_completed' if res.status=='completed' else 'candidate_attempt_failed'
-            ctx.recorder.record(ev, payload={'attempt_id':aid,'status':res.status,'exit_code':res.exit_code,'failure_reason':res.failure_reason,'batch_index':batch_count,'artifact_paths':{'stdout':res.stdout_path,'stderr':res.stderr_path,'patch':res.patch_path}})
+            ctx.recorder.record(ev, payload={'attempt_id':aid,'status':res.status,'exit_code':res.exit_code,'failure_reason':res.failure_reason,'batch_index':batch_count,'fallback':fallback_active,'artifact_paths':{'stdout':res.stdout_path,'stderr':res.stderr_path,'patch':res.patch_path}})
         state.save(Path(state.run_dir)/'state.json')
     state.concurrency_mode=final_mode; state.batch_count=batch_count
     state.candidate_concurrency={'concurrency_mode':final_mode,'max_parallel':maxp,'batch_count':batch_count,'worker_state_mutation':'disabled'}
     state.execution_concurrency={'candidate_concurrency_mode':final_mode,'max_parallel':maxp,'candidate_batch_count':batch_count}
     state.phase='selecting'; return {'launched':made,'max_parallel':maxp,'batch_count':batch_count,'concurrency_mode':final_mode,'semantics':'attempts execute in isolated worktrees; main thread mutates OpsRunState; batches never exceed max_parallel'}
+
+def _update_decomposed_execution_state(state, ctx=None):
+    if state.execution_path!='decomposed_subtasks': return None
+    state.decomposed_execution_completed_subtasks=sorted(s.subtask_id for s in state.subtasks if s.status=='accepted')
+    state.decomposed_execution_failed_subtasks=sorted(s.subtask_id for s in state.subtasks if s.status=='failed')
+    state.decomposed_execution_blocked_subtasks=sorted(s.subtask_id for s in state.subtasks if s.status=='skipped')
+    dead=detect_decomposition_deadlock(state)
+    if dead:
+        state.decomposed_execution_status='blocked'; state.decomposed_execution_failed_subtasks=dead.failed_subtasks; state.decomposed_execution_blocked_subtasks=dead.blocked_subtasks
+        state.decomposed_execution_blockers=sorted(set((state.decomposed_execution_blockers or []) + dead.reason.split(',') + ['decomposition_deadlocked']))
+        state.partial_progress={'accepted_subtasks':dead.accepted_subtasks,'failed_subtasks':dead.failed_subtasks,'blocked_subtasks':dead.blocked_subtasks}
+        for st in state.subtasks:
+            if st.status=='accepted' and st.accepted_attempt_id: state.best_partial_attempt_id=st.accepted_attempt_id
+        if ctx: ctx.recorder.record('decomposition_deadlock_detected', payload=dead.model_dump())
+        return dead
+    if state.subtasks and all(s.status in {'accepted','skipped'} for s in state.subtasks): state.decomposed_execution_status='completed'
+    elif any(s.status in {'running','pending'} for s in state.subtasks): state.decomposed_execution_status='running'
+    return None
 
 def h_launch_subtasks(state, inp, ctx):
     by={s.subtask_id:s for s in state.subtasks}
@@ -383,7 +412,8 @@ def h_launch_subtasks(state, inp, ctx):
     state.wave_count=wave_index; state.concurrency_mode=mode
     state.subtask_concurrency={'concurrency_mode':mode,'max_parallel':maxp,'wave_count':wave_index,'waves':waves,'review':'sequential_main_thread'}
     state.execution_concurrency={**(state.execution_concurrency or {}),'subtask_concurrency_mode':mode,'subtask_wave_count':wave_index,'max_parallel':maxp}
-    state.phase='integrating' if all(s.status in {'accepted','skipped'} for s in state.subtasks) else 'running_subtasks'
+    dead=_update_decomposed_execution_state(state, ctx)
+    state.phase='running_subtasks' if dead else ('integrating' if all(s.status in {'accepted','skipped'} for s in state.subtasks) else 'running_subtasks')
     return {'launched':launched,'max_parallel':maxp,'wave_count':wave_index,'concurrency_mode':mode,'waves':waves,'semantics':'dependency waves; runner attempts concurrent up to max_parallel; reviews serialized on main thread'}
 
 def _find_attempt(state, aid):
@@ -658,10 +688,10 @@ def h_select_winner(state, inp, ctx):
     if not inp.selected_attempt_id: raise ValueError('selected_attempt_id is required')
     a, st=_find_attempt(state, inp.selected_attempt_id)
     if not a: raise ValueError(f'selected attempt {inp.selected_attempt_id} does not exist')
-    if state.execution_path=='decomposed_subtasks':
+    if state.execution_path=='decomposed_subtasks' and state.fallback_execution_path!='parallel_candidates_after_decomposition_deadlock':
         if st is not None: raise ValueError('cannot select raw subtask attempt as final winner')
         if not isinstance(a,dict) or inp.selected_attempt_id!='integration_001': raise ValueError('decomposed final selection requires integration result')
-    if state.execution_path=='parallel_candidates' and (isinstance(a,dict) or getattr(a,'scope',None)!='candidate'):
+    if (state.execution_path=='parallel_candidates' or state.fallback_execution_path=='parallel_candidates_after_decomposition_deadlock') and (isinstance(a,dict) or getattr(a,'scope',None)!='candidate'):
         raise ValueError('candidate path selection requires candidate attempt')
     status=a.get('status') if isinstance(a,dict) else a.status
     if status=='running': raise ValueError('cannot select running attempt')
@@ -680,6 +710,17 @@ def h_select_winner(state, inp, ctx):
 
 def h_finalize(state, inp, ctx):
     final_payload=inp.model_dump()
+    if inp.decision!='accepted' and inp.selected_attempt_id:
+        a0, st0=_find_attempt(state, inp.selected_attempt_id)
+        if st0 is not None:
+            final_payload['best_partial_attempt_id']=inp.selected_attempt_id; final_payload['selected_attempt_id']=None
+    if state.partial_progress: final_payload['partial_progress']=state.partial_progress
+    if inp.decision!='accepted' and state.decomposed_execution_status in {'blocked','failed'}:
+        fs=', '.join(state.decomposed_execution_failed_subtasks); bs=', '.join(state.decomposed_execution_blocked_subtasks)
+        extra='Decomposed execution deadlocked because required subtasks failed: ' + (fs or 'unknown') + '.' + ((' Blocked dependent subtasks: ' + bs + '.') if bs else '')
+        if state.fallback_used: extra += ' Villani Ops fell back to full-task candidates.'
+        final_payload['summary']=extra if final_payload.get('summary') in {'','x','failed'} else final_payload.get('summary') + ' ' + extra
+        final_payload['blockers']=sorted(set((final_payload.get('blockers') or []) + state.decomposed_execution_blockers + ['decomposition_deadlocked']))
     if inp.decision!='accepted' and state.execution_path=='decomposed_subtasks' and state.integration and state.integration.get('status')=='failed':
         final_payload['summary']='Subtasks were individually accepted by scoped review, but Villani Ops did not produce an integrated patch. Final validation failed, so no accepted solution was produced.'
         final_payload['blockers']=sorted(set((final_payload.get('blockers') or []) + ['integration_failed']))
@@ -718,6 +759,7 @@ OPS_TOOLS={
 'ops_validate_decomposition':ToolSpec('ops_validate_decomposition','Validate decomposition',OpsValidateDecompositionInput,h_validate_decomposition),
 'ops_select_execution_path':ToolSpec('ops_select_execution_path','Select execution path',OpsSelectExecutionPathInput,h_select_path),
 'ops_launch_candidates':ToolSpec('ops_launch_candidates','Launch candidates',OpsLaunchCandidatesInput,h_launch_candidates),
+'ops_start_candidate_fallback':ToolSpec('ops_start_candidate_fallback','Start full-task candidate fallback after decomposition deadlock',OpsStartCandidateFallbackInput,h_start_candidate_fallback),
 'ops_launch_subtasks':ToolSpec('ops_launch_subtasks','Launch subtasks',OpsLaunchSubtasksInput,h_launch_subtasks),
 'ops_review_attempt':ToolSpec('ops_review_attempt','Review attempt',OpsReviewAttemptInput,h_review_attempt),
 'ops_integrate_subtasks':ToolSpec('ops_integrate_subtasks','Integrate subtasks',OpsIntegrateSubtasksInput,h_integrate),

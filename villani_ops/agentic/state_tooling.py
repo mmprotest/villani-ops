@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from pydantic import BaseModel, ConfigDict
 from .tools import OPS_TOOLS
+from .state import detect_decomposition_deadlock
 @dataclass
 class OpsToolContext:
     run_dir:Path; recorder:any; transcript:list[dict]; recent_events:list[dict]|None=None; runner_adapter:any=None; reviewer:any=None; backend:any=None; backend_name:str|None=None; coding_backend:any=None; coding_backend_name:str|None=None; review_backend:any=None; review_backend_name:str|None=None; timeout_seconds:int|None=None; max_parallel:int=1; production:bool=True; allow_fake_dependencies:bool=False
@@ -19,9 +20,13 @@ def _allowed(state, name, data):
         p=data.get('path')
         if p=='decomposed_subtasks' and not (state.decomposition_validated and state.decomposition_accepted and len(state.subtasks)>=2): return False,'decomposed_subtasks requires accepted validation and at least 2 subtasks'
         if p=='parallel_candidates' and not state.plan: return False,'parallel_candidates requires plan'
-    if name=='ops_launch_candidates' and state.execution_path!='parallel_candidates': return False,'candidates require parallel_candidates execution path'
+    if name=='ops_start_candidate_fallback':
+        if state.decomposed_execution_status not in {'blocked','failed'} or not detect_decomposition_deadlock(state): return False,'fallback requires decomposition deadlock'
+    if name=='ops_launch_candidates' and state.execution_path!='parallel_candidates' and state.fallback_execution_path!='parallel_candidates_after_decomposition_deadlock': return False,'candidates require parallel_candidates execution path or fallback'
     if name=='ops_launch_subtasks' and state.execution_path!='decomposed_subtasks': return False,'subtasks require decomposed_subtasks execution path'
-    if name=='ops_integrate_subtasks' and any(s.status=='running' for s in state.subtasks): return False,'subtasks still running'
+    if name=='ops_integrate_subtasks':
+        if state.decomposed_execution_status in {'blocked','failed'}: return False,'cannot integrate blocked decomposed execution'
+        if any(s.status=='running' for s in state.subtasks): return False,'subtasks still running'
     if name=='ops_select_winner':
         if data.get('decision')=='reject_all' and not data.get('reasons'):
             return False,'reject_all requires reasons'
