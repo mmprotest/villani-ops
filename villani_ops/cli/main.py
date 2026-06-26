@@ -15,6 +15,46 @@ app=typer.Typer(help='Villani Ops: CLI-only multi-agent performance orchestrator
 backend_app=typer.Typer(); task_app=typer.Typer(); policy_app=typer.Typer(); runner_app=typer.Typer()
 app.add_typer(backend_app,name='backend'); app.add_typer(task_app,name='task'); app.add_typer(policy_app,name='policy'); app.add_typer(runner_app,name='runner')
 console=Console()
+
+
+def _fmt_tokens(n):
+    if n is None:
+        return 'unavailable'
+    if n >= 1_000_000:
+        return f'{n/1_000_000:.1f}M'
+    if n >= 1_000:
+        return f'{n/1_000:.1f}k'
+    return str(n)
+
+def _print_usage_summary(result, verbose=False):
+    summary = getattr(getattr(result, 'state', None), 'usage_summary', None) or {}
+    if not summary:
+        p = Path(getattr(result, 'run_dir', '')) / 'cost_summary.json'
+        if p.exists():
+            try:
+                summary = json.loads(p.read_text(encoding='utf-8'))
+            except Exception:
+                summary = {}
+    calls = summary.get('calls_count', 0)
+    unavailable = summary.get('unavailable_calls_count', 0)
+    if not calls and not summary:
+        return
+    if not calls or unavailable == calls:
+        console.print('Tokens: unavailable')
+        console.print('Cost: unavailable')
+    else:
+        console.print(f"Tokens: {_fmt_tokens(summary.get('input_tokens',0))} input / {_fmt_tokens(summary.get('output_tokens',0))} output / {_fmt_tokens(summary.get('total_tokens',0))} total")
+        label = 'partial, ' if unavailable else ''
+        console.print(f"Cost: {label}${summary.get('total_cost',0.0):.4f} total (${summary.get('input_cost',0.0):.4f} input, ${summary.get('output_cost',0.0):.4f} output)")
+    console.print(f"Usage: {calls} calls tracked, {unavailable} calls unavailable")
+    if verbose:
+        for title, key in [('Usage by role','by_role'), ('Usage by backend','by_backend')]:
+            buckets = summary.get(key) or {}
+            if buckets:
+                console.print(title + ':')
+                for name, b in buckets.items():
+                    console.print(f"  {name}: {_fmt_tokens(b.get('total_tokens',0))} tokens, ${b.get('total_cost',0.0):.4f}")
+
 def storage(workspace='.villani-ops'): return FileStorage(workspace)
 
 @app.command()
@@ -150,6 +190,7 @@ def run(ctx: typer.Context, repo: str|None=None, task: str|None=typer.Option(Non
         console.print(f"Candidate attempts requested/completed: {d.candidate_attempts_requested}/{d.candidate_attempts_completed}")
     console.print(f"Winner: {d.winning_attempt_id or 'none'}")
     console.print(f"Controller reason: {d.reason}")
+    _print_usage_summary(result, verbose=verbose)
     console.print(f"Run directory: {result.run_dir}")
 
 

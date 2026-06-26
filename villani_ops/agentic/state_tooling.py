@@ -6,7 +6,7 @@ from .tools import OPS_TOOLS
 from .state import detect_decomposition_deadlock
 @dataclass
 class OpsToolContext:
-    run_dir:Path; recorder:any; transcript:list[dict]; recent_events:list[dict]|None=None; runner_adapter:any=None; reviewer:any=None; backend:any=None; backend_name:str|None=None; coding_backend:any=None; coding_backend_name:str|None=None; review_backend:any=None; review_backend_name:str|None=None; timeout_seconds:int|None=None; max_parallel:int=1; production:bool=True; allow_fake_dependencies:bool=False
+    run_dir:Path; recorder:any; transcript:list[dict]; recent_events:list[dict]|None=None; runner_adapter:any=None; reviewer:any=None; backend:any=None; backend_name:str|None=None; coding_backend:any=None; coding_backend_name:str|None=None; review_backend:any=None; review_backend_name:str|None=None; usage_recorder:any=None; timeout_seconds:int|None=None; max_parallel:int=1; production:bool=True; allow_fake_dependencies:bool=False
 class OpsToolResult(BaseModel):
     model_config=ConfigDict(extra='forbid')
     tool_use_id:str; tool_name:str; content:dict|str; is_error:bool=False
