@@ -12,8 +12,8 @@ from villani_ops.controller.progress import RunProgressReporter
 from villani_ops.agentic.progress import AgenticProgressReporter
 
 app=typer.Typer(help='Villani Ops: CLI-only multi-agent performance orchestrator for coding tasks.')
-backend_app=typer.Typer(); task_app=typer.Typer(); policy_app=typer.Typer(); runner_app=typer.Typer()
-app.add_typer(backend_app,name='backend'); app.add_typer(task_app,name='task'); app.add_typer(policy_app,name='policy'); app.add_typer(runner_app,name='runner')
+backend_app=typer.Typer(); task_app=typer.Typer(); policy_app=typer.Typer(); runner_app=typer.Typer(); viewer_app=typer.Typer(help='Local run viewer commands')
+app.add_typer(backend_app,name='backend'); app.add_typer(task_app,name='task'); app.add_typer(policy_app,name='policy'); app.add_typer(runner_app,name='runner'); app.add_typer(viewer_app,name='viewer')
 console=Console()
 
 
@@ -125,7 +125,7 @@ def policy_create_default(name: str=typer.Option('balanced'), workspace: str='.v
     pol=Policy(name=name, attempts=attempts); path=s.workspace/'policies'/f'{name}.yaml'; pol.save(path); console.print(f'Created policy at {path}')
 
 @app.command(context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
-def run(ctx: typer.Context, repo: str|None=None, task: str|None=typer.Option(None,'--task'), task_id: str|None=None, success_criteria: str|None=None, mode: str=typer.Option('performance', '--mode', help='Execution mode: performance, cheap, balanced, or quality'), runner: str=typer.Option('villani-code', '--runner'), candidate_attempts: int=typer.Option(3, '--candidate-attempts', min=1, max=8), timeout_seconds: int|None=None, classify: bool=typer.Option(True, '--classify/--no-classify'), non_interactive: bool=False, quiet: bool=typer.Option(False, '--quiet'), verbose: bool=typer.Option(False, '--verbose'), orchestrator: str=typer.Option('graph', '--orchestrator', help='Orchestrator architecture: graph or agentic'), workspace: str='.villani-ops'):
+def run(ctx: typer.Context, repo: str|None=None, task: str|None=typer.Option(None,'--task'), task_id: str|None=None, success_criteria: str|None=None, mode: str=typer.Option('performance', '--mode', help='Execution mode: performance, cheap, balanced, or quality'), runner: str=typer.Option('villani-code', '--runner'), candidate_attempts: int=typer.Option(3, '--candidate-attempts', min=1, max=8), timeout_seconds: int|None=None, classify: bool=typer.Option(True, '--classify/--no-classify'), non_interactive: bool=False, quiet: bool=typer.Option(False, '--quiet'), verbose: bool=typer.Option(False, '--verbose'), orchestrator: str=typer.Option('graph', '--orchestrator', help='Orchestrator architecture: graph or agentic'), ui: bool=typer.Option(False, '--ui', help='Start local run viewer'), no_ui: bool=typer.Option(False, '--no-ui', help='Disable local run viewer'), ui_port: int=typer.Option(8765, '--ui-port'), open_ui: bool=typer.Option(False, '--open-ui'), workspace: str='.villani-ops'):
     forbidden = {
         '--policy': '--policy has been replaced by --mode. Use --mode performance|cheap|balanced|quality. Cost policies moved to villani-ops cost-run.',
         '--backend': 'Backend assignment is controlled by the execution policy. Configure backends, then use --mode. Performance orchestration always uses the most capable enabled backend in performance mode.',
@@ -143,6 +143,24 @@ def run(ctx: typer.Context, repo: str|None=None, task: str|None=typer.Option(Non
         console.print(f'Unknown argument(s): {" ".join(ctx.args)}')
         raise typer.Exit(2)
     s=storage(workspace)
+    viewer_server=None
+    viewer_enabled=bool(ui and not no_ui)
+    if viewer_enabled:
+        from villani_ops.viewer.server import ViewerServer
+        class ViewerStorage(FileStorage):
+            def create_run_dir(self, run_id):
+                nonlocal viewer_server
+                p=super().create_run_dir(run_id)
+                try:
+                    viewer_server=ViewerServer(self.workspace/'runs', port=ui_port).start()
+                    url=viewer_server.url(run_id)
+                    console.print(f'Live dashboard: {url}')
+                    if open_ui:
+                        import webbrowser; webbrowser.open(url)
+                except Exception as e:
+                    console.print(f'Warning: viewer server failed to start: {e}')
+                return p
+        s=ViewerStorage(workspace)
     if task_id:
         data=json.loads((s.workspace/'tasks'/task_id/'task.json').read_text()); t=Task.model_validate(data); repo=t.repo_path
     else:
@@ -157,10 +175,10 @@ def run(ctx: typer.Context, repo: str|None=None, task: str|None=typer.Option(Non
     if orchestrator == 'agentic':
         from villani_ops.agentic import OpsRunner, OpsRunRequest
         
-        s=storage(workspace); s.init_workspace(); backends=s.load_backends()
+        s.init_workspace(); backends=s.load_backends()
         result=OpsRunner(s, backends=backends, progress_reporter=AgenticProgressReporter(not quiet, verbose=verbose, console=console)).run(OpsRunRequest(repo_path=str(Path(repo).resolve()), task=t.objective, success_criteria=t.success_criteria, mode=mode, runner=runner, candidate_attempts=candidate_attempts, timeout_seconds=timeout_seconds, workspace=workspace, backends=backends))
     else:
-        result=VillaniOps(storage(workspace), progress_reporter=RunProgressReporter(not quiet, verbose=verbose)).run(repo=repo, task=t, candidate_attempts=candidate_attempts, timeout_seconds=timeout_seconds, classify=classify, non_interactive=(non_interactive or not sys.stdin.isatty()), mode=mode, runner=runner)
+        result=VillaniOps(s, progress_reporter=RunProgressReporter(not quiet, verbose=verbose)).run(repo=repo, task=t, candidate_attempts=candidate_attempts, timeout_seconds=timeout_seconds, classify=classify, non_interactive=(non_interactive or not sys.stdin.isatty()), mode=mode, runner=runner)
     d=result.decision
     console.print(f"Result: {'ACCEPTED' if d.accepted else 'FAILED'}")
     console.print(f'Mode: {d.mode}')
@@ -192,6 +210,44 @@ def run(ctx: typer.Context, repo: str|None=None, task: str|None=typer.Option(Non
     console.print(f"Controller reason: {d.reason}")
     _print_usage_summary(result, verbose=verbose)
     console.print(f"Run directory: {result.run_dir}")
+    if viewer_enabled:
+        try:
+            from villani_ops.viewer.builder import write_offline_viewer
+            viewer_path=write_offline_viewer(Path(result.run_dir))
+            console.print(f'Run viewer saved: {viewer_path}')
+        except Exception as e:
+            console.print(f'Warning: offline viewer could not be written: {e}')
+
+
+@viewer_app.command('list')
+def viewer_list(workspace: str='.villani-ops'):
+    runs=(storage(workspace).workspace/'runs')
+    table=Table('run_id','status','task','started','result','cost', width=140)
+    for rd in sorted([p for p in runs.iterdir() if p.is_dir()], key=lambda p:p.stat().st_mtime, reverse=True)[:25] if runs.exists() else []:
+        try:
+            from villani_ops.viewer.adapter import build_viewer_snapshot
+            snap=build_viewer_snapshot(rd); r=snap.get('run',{}); u=snap.get('usage',{})
+            res=r.get('result') or {}; result=(res.get('decision') if isinstance(res,dict) else '') or ''
+            table.add_row(rd.name, str(r.get('status','')), str(r.get('task',''))[:50], str(r.get('started_at','')), str(result), f"${u.get('total_cost',0) or 0:.4f}")
+        except Exception: table.add_row(rd.name,'unknown','','','','')
+    console.print(table)
+
+@viewer_app.command('serve')
+def viewer_serve(port: int=typer.Option(8765,'--port'), workspace: str='.villani-ops'):
+    from villani_ops.viewer.server import serve_forever
+    serve_forever(storage(workspace).workspace/'runs', port=port)
+
+@viewer_app.command('open')
+def viewer_open(run_id: str, port: int=typer.Option(8765,'--port'), open_browser: bool=typer.Option(False,'--open'), workspace: str='.villani-ops'):
+    from villani_ops.viewer.server import ViewerServer
+    srv=ViewerServer(storage(workspace).workspace/'runs', port=port).start(); url=srv.url(run_id); console.print(url)
+    if open_browser:
+        import webbrowser; webbrowser.open(url)
+    try:
+        import time
+        while True: time.sleep(3600)
+    except KeyboardInterrupt:
+        srv.stop()
 
 
 @app.command('cost-run')
