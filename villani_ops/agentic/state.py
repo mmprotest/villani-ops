@@ -12,6 +12,8 @@ class CandidateAttemptState(BaseModel):
     changed_files:list[str]=Field(default_factory=list); stdout_path:str|None=None; stderr_path:str|None=None; transcript_path:str|None=None
     review:dict|None=None; acceptance_eligible:bool=False; acceptance_blockers:list[str]=Field(default_factory=list)
     started_at:str|None=None; completed_at:str|None=None
+    exit_code:int|None=None; exit_reason:str|None=None; failure_reason:str|None=None
+    validation:dict|None=None; token_usage:dict|None=None; cost:float|None=None
 
 class SubtaskState(BaseModel):
     model_config=ConfigDict(extra='forbid')
@@ -34,7 +36,8 @@ class OpsRunState(BaseModel):
     integration:dict|None=None; reviews:list[dict]=Field(default_factory=list); selection:dict|None=None; final_decision:dict|None=None
     active_nodes:list[str]=Field(default_factory=list); completed_nodes:list[str]=Field(default_factory=list); failed_nodes:list[str]=Field(default_factory=list)
     costs:dict[str,float]=Field(default_factory=dict); input_tokens:int=0; output_tokens:int=0
-    warnings:list[str]=Field(default_factory=list); recovery_count:int=0; last_error:str|None=None; last_tool_name:str|None=None; last_tool_input:dict|None=None
+    warnings:list[str]=Field(default_factory=list); blockers:list[str]=Field(default_factory=list); recovery_count:int=0; last_error:str|None=None; last_tool_name:str|None=None; last_tool_input:dict|None=None
+    last_invalid_tool_name:str|None=None; last_invalid_tool_input_hash:str|None=None; repeat_invalid_count:int=0; last_progress_event_id:str|None=None; turns_since_progress:int=0
     def is_terminal(self)->bool: return self.status in {'completed','failed','interrupted'}
     def allowed_next_actions(self)->list[str]:
         if self.is_terminal(): return []

@@ -12,19 +12,36 @@ from .prompts import SYSTEM_PROMPT, initial_user_message
 from .recovery import handle_no_tool_call
 from .artifacts import write_artifacts
 from .client import ToolCallingLLMClient
-class _TestFakeRunner:
-    name='explicit-test-fake-runner'
-    def run_task(self, **kwargs):
-        from villani_ops.runners.base import RunnerResult
-        p=kwargs['repo_path']/'agentic_fake_change.txt'; p.write_text('test fake runner output')
-        return RunnerResult(exit_code=0, stdout='explicit fake runner for injected fake client')
 from villani_ops.runners import runner_for_name
 from villani_ops.execution_policies import policy_for_mode
 from villani_ops.orchestration.nodes import OrchestrationNode
 from villani_ops.orchestration.context import TaskContext
+
+class AgenticLLMReviewer:
+    def __init__(self, review_backend): self.review_backend=review_backend
+    def review(self, *, state, attempt, scope):
+        from villani_ops.review.reviewer import LLMReviewer
+        from villani_ops.core.task import Task
+        a=attempt.model_dump(mode='json') if hasattr(attempt,'model_dump') else dict(attempt)
+        task=Task(repo_path=state.repo_path, objective=state.task, success_criteria=state.success_criteria)
+        review,_=LLMReviewer().review(task=task, classification=None, coding_backend=self.review_backend, attempt={'scope':scope, **a, 'success_criteria':state.success_criteria}, backends={self.review_backend.name:self.review_backend}, backend_override=self.review_backend, estimate_cost=False)
+        action={'accept':'accept','retry_same_backend':'retry','escalate':'retry','ask_human':'reject','fail':'reject'}.get(review.recommended_action,'reject')
+        return {'decision':review.decision if review.decision in {'pass','fail'} else 'fail','recommended_action':action,'score':review.score,'summary':review.summary,'evidence':review.evidence,'issues':review.issues}
+
+def _fakeish(obj):
+    n=(getattr(obj,'name',None) or obj.__class__.__name__).lower()
+    return 'fake' in n or 'placeholder' in n
+
+def _select_role_backend(mode, backends, role, task):
+    node_kind={'orchestration':'plan','investigation':'investigate','decomposition':'decompose','coding':'code','review':'review','selection':'select'}[role]
+    node=OrchestrationNode(id=f'agentic_{role}',kind=node_kind,objective=f'agentic {role}')
+    sel=policy_for_mode(mode).select_backend(node=node, backends=backends, task_context=TaskContext(objective=task))
+    if not sel.backend: raise ValueError(f'agentic_backend_role_unavailable: {role}')
+    return sel.backend_name, sel.backend
+
 class OpsRunRequest(BaseModel):
     model_config=ConfigDict(extra='forbid', arbitrary_types_allowed=True)
-    repo_path:str; task:str; success_criteria:str|None=None; mode:str='performance'; runner:str='villani-code'; candidate_attempts:int=3; timeout_seconds:int|None=None; workspace:str='.villani-ops'; backend:object|None=None; backends:object|None=None; runner_adapter:object|None=None; reviewer:object|None=None
+    repo_path:str; task:str; success_criteria:str|None=None; mode:str='performance'; runner:str='villani-code'; candidate_attempts:int=3; timeout_seconds:int|None=None; workspace:str='.villani-ops'; backend:object|None=None; backends:object|None=None; runner_adapter:object|None=None; reviewer:object|None=None; production:bool=True; allow_fake_dependencies:bool=False
 class OpsRunResult(BaseModel):
     model_config=ConfigDict(arbitrary_types_allowed=True)
     run_id:str; run_dir:str; state:OpsRunState; decision:Decision
@@ -35,22 +52,28 @@ class OpsRunner:
         run_dir=(self.storage.create_run_dir(rid) if self.storage else Path(request.workspace)/'runs'/rid); run_dir.mkdir(parents=True,exist_ok=True)
         state=OpsRunState(run_id=rid,run_dir=str(run_dir),repo_path=request.repo_path,task=request.task,success_criteria=request.success_criteria,mode=request.mode,runner=request.runner,candidate_attempts=request.candidate_attempts)
         rec=OpsEventRecorder(run_dir,rid); transcript=[]; state.save(run_dir/'state.json'); rec.record('run_started',phase=state.phase)
-        backend=request.backend or self.backend
         backends=request.backends or self.backends
-        if backend is None and backends:
-            try:
-                node=OrchestrationNode(id='agentic_orchestrator',kind='policy',objective='orchestrate run')
-                sel=policy_for_mode(request.mode).select_backend(node=node, backends=backends, task_context=TaskContext(task=request.task, success_criteria=request.success_criteria))
-                backend=sel.backend
-            except Exception:
-                from villani_ops.core.backend import select_backend
-                backend=select_backend(backends,'policy')
-        if backend is None and self.client.__class__.__name__ == 'FakeClient':
-            from types import SimpleNamespace
-            backend=SimpleNamespace(name='explicit_test_fake',model='explicit-test-fake',base_url='http://test.invalid')
-        if backend is None or not getattr(backend,'model',None) or not (hasattr(backend,'create_message') or getattr(backend,'base_url',None)):
-            state.status='failed'; state.phase='failed'; state.final_decision={'decision':'failed','summary':'agentic orchestrator requires a configured backend with tool-calling support or OpenAI-compatible chat completions','blockers':['backend_config_missing']}; state.save(run_dir/'state.json'); rec.record('run_finalized',payload=state.final_decision); rec.write_digest(state); write_artifacts(run_dir,state,rec.events(),transcript); return OpsRunResult(run_id=rid,run_dir=str(run_dir),state=state,decision=Decision(run_id=rid,accepted=False,mode=state.mode,runner=state.runner,reason=state.final_decision['summary'],failure_reason=state.final_decision['summary']))
-        runner_adapter=request.runner_adapter or self.runner_adapter or ( _TestFakeRunner() if getattr(backend,'name',None)=='explicit_test_fake' else runner_for_name(request.runner))
+        backend=request.backend or self.backend
+        role_backends={}
+        try:
+            if backends:
+                for role in ['orchestration','coding','review','selection']:
+                    role_backends[role]=_select_role_backend(request.mode, backends, role, request.task)
+                if backend is None: backend=role_backends['orchestration'][1]
+            elif backend is not None:
+                role_backends={r:(getattr(backend,'name','backend'),backend) for r in ['orchestration','coding','review','selection']}
+        except Exception as e:
+            state.status='failed'; state.phase='failed'; state.final_decision={'decision':'failed','summary':str(e),'blockers':['agentic_backend_role_unavailable']}; state.save(run_dir/'state.json'); rec.record('run_finalized',payload=state.final_decision); rec.write_digest(state); write_artifacts(run_dir,state,rec.events(),transcript); return OpsRunResult(run_id=rid,run_dir=str(run_dir),state=state,decision=Decision(run_id=rid,accepted=False,mode=state.mode,runner=state.runner,reason=str(e),failure_reason=str(e)))
+        if backend is None or not getattr(backend,'model',None) or not (hasattr(backend,'create_message') or getattr(backend,'base_url',None)) or (request.production and not request.allow_fake_dependencies and _fakeish(backend)):
+            msg='agentic orchestrator requires a real configured backend with tool-calling support or OpenAI-compatible chat completions'
+            state.status='failed'; state.phase='failed'; state.final_decision={'decision':'failed','summary':msg,'blockers':['backend_config_missing']}; state.save(run_dir/'state.json'); rec.record('run_finalized',payload=state.final_decision); rec.write_digest(state); write_artifacts(run_dir,state,rec.events(),transcript); return OpsRunResult(run_id=rid,run_dir=str(run_dir),state=state,decision=Decision(run_id=rid,accepted=False,mode=state.mode,runner=state.runner,reason=msg,failure_reason=msg))
+        if request.production and not request.allow_fake_dependencies and _fakeish(self.client):
+            msg='fake orchestrator client forbidden in production agentic mode'
+            state.status='failed'; state.phase='failed'; state.final_decision={'decision':'failed','summary':msg,'blockers':['agentic_fake_client_forbidden']}; state.save(run_dir/'state.json'); rec.record('run_finalized',payload=state.final_decision); rec.write_digest(state); write_artifacts(run_dir,state,rec.events(),transcript); return OpsRunResult(run_id=rid,run_dir=str(run_dir),state=state,decision=Decision(run_id=rid,accepted=False,mode=state.mode,runner=state.runner,reason=msg,failure_reason=msg))
+        runner_adapter=request.runner_adapter or self.runner_adapter or runner_for_name(request.runner)
+        reviewer=request.reviewer or self.reviewer or (AgenticLLMReviewer(role_backends['review'][1]) if role_backends.get('review') else None)
+        coding_name,coding_backend=role_backends.get('coding',(getattr(backend,'name',None),backend))
+        review_name,review_backend=role_backends.get('review',(None,None))
         messages=[initial_user_message(task=request.task,success_criteria=request.success_criteria,mode=request.mode,runner=request.runner,candidate_attempts=request.candidate_attempts,repo_path=request.repo_path)]
         for _ in range(self.max_turns):
             if state.is_terminal(): break
@@ -68,7 +91,7 @@ class OpsRunner:
                     state.status='failed'; state.phase='failed'; state.final_decision={'decision':'failed','summary':'agentic_orchestrator_no_progress','blockers':['agentic_orchestrator_no_progress']}; rec.record('run_finalized',payload=state.final_decision); break
                 continue
             for tc in tool_calls:
-                res=execute_tool_with_policy(state,tc['name'],tc.get('input') or {},tc.get('id','tool'),OpsToolContext(run_dir=run_dir,recorder=rec,transcript=transcript,runner_adapter=runner_adapter,reviewer=request.reviewer or self.reviewer,backend=backend,backend_name=getattr(backend,'name',None),timeout_seconds=request.timeout_seconds,max_parallel=getattr(backend,'max_parallel',1)))
+                res=execute_tool_with_policy(state,tc['name'],tc.get('input') or {},tc.get('id','tool'),OpsToolContext(run_dir=run_dir,recorder=rec,transcript=transcript,runner_adapter=runner_adapter,reviewer=reviewer,backend=backend,backend_name=getattr(backend,'name',None),coding_backend=coding_backend,coding_backend_name=coding_name,review_backend=review_backend,review_backend_name=review_name,timeout_seconds=request.timeout_seconds,max_parallel=getattr(coding_backend,'max_parallel',1),production=request.production,allow_fake_dependencies=request.allow_fake_dependencies))
                 block={'type':'tool_result','tool_use_id':res.tool_use_id,'content':res.content,'is_error':res.is_error}; transcript.append(block); messages.append({'role':'tool','tool_call_id':res.tool_use_id,'content':str(res.content)}); rec.record('tool_result_appended',tool_name=res.tool_name,payload=block)
         if not state.is_terminal():
             state.status='failed'; state.phase='failed'; state.final_decision={'decision':'failed','summary':'max orchestration turns reached'}; rec.record('run_finalized',payload=state.final_decision)
