@@ -18,15 +18,25 @@ from villani_ops.orchestration.nodes import OrchestrationNode
 from villani_ops.orchestration.context import TaskContext
 
 class AgenticLLMReviewer:
-    def __init__(self, review_backend): self.review_backend=review_backend
+    def __init__(self, review_backend):
+        self.review_backend=review_backend
+        self.client=ToolCallingLLMClient()
     def review(self, *, state, attempt, scope):
-        from villani_ops.review.reviewer import LLMReviewer
-        from villani_ops.core.task import Task
-        a=attempt.model_dump(mode='json') if hasattr(attempt,'model_dump') else dict(attempt)
-        task=Task(repo_path=state.repo_path, objective=state.task, success_criteria=state.success_criteria)
-        review,_=LLMReviewer().review(task=task, classification=None, coding_backend=self.review_backend, attempt={'scope':scope, **a, 'success_criteria':state.success_criteria}, backends={self.review_backend.name:self.review_backend}, backend_override=self.review_backend, estimate_cost=False)
-        action={'accept':'accept','retry_same_backend':'retry','escalate':'retry','ask_human':'reject','fail':'reject'}.get(review.recommended_action,'reject')
-        return {'decision':review.decision if review.decision in {'pass','fail'} else 'fail','recommended_action':action,'score':review.score,'summary':review.summary,'evidence':review.evidence,'issues':review.issues}
+        from .tools import OpsReviewResult
+        payload={'task':state.task,'success_criteria':state.success_criteria,'execution_path':state.execution_path,'scope':scope,'review_payload':attempt}
+        tool={'type':'function','function':{'name':'agentic_review_decision','description':'Return a structured Villani Ops review decision. Never pass without evidence.','parameters':OpsReviewResult.model_json_schema(),'strict':True}}
+        messages=[{'role':'user','content':'Review this attempt using the forced structured review tool. Fail closed on missing evidence, runner failure, validation failure, or scope mismatch.\n'+__import__('json').dumps(payload,indent=2,default=str)[:120000]}]
+        resp=self.client.create_message(backend=self.review_backend,messages=messages,system='You are a strict production code reviewer for Villani Ops agentic mode.',tools=[tool],tool_choice={'type':'function','function':{'name':'agentic_review_decision'}},strict=True)
+        raw={'raw_response':getattr(resp,'raw_response',{}),'content':getattr(resp,'content',[])}
+        state_reviews=getattr(state,'reviews',None)
+        if isinstance(state_reviews,list):
+            state_reviews.append({'attempt_id':attempt.get('attempt',{}).get('attempt_id') if isinstance(attempt,dict) else None,'structured_review_request_summary':{'scope':scope,'changed_files':attempt.get('changed_files') if isinstance(attempt,dict) else None},'structured_review_raw_response':raw})
+        calls=[b for b in resp.content if b.get('type')=='tool_use' and b.get('name')=='agentic_review_decision']
+        if not calls:
+            raise ValueError('agentic_structured_review_missing_tool_call')
+        parsed=OpsReviewResult.model_validate(calls[0].get('input') or {})
+        if isinstance(state_reviews,list): state_reviews[-1]['structured_review_parsed_result']=parsed.model_dump()
+        return parsed.model_dump()
 
 def _fakeish(obj):
     n=(getattr(obj,'name',None) or obj.__class__.__name__).lower()

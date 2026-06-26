@@ -5,9 +5,38 @@ from typing import Any, Callable, Literal
 from pydantic import BaseModel, Field, ConfigDict, model_validator
 from .state import CandidateAttemptState, SubtaskState
 from villani_ops.storage.files import capture_diff
-from villani_ops.validation.base import DiffReviewValidator
 from villani_ops.core.acceptance import is_attempt_acceptance_eligible, attempt_requires_patch
 import subprocess, json, time, shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+def extract_changed_file_metadata(diff_text:str)->dict[str,list[str]]:
+    changed=[]; added=[]; deleted=[]; modified=[]; renamed=[]; old=None
+    def norm(p):
+        p=p.strip()
+        if p=='/dev/null': return None
+        return p[2:] if p.startswith(('a/','b/')) else p
+    def add(lst, v):
+        if v and v not in lst: lst.append(v)
+    for line in diff_text.splitlines():
+        if line.startswith('rename from '):
+            old=norm('a/'+line[len('rename from '):].strip()); continue
+        if line.startswith('rename to '):
+            new=norm('b/'+line[len('rename to '):].strip()); add(renamed,new); add(changed,new); old=None; continue
+        if line.startswith('Binary files ') and ' differ' in line:
+            parts=line.split();
+            for token in parts[2:4]: add(changed,norm(token))
+            continue
+        if line.startswith('--- '):
+            old=norm(line[4:].split('	',1)[0]); continue
+        if line.startswith('+++ '):
+            new=norm(line[4:].split('	',1)[0])
+            if old and not new: add(deleted,old); add(changed,old)
+            elif new and not old: add(added,new); add(changed,new)
+            elif new: add(modified,new); add(changed,new)
+            elif old: add(changed,old)
+            old=None
+    return {'changed_files':changed,'added_files':added,'deleted_files':deleted,'modified_files':modified,'renamed_files':renamed}
 
 def _read_text_tail(path, max_chars=12000):
     if not path:
@@ -87,7 +116,7 @@ class OpsSelectExecutionPathInput(StrictModel): path:Literal['parallel_candidate
 class OpsLaunchCandidatesInput(StrictModel): attempts:int; backend_name:str|None=None; reason:str
 class OpsLaunchSubtasksInput(StrictModel): subtask_ids:list[str]; backend_name:str|None=None; attempts_per_subtask:int; reason:str
 class OpsReviewAttemptInput(StrictModel): attempt_id:str; scope:Literal['candidate','subtask','integration']
-class OpsReviewResult(StrictModel): decision:Literal['pass','fail']; recommended_action:Literal['accept','reject','retry','repair']; score:float; summary:str; evidence:list[str]=Field(default_factory=list); issues:list[str]=Field(default_factory=list); subtask_passed:bool|None=None; scope_ok:bool|None=None; integration_risk:Literal['low','medium','high','unknown']|None=None
+class OpsReviewResult(StrictModel): decision:Literal['pass','fail']; recommended_action:Literal['accept','reject','retry','repair']; score:float; summary:str; evidence:list[str]=Field(default_factory=list); issues:list[str]=Field(default_factory=list); blockers:list[str]=Field(default_factory=list); confidence:float=0.0; subtask_passed:bool|None=None; scope_ok:bool|None=None; integration_risk:Literal['low','medium','high','unknown']|None=None
 class OpsIntegrateSubtasksInput(StrictModel): reason:str
 class OpsRunValidationInput(StrictModel): commands:list[ValidationCommand]; target:Literal['candidate','integration','repo']; target_id:str|None=None
 class OpsSelectWinnerInput(StrictModel): selected_attempt_id:str|None=None; decision:Literal['select','reject_all']; summary:str; reasons:list[str]=Field(default_factory=list); rejected_attempts:list[str]=Field(default_factory=list); confidence:float
@@ -177,32 +206,52 @@ def _run_attempt(state, ctx, aid, scope, task, success, subtask_id=None, backend
         (adir/'stdout.log').write_text(getattr(res,'stdout','') or ''); (adir/'stderr.log').write_text(getattr(res,'stderr','') or '')
         diff=capture_diff(Path(state.repo_path), wtree, adir/'diff.patch')
         a.stdout_path=str(adir/'stdout.log'); a.stderr_path=str(adir/'stderr.log'); a.patch_path=str(diff); a.transcript_path=getattr(res,'telemetry_path',None)
-        a.changed_files=sorted({l[6:].strip() for l in diff.read_text(errors='replace').splitlines() if l.startswith('+++ b/') and not l.startswith('+++ /dev/null')})
+        meta=extract_changed_file_metadata(diff.read_text(errors='replace'))
+        a.changed_files=meta['changed_files']; a.added_files=meta['added_files']; a.deleted_files=meta['deleted_files']; a.modified_files=meta['modified_files']; a.renamed_files=meta['renamed_files']
         a.model=getattr(backend,'model',None); a.completed_at=str(time.time())
         ok=getattr(res,'exit_code',1)==0
+        a.exit_code=getattr(res,'exit_code',None); a.exit_reason=getattr(res,'exit_reason',None); a.runner_status=getattr(res,'status',None)
         a.status='completed' if ok else 'failed'
-        setattr(a,'exit_code',getattr(res,'exit_code',None)) if hasattr(a,'exit_code') else None
+        if not ok: a.failure_reason=(getattr(res,'stderr','') or getattr(res,'status',None) or f'runner exit code is {a.exit_code}')[:1000]
         ev=f'{scope}_attempt_completed' if ok else f'{scope}_attempt_failed'
         ctx.recorder.record(ev, payload={'attempt_id':aid,'subtask_id':subtask_id,'status':a.status,'exit_code':getattr(res,'exit_code',None),'failure_reason':getattr(res,'stderr','') if not ok else None,'artifact_paths':{'stdout':a.stdout_path,'stderr':a.stderr_path,'patch':a.patch_path}})
     except Exception as e:
-        a.status='failed'; a.completed_at=str(time.time()); a.acceptance_eligible=False; a.acceptance_blockers=[f'runner_exception: {type(e).__name__}: {e}']
+        a.status='failed'; a.completed_at=str(time.time()); a.duration_seconds=float(a.completed_at)-float(a.started_at or a.completed_at); a.failure_reason=f'{type(e).__name__}: {e}'; a.runner_error_type=type(e).__name__; a.runner_status='exception'; a.acceptance_eligible=False; a.acceptance_blockers=['runner_exception', f'runner_exception: {type(e).__name__}: {e}']
         a.stdout_path=str(adir/'stdout.log'); a.stderr_path=str(adir/'stderr.log')
         if not Path(a.stdout_path).exists(): Path(a.stdout_path).write_text('')
         Path(a.stderr_path).write_text(f'{type(e).__name__}: {e}\n')
         ctx.recorder.record(f'{scope}_attempt_failed', payload={'attempt_id':aid,'subtask_id':subtask_id,'status':'failed','failure_reason':a.acceptance_blockers[0],'artifact_paths':{'stdout':a.stdout_path,'stderr':a.stderr_path,'artifacts_dir':str(adir)}})
+    if a.completed_at and a.started_at and a.duration_seconds is None:
+        a.duration_seconds=float(a.completed_at)-float(a.started_at)
+    _set_acceptance_from_gate(state,a)
     return a
 
 def h_launch_candidates(state, inp, ctx):
     if state.execution_path!='parallel_candidates': raise ValueError('candidates require parallel_candidates execution path')
     made=[]; maxp=max(1, int(getattr(ctx.coding_backend or ctx.backend,'max_parallel',None) or ctx.max_parallel or 1))
-    for i in range(inp.attempts):
-        aid=f'candidate_{len(state.candidates)+1:03d}'
-        c=_run_attempt(state,ctx,aid,'candidate',state.task,state.success_criteria,backend_name=inp.backend_name or ctx.coding_backend_name or ctx.backend_name)
-        state.candidates.append(c); made.append(aid)
-    state.phase='selecting'; return {'launched':made,'max_parallel':maxp,'batch_count':(len(made)+maxp-1)//maxp,'concurrency':'sequential_batches','semantics':'candidate_attempts=N launches N full-task attempts; never exceeds max_parallel'}
+    state.max_parallel=maxp
+    total=int(inp.attempts)
+    for off in range(0,total,maxp):
+        batch=list(range(off, min(off+maxp,total)))
+        mode='parallel' if len(batch)>1 else 'sequential'
+        state.concurrency_mode=mode
+        with ThreadPoolExecutor(max_workers=len(batch)) as ex:
+            futs=[]
+            ids=[]
+            for i in batch:
+                aid=f'candidate_{len(state.candidates)+len(ids)+1:03d}'
+                ids.append(aid); made.append(aid)
+                futs.append(ex.submit(_run_attempt,state,ctx,aid,'candidate',state.task,state.success_criteria,None,inp.backend_name or ctx.coding_backend_name or ctx.backend_name))
+            results=[]
+            for fut in as_completed(futs):
+                results.append(fut.result())
+        byid={a.attempt_id:a for a in results}
+        for aid in ids:
+            state.candidates.append(byid[aid])
+    state.phase='selecting'; return {'launched':made,'max_parallel':maxp,'batch_count':(len(made)+maxp-1)//maxp,'concurrency_mode':state.concurrency_mode,'semantics':'attempts execute in isolated worktrees; batches never exceed max_parallel'}
 
 def h_launch_subtasks(state, inp, ctx):
-    launched={}; by={s.subtask_id:s for s in state.subtasks}
+    launched={}; by={s.subtask_id:s for s in state.subtasks}; state.max_parallel=max(1,int(getattr(ctx.coding_backend or ctx.backend,'max_parallel',None) or ctx.max_parallel or 1)); state.concurrency_mode='sequential_due_dependency_review_loop'
     for sid in inp.subtask_ids:
         if sid not in by: raise ValueError(f'unknown subtask {sid}')
         st=by[sid]
@@ -221,7 +270,7 @@ def h_launch_subtasks(state, inp, ctx):
                 if a.acceptance_eligible:
                     st.status='accepted'; st.accepted_attempt_id=aid; ctx.recorder.record('subtask_accepted', payload={'subtask_id':sid,'attempt_id':aid}); break
         if st.status!='accepted': st.status='failed'; ctx.recorder.record('subtask_failed', payload={'subtask_id':sid,'attempts':len(st.attempts)})
-    state.phase='integrating' if all(s.status in {'accepted','skipped'} for s in state.subtasks) else 'running_subtasks'; return {'launched':launched,'max_parallel':max(1,int(getattr(ctx.coding_backend or ctx.backend,'max_parallel',None) or ctx.max_parallel or 1)),'concurrency':'dependency_ordered_sequential_batches','semantics':'candidate_attempts=N is attempts per subtask with early stop'}
+    state.phase='integrating' if all(s.status in {'accepted','skipped'} for s in state.subtasks) else 'running_subtasks'; return {'launched':launched,'max_parallel':state.max_parallel,'concurrency_mode':state.concurrency_mode,'warnings':['subtask execution remains sequential because each attempt is immediately reviewed before dependent subtasks unblock'],'semantics':'attempts_per_subtask controls attempts per subtask with early stop'}
 def _find_attempt(state, aid):
     for c in state.candidates:
         if c.attempt_id==aid: return c, None
@@ -245,7 +294,7 @@ def h_review_attempt(state, inp, ctx):
         raw=ctx.reviewer.review(state=state, attempt=a, scope=inp.scope) if hasattr(ctx.reviewer,'review') else ctx.reviewer(state,a,inp.scope)
     res=OpsReviewResult.model_validate(raw)
     if isinstance(a, dict):
-        a['review']=res.model_dump(); a['status']='reviewed' if a.get('status')!='failed' else 'rejected'
+        a['review']=res.model_dump(); a['status']='reviewed' if a.get('status') not in {'failed','completed'} else a.get('status')
         eligible, blockers=_set_acceptance_from_gate(state, a)
     else:
         a.review=res.model_dump(); a.status='reviewed' if a.status!='failed' else 'rejected'
@@ -257,12 +306,49 @@ def h_review_attempt(state, inp, ctx):
         state.blockers=sorted(set(state.blockers+blockers))
     ctx.recorder.record(f'{inp.scope}_attempt_reviewed', payload={'attempt_id':inp.attempt_id,'review_decision':res.decision,'review_recommended_action':res.recommended_action,'central_acceptance_eligible':eligible,'acceptance_eligible':eligible,'acceptance_blockers':blockers,'validation_blocked':any(b.startswith('validation_') for b in blockers),'artifact_blocked':any(b in {'missing_patch','empty_changed_files','patch_unreadable'} for b in blockers)})
     return {**res.model_dump(),'acceptance_eligible':eligible,'acceptance_blockers':blockers,'review_payload_included':['patch_excerpt','stdout_tail','stderr_tail','validation']}
+def _accepted_subtask_attempt(state, st):
+    for a in st.attempts:
+        if a.attempt_id==st.accepted_attempt_id:
+            return a
+    return None
+
 def h_integrate(state, inp, ctx):
     if state.execution_path!='decomposed_subtasks': raise ValueError('integration requires decomposed_subtasks execution path')
-    unaccepted=[s.subtask_id for s in state.subtasks if s.status!='accepted']
-    if unaccepted: raise ValueError(f'cannot integrate; subtasks not accepted: {unaccepted}')
-    state.integration={'attempt_id':'integration_001','status':'failed','reason':inp.reason,'failure_reason':'agentic_subtask_integration_not_implemented','acceptance_eligible':False,'acceptance_blockers':['agentic_subtask_integration_not_implemented']}
-    state.phase='failed'; state.last_error='agentic_subtask_integration_not_implemented'; ctx.recorder.record('integration_failed', payload=state.integration); return state.integration
+    if state.decomposition_accepted is not True: raise ValueError('integration requires accepted decomposition')
+    running=[s.subtask_id for s in state.subtasks if s.status=='running']
+    if running: raise ValueError(f'cannot integrate; subtasks still running: {running}')
+    unaccepted=[s.subtask_id for s in state.subtasks if s.status not in {'accepted','skipped'}]
+    if unaccepted:
+        state.integration={'attempt_id':'integration_001','scope':'integration','status':'failed','reason':inp.reason,'failure_reason':'subtasks_incomplete','failed_subtasks':unaccepted,'acceptance_eligible':False,'acceptance_blockers':['subtasks_incomplete']}
+        ctx.recorder.record('integration_failed', payload=state.integration); return state.integration
+    iid='integration_001'; idir=Path(state.run_dir)/'integration'/iid; idir.mkdir(parents=True,exist_ok=True)
+    wtree=idir/'worktree'; started=str(time.time()); conflicts=[]; applied=[]; failed=[]
+    _copy_worktree(Path(state.repo_path), wtree)
+    for st in state.subtasks:
+        if st.status=='skipped': continue
+        a=_accepted_subtask_attempt(state, st)
+        if not a or not a.patch_path:
+            failed.append({'subtask_id':st.subtask_id,'reason':'missing accepted patch'}); continue
+        check=subprocess.run(['git','apply','--check',a.patch_path],cwd=wtree,text=True,capture_output=True)
+        if check.returncode!=0:
+            conflicts.append({'subtask_id':st.subtask_id,'attempt_id':a.attempt_id,'stderr':check.stderr[-4000:]}); failed.append({'subtask_id':st.subtask_id,'attempt_id':a.attempt_id,'reason':'patch_apply_check_failed'}); continue
+        apply=subprocess.run(['git','apply',a.patch_path],cwd=wtree,text=True,capture_output=True)
+        if apply.returncode!=0:
+            conflicts.append({'subtask_id':st.subtask_id,'attempt_id':a.attempt_id,'stderr':apply.stderr[-4000:]}); failed.append({'subtask_id':st.subtask_id,'attempt_id':a.attempt_id,'reason':'patch_apply_failed'}); continue
+        applied.append({'subtask_id':st.subtask_id,'attempt_id':a.attempt_id,'patch_path':a.patch_path})
+    patch=capture_diff(Path(state.repo_path), wtree, idir/'diff.patch')
+    meta=extract_changed_file_metadata(patch.read_text(errors='replace'))
+    status='failed' if failed or conflicts else 'completed'
+    blockers=[]
+    if failed: blockers.append('integration_failed')
+    if conflicts: blockers.append('merge_conflicts')
+    integ={'attempt_id':iid,'scope':'integration','status':status,'reason':inp.reason,'worktree_path':str(wtree),'artifacts_dir':str(idir),'patch_path':str(patch),'changed_files':meta['changed_files'],'added_files':meta['added_files'],'deleted_files':meta['deleted_files'],'modified_files':meta['modified_files'],'renamed_files':meta['renamed_files'],'merge_conflicts':conflicts,'applied_subtasks':applied,'failed_subtasks':failed,'failure_reason':'integration_failed' if status=='failed' else None,'started_at':started,'completed_at':str(time.time()),'acceptance_eligible':False,'acceptance_blockers':blockers or ['review_missing'],'review':None,'validation':None}
+    state.integration=integ; _set_acceptance_from_gate(state, state.integration)
+    state.phase='selecting' if status=='completed' else 'failed'
+    if status=='failed': state.last_error=state.integration.get('failure_reason')
+    ctx.recorder.record('integration_completed' if status=='completed' else 'integration_failed', payload=state.integration)
+    return state.integration
+
 def h_validation(state, inp, ctx):
     if inp.target=='candidate':
         if not inp.target_id: raise ValueError('target_id required for candidate validation')
@@ -292,7 +378,7 @@ def h_validation(state, inp, ctx):
                 a.acceptance_eligible=False; a.acceptance_blockers=sorted(set(a.acceptance_blockers+['validation_failed']))
     elif inp.target=='integration' and state.integration is not None:
         state.integration['validation']=res
-        if not all_pass: state.integration['acceptance_eligible']=False
+        _set_acceptance_from_gate(state, state.integration)
     return res
 
 def h_select_winner(state, inp, ctx):
