@@ -68,3 +68,73 @@ def test_viewer_list_cli(tmp_path):
     result=CliRunner().invoke(app, ['viewer','list','--workspace', str(tmp_path/'.villani-ops')])
     assert result.exit_code==0
     assert rd.name in result.output
+
+
+def test_viewer_progress_starts_low_and_finalizes(tmp_path):
+    rd=tmp_path/'runs'/'early'; rd.mkdir(parents=True)
+    (rd/'state.json').write_text(json.dumps({'run_id':'early','status':'running'}))
+    (rd/'runtime_events.jsonl').write_text(json.dumps({'timestamp':'2026-06-26T00:00:00+00:00','type':'run_started','payload':{}}))
+    snap=build_viewer_snapshot(rd)
+    assert snap['run']['progress_percent'] == 5
+    (rd/'runtime_events.jsonl').write_text('\n'.join([
+        json.dumps({'timestamp':'2026-06-26T00:00:00+00:00','type':'run_started','payload':{}}),
+        json.dumps({'timestamp':'2026-06-26T00:00:01+00:00','type':'run_finalized','payload':{}}),
+    ]))
+    assert build_viewer_snapshot(rd)['run']['progress_percent'] == 100
+
+
+def test_viewer_usage_model_from_cost_summary_and_usage_record(tmp_path):
+    rd=tmp_path/'runs'/'usage'; rd.mkdir(parents=True)
+    (rd/'state.json').write_text(json.dumps({'run_id':'usage','status':'running'}))
+    (rd/'runtime_events.jsonl').write_text(json.dumps({'timestamp':'2026-06-26T00:00:00+00:00','type':'run_started','payload':{'model':'qwen35b'}}))
+    (rd/'cost_summary.json').write_text(json.dumps({'input_tokens':58342,'output_tokens':27615,'total_tokens':85957,'total_cost':0.1372}))
+    snap=build_viewer_snapshot(rd)
+    assert snap['run']['model'] == 'qwen35b'
+    assert snap['usage']['input_tokens'] == 58342
+    assert snap['usage']['output_tokens'] == 27615
+    assert snap['usage']['total_cost'] == 0.1372
+    assert snap['run']['run_id_short']
+    assert snap['run']['run_dir_short'].endswith('/usage')
+
+
+def test_viewer_timeline_order_labels_and_status(tmp_path):
+    rd=tmp_path/'runs'/'timeline'; rd.mkdir(parents=True)
+    (rd/'state.json').write_text(json.dumps({'run_id':'timeline'}))
+    (rd/'runtime_events.jsonl').write_text('\n'.join([
+        json.dumps({'timestamp':'2026-06-26T00:00:02+00:00','type':'subtask_accepted','payload':{'subtask_id':'st1'}}),
+        json.dumps({'timestamp':'2026-06-26T00:00:01+00:00','type':'subtask_attempt_started','payload':{'subtask_id':'st1','attempt_id':'st1_attempt_001'}}),
+    ]))
+    tl=build_viewer_snapshot(rd)['timeline']
+    assert [e['type'] for e in tl] == ['subtask_attempt_started','subtask_accepted']
+    assert tl[-1]['status'] == 'accepted'
+    assert 'Subtask 1' in tl[-1]['subtitle']
+
+
+def test_viewer_graph_layout_humanized_grouped_and_non_overlapping(tmp_path):
+    rd=tmp_path/'runs'/'graph'; rd.mkdir(parents=True)
+    (rd/'state.json').write_text(json.dumps({'run_id':'graph'}))
+    events=[
+        {'timestamp':'2026-06-26T00:00:00+00:00','type':'run_started','payload':{}},
+        {'timestamp':'2026-06-26T00:00:01+00:00','type':'investigation_submitted','payload':{}},
+        {'timestamp':'2026-06-26T00:00:02+00:00','type':'classification_submitted','payload':{}},
+        {'timestamp':'2026-06-26T00:00:03+00:00','type':'plan_submitted','payload':{}},
+        {'timestamp':'2026-06-26T00:00:04+00:00','type':'decomposition_submitted','payload':{}},
+        {'timestamp':'2026-06-26T00:00:05+00:00','type':'execution_path_selected','payload':{}},
+    ] + [{'timestamp':f'2026-06-26T00:00:0{i}+00:00','type':'subtask_attempt_completed','payload':{'subtask_id':f'st{i}'}} for i in range(1,6)]
+    (rd/'runtime_events.jsonl').write_text('\n'.join(json.dumps(e) for e in events))
+    graph=build_viewer_snapshot(rd)['graph']
+    positions=[(n['row'],n['col']) for n in graph['nodes']]
+    assert len(positions) == len(set(positions))
+    assert any(n['id']=='subtasks_group' for n in graph['nodes'])
+    assert any(n['label']=='Subtask 1' and n['status']=='completed' for n in graph['nodes'])
+    assert sum(1 for e in graph['edges'] if e['source']=='select_path' and e['target'].startswith('st')) == 0
+
+
+def test_offline_viewer_contains_required_ui_without_external_deps(tmp_path):
+    rd=fake_run(tmp_path)
+    text=write_offline_viewer(rd).read_text()
+    assert 'timeline-rail' in text and 'timeline-dot' in text
+    assert 'graphInner' in text and 'elbowPath' in text
+    assert 'formatInteger' in text and 'formatCost' in text
+    assert 'villani-run-snapshot' in text
+    assert 'https://' not in text and 'cdn' not in text.lower() and 'npm' not in text.lower()
