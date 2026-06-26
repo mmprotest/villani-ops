@@ -247,3 +247,135 @@ def test_recovery_recommends_single_task_path_and_runner(tmp_path):
     s.execution_path='single_task'
     rec=recommend_next_agentic_action(s)
     assert rec.tool_name == 'ops_run_next_candidate_attempt'
+
+from villani_ops.agentic.tools import _observe_completed_attempt
+
+
+def _attempt(attempt_id, *, backend='fake-backend', patch=True, changed=True, failure_reason=None):
+    return CandidateAttemptState(
+        attempt_id=attempt_id,
+        backend_name=backend,
+        model='fake-model',
+        status='failed' if failure_reason else 'completed',
+        scope='candidate',
+        exit_code=1 if failure_reason else 0,
+        failure_reason=failure_reason,
+        patch_path=f'/tmp/{attempt_id}.patch' if patch else None,
+        changed_files=[f'{attempt_id}.py'] if changed else [],
+        runner_telemetry={'total_file_reads': 1, 'total_file_writes': 1 if changed else 0},
+    )
+
+
+def _decision_flags(obs):
+    return {
+        'outcome': obs.outcome,
+        'should_retry_same_plan': obs.should_retry_same_plan,
+        'should_repair': obs.should_repair,
+        'should_decompose': obs.should_decompose,
+        'should_escalate_backend': obs.should_escalate_backend,
+        'next_attempt_directives': list(obs.next_attempt_directives),
+    }
+
+
+def test_refreshing_first_partial_progress_observation_does_not_set_should_decompose(tmp_path):
+    s = state(tmp_path)
+    a = _attempt('candidate_001')
+    s.candidates.append(a)
+
+    first = _observe_completed_attempt(s, a)
+    first_flags = _decision_flags(first)
+    refreshed = _observe_completed_attempt(s, a)
+
+    assert first.outcome == 'partial_progress'
+    assert first.should_decompose is False
+    assert refreshed.should_decompose is False
+    assert _decision_flags(refreshed) == first_flags
+    assert [o.attempt_id for o in s.attempt_observations] == ['candidate_001']
+    assert s.runner_assessment['attempts'] == 1
+    assert s.backend_assessments['fake-backend']['attempts'] == 1
+
+
+def test_second_distinct_partial_progress_attempt_can_set_should_decompose(tmp_path):
+    s = state(tmp_path)
+    a1 = _attempt('candidate_001')
+    a2 = _attempt('candidate_002')
+    s.candidates.extend([a1, a2])
+
+    first = _observe_completed_attempt(s, a1)
+    second = _observe_completed_attempt(s, a2)
+
+    assert first.outcome == 'partial_progress'
+    assert first.should_decompose is False
+    assert second.outcome == 'partial_progress'
+    assert second.should_decompose is True
+    assert {o.attempt_id for o in s.attempt_observations} == {'candidate_001', 'candidate_002'}
+
+
+def test_refreshing_first_no_patch_observation_does_not_set_should_escalate_backend(tmp_path):
+    s = state(tmp_path)
+    a = _attempt('candidate_001', patch=False, changed=False)
+    s.candidates.append(a)
+
+    first = _observe_completed_attempt(s, a)
+    first_flags = _decision_flags(first)
+    refreshed = _observe_completed_attempt(s, a)
+
+    assert first.outcome == 'no_patch'
+    assert first.should_escalate_backend is False
+    assert refreshed.should_escalate_backend is False
+    assert _decision_flags(refreshed) == first_flags
+    assert [o.attempt_id for o in s.attempt_observations] == ['candidate_001']
+    assert s.runner_assessment['attempts'] == 1
+    assert s.backend_assessments['fake-backend']['attempts'] == 1
+
+
+def test_second_distinct_no_patch_attempt_same_backend_can_escalate_backend(tmp_path):
+    s = state(tmp_path)
+    a1 = _attempt('candidate_001', patch=False, changed=False)
+    a2 = _attempt('candidate_002', patch=False, changed=False)
+    s.candidates.extend([a1, a2])
+
+    first = _observe_completed_attempt(s, a1)
+    second = _observe_completed_attempt(s, a2)
+
+    assert first.outcome == 'no_patch'
+    assert first.should_escalate_backend is False
+    assert second.outcome == 'no_patch'
+    assert second.should_escalate_backend is True
+    assert s.backend_assessments['fake-backend']['attempts'] == 2
+
+
+def test_refreshing_first_runner_failed_observation_does_not_trigger_repeated_failure_escalation(tmp_path):
+    s = state(tmp_path)
+    a = _attempt('candidate_001', patch=False, changed=False, failure_reason='runner boom')
+    s.candidates.append(a)
+
+    first = _observe_completed_attempt(s, a)
+    first_flags = _decision_flags(first)
+    refreshed = _observe_completed_attempt(s, a)
+
+    assert first.outcome == 'runner_failed'
+    assert first.should_escalate_backend is False
+    assert refreshed.should_escalate_backend is False
+    assert _decision_flags(refreshed) == first_flags
+    assert [o.attempt_id for o in s.attempt_observations] == ['candidate_001']
+    assert s.runner_assessment['attempts'] == 1
+    assert s.runner_assessment['runner_failures'] == 1
+    assert s.backend_assessments['fake-backend']['attempts'] == 1
+
+
+def test_second_distinct_runner_failed_attempt_can_trigger_repeated_failure_escalation(tmp_path):
+    s = state(tmp_path)
+    a1 = _attempt('candidate_001', patch=False, changed=False, failure_reason='runner boom')
+    a2 = _attempt('candidate_002', patch=False, changed=False, failure_reason='runner boom again')
+    s.candidates.extend([a1, a2])
+
+    first = _observe_completed_attempt(s, a1)
+    second = _observe_completed_attempt(s, a2)
+
+    assert first.outcome == 'runner_failed'
+    assert first.should_escalate_backend is False
+    assert second.outcome == 'runner_failed'
+    assert second.should_escalate_backend is True
+    assert s.runner_assessment['attempts'] == 2
+    assert s.runner_assessment['runner_failures'] == 2
