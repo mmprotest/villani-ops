@@ -18,10 +18,59 @@ def has_non_empty_patch(patch_path: Any) -> bool:
         return False
 
 
-def is_attempt_acceptance_eligible(attempt: Any, human_approval: Any | None = None) -> tuple[bool, list[str]]:
+def _patch_readable(patch_path: Any) -> bool:
+    if not patch_path:
+        return False
+    try:
+        Path(patch_path).read_text(errors="replace")
+        return True
+    except Exception:
+        return False
+
+
+def attempt_requires_patch(state: Any | None, attempt: Any) -> bool:
+    """Return whether acceptance requires patch and changed-file evidence.
+
+    Villani Ops normally executes coding attempts, so absence of an explicit
+    no-change/analysis-only classification means changes are expected.
+    """
+    classification = _get(attempt, "classification") or (_get(state, "classification") if state is not None else None) or {}
+    if not isinstance(classification, dict):
+        classification = getattr(classification, "model_dump", lambda **_: {})()
+    category = str(classification.get("category") or classification.get("type") or "").lower()
+    no_change = classification.get("requires_code_changes") is False or classification.get("code_change_expected") is False
+    if no_change or category in {"analysis", "analysis_only", "no_change", "documentation_review"}:
+        return False
+    return True
+
+
+def _validation_blockers(validation: Any) -> list[str]:
+    blockers: list[str] = []
+    if not validation:
+        return blockers
+    if not isinstance(validation, dict):
+        validation = getattr(validation, "model_dump", lambda **_: {})()
+    if validation.get("passed") is False:
+        blockers.append("validation_failed")
+    for item in validation.get("commands") or []:
+        if not isinstance(item, dict):
+            item = getattr(item, "model_dump", lambda **_: {})()
+        status = str(item.get("status") or "").lower()
+        if item.get("passed") is False or status == "failed":
+            blockers.append("validation_failed")
+        if status == "timeout":
+            blockers.append("validation_timed_out")
+        if status == "error":
+            blockers.append("validation_error")
+    return sorted(set(blockers))
+
+
+def is_attempt_acceptance_eligible(attempt: Any, human_approval: Any | None = None, *, state: Any | None = None) -> tuple[bool, list[str]]:
     """Return whether an attempt may be accepted by the controller.
 
-    Human approval is the only override for runner failures / uncertain reviews.
+    Review approval is necessary but never sufficient: runner success,
+    artifact evidence, validation evidence, and blocker state are enforced in
+    one central gate. Human approval is the only structured override path.
     """
     blockers: list[str] = []
     status = _get(attempt, "status")
@@ -34,30 +83,52 @@ def is_attempt_acceptance_eligible(attempt: Any, human_approval: Any | None = No
             return True, []
         return False, override_blockers
 
-    patch_path = _get(attempt, "patch_path")
-    if not has_non_empty_patch(patch_path):
-        blockers.append("patch is missing or empty")
-    if not (_get(attempt, "changed_files") or []):
-        blockers.append("changed files are missing")
+    if attempt is None:
+        return False, ["attempt_missing"]
+
+    scope = _get(attempt, "scope")
+    if scope == "subtask" and not _get(attempt, "subtask_id"):
+        blockers.append("subtask_id_missing")
+    if status in {None, "scheduled", "running"}:
+        blockers.append("attempt_not_completed")
+    elif status in {"failed", "rejected"}:
+        blockers.append("runner_failed")
+    elif status not in {"completed", "reviewed", "validated", "accepted", "human_approved"}:
+        blockers.append(f"attempt_status_invalid:{status}")
+
     exit_code = _get(attempt, "exit_code")
-    if exit_code != 0:
+    if exit_code is not None and exit_code != 0:
         blockers.append(f"runner exit code is {exit_code}")
-    if _get(attempt, "error"):
-        blockers.append(f"runner error: {_get(attempt, 'error')}")
+    if _get(attempt, "error") or _get(attempt, "failure_reason"):
+        blockers.append("runner_failed")
+
+    if attempt_requires_patch(state, attempt):
+        patch_path = _get(attempt, "patch_path")
+        if not patch_path:
+            blockers.append("missing_patch")
+        elif not _patch_readable(patch_path):
+            blockers.append("patch_unreadable")
+        elif not has_non_empty_patch(patch_path):
+            blockers.append("missing_patch")
+        if not (_get(attempt, "changed_files") or []):
+            blockers.append("empty_changed_files")
+
     review = _get(attempt, "review")
     if not review:
-        blockers.append("reviewer result is missing")
+        blockers.append("review_missing")
         review = {}
     if isinstance(review, dict):
         if review.get("decision") != "pass":
-            blockers.append(f"review decision is {review.get('decision') or 'missing'}")
-        if review.get("passed") is not True:
-            blockers.append("review passed is not true")
+            blockers.append("review_failed")
+        if "passed" in review and review.get("passed") is not True:
+            blockers.append("review_failed")
         if review.get("recommended_action") != "accept":
-            blockers.append(f"review recommended action is {review.get('recommended_action') or 'missing'}")
-    if status not in {"validated", "human_approved"}:
-        blockers.append(f"attempt status is {status or 'missing'}")
-    return (not blockers), blockers
+            blockers.append("review_failed")
+        if review.get("issues"):
+            blockers.append("review_blocking_issues")
+
+    blockers.extend(_validation_blockers(_get(attempt, "validation")))
+    return (not blockers), sorted(set(blockers))
 
 
 def human_override_blockers(attempt: Any, human_approval: Any | None = None) -> tuple[bool, list[str]]:

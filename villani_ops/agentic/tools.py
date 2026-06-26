@@ -6,7 +6,60 @@ from pydantic import BaseModel, Field, ConfigDict, model_validator
 from .state import CandidateAttemptState, SubtaskState
 from villani_ops.storage.files import capture_diff
 from villani_ops.validation.base import DiffReviewValidator
+from villani_ops.core.acceptance import is_attempt_acceptance_eligible, attempt_requires_patch
 import subprocess, json, time, shutil
+
+def _read_text_tail(path, max_chars=12000):
+    if not path:
+        return None
+    try:
+        text=Path(path).read_text(errors='replace')
+        return text[-max_chars:]
+    except Exception as e:
+        return {'error':f'unreadable: {type(e).__name__}: {e}', 'path':str(path)}
+
+def _read_patch_excerpt(path, max_chars=24000):
+    return _read_text_tail(path, max_chars=max_chars)
+
+def _attempt_to_dict(a):
+    return a.model_dump(mode='json') if hasattr(a,'model_dump') else dict(a)
+
+def build_agentic_review_payload(state, attempt, scope, subtask=None):
+    data=_attempt_to_dict(attempt)
+    validation=data.get('validation') or {}
+    validation_tails=[]
+    for item in validation.get('commands') or []:
+        validation_tails.append({**item, 'stdout_tail':_read_text_tail(item.get('stdout_path'), max_chars=4000), 'stderr_tail':_read_text_tail(item.get('stderr_path'), max_chars=4000)})
+    payload={
+        'parent_task':state.task,
+        'success_criteria':state.success_criteria,
+        'execution_path':state.execution_path,
+        'scope':scope,
+        'attempt':data,
+        'changed_files':data.get('changed_files') or [],
+        'patch_excerpt':_read_patch_excerpt(data.get('patch_path')),
+        'stdout_tail':_read_text_tail(data.get('stdout_path')),
+        'stderr_tail':_read_text_tail(data.get('stderr_path')),
+        'transcript_tail':_read_text_tail(data.get('transcript_path')),
+        'validation':{**validation, 'commands':validation_tails},
+        'failure_reason':data.get('failure_reason') or data.get('error'),
+        'exit_code':data.get('exit_code'),
+        'artifact_paths':{k:data.get(k) for k in ['artifacts_dir','worktree_path','patch_path','stdout_path','stderr_path','transcript_path']},
+        'known_blockers':data.get('acceptance_blockers') or [],
+        'requires_patch':attempt_requires_patch(state, attempt),
+        'investigation_relevant_files':(state.investigation or {}).get('relevant_files') if state.investigation else [],
+    }
+    if subtask is not None:
+        payload['subtask']={'id':subtask.subtask_id,'title':subtask.title,'objective':subtask.objective,'success_criteria':subtask.success_criteria,'relevant_files':subtask.relevant_files}
+    return payload
+
+def _set_acceptance_from_gate(state, attempt):
+    eligible, blockers=is_attempt_acceptance_eligible(attempt, state=state)
+    if isinstance(attempt, dict):
+        attempt['acceptance_eligible']=eligible; attempt['acceptance_blockers']=blockers
+    else:
+        attempt.acceptance_eligible=eligible; attempt.acceptance_blockers=blockers
+    return eligible, blockers
 
 class StrictModel(BaseModel): model_config=ConfigDict(extra='forbid')
 class OpsGetStateInput(StrictModel): include_artifacts:bool=False; include_recent_events:bool=True
@@ -182,21 +235,28 @@ def h_review_attempt(state, inp, ctx):
     a, st=_find_attempt(state, inp.attempt_id)
     if not a: raise ValueError(f'unknown attempt {inp.attempt_id}')
     if not isinstance(a, dict) and a.status=='running': raise ValueError('cannot review running attempt')
+    if isinstance(a, dict) and a.get('status')=='running': raise ValueError('cannot review running attempt')
     if ctx.reviewer is None: raise ValueError('agentic_real_reviewer_not_configured')
     if ctx.production and not ctx.allow_fake_dependencies and _is_fake_dependency(ctx.reviewer): raise ValueError('fake reviewer dependency forbidden in production agentic mode')
-    raw=ctx.reviewer.review(state=state, attempt=a, scope=inp.scope) if hasattr(ctx.reviewer,'review') else ctx.reviewer(state,a,inp.scope)
+    payload=build_agentic_review_payload(state, a, inp.scope, st)
+    try:
+        raw=ctx.reviewer.review(state=state, attempt=payload, scope=inp.scope) if hasattr(ctx.reviewer,'review') else ctx.reviewer(state,payload,inp.scope)
+    except TypeError:
+        raw=ctx.reviewer.review(state=state, attempt=a, scope=inp.scope) if hasattr(ctx.reviewer,'review') else ctx.reviewer(state,a,inp.scope)
     res=OpsReviewResult.model_validate(raw)
     if isinstance(a, dict):
-        eligible=res.decision=='pass' and res.recommended_action=='accept' and not res.issues and not any((v.get('passed') is False) for v in a.get('validation',{}).get('commands',[]))
-        a['review']=res.model_dump(); a['acceptance_eligible']=eligible; a['acceptance_blockers']=[] if eligible else (res.issues or [res.summary]); a['status']='reviewed'
+        a['review']=res.model_dump(); a['status']='reviewed' if a.get('status')!='failed' else 'rejected'
+        eligible, blockers=_set_acceptance_from_gate(state, a)
     else:
-        validation_failed=any((v.get('passed') is False) for v in ((getattr(a,'validation',None) or {}).get('commands',[]) if hasattr(a,'validation') else []))
-        eligible=res.decision=='pass' and res.recommended_action=='accept' and not res.issues and not validation_failed
-        a.review=res.model_dump(); a.acceptance_eligible=eligible; a.acceptance_blockers=[] if eligible else (res.issues or [res.summary] + (['validation_failed'] if validation_failed else [])); a.status='reviewed' if a.status!='failed' else 'rejected'
-        if st and a.acceptance_eligible: st.status='accepted'; st.accepted_attempt_id=a.attempt_id
-    state.reviews.append({'attempt_id':inp.attempt_id,**res.model_dump()})
-    ctx.recorder.record(f'{inp.scope}_attempt_reviewed', payload={'attempt_id':inp.attempt_id,'review_decision':res.decision,'acceptance_eligible':(not isinstance(a,dict) and a.acceptance_eligible) or (isinstance(a,dict) and a.get('acceptance_eligible'))})
-    return res.model_dump()
+        a.review=res.model_dump(); a.status='reviewed' if a.status!='failed' else 'rejected'
+        eligible, blockers=_set_acceptance_from_gate(state, a)
+        if st and eligible:
+            st.status='accepted'; st.accepted_attempt_id=a.attempt_id
+    state.reviews.append({'attempt_id':inp.attempt_id,**res.model_dump(),'acceptance_eligible':eligible,'acceptance_blockers':blockers})
+    if not eligible and blockers:
+        state.blockers=sorted(set(state.blockers+blockers))
+    ctx.recorder.record(f'{inp.scope}_attempt_reviewed', payload={'attempt_id':inp.attempt_id,'review_decision':res.decision,'review_recommended_action':res.recommended_action,'central_acceptance_eligible':eligible,'acceptance_eligible':eligible,'acceptance_blockers':blockers,'validation_blocked':any(b.startswith('validation_') for b in blockers),'artifact_blocked':any(b in {'missing_patch','empty_changed_files','patch_unreadable'} for b in blockers)})
+    return {**res.model_dump(),'acceptance_eligible':eligible,'acceptance_blockers':blockers,'review_payload_included':['patch_excerpt','stdout_tail','stderr_tail','validation']}
 def h_integrate(state, inp, ctx):
     if state.execution_path!='decomposed_subtasks': raise ValueError('integration requires decomposed_subtasks execution path')
     unaccepted=[s.subtask_id for s in state.subtasks if s.status!='accepted']
@@ -245,28 +305,49 @@ def h_select_winner(state, inp, ctx):
     if state.execution_path=='decomposed_subtasks':
         if st is not None: raise ValueError('cannot select raw subtask attempt as final winner')
         if not isinstance(a,dict) or inp.selected_attempt_id!='integration_001': raise ValueError('decomposed final selection requires integration result')
-    if isinstance(a,dict):
-        eligible=a.get('acceptance_eligible') is True and a.get('review')
-        status=a.get('status')
-        blockers=a.get('acceptance_blockers') or []
-    else:
-        eligible=a.acceptance_eligible and a.review is not None and not any((v.get('passed') is False) for v in ((getattr(a,'validation',None) or {}).get('commands',[]) if hasattr(a,'validation') else [])); status=a.status; blockers=a.acceptance_blockers
-        if state.execution_path=='parallel_candidates' and a.scope!='candidate': raise ValueError('candidate path selection requires candidate attempt')
+    if state.execution_path=='parallel_candidates' and (isinstance(a,dict) or getattr(a,'scope',None)!='candidate'):
+        raise ValueError('candidate path selection requires candidate attempt')
+    status=a.get('status') if isinstance(a,dict) else a.status
     if status=='running': raise ValueError('cannot select running attempt')
-    if not eligible or blockers: raise ValueError('selected attempt is not acceptance eligible')
-    state.selection=inp.model_dump(); state.phase='finalizing'; return state.selection
+    eligible, blockers=is_attempt_acceptance_eligible(a, state=state)
+    stored=a.get('acceptance_eligible') if isinstance(a,dict) else a.acceptance_eligible
+    if isinstance(a,dict):
+        a['acceptance_eligible']=eligible; a['acceptance_blockers']=blockers
+    else:
+        a.acceptance_eligible=eligible; a.acceptance_blockers=blockers
+    if not eligible:
+        state.blockers=sorted(set(state.blockers+blockers))
+        ctx.recorder.record('selection_rejected', payload={'selected_attempt_id':inp.selected_attempt_id,'stored_acceptance_eligible':stored,'recomputed_acceptance_eligible':eligible,'acceptance_blockers':blockers})
+        raise ValueError('selected attempt is not acceptance eligible: '+', '.join(blockers))
+    state.selection={**inp.model_dump(),'selection_evidence':{'stored_acceptance_eligible':stored,'recomputed_acceptance_eligible':eligible,'acceptance_blockers':blockers}}
+    state.phase='finalizing'; ctx.recorder.record('winner_selected', payload=state.selection); return state.selection
 
 def h_finalize(state, inp, ctx):
     if inp.decision=='accepted':
         sel=state.selection or {}; aid=inp.selected_attempt_id or sel.get('selected_attempt_id')
         if sel.get('decision')!='select': raise ValueError('accepted finalization requires select decision')
-        a,_=_find_attempt(state, aid)
+        if not aid or (inp.selected_attempt_id and sel.get('selected_attempt_id') and inp.selected_attempt_id!=sel.get('selected_attempt_id')):
+            raise ValueError('final selected attempt does not match selection')
+        a, st=_find_attempt(state, aid)
         if not a: raise ValueError('selected attempt does not exist')
-        eligible=(a.get('acceptance_eligible') if isinstance(a,dict) else a.acceptance_eligible)
-        if not eligible: raise ValueError('selected attempt is not acceptance eligible')
-        if state.execution_path=='decomposed_subtasks' and (not isinstance(a,dict) or a.get('status')!='completed'):
-            raise ValueError('accepted finalization in decomposed mode requires completed eligible integration')
-    state.final_decision=inp.model_dump(); state.status='completed' if inp.decision=='accepted' else 'failed'; state.phase='completed' if state.status=='completed' else 'failed'; return state.final_decision
+        if st is not None: raise ValueError('raw subtask attempt cannot be finalized as accepted')
+        if state.execution_path=='decomposed_subtasks':
+            if not isinstance(a,dict) or aid!='integration_001': raise ValueError('accepted finalization in decomposed mode requires integration result')
+            if a.get('status')!='completed': raise ValueError('accepted finalization in decomposed mode requires completed eligible integration')
+        if any(c.status=='running' for c in state.candidates) or any(a2.status=='running' for s in state.subtasks for a2 in s.attempts):
+            raise ValueError('accepted finalization requires no running work')
+        eligible, blockers=is_attempt_acceptance_eligible(a, state=state)
+        if isinstance(a,dict):
+            a['acceptance_eligible']=eligible; a['acceptance_blockers']=blockers
+        else:
+            a.acceptance_eligible=eligible; a.acceptance_blockers=blockers
+        if not eligible:
+            state.blockers=sorted(set(state.blockers+blockers))
+            ctx.recorder.record('finalization_blocked', payload={'selected_attempt_id':aid,'acceptance_blockers':blockers})
+            raise ValueError('selected attempt is not acceptance eligible: '+', '.join(blockers))
+        if inp.selected_patch_path and (a.get('patch_path') if isinstance(a,dict) else a.patch_path) != inp.selected_patch_path:
+            raise ValueError('final selected patch does not match selected attempt')
+    state.final_decision=inp.model_dump(); state.status='completed' if inp.decision=='accepted' else 'failed'; state.phase='completed' if state.status=='completed' else 'failed'; ctx.recorder.record('run_finalized', payload=state.final_decision); return state.final_decision
 OPS_TOOLS={
 'ops_get_state':ToolSpec('ops_get_state','Inspect canonical run state',OpsGetStateInput,h_get_state,True),
 'ops_inspect_repo':ToolSpec('ops_inspect_repo','Inspect repository',OpsInspectRepoInput,h_inspect_repo,True),
