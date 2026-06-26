@@ -1,9 +1,44 @@
 from __future__ import annotations
 from pathlib import Path
+from typing import Any
 import json
 
-def write_transcript(run_dir:Path, transcript:list[dict]): (Path(run_dir)/'transcript.json').write_text(json.dumps(transcript,indent=2))
-def derive_graph(state, events:list[dict])->dict:
+
+def write_text_utf8(path: Path, text: str, *, atomic: bool = False) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if atomic:
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(text, encoding="utf-8", newline="\n")
+        tmp.replace(path)
+    else:
+        path.write_text(text, encoding="utf-8", newline="\n")
+
+
+def read_text_utf8(path: Path, default: str | None = None) -> str:
+    path = Path(path)
+    try:
+        return path.read_text(encoding="utf-8")
+    except Exception:
+        if default is not None:
+            return default
+        raise
+
+
+def write_json_utf8(path: Path, data: Any, *, atomic: bool = False, indent: int = 2) -> None:
+    text = json.dumps(data, indent=indent, ensure_ascii=False, default=str)
+    write_text_utf8(Path(path), text, atomic=atomic)
+
+
+def read_json_utf8(path: Path) -> Any:
+    return json.loads(read_text_utf8(Path(path)))
+
+
+def write_transcript(run_dir: Path, transcript: list[dict]):
+    write_json_utf8(Path(run_dir) / 'transcript.json', transcript, atomic=True)
+
+
+def derive_graph(state, events: list[dict]) -> dict:
     nodes=[{'id':'run','type':'run','status':state.status,'concurrency_mode':getattr(state,'concurrency_mode',None),'max_parallel':getattr(state,'max_parallel',None),'execution_concurrency':getattr(state,'execution_concurrency',{}),'candidate_concurrency':getattr(state,'candidate_concurrency',{}),'subtask_concurrency':getattr(state,'subtask_concurrency',{})},{'id':'investigation','type':'investigation','present':state.investigation is not None},{'id':'plan','type':'plan','present':state.plan is not None}]
     if state.decomposition: nodes.append({'id':'decomposition','type':'decomposition','accepted':state.decomposition_accepted,'validated':state.decomposition_validated,'executed':state.decomposition_executed,'fallback_used':state.decomposition_fallback_used})
     for c in state.candidates: nodes.append({'id':c.attempt_id,'type':c.scope,'status':('accepted' if c.status=='accepted' and c.acceptance_eligible else c.status),'runner_failed':bool(c.failure_reason or (c.exit_code is not None and c.exit_code!=0)),'review_passed_but_blocked':bool(c.review and c.review.get('decision')=='pass' and not c.acceptance_eligible),'validation_failed':bool((c.validation or {}).get('passed') is False),'deletion_only_patch':bool(c.deleted_files and not (c.added_files or c.modified_files or c.renamed_files)),'changed_files':c.changed_files,'deleted_files':c.deleted_files,'acceptance_eligible':c.acceptance_eligible,'acceptance_blockers':c.acceptance_blockers})
@@ -13,5 +48,10 @@ def derive_graph(state, events:list[dict])->dict:
     if state.integration: nodes.append({'id':'integration','type':'integration','status':state.integration.get('status'),'integration_unsupported':state.integration.get('failure_reason')=='agentic_subtask_integration_not_implemented','integration_failed':state.integration.get('status')=='failed','completed_but_unreviewed':state.integration.get('status')=='completed' and not state.integration.get('review'),'failure_reason':state.integration.get('failure_reason'),'merge_conflicts':state.integration.get('merge_conflicts') or [],'conflict_artifacts':state.integration.get('conflict_artifacts') or [],'applied_subtasks':state.integration.get('applied_subtasks') or [],'failed_subtasks':state.integration.get('failed_subtasks') or [],'acceptance_eligible':state.integration.get('acceptance_eligible'),'acceptance_blockers':state.integration.get('acceptance_blockers') or []})
     nodes += [{'id':'selection','type':'selection','present':state.selection is not None},{'id':'finalization','type':'finalization','present':state.final_decision is not None}]
     return {'canonical':'state.json','derived_from_events':len(events),'nodes':nodes,'edges':[]}
-def write_artifacts(run_dir:Path,state,events:list[dict],transcript:list[dict]):
-    run_dir=Path(run_dir); state.save(run_dir/'state.json'); write_transcript(run_dir,transcript); (run_dir/'orchestration_graph.json').write_text(json.dumps(derive_graph(state,events),indent=2))
+
+
+def write_artifacts(run_dir: Path, state, events: list[dict], transcript: list[dict]):
+    run_dir=Path(run_dir)
+    state.save(run_dir/'state.json')
+    write_transcript(run_dir,transcript)
+    write_json_utf8(run_dir/'orchestration_graph.json', derive_graph(state,events), atomic=True)

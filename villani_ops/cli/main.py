@@ -9,6 +9,7 @@ from villani_ops.core.backend import Backend
 from villani_ops.storage.files import FileStorage
 from villani_ops.policy_engine.defaults import DEFAULT_PROFILES
 from villani_ops.controller.progress import RunProgressReporter
+from villani_ops.agentic.progress import AgenticProgressReporter
 
 app=typer.Typer(help='Villani Ops: CLI-only multi-agent performance orchestrator for coding tasks.')
 backend_app=typer.Typer(); task_app=typer.Typer(); policy_app=typer.Typer(); runner_app=typer.Typer()
@@ -117,7 +118,7 @@ def run(ctx: typer.Context, repo: str|None=None, task: str|None=typer.Option(Non
         from villani_ops.agentic import OpsRunner, OpsRunRequest
         
         s=storage(workspace); s.init_workspace(); backends=s.load_backends()
-        result=OpsRunner(s, backends=backends).run(OpsRunRequest(repo_path=str(Path(repo).resolve()), task=t.objective, success_criteria=t.success_criteria, mode=mode, runner=runner, candidate_attempts=candidate_attempts, timeout_seconds=timeout_seconds, workspace=workspace, backends=backends))
+        result=OpsRunner(s, backends=backends, progress_reporter=AgenticProgressReporter(not quiet, verbose=verbose, console=console)).run(OpsRunRequest(repo_path=str(Path(repo).resolve()), task=t.objective, success_criteria=t.success_criteria, mode=mode, runner=runner, candidate_attempts=candidate_attempts, timeout_seconds=timeout_seconds, workspace=workspace, backends=backends))
     else:
         result=VillaniOps(storage(workspace), progress_reporter=RunProgressReporter(not quiet, verbose=verbose)).run(repo=repo, task=t, candidate_attempts=candidate_attempts, timeout_seconds=timeout_seconds, classify=classify, non_interactive=(non_interactive or not sys.stdin.isatty()), mode=mode, runner=runner)
     d=result.decision

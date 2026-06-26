@@ -2,6 +2,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal
 from pydantic import BaseModel, Field, ConfigDict
+from .artifacts import read_text_utf8, write_text_utf8
 
 class CandidateAttemptState(BaseModel):
     model_config=ConfigDict(extra='forbid')
@@ -55,6 +56,16 @@ class OpsRunState(BaseModel):
             if all(s.status in {'accepted','skipped'} for s in self.subtasks) and not self.integration: a.append('ops_integrate_subtasks'); return a
         a += ['ops_review_attempt','ops_run_validation','ops_select_winner','ops_finalize_run']
         return a
-    def save(self,path:Path)->None: path.write_text(self.model_dump_json(indent=2))
+    def save(self,path:Path)->None:
+        write_text_utf8(path, self.model_dump_json(indent=2), atomic=True)
     @classmethod
-    def load(cls,path:Path)->'OpsRunState': return cls.model_validate_json(path.read_text())
+    def load(cls,path:Path)->'OpsRunState':
+        text = read_text_utf8(path)
+        if not text.strip():
+            tmp = Path(path).with_name(Path(path).name + '.tmp')
+            if tmp.exists():
+                tmp_text = read_text_utf8(tmp)
+                if tmp_text.strip():
+                    return cls.model_validate_json(tmp_text)
+            raise ValueError('state.json is empty or corrupted, likely due a previous interrupted/failed write. Check runtime_events.jsonl and transcript.json.')
+        return cls.model_validate_json(text)
