@@ -16,8 +16,31 @@ class CandidateAttemptState(BaseModel):
     exit_code:int|None=None; exit_reason:str|None=None; failure_reason:str|None=None; runner_status:str|None=None; runner_error_type:str|None=None; duration_seconds:float|None=None
     added_files:list[str]=Field(default_factory=list); deleted_files:list[str]=Field(default_factory=list); modified_files:list[str]=Field(default_factory=list); renamed_files:list[str]=Field(default_factory=list)
     validation:dict|None=None; validation_results:list[dict]=Field(default_factory=list); validation_status:Literal['not_run','passed','failed','command_rejected','error','timed_out']='not_run'; validation_source:str|None=None; token_usage:dict|None=None; cost:float|None=None
-    patch_hygiene:dict|None=None; scope_assessment:dict|None=None
+    patch_hygiene:dict|None=None; scope_assessment:dict|None=None; runner_telemetry:dict=Field(default_factory=dict)
     review_status:Literal['not_run','passed','failed','unavailable','malformed','provider_error']='not_run'; review_error_type:str|None=None; review_error_message:str|None=None; review_retry_count:int=0
+
+class AttemptObservation(BaseModel):
+    model_config=ConfigDict(extra='forbid')
+    attempt_id:str
+    scope:Literal["candidate","subtask","integration"]
+    subtask_id:str|None=None
+    backend_name:str|None=None
+    model:str|None=None
+    outcome:Literal["accepted","validation_failed","review_failed","runner_failed","infra_failed","no_patch","scope_failed","patch_failed","partial_progress","unknown"]
+    progress_score:float=0.0
+    failure_class:str|None=None
+    evidence:list[str]=Field(default_factory=list)
+    blockers:list[str]=Field(default_factory=list)
+    changed_files:list[str]=Field(default_factory=list)
+    validation_status:str|None=None
+    review_status:str|None=None
+    runner_signals:dict=Field(default_factory=dict)
+    backend_signals:dict=Field(default_factory=dict)
+    next_attempt_directives:list[str]=Field(default_factory=list)
+    should_retry_same_plan:bool=False
+    should_repair:bool=False
+    should_decompose:bool=False
+    should_escalate_backend:bool=False
 
 class SubtaskState(BaseModel):
     model_config=ConfigDict(extra='forbid')
@@ -83,6 +106,7 @@ class OpsRunState(BaseModel):
     fallback_reason:str|None=None; fallback_used:bool=False; fallback_from_execution_path:str|None=None; fallback_started_at:str|None=None
     best_partial_attempt_id:str|None=None; partial_progress:dict|None=None
     candidates:list[CandidateAttemptState]=Field(default_factory=list); subtasks:list[SubtaskState]=Field(default_factory=list)
+    attempt_observations:list[AttemptObservation]=Field(default_factory=list); backend_assessments:dict[str,dict]=Field(default_factory=dict); runner_assessment:dict=Field(default_factory=dict); adaptive_context:dict=Field(default_factory=dict)
     integration:dict|None=None; reviews:list[dict]=Field(default_factory=list); repo_validation_results:list[dict]=Field(default_factory=list); selection:dict|None=None; final_decision:dict|None=None
     active_nodes:list[str]=Field(default_factory=list); completed_nodes:list[str]=Field(default_factory=list); failed_nodes:list[str]=Field(default_factory=list)
     costs:dict[str,float]=Field(default_factory=dict); input_tokens:int=0; output_tokens:int=0
@@ -99,9 +123,9 @@ class OpsRunState(BaseModel):
         if self.decomposition_requested and not self.decomposition: a.append('ops_submit_decomposition'); return a
         if self.decomposition and not self.decomposition_validated: a.append('ops_validate_decomposition'); return a
         if self.execution_path=='unknown': a.append('ops_select_execution_path'); return a
-        if self.execution_path=='single_task' and not self.candidates: a.append('ops_run_single_task_attempts'); return a
+        if self.execution_path=='single_task' and len(self.candidates) < max(1,int(self.candidate_attempts or 1)): a += ['ops_run_next_candidate_attempt','ops_run_single_task_attempts']; return list(dict.fromkeys(a))
         if self.execution_path=='single_task':
-            a += ['ops_review_attempt','ops_run_validation','ops_select_winner','ops_finalize_run']; return list(dict.fromkeys(a))
+            a += ['ops_run_next_candidate_attempt','ops_review_attempt','ops_run_validation','ops_select_winner','ops_finalize_run']; return list(dict.fromkeys(a))
         if self.execution_path=='parallel_candidates' and not self.candidates: a.append('ops_launch_candidates'); return a
         if self.fallback_execution_path=='parallel_candidates_after_decomposition_deadlock' and not self.candidates: a.append('ops_launch_candidates'); return a
         if self.fallback_execution_path=='parallel_candidates_after_decomposition_deadlock' and self.candidates:

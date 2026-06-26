@@ -70,7 +70,7 @@ def recommend_next_agentic_action(state):
     if (state.plan or {}).get('strategy')=='single_task' and state.execution_path=='unknown':
         return RecoveryRecommendation(action='select_single_task_execution_path',tool_name='ops_select_execution_path',tool_input={'path':'single_task','reason':'Planner selected single_task; run sequential attempts with validation/review after each attempt.'},reason='single_task plan has no selected execution path',can_execute_deterministically=True)
     if state.execution_path=='single_task' and not state.candidates:
-        return RecoveryRecommendation(action='run_single_task_attempts',tool_name='ops_run_single_task_attempts',tool_input={'attempts':state.candidate_attempts,'reason':'Run sequential single-task attempts, stopping once an attempt passes validation and review.'},reason='single_task execution path selected but no attempts have launched',can_execute_deterministically=True)
+        return RecoveryRecommendation(action='run_next_candidate_attempt',tool_name='ops_run_next_candidate_attempt',tool_input={'reason':'Run the first adaptive single-task candidate attempt.'},reason='single_task execution path selected but no attempts have launched',can_execute_deterministically=True)
     if state.decomposition_validated and state.decomposition_accepted is True and state.execution_path=='unknown' and state.subtasks:
         return RecoveryRecommendation(action='select_decomposed_execution_path',tool_name='ops_select_execution_path',tool_input={'path':'decomposed_subtasks','reason':'Decomposition has been validated and accepted.'},reason='Accepted decomposition has no selected execution path.',can_execute_deterministically=True)
     if state.execution_path=='decomposed_subtasks' and state.decomposition_accepted is True and state.subtasks and not _has_active_subtask_attempts(state) and all(s.status=='pending' and not s.attempts for s in state.subtasks):
@@ -88,6 +88,9 @@ def recommend_next_agentic_action(state):
         eligible, blockers=is_attempt_acceptance_eligible(a,state=state)
         if eligible:
             return RecoveryRecommendation(action='select_winner',tool_name='ops_select_winner',tool_input={'decision':'select','selected_attempt_id':aid,'summary':'Candidate passed review and validation and is centrally acceptance eligible.','reasons':['central acceptance gate passed'],'confidence':0.95},reason='eligible candidate/integration exists',can_execute_deterministically=True)
+    for a in state.candidates:
+        if not any(getattr(o,'attempt_id',None)==a.attempt_id for o in getattr(state,'attempt_observations',[]) or []) and _status(a) in {'completed','failed','reviewed','rejected'}:
+            return RecoveryRecommendation(action='create_missing_observation',tool_name='ops_run_next_candidate_attempt' if len(state.candidates)<state.candidate_attempts else None,tool_input={'reason':'Use observations from prior attempt before retrying.'} if len(state.candidates)<state.candidate_attempts else None,reason='completed attempt lacks an observation; next adaptive attempt tool will observe before retrying',can_execute_deterministically=bool(len(state.candidates)<state.candidate_attempts))
     for a in state.candidates:
         val=_validation(a) or {}
         if val.get('passed') is True and _patch(a) and _changed(a) and _review_status(a) in {'unavailable','malformed','provider_error'} and _review_retry_count(a) < 3:
@@ -118,8 +121,8 @@ def handle_no_tool_call(state, reason='no_tool_call', max_recovery_attempts:int=
             content='Call ops_select_execution_path with path="decomposed_subtasks".'
         if rec.tool_name=='ops_select_execution_path' and rec.tool_input and rec.tool_input.get('path')=='single_task':
             content='Call ops_select_execution_path with path="single_task".'
-        if rec.tool_name=='ops_run_single_task_attempts':
-            content='Call ops_run_single_task_attempts to run sequential single-task attempts. Do not call ops_launch_candidates.'
+        if rec.tool_name=='ops_run_next_candidate_attempt':
+            content='Call ops_run_next_candidate_attempt to run exactly one adaptive candidate attempt. Do not call bulk attempt tools.'
         if rec.tool_name=='ops_select_winner' and rec.tool_input and rec.tool_input.get('selected_attempt_id'):
             content=f"There is a reviewed and validated eligible candidate: {rec.tool_input['selected_attempt_id']}. Call ops_select_winner."
         if rec.tool_name=='ops_run_validation' and rec.tool_input:

@@ -240,4 +240,4 @@ def test_recovery_recommends_single_task_path_and_runner(tmp_path):
     assert rec.tool_input['path'] == 'single_task'
     s.execution_path='single_task'
     rec=recommend_next_agentic_action(s)
-    assert rec.tool_name == 'ops_run_single_task_attempts'
+    assert rec.tool_name == 'ops_run_next_candidate_attempt'
