@@ -49,6 +49,20 @@ def _select_role_backend(mode, backends, role, task):
     if not sel.backend: raise ValueError(f'agentic_backend_role_unavailable: {role}')
     return sel.backend_name, sel.backend
 
+
+def _state_aware_no_progress_summary(state):
+    reviewed=[c.attempt_id for c in state.candidates if c.review]
+    validated=[c.attempt_id for c in state.candidates if c.validation]
+    eligible=[]
+    try:
+        from villani_ops.core.acceptance import is_attempt_acceptance_eligible
+        eligible=[c.attempt_id for c in state.candidates if is_attempt_acceptance_eligible(c,state=state)[0]]
+    except Exception:
+        pass
+    if reviewed or validated or eligible:
+        return f"The orchestrator made no tool-call progress. Candidates completed={len(state.candidates)}, reviewed={reviewed}, validated={validated}, eligible={eligible}, selection={(state.selection or {}).get('selected_attempt_id')}. No accepted result was finalized."
+    return 'agentic_orchestrator_no_progress'
+
 class OpsRunRequest(BaseModel):
     model_config=ConfigDict(extra='forbid', arbitrary_types_allowed=True)
     repo_path:str; task:str; success_criteria:str|None=None; mode:str='performance'; runner:str='villani-code'; candidate_attempts:int=3; timeout_seconds:int|None=None; workspace:str='.villani-ops'; backend:object|None=None; backends:object|None=None; runner_adapter:object|None=None; reviewer:object|None=None; production:bool=True; allow_fake_dependencies:bool=False
@@ -96,9 +110,17 @@ class OpsRunner:
                 text='\n'.join([b.get('text','') for b in resp.content if b.get('type')=='text']) or None
                 messages.append({'role':'assistant','content':text,'tool_calls':[{'id':tc.get('id'),'type':'function','function':{'name':tc['name'],'arguments':_json.dumps(tc.get('input') or {})}} for tc in tool_calls]})
             if not tool_calls:
-                rr=handle_no_tool_call(state,max_recovery_attempts=self.max_recovery_attempts); rec.record('recovery_injected',payload={'message':rr.message}); messages.append(rr.message); state.save(run_dir/'state.json')
+                rr=handle_no_tool_call(state,max_recovery_attempts=self.max_recovery_attempts)
+                rec.record('recovery_injected',payload={'message':rr.message,'recommendation':rr.recommendation.model_dump() if rr.recommendation else None})
+                if rr.recommendation and rr.recommendation.can_execute_deterministically and rr.recommendation.tool_name:
+                    rec.record('recovery_deterministic_action_executed', payload=rr.recommendation.model_dump())
+                    res=execute_tool_with_policy(state,rr.recommendation.tool_name,rr.recommendation.tool_input or {},'recovery',OpsToolContext(run_dir=run_dir,recorder=rec,transcript=transcript,runner_adapter=runner_adapter,reviewer=reviewer,backend=backend,backend_name=getattr(backend,'name',None),coding_backend=coding_backend,coding_backend_name=coding_name,review_backend=review_backend,review_backend_name=review_name,timeout_seconds=request.timeout_seconds,max_parallel=getattr(coding_backend,'max_parallel',1),production=request.production,allow_fake_dependencies=request.allow_fake_dependencies))
+                    block={'type':'tool_result','tool_use_id':res.tool_use_id,'content':res.content,'is_error':res.is_error}; transcript.append(block); messages.append({'role':'tool','tool_call_id':res.tool_use_id,'content':str(res.content)}); rec.record('tool_result_appended',tool_name=res.tool_name,payload=block)
+                    continue
+                messages.append(rr.message); state.save(run_dir/'state.json')
                 if rr.should_fail:
-                    state.status='failed'; state.phase='failed'; state.final_decision={'decision':'failed','summary':'agentic_orchestrator_no_progress','blockers':['agentic_orchestrator_no_progress']}; rec.record('run_finalized',payload=state.final_decision); break
+                    summary=_state_aware_no_progress_summary(state)
+                    state.status='failed'; state.phase='failed'; state.final_decision={'decision':'failed','summary':summary,'blockers':['agentic_orchestrator_no_progress']}; rec.record('run_finalized',payload=state.final_decision); break
                 continue
             for tc in tool_calls:
                 res=execute_tool_with_policy(state,tc['name'],tc.get('input') or {},tc.get('id','tool'),OpsToolContext(run_dir=run_dir,recorder=rec,transcript=transcript,runner_adapter=runner_adapter,reviewer=reviewer,backend=backend,backend_name=getattr(backend,'name',None),coding_backend=coding_backend,coding_backend_name=coding_name,review_backend=review_backend,review_backend_name=review_name,timeout_seconds=request.timeout_seconds,max_parallel=getattr(coding_backend,'max_parallel',1),production=request.production,allow_fake_dependencies=request.allow_fake_dependencies))

@@ -6,7 +6,7 @@ from pydantic import BaseModel, Field, ConfigDict, model_validator
 from .state import CandidateAttemptState, SubtaskState
 from .git_artifacts import capture_git_patch, ensure_git_baseline, clean_runner_artifacts_from_worktree, DEFAULT_PATCH_EXCLUDES, is_git_compatible_patch, patch_contains_internal_artifacts
 from villani_ops.core.acceptance import is_attempt_acceptance_eligible, attempt_requires_patch
-import subprocess, json, time, shutil
+import subprocess, json, time, shutil, os, re
 from .artifacts import read_text_utf8, write_text_utf8, write_json_utf8
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -163,7 +163,7 @@ class OpsLaunchSubtasksInput(StrictModel): subtask_ids:list[str]; backend_name:s
 class OpsReviewAttemptInput(StrictModel): attempt_id:str; scope:Literal['candidate','subtask','integration']
 class OpsReviewResult(StrictModel): decision:Literal['pass','fail']; recommended_action:Literal['accept','reject','retry','repair']; score:float; summary:str; evidence:list[str]=Field(default_factory=list); issues:list[str]=Field(default_factory=list); blockers:list[str]=Field(default_factory=list); confidence:float=0.0; subtask_passed:bool|None=None; scope_ok:bool|None=None; integration_risk:Literal['low','medium','high','unknown']|None=None
 class OpsIntegrateSubtasksInput(StrictModel): reason:str
-class OpsRunValidationInput(StrictModel): commands:list[ValidationCommand]; target:Literal['candidate','integration','repo']; target_id:str|None=None
+class OpsRunValidationInput(StrictModel): commands:list[ValidationCommand]; target:Literal['candidate','integration','repo']; target_id:str|None=None; allow_cwd_escape:bool=False
 class OpsSelectWinnerInput(StrictModel): selected_attempt_id:str|None=None; decision:Literal['select','reject_all']; summary:str; reasons:list[str]=Field(default_factory=list); rejected_attempts:list[str]=Field(default_factory=list); confidence:float
 class OpsFinalizeRunInput(StrictModel): decision:Literal['accepted','rejected','failed']; summary:str; selected_attempt_id:str|None=None; selected_patch_path:str|None=None; blockers:list[str]=Field(default_factory=list)
 @dataclass
@@ -286,12 +286,13 @@ def h_launch_candidates(state, inp, ctx):
     made=[]; maxp=max(1, int(getattr(ctx.coding_backend or ctx.backend,'max_parallel',None) or ctx.max_parallel or 1))
     state.max_parallel=maxp
     total=int(inp.attempts); batch_count=0; final_mode='sequential_due_max_parallel_1' if maxp<=1 or total<=1 else 'parallel_candidates'
+    next_index=len(state.candidates)+1
     for off in range(0,total,maxp):
         batch=list(range(off, min(off+maxp,total))); batch_count+=1
         ids=[]; futs=[]
         with ThreadPoolExecutor(max_workers=len(batch)) as ex:
             for _i in batch:
-                aid=f'candidate_{len(state.candidates)+len(ids)+1:03d}'
+                aid=f'candidate_{next_index:03d}'; next_index+=1
                 ids.append(aid); made.append(aid)
                 scheduled=_attempt(aid,'candidate',backend=inp.backend_name or ctx.coding_backend_name or ctx.backend_name,artifacts=Path(state.run_dir)/'attempts'/aid)
                 scheduled.status='running'; scheduled.started_at=str(time.time()); scheduled.worktree_path=str(Path(state.run_dir)/'attempts'/aid/'worktree')
@@ -548,36 +549,106 @@ def h_integrate(state, inp, ctx):
     ctx.recorder.record('integration_completed' if status=='completed' else 'integration_failed', payload=state.integration)
     return state.integration
 
-def h_validation(state, inp, ctx):
+def _is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve()); return True
+    except Exception:
+        return False
+
+def _target_label(target: str, target_id: str | None) -> str:
+    return target_id if target in {'candidate','integration'} and target_id else target
+
+def _resolve_validation_target(state, inp):
     if inp.target=='candidate':
         if not inp.target_id: raise ValueError('target_id required for candidate validation')
-        a,_=_find_attempt(state, inp.target_id)
-        if not a or isinstance(a,dict): raise ValueError(f'unknown candidate {inp.target_id}')
-        cwd=Path(a.worktree_path or state.repo_path)
-    elif inp.target=='integration':
-        cwd=Path((state.integration or {}).get('worktree_path') or state.repo_path)
-    else: cwd=Path(state.repo_path)
-    results=[]; all_pass=True
+        a, st=_find_attempt(state, inp.target_id)
+        if not a or isinstance(a,dict) or getattr(a,'scope',None) not in {'candidate','subtask'}: raise ValueError(f'unknown candidate/subtask attempt {inp.target_id}')
+        if not a.worktree_path: raise ValueError(f'attempt {inp.target_id} has no worktree_path')
+        return a, Path(a.worktree_path), st
+    if inp.target=='integration':
+        integ=state.integration
+        if not integ: raise ValueError('integration validation requires integration result')
+        w=integ.get('worktree_path')
+        if not w: raise ValueError('integration result has no worktree_path')
+        return integ, Path(w), None
+    return None, Path(state.repo_path), None
+
+def _resolve_command_cwd(cwd_value: str | None, base: Path, *, target: str, allow_escape: bool) -> Path:
+    if not cwd_value:
+        return base.resolve()
+    cwd=Path(cwd_value)
+    resolved=(cwd if cwd.is_absolute() else base/cwd).resolve()
+    if target in {'candidate','integration'} and not allow_escape and not _is_relative_to(resolved, base.resolve()):
+        raise ValueError(f'targeted validation cwd must stay inside the {target} worktree')
+    return resolved
+
+def _embedded_cd_error(cmd: str) -> str | None:
+    c=cmd.strip()
+    patterns=[r'(?is)^cd\s+.+?(?:&&|;)', r'(?is)^set-location\s+.+?(?:;|&&)', r'(?is)^pushd\s+.+?(?:&&|;)']
+    if any(re.match(p,c) for p in patterns):
+        return 'targeted validation runs in the target worktree automatically; remove embedded cd from the command'
+    return None
+
+def _validation_platform_is_windows() -> bool:
+    return os.name=='nt'
+
+def _platform_command_error(cmd: str) -> tuple[str,str] | None:
+    if not _validation_platform_is_windows():
+        return None
+    checks=[('head', r'(?i)(?:\|\s*head\b|^\s*head\b)'),('tail', r'(?i)(?:\|\s*tail\b|^\s*tail\b)'),('grep', r'(?i)(?:^|[|&;]\s*)grep\b'),('sed', r'(?i)(?:^|[|&;]\s*)sed\b'),('awk', r'(?i)(?:^|[|&;]\s*)awk\b'),('cat', r'(?i)(?:^|[|&;]\s*)cat\b'),('rm -rf', r'(?i)\brm\s+-rf\b'),('export', r'(?i)^\s*export\s+\w+=')]
+    for name,pat in checks:
+        if re.search(pat, cmd):
+            return name, f"validation command uses Unix-only utility '{name}' on Windows; use a Python one-liner or pytest flags instead"
+    return None
+
+def _attach_validation(state, target_obj, target, result):
+    status=result.get('status') or ('passed' if result.get('passed') else 'failed')
+    if target=='candidate' and target_obj is not None:
+        target_obj.validation=result; target_obj.validation_status=status; target_obj.validation_results=list(getattr(target_obj,'validation_results',[]) or [])+[result]
+        _set_acceptance_from_gate(state,target_obj)
+    elif target=='integration' and isinstance(target_obj,dict):
+        target_obj['validation']=result; target_obj['validation_status']=status; target_obj['validation_results']=(target_obj.get('validation_results') or [])+[result]
+        _set_acceptance_from_gate(state,target_obj)
+    elif target=='repo':
+        vals=list(getattr(state,'repo_validation_results',[]) or []); vals.append(result); state.repo_validation_results=vals
+
+def h_validation(state, inp, ctx):
+    target_obj, base_cwd, _st = _resolve_validation_target(state, inp)
+    results=[]; all_pass=True; overall_status='passed'; first_cwd=None
+    outdir=Path(state.run_dir)/'validation'; outdir.mkdir(exist_ok=True)
+    label=_target_label(inp.target, inp.target_id)
     for i,c in enumerate(inp.commands,1):
-        ctx.recorder.record('validation_started', payload={'target':inp.target,'target_id':inp.target_id,'cmd':c.cmd})
-        outdir=Path(state.run_dir)/'validation'; outdir.mkdir(exist_ok=True); so=outdir/f'{inp.target}_{inp.target_id or "repo"}_{i}.stdout.log'; se=outdir/f'{inp.target}_{inp.target_id or "repo"}_{i}.stderr.log'
         try:
-            p=subprocess.run(c.cmd,shell=True,cwd=c.cwd or cwd,text=True,capture_output=True,timeout=c.timeout_seconds or 300)
+            cmd_cwd=_resolve_command_cwd(c.cwd, base_cwd, target=inp.target, allow_escape=inp.allow_cwd_escape)
+            first_cwd=first_cwd or str(cmd_cwd)
+            if inp.target in {'candidate','integration'}:
+                msg=_embedded_cd_error(c.cmd)
+                if msg: raise ValueError(msg)
+            perr=_platform_command_error(c.cmd)
+            if perr:
+                util,msg=perr; raise RuntimeError(msg)
+        except Exception as e:
+            reason='platform_unsupported_command' if isinstance(e,RuntimeError) else 'targeted_cwd_rejected'
+            item={'cmd':c.cmd,'passed':False,'status':'command_rejected','reason':reason,'error':str(e),'cwd':str(base_cwd.resolve())}
+            results.append(item); all_pass=False; overall_status='command_rejected'
+            ctx.recorder.record('validation_command_rejected', payload={'target':inp.target,'target_id':inp.target_id,'cmd':c.cmd,'reason':reason,'message':str(e)})
+            continue
+        ctx.recorder.record('validation_started', payload={'target':inp.target,'target_id':inp.target_id,'target_label':label,'cmd':c.cmd,'cwd':str(cmd_cwd),'worktree_path':str(base_cwd) if inp.target in {'candidate','integration'} else None})
+        so=outdir/f'{inp.target}_{inp.target_id or "repo"}_{i}.stdout.log'; se=outdir/f'{inp.target}_{inp.target_id or "repo"}_{i}.stderr.log'
+        try:
+            p=subprocess.run(c.cmd,shell=True,cwd=cmd_cwd,text=True,capture_output=True,timeout=c.timeout_seconds or 300)
             write_text_utf8(so, p.stdout or ''); write_text_utf8(se, p.stderr or ''); passed=p.returncode==0; status='passed' if passed else 'failed'
+            if not passed: overall_status='failed'
         except subprocess.TimeoutExpired as e:
-            write_text_utf8(so, e.stdout or ''); write_text_utf8(se, (e.stderr or '')+'\ntimeout'); passed=False; status='timeout'
-        all_pass=all_pass and passed; item={'cmd':c.cmd,'passed':passed,'status':status,'stdout_path':str(so),'stderr_path':str(se)}; results.append(item)
-        ctx.recorder.record('validation_completed' if passed else 'validation_failed', payload={'target':inp.target,'target_id':inp.target_id,'validation_result':item})
-    res={'passed':all_pass,'commands':results}
-    if inp.target=='candidate' and inp.target_id:
-        a,_=_find_attempt(state, inp.target_id)
-        if a and not isinstance(a,dict):
-            a.validation=res
-            if not all_pass:
-                a.acceptance_eligible=False; a.acceptance_blockers=sorted(set(a.acceptance_blockers+['validation_failed']))
-    elif inp.target=='integration' and state.integration is not None:
-        state.integration['validation']=res
-        _set_acceptance_from_gate(state, state.integration)
+            write_text_utf8(so, e.stdout or ''); write_text_utf8(se, (e.stderr or '')+'\ntimeout'); passed=False; status='timed_out'; overall_status='timed_out'
+        except Exception as e:
+            write_text_utf8(so, ''); write_text_utf8(se, f'{type(e).__name__}: {e}\n'); passed=False; status='infrastructure_error'; overall_status='error'
+        all_pass=all_pass and passed
+        item={'cmd':c.cmd,'passed':passed,'status':status,'cwd':str(cmd_cwd),'stdout_path':str(so),'stderr_path':str(se)}; results.append(item)
+        ctx.recorder.record('validation_completed' if passed else 'validation_failed', payload={'target':inp.target,'target_id':inp.target_id,'passed':passed,'command_count':len(inp.commands),'cwd':str(cmd_cwd),'artifact_paths':{'stdout':str(so),'stderr':str(se)},'validation_result':item})
+    res={'passed':all_pass,'status':overall_status if not all_pass else 'passed','commands':results,'target':inp.target,'target_id':inp.target_id,'cwd':first_cwd or str(base_cwd.resolve())}
+    _attach_validation(state,target_obj,inp.target,res)
+    ctx.recorder.record('validation_attached', payload={'target':inp.target,'target_id':inp.target_id,'passed':all_pass,'status':res['status'],'command_count':len(inp.commands),'cwd':res['cwd'],'artifact_paths':[p for r in results for p in [r.get('stdout_path'),r.get('stderr_path')] if p]})
     return res
 
 def h_select_winner(state, inp, ctx):
@@ -650,7 +721,7 @@ OPS_TOOLS={
 'ops_launch_subtasks':ToolSpec('ops_launch_subtasks','Launch subtasks',OpsLaunchSubtasksInput,h_launch_subtasks),
 'ops_review_attempt':ToolSpec('ops_review_attempt','Review attempt',OpsReviewAttemptInput,h_review_attempt),
 'ops_integrate_subtasks':ToolSpec('ops_integrate_subtasks','Integrate subtasks',OpsIntegrateSubtasksInput,h_integrate),
-'ops_run_validation':ToolSpec('ops_run_validation','Run validation commands',OpsRunValidationInput,h_validation),
+'ops_run_validation':ToolSpec('ops_run_validation','Run validation commands in the selected target workspace automatically. For candidate/integration targets, provide target_id and commands without cd/pushd/Set-Location; cwd defaults to the target worktree and relative cwd is resolved inside it. Keep commands cross-platform; do not use Unix-only utilities like head, tail, grep, sed, awk, cat, rm -rf, or export. Prefer python -m pytest --tb=short -v or Python one-liners.',OpsRunValidationInput,h_validation),
 'ops_select_winner':ToolSpec('ops_select_winner','Select winner',OpsSelectWinnerInput,h_select_winner),
 'ops_finalize_run':ToolSpec('ops_finalize_run','Finalize run',OpsFinalizeRunInput,h_finalize),
 }

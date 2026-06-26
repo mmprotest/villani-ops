@@ -15,7 +15,7 @@ class CandidateAttemptState(BaseModel):
     started_at:str|None=None; completed_at:str|None=None
     exit_code:int|None=None; exit_reason:str|None=None; failure_reason:str|None=None; runner_status:str|None=None; runner_error_type:str|None=None; duration_seconds:float|None=None
     added_files:list[str]=Field(default_factory=list); deleted_files:list[str]=Field(default_factory=list); modified_files:list[str]=Field(default_factory=list); renamed_files:list[str]=Field(default_factory=list)
-    validation:dict|None=None; token_usage:dict|None=None; cost:float|None=None
+    validation:dict|None=None; validation_results:list[dict]=Field(default_factory=list); validation_status:Literal['not_run','passed','failed','command_rejected','error','timed_out']='not_run'; token_usage:dict|None=None; cost:float|None=None
     patch_hygiene:dict|None=None
 
 class SubtaskState(BaseModel):
@@ -36,7 +36,7 @@ class OpsRunState(BaseModel):
     decomposition_requested:bool=False; decomposition_validated:bool=False; decomposition_accepted:bool|None=None; decomposition_executed:bool=False
     decomposition_fallback_used:bool=False; decomposition_fallback_reason:str|None=None
     candidates:list[CandidateAttemptState]=Field(default_factory=list); subtasks:list[SubtaskState]=Field(default_factory=list)
-    integration:dict|None=None; reviews:list[dict]=Field(default_factory=list); selection:dict|None=None; final_decision:dict|None=None
+    integration:dict|None=None; reviews:list[dict]=Field(default_factory=list); repo_validation_results:list[dict]=Field(default_factory=list); selection:dict|None=None; final_decision:dict|None=None
     active_nodes:list[str]=Field(default_factory=list); completed_nodes:list[str]=Field(default_factory=list); failed_nodes:list[str]=Field(default_factory=list)
     costs:dict[str,float]=Field(default_factory=dict); input_tokens:int=0; output_tokens:int=0
     warnings:list[str]=Field(default_factory=list); blockers:list[str]=Field(default_factory=list); concurrency_mode:str|None=None; max_parallel:int|None=None; execution_concurrency:dict=Field(default_factory=dict); candidate_concurrency:dict=Field(default_factory=dict); subtask_concurrency:dict=Field(default_factory=dict); batch_count:int|None=None; wave_count:int|None=None; recovery_count:int=0; last_error:str|None=None; last_tool_name:str|None=None; last_tool_input:dict|None=None
