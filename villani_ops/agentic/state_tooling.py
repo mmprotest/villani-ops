@@ -5,7 +5,7 @@ from pydantic import BaseModel, ConfigDict
 from .tools import OPS_TOOLS
 @dataclass
 class OpsToolContext:
-    run_dir:Path; recorder:any; transcript:list[dict]; recent_events:list[dict]|None=None; runner_adapter:any=None; reviewer:any=None; backend:any=None; backend_name:str|None=None; timeout_seconds:int|None=None; max_parallel:int=1
+    run_dir:Path; recorder:any; transcript:list[dict]; recent_events:list[dict]|None=None; runner_adapter:any=None; reviewer:any=None; backend:any=None; backend_name:str|None=None; coding_backend:any=None; coding_backend_name:str|None=None; review_backend:any=None; review_backend_name:str|None=None; timeout_seconds:int|None=None; max_parallel:int=1; production:bool=True; allow_fake_dependencies:bool=False
 class OpsToolResult(BaseModel):
     model_config=ConfigDict(extra='forbid')
     tool_use_id:str; tool_name:str; content:dict|str; is_error:bool=False
@@ -41,7 +41,7 @@ def execute_tool_with_policy(state, tool_name:str, tool_input:dict, tool_use_id:
     rec.record('tool_call_received',tool_name=tool_name,payload={'input':tool_input})
     spec=OPS_TOOLS.get(tool_name)
     if not spec:
-        rec.record('tool_failed',tool_name=tool_name,payload={'error':'unknown tool'}); return OpsToolResult(tool_use_id=tool_use_id,tool_name=tool_name,content='unknown tool',is_error=True)
+        state.recovery_count += 1; rec.record('tool_failed',tool_name=tool_name,payload={'error':'unknown tool'}); return OpsToolResult(tool_use_id=tool_use_id,tool_name=tool_name,content='unknown tool',is_error=True)
     try:
         parsed=spec.input_model.model_validate(tool_input)
         ok,err=_allowed(state,tool_name,tool_input)
@@ -51,11 +51,13 @@ def execute_tool_with_policy(state, tool_name:str, tool_input:dict, tool_use_id:
         state.last_tool_name=tool_name; state.last_tool_input=tool_input; state.last_error=None
         state.save(Path(state.run_dir)/'state.json')
         rec.record('state_saved',tool_name=tool_name); rec.record('state_updated',tool_name=tool_name)
-        event_map={'ops_submit_classification':'classification_submitted','ops_submit_investigation':'investigation_submitted','ops_submit_plan':'plan_submitted','ops_submit_decomposition':'decomposition_submitted','ops_validate_decomposition':'decomposition_validation_completed','ops_select_execution_path':'execution_path_selected','ops_integrate_subtasks':'integration_completed','ops_select_winner':'selection_completed','ops_finalize_run':'run_finalized'}
+        event_map={'ops_submit_classification':'classification_submitted','ops_submit_investigation':'investigation_submitted','ops_submit_plan':'plan_submitted','ops_submit_decomposition':'decomposition_submitted','ops_validate_decomposition':'decomposition_validation_completed','ops_select_execution_path':'execution_path_selected','ops_select_winner':'selection_completed','ops_finalize_run':'run_finalized'}
         if tool_name in event_map: rec.record(event_map[tool_name],tool_name=tool_name,payload=out if isinstance(out,dict) else {'result':out})
+        if tool_name=='ops_integrate_subtasks': rec.record('integration_completed' if isinstance(out,dict) and out.get('status')=='completed' else 'integration_failed', tool_name=tool_name, payload=out if isinstance(out,dict) else {'result':out})
         rec.record('tool_finished',tool_name=tool_name,payload={'result':out})
         return OpsToolResult(tool_use_id=tool_use_id,tool_name=tool_name,content=out)
     except Exception as e:
+        state.recovery_count += 1
         state.last_error=str(e); state.last_tool_name=tool_name; state.last_tool_input=tool_input
         state.save(Path(state.run_dir)/'state.json')
         rec.record('tool_failed',tool_name=tool_name,payload={'error':str(e)})
