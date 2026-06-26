@@ -1,5 +1,6 @@
 from pydantic import BaseModel
 from villani_ops.core.acceptance import is_attempt_acceptance_eligible
+from .state import detect_decomposition_deadlock
 
 class RecoveryRecommendation(BaseModel):
     action:str
@@ -23,6 +24,11 @@ def _review_passed(a):
     return r.get('decision')=='pass' and r.get('recommended_action')=='accept' and not r.get('blockers')
 
 def recommend_next_agentic_action(state):
+    dead=detect_decomposition_deadlock(state)
+    if dead and state.fallback_execution_path!='parallel_candidates_after_decomposition_deadlock' and not state.candidates:
+        return RecoveryRecommendation(action='start_candidate_fallback',tool_name='ops_start_candidate_fallback',tool_input={'reason':'required subtask failed and dependent subtasks are blocked'},reason='decomposition deadlock detected; full-task candidate fallback is available',can_execute_deterministically=True)
+    if state.fallback_execution_path=='parallel_candidates_after_decomposition_deadlock' and not state.candidates:
+        return RecoveryRecommendation(action='launch_fallback_candidates',tool_name='ops_launch_candidates',tool_input={'attempts':state.candidate_attempts,'reason':'fallback after decomposition deadlock'},reason='candidate fallback is started but no fallback candidates have launched',can_execute_deterministically=False)
     sel=state.selection or {}
     if sel.get('decision')=='select':
         aid=sel.get('selected_attempt_id')
@@ -43,7 +49,7 @@ def recommend_next_agentic_action(state):
     for a in _attempts(state):
         _, bs=is_attempt_acceptance_eligible(a,state=state); blockers.extend(bs)
     if blockers and (state.candidates or state.integration):
-        return RecoveryRecommendation(action='reject_all',tool_name='ops_select_winner',tool_input={'decision':'reject_all','summary':'No centrally eligible result is available.','reasons':sorted(set(blockers)),'rejected_attempts':[_aid(a) for a in _attempts(state) if _aid(a)],'confidence':0.8},reason='all attempted results are ineligible',can_execute_deterministically=True)
+        return RecoveryRecommendation(action='finalize_failed' if detect_decomposition_deadlock(state) else 'reject_all',tool_name=('ops_finalize_run' if detect_decomposition_deadlock(state) else 'ops_select_winner'),tool_input=({'decision':'failed','summary':'Decomposed execution deadlocked and no centrally eligible fallback candidate is available.','blockers':['required_subtask_failed','decomposition_deadlocked','candidate_fallback_unavailable']} if detect_decomposition_deadlock(state) else {'decision':'reject_all','summary':'No centrally eligible result is available.','reasons':sorted(set(blockers)),'rejected_attempts':[_aid(a) for a in _attempts(state) if _aid(a)],'confidence':0.8}),reason='all attempted results are ineligible',can_execute_deterministically=True)
     return RecoveryRecommendation(action='ask_model',reason='no deterministic recovery action available')
 
 def handle_no_tool_call(state, reason='no_tool_call', max_recovery_attempts:int=2):

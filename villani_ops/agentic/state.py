@@ -26,6 +26,43 @@ class SubtaskState(BaseModel):
     attempts:list[CandidateAttemptState]=Field(default_factory=list); accepted_attempt_id:str|None=None
     expected_difficulty:Literal['easy','medium','hard','unknown']='unknown'; risk:Literal['low','medium','high','unknown']='unknown'
 
+class DecompositionDeadlock(BaseModel):
+    model_config=ConfigDict(extra='forbid')
+    deadlocked:bool
+    reason:str
+    failed_subtasks:list[str]=Field(default_factory=list)
+    blocked_subtasks:list[str]=Field(default_factory=list)
+    accepted_subtasks:list[str]=Field(default_factory=list)
+    pending_subtasks:list[str]=Field(default_factory=list)
+    can_continue_subtasks:bool=False
+
+def _depends_on_failed(sid:str, by:dict, failed:set[str], seen:set[str]|None=None)->bool:
+    seen=seen or set()
+    if sid in seen: return False
+    seen.add(sid)
+    st=by.get(sid)
+    if not st: return False
+    return any(d in failed or _depends_on_failed(d, by, failed, seen) for d in st.dependencies)
+
+def detect_decomposition_deadlock(state:'OpsRunState')->DecompositionDeadlock|None:
+    if state.execution_path!='decomposed_subtasks': return None
+    by={s.subtask_id:s for s in state.subtasks}
+    failed={s.subtask_id for s in state.subtasks if s.status=='failed'}
+    if not failed: return None
+    accepted=sorted(s.subtask_id for s in state.subtasks if s.status=='accepted')
+    pending=sorted(s.subtask_id for s in state.subtasks if s.status in {'pending','running'})
+    blocked=sorted(s.subtask_id for s in state.subtasks if s.status=='skipped' or (s.status in {'pending','running'} and _depends_on_failed(s.subtask_id, by, failed)))
+    ready=[s.subtask_id for s in state.subtasks if s.status=='pending' and all(by[d].status=='accepted' for d in s.dependencies)]
+    exhausted=any(s.status=='failed' and len(s.attempts)>=max(1,int(state.candidate_attempts or 1)) for s in state.subtasks)
+    incomplete=any(s.status not in {'accepted','skipped'} for s in state.subtasks) or bool(blocked)
+    if (blocked or incomplete) and not ready and exhausted:
+        reasons=['required_subtask_failed']
+        if blocked: reasons += ['dependency_failed','blocked_dependents_exist']
+        if exhausted: reasons.append('subtask_attempts_exhausted')
+        if not ready: reasons.append('no_ready_subtasks_remaining')
+        return DecompositionDeadlock(deadlocked=True,reason=','.join(dict.fromkeys(reasons)),failed_subtasks=sorted(failed),blocked_subtasks=blocked,accepted_subtasks=accepted,pending_subtasks=pending,can_continue_subtasks=False)
+    return None
+
 class OpsRunState(BaseModel):
     model_config=ConfigDict(extra='forbid')
     run_id:str; run_dir:str; repo_path:str; task:str; success_criteria:str|None=None; mode:str; runner:str; candidate_attempts:int
@@ -35,6 +72,14 @@ class OpsRunState(BaseModel):
     execution_path:Literal['unknown','parallel_candidates','decomposed_subtasks']='unknown'
     decomposition_requested:bool=False; decomposition_validated:bool=False; decomposition_accepted:bool|None=None; decomposition_executed:bool=False
     decomposition_fallback_used:bool=False; decomposition_fallback_reason:str|None=None
+    decomposed_execution_status:Literal['not_started','running','completed','blocked','failed']='not_started'
+    decomposed_execution_blockers:list[str]=Field(default_factory=list)
+    decomposed_execution_failed_subtasks:list[str]=Field(default_factory=list)
+    decomposed_execution_blocked_subtasks:list[str]=Field(default_factory=list)
+    decomposed_execution_completed_subtasks:list[str]=Field(default_factory=list)
+    fallback_execution_path:Literal['none','parallel_candidates_after_decomposition_deadlock']='none'
+    fallback_reason:str|None=None; fallback_used:bool=False; fallback_from_execution_path:str|None=None; fallback_started_at:str|None=None
+    best_partial_attempt_id:str|None=None; partial_progress:dict|None=None
     candidates:list[CandidateAttemptState]=Field(default_factory=list); subtasks:list[SubtaskState]=Field(default_factory=list)
     integration:dict|None=None; reviews:list[dict]=Field(default_factory=list); repo_validation_results:list[dict]=Field(default_factory=list); selection:dict|None=None; final_decision:dict|None=None
     active_nodes:list[str]=Field(default_factory=list); completed_nodes:list[str]=Field(default_factory=list); failed_nodes:list[str]=Field(default_factory=list)
@@ -52,6 +97,9 @@ class OpsRunState(BaseModel):
         if self.decomposition and not self.decomposition_validated: a.append('ops_validate_decomposition'); return a
         if self.execution_path=='unknown': a.append('ops_select_execution_path'); return a
         if self.execution_path=='parallel_candidates' and not self.candidates: a.append('ops_launch_candidates'); return a
+        if self.fallback_execution_path=='parallel_candidates_after_decomposition_deadlock' and not self.candidates: a.append('ops_launch_candidates'); return a
+        if self.execution_path=='decomposed_subtasks' and self.decomposed_execution_status in {'blocked','failed'}:
+            a += ['ops_start_candidate_fallback','ops_launch_candidates','ops_select_winner','ops_finalize_run']; return list(dict.fromkeys(a))
         if self.execution_path=='decomposed_subtasks':
             if any(s.status=='pending' for s in self.subtasks): a.append('ops_launch_subtasks'); return a
             if all(s.status in {'accepted','skipped'} for s in self.subtasks) and not self.integration: a.append('ops_integrate_subtasks'); return a
