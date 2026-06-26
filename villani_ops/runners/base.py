@@ -21,6 +21,9 @@ class RunnerResult(BaseModel):
     stderr: str = ""
     input_tokens: int = 0
     output_tokens: int = 0
+    total_tokens: int | None = None
+    total_cost: float | None = None
+    usage_records: list[Any] = Field(default_factory=list)
     events: list[dict[str, Any]] = Field(default_factory=list)
     debug_artifact_dir: str | None = None
     resolved_trace_dir: str | None = None

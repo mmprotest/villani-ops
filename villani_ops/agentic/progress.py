@@ -41,7 +41,12 @@ class AgenticProgressReporter:
             kind=('Single-task' if t.startswith('candidate') and p.get('execution_path')=='single_task' else ('Fallback candidate' if t.startswith('candidate') and p.get('fallback') else ('Candidate' if t.startswith('candidate') else f"Subtask {p.get('subtask_id') or ''}".strip())))
             status='completed' if t.endswith('completed') else 'failed'
             extra=f"exit_code={p.get('exit_code')}" if p.get('exit_code') is not None else (p.get('failure_reason') or '')
-            self._print(f"[agentic] {kind} attempt {p.get('attempt_id')} {status}: {extra}".rstrip()+detail)
+            usage=''
+            if p.get('total_tokens') is not None or p.get('total_cost') is not None:
+                toks=p.get('total_tokens'); usage += f", tokens={toks/1000:.1f}k" if isinstance(toks,(int,float)) and toks>=1000 else (f", tokens={toks}" if toks is not None else '')
+                if p.get('total_cost') is not None: usage += f", cost=${p.get('total_cost'):.4f}"
+            elif p.get('usage_source')=='unavailable': usage=', usage=unavailable'
+            self._print(f"[agentic] {kind} attempt {p.get('attempt_id')} {status}: {extra}{usage}".rstrip()+detail)
         elif t in {'candidate_attempt_reviewed','subtask_attempt_reviewed'}:
             kind='Single-task' if t.startswith('candidate') and p.get('execution_path')=='single_task' else ('Candidate' if t.startswith('candidate') else 'Subtask')
             self._print(f"[agentic] {kind} review {p.get('attempt_id')}: {p.get('review_decision')}, {p.get('review_recommended_action')}")

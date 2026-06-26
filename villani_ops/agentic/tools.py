@@ -9,6 +9,7 @@ from villani_ops.core.acceptance import is_attempt_acceptance_eligible, attempt_
 import subprocess, json, time, shutil, os, re
 from .artifacts import read_text_utf8, write_text_utf8, write_json_utf8
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from villani_ops.telemetry.usage import usage_record_from_runner, usage_record_from_response
 
 
 def extract_changed_file_metadata(diff_text:str)->dict[str,list[str]]:
@@ -366,6 +367,11 @@ def _run_attempt(state, ctx, aid, scope, task, success, subtask_id=None, backend
         _copy_worktree(Path(state.repo_path), wtree)
         ensure_git_baseline(wtree)
         res=ctx.runner_adapter.run_task(repo_path=wtree,task=task,success_criteria=success,backend_name=a.backend_name or '',backend_config=backend,timeout_seconds=ctx.timeout_seconds,context={'attempt_id':aid,'subtask_id':subtask_id,'parent_task':state.task},artifacts_dir=adir)
+        usage_record=None
+        if getattr(ctx, 'usage_recorder', None):
+            usage_record=usage_record_from_runner(run_id=state.run_id,phase='candidate_attempt' if scope=='candidate' else 'subtask_attempt',role='coding',backend=backend,result=res,attempt_id=aid,subtask_id=subtask_id)
+            ctx.usage_recorder.record(usage_record)
+            summary=ctx.usage_recorder.summarize(); state.usage_summary=summary.model_dump(mode='json'); state.usage_records_count=summary.calls_count; state.total_input_tokens=summary.input_tokens; state.total_output_tokens=summary.output_tokens; state.total_tokens=summary.total_tokens; state.total_cost=summary.total_cost; state.usage_unavailable_count=summary.unavailable_calls_count; state.input_tokens=summary.input_tokens; state.output_tokens=summary.output_tokens; state.costs={'total':summary.total_cost,'input':summary.input_cost,'output':summary.output_cost}
         write_text_utf8(adir/'stdout.log', getattr(res,'stdout','') or ''); write_text_utf8(adir/'stderr.log', getattr(res,'stderr','') or '')
         removed_scratch=clean_untracked_scratch_artifacts(wtree)
         cap=capture_git_patch(wtree, adir/'diff.patch', exclude_patterns=DEFAULT_PATCH_EXCLUDES)
@@ -396,11 +402,13 @@ def _run_attempt(state, ctx, aid, scope, task, success, subtask_id=None, backend
         a.model=getattr(backend,'model',None); a.completed_at=str(time.time())
         ok=getattr(res,'exit_code',1)==0
         a.exit_code=getattr(res,'exit_code',None); a.exit_reason=getattr(res,'exit_reason',None); a.runner_status=getattr(res,'status',None)
+        if usage_record is not None:
+            a.token_usage=usage_record.model_dump(mode='json'); a.cost=usage_record.total_cost
         a.status='completed' if ok else 'failed'
         if not ok: a.failure_reason=(getattr(res,'stderr','') or getattr(res,'status',None) or f'runner exit code is {a.exit_code}')[:1000]
         ev=f'{scope}_attempt_completed' if ok else f'{scope}_attempt_failed'
         if record_events:
-            ctx.recorder.record(ev, payload={'attempt_id':aid,'subtask_id':subtask_id,'status':a.status,'exit_code':getattr(res,'exit_code',None),'failure_reason':getattr(res,'stderr','') if not ok else None,'execution_path':state.execution_path,'artifact_paths':{'stdout':a.stdout_path,'stderr':a.stderr_path,'patch':a.patch_path}})
+            ctx.recorder.record(ev, payload={'attempt_id':aid,'subtask_id':subtask_id,'status':a.status,'exit_code':getattr(res,'exit_code',None),'failure_reason':getattr(res,'stderr','') if not ok else None,'execution_path':state.execution_path,'artifact_paths':{'stdout':a.stdout_path,'stderr':a.stderr_path,'patch':a.patch_path}, **(({k:getattr(usage_record,k) for k in ['input_tokens','output_tokens','total_tokens','total_cost','usage_source']} if 'usage_record' in locals() and usage_record is not None else {}))})
     except Exception as e:
         a.status='failed'; a.completed_at=str(time.time()); a.duration_seconds=float(a.completed_at)-float(a.started_at or a.completed_at); a.failure_reason=f'{type(e).__name__}: {e}'; a.runner_error_type=type(e).__name__; a.runner_status='exception'; a.acceptance_eligible=False; a.acceptance_blockers=['runner_exception', f'runner_exception: {type(e).__name__}: {e}']
         a.stdout_path=str(adir/'stdout.log'); a.stderr_path=str(adir/'stderr.log')
@@ -450,7 +458,7 @@ def h_launch_candidates(state, inp, ctx):
                 if c.attempt_id==aid:
                     state.candidates[idx]=res; break
             ev='candidate_attempt_completed' if res.status=='completed' else 'candidate_attempt_failed'
-            ctx.recorder.record(ev, payload={'attempt_id':aid,'status':res.status,'exit_code':res.exit_code,'failure_reason':res.failure_reason,'batch_index':batch_count,'fallback':fallback_active,'artifact_paths':{'stdout':res.stdout_path,'stderr':res.stderr_path,'patch':res.patch_path}})
+            ctx.recorder.record(ev, payload={'attempt_id':aid,'status':res.status,'exit_code':res.exit_code,'failure_reason':res.failure_reason,'batch_index':batch_count,'fallback':fallback_active,'artifact_paths':{'stdout':res.stdout_path,'stderr':res.stderr_path,'patch':res.patch_path}, **({k:res.token_usage.get(k) for k in ['input_tokens','output_tokens','total_tokens','total_cost','usage_source'] if res.token_usage} if res.token_usage else {})})
         state.save(Path(state.run_dir)/'state.json')
     state.concurrency_mode=final_mode; state.batch_count=batch_count
     state.candidate_concurrency={'concurrency_mode':final_mode,'max_parallel':maxp,'batch_count':batch_count,'worker_state_mutation':'disabled'}
@@ -626,6 +634,11 @@ def h_review_attempt(state, inp, ctx):
             last_error=e; raw=None
         try:
             res=OpsReviewResult.model_validate(_normalize_nulls(raw))
+            if getattr(ctx, 'usage_recorder', None) and getattr(ctx.reviewer, 'last_response', None) is not None:
+                review_backend=getattr(ctx, 'review_backend', None) or getattr(ctx.reviewer, 'review_backend', None) or getattr(ctx, 'backend', None)
+                usage_record=usage_record_from_response(run_id=state.run_id,phase='review',role='review',backend=review_backend,response=ctx.reviewer.last_response,attempt_id=inp.attempt_id,subtask_id=(st.subtask_id if st else None))
+                ctx.usage_recorder.record(usage_record)
+                summary=ctx.usage_recorder.summarize(); state.usage_summary=summary.model_dump(mode='json'); state.usage_records_count=summary.calls_count; state.total_input_tokens=summary.input_tokens; state.total_output_tokens=summary.output_tokens; state.total_tokens=summary.total_tokens; state.total_cost=summary.total_cost; state.usage_unavailable_count=summary.unavailable_calls_count; state.input_tokens=summary.input_tokens; state.output_tokens=summary.output_tokens; state.costs={'total':summary.total_cost,'input':summary.input_cost,'output':summary.output_cost}
             failure_kind=None
             break
         except Exception as e:
@@ -671,7 +684,7 @@ def h_review_attempt(state, inp, ctx):
     state.reviews.append({'attempt_id':inp.attempt_id,**res.model_dump(),'acceptance_eligible':eligible,'acceptance_blockers':blockers})
     if not eligible and blockers:
         state.blockers=sorted(set(state.blockers+blockers))
-    ctx.recorder.record(f'{inp.scope}_attempt_reviewed', payload={'attempt_id':inp.attempt_id,'review_decision':res.decision,'review_recommended_action':res.recommended_action,'central_acceptance_eligible':eligible,'acceptance_eligible':eligible,'acceptance_blockers':blockers,'execution_path':state.execution_path,'validation_blocked':any(b.startswith('validation_') for b in blockers),'artifact_blocked':any(b in {'missing_patch','empty_changed_files','patch_unreadable'} for b in blockers)})
+    ctx.recorder.record(f'{inp.scope}_attempt_reviewed', payload={'attempt_id':inp.attempt_id,'review_decision':res.decision,'review_recommended_action':res.recommended_action,'central_acceptance_eligible':eligible,'acceptance_eligible':eligible,'acceptance_blockers':blockers,'execution_path':state.execution_path,'validation_blocked':any(b.startswith('validation_') for b in blockers),'artifact_blocked':any(b in {'missing_patch','empty_changed_files','patch_unreadable'} for b in blockers), **(({k:getattr(usage_record,k) for k in ['input_tokens','output_tokens','total_tokens','total_cost','usage_source']} if 'usage_record' in locals() and usage_record is not None else {}))})
     return {**res.model_dump(),'acceptance_eligible':eligible,'acceptance_blockers':blockers,'review_payload_included':['patch_excerpt','stdout_tail','stderr_tail','validation']}
 def _accepted_subtask_attempt(state, st):
     for a in st.attempts:
