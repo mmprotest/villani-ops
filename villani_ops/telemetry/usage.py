@@ -6,6 +6,7 @@ from typing import Any, Literal
 import json, threading, time, uuid
 
 from pydantic import BaseModel, Field, ConfigDict
+from villani_ops.core.durable_io import durable_write_json
 
 UsageSource = Literal['provider_response','runner_result','debug_trace','unavailable','estimated']
 
@@ -113,7 +114,7 @@ def usage_record_from_runner(*, run_id: str, phase: str, role: str, backend: Any
 
 class UsageRecorder:
     def __init__(self, run_dir: Path, run_id: str):
-        self.run_dir=Path(run_dir); self.run_id=run_id; self.path=self.run_dir/'usage.jsonl'; self.run_dir.mkdir(parents=True, exist_ok=True); self._lock=threading.Lock(); self.records:list[UsageRecord]=[]; self._summary_write_interval_seconds=0.5; self._last_summary_write_at=0.0
+        self.run_dir=Path(run_dir); self.run_id=run_id; self.path=self.run_dir/'usage.jsonl'; self.run_dir.mkdir(parents=True, exist_ok=True); self._lock=threading.Lock(); self.records:list[UsageRecord]=[]; self._summary_write_interval_seconds=3.0; self._last_summary_write_at=0.0
     def record(self, usage: UsageRecord) -> None:
         if usage.run_id is None: usage.run_id=self.run_id
         line=json.dumps(usage.model_dump(mode='json'), ensure_ascii=False, default=str)+'\n'
@@ -122,8 +123,11 @@ class UsageRecorder:
             with self.path.open('a', encoding='utf-8', newline='\n') as f: f.write(line); f.flush()
             now=time.monotonic()
             if now - self._last_summary_write_at >= self._summary_write_interval_seconds:
-                self._write_artifacts_unlocked()
-                self._last_summary_write_at=now
+                try:
+                    self._write_artifacts_unlocked()
+                    self._last_summary_write_at=now
+                except Exception as e:
+                    print('[agentic] Warning: usage summary write failed; usage.jsonl remains available')
     def summarize(self) -> UsageSummary:
         with self._lock:
             records=list(self.records)
@@ -158,6 +162,4 @@ def _add(b: UsageBucket, r: UsageRecord) -> None:
     b.input_cost += r.input_cost or 0.0; b.output_cost += r.output_cost or 0.0; b.total_cost += r.total_cost or 0.0
 
 def _atomic_json(path: Path, data: Any) -> None:
-    tmp=Path(path).with_name(Path(path).name+'.tmp')
-    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False, default=str), encoding='utf-8', newline='\n')
-    tmp.replace(path)
+    durable_write_json(Path(path), data, indent=2)

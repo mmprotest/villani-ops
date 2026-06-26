@@ -2,15 +2,14 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 import json
+from villani_ops.core.durable_io import durable_write_text, durable_write_json
 
 
 def write_text_utf8(path: Path, text: str, *, atomic: bool = False) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     if atomic:
-        tmp = path.with_name(path.name + ".tmp")
-        tmp.write_text(text, encoding="utf-8", newline="\n")
-        tmp.replace(path)
+        durable_write_text(path, text)
     else:
         path.write_text(text, encoding="utf-8", newline="\n")
 
@@ -26,8 +25,11 @@ def read_text_utf8(path: Path, default: str | None = None) -> str:
 
 
 def write_json_utf8(path: Path, data: Any, *, atomic: bool = False, indent: int = 2) -> None:
-    text = json.dumps(data, indent=indent, ensure_ascii=False, default=str)
-    write_text_utf8(Path(path), text, atomic=atomic)
+    if atomic:
+        durable_write_json(Path(path), data, indent=indent)
+    else:
+        text = json.dumps(data, indent=indent, ensure_ascii=False, default=str)
+        write_text_utf8(Path(path), text, atomic=False)
 
 
 def read_json_utf8(path: Path) -> Any:

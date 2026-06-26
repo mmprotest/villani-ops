@@ -26,6 +26,30 @@ def _patch(a): return a.get('patch_path') if isinstance(a,dict) else a.patch_pat
 def _changed(a): return a.get('changed_files') if isinstance(a,dict) else a.changed_files
 def _failure(a): return a.get('failure_reason') if isinstance(a,dict) else a.failure_reason
 def _status(a): return a.get('status') if isinstance(a,dict) else a.status
+
+def _find_attempt_by_id(state, aid):
+    for a in _attempts(state):
+        if _aid(a)==aid: return a
+    return None
+
+def has_valid_selected_winner(state):
+    sel=state.selection or {}
+    aid=sel.get('selected_attempt_id')
+    if sel.get('decision')!='select' or not aid or state.is_terminal(): return False
+    a=_find_attempt_by_id(state, aid)
+    if not a: return False
+    try:
+        return is_attempt_acceptance_eligible(a,state=state)[0]
+    except Exception:
+        return False
+
+def build_evidence_based_acceptance_summary(state):
+    aid=(state.selection or {}).get('selected_attempt_id')
+    a=_find_attempt_by_id(state, aid) if aid else None
+    changed=_changed(a) if a else []
+    val=(_validation(a) or {}).get('status') if a else None
+    return f"Selected {aid} is centrally acceptance eligible; changed {', '.join(changed or []) or 'no files'}; validation {val or 'not_run'}."
+
 def _review_passed(a):
     r=(a.get('review') if isinstance(a,dict) else a.review) or {}
     return r.get('decision')=='pass' and r.get('recommended_action')=='accept' and not r.get('blockers')
@@ -39,6 +63,10 @@ def _has_active_subtask_attempts(state):
     return any(a.status in {'scheduled','running'} for s in state.subtasks for a in s.attempts)
 
 def recommend_next_agentic_action(state):
+    if has_valid_selected_winner(state):
+        aid=(state.selection or {}).get('selected_attempt_id')
+        a=_find_attempt_by_id(state, aid)
+        return RecoveryRecommendation(action='finalize_selected_winner',tool_name='ops_finalize_run',tool_input={'decision':'accepted','summary':build_evidence_based_acceptance_summary(state),'selected_attempt_id':aid,'selected_patch_path':_patch(a),'blockers':[]},reason='A selected result is centrally acceptance eligible and should be finalized.',can_execute_deterministically=True)
     if (state.plan or {}).get('strategy')=='single_task' and state.execution_path=='unknown':
         return RecoveryRecommendation(action='select_single_task_execution_path',tool_name='ops_select_execution_path',tool_input={'path':'single_task','reason':'Planner selected single_task; run sequential attempts with validation/review after each attempt.'},reason='single_task plan has no selected execution path',can_execute_deterministically=True)
     if state.execution_path=='single_task' and not state.candidates:
@@ -54,10 +82,6 @@ def recommend_next_agentic_action(state):
         return RecoveryRecommendation(action='start_candidate_fallback',tool_name='ops_start_candidate_fallback',tool_input={'reason':'required subtask failed and dependent subtasks are blocked'},reason='decomposition deadlock detected; full-task candidate fallback is available',can_execute_deterministically=True)
     if state.fallback_execution_path=='parallel_candidates_after_decomposition_deadlock' and not state.candidates:
         return RecoveryRecommendation(action='launch_fallback_candidates',tool_name='ops_launch_candidates',tool_input={'attempts':state.candidate_attempts,'reason':'fallback after decomposition deadlock'},reason='candidate fallback is started but no fallback candidates have launched',can_execute_deterministically=False)
-    sel=state.selection or {}
-    if sel.get('decision')=='select':
-        aid=sel.get('selected_attempt_id')
-        return RecoveryRecommendation(action='finalize_accepted',tool_name='ops_finalize_run',tool_input={'decision':'accepted','summary':'Selected result is centrally eligible and ready to finalize.','selected_attempt_id':aid},reason='selection exists and accepted finalization is legal',can_execute_deterministically=True)
     for a in _attempts(state):
         aid=_aid(a)
         if not aid: continue
