@@ -164,6 +164,72 @@ def test_single_task_attempts_retry_sequentially_and_stop_once_accepted(tmp_path
     assert s.stop_reason == 'accepted_attempt'
     events=(tmp_path/'run'/'runtime_events.jsonl').read_text()
     assert events.index('candidate_001') < events.index('candidate_002')
+    assert events.index('"type": "validation_started"') < events.index('"type": "candidate_attempt_reviewed"')
+    assert s.candidates[0].validation_source == 'ops_run_validation'
+
+
+def test_fresh_validation_overrides_debug_history_in_review_payload(tmp_path):
+    seen={}
+    class PayloadReviewer(FakeReviewer):
+        def review(self, *, state, attempt, scope):
+            seen.update(attempt)
+            return super().review(state=state, attempt=attempt, scope=scope)
+    s=state(tmp_path); c=ctx(tmp_path); c.reviewer=PayloadReviewer()
+    s.investigation={'summary':'i'}; s.plan={'summary':'p'}; s.execution_path='parallel_candidates'; s.phase='selecting'
+    patch=tmp_path/'run'/'diff.patch'; patch.write_text('diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-a\n+b\n')
+    s.candidates.append(CandidateAttemptState(
+        attempt_id='candidate_001',status='completed',scope='candidate',exit_code=0,patch_path=str(patch),changed_files=['a.py'],
+        validation={'passed':True,'status':'passed','commands':[{'cmd':'python -m pytest --tb=short -v','passed':True,'status':'passed'}],'validation_source':'ops_run_validation'},
+        validation_source='ops_run_validation',
+        validation_results=[{'passed':False,'status':'failed','validation_source':'villani_code_debug_trace','commands':[{'cmd':'pytest','passed':False,'status':'failed'}]}]))
+    res=execute_tool_with_policy(s,'ops_review_attempt',{'attempt_id':'candidate_001','scope':'candidate'},'r',c)
+    assert not res.is_error
+    assert seen['current_validation']['status'] == 'passed'
+    assert seen['debug_validation_history']['status'] == 'historical'
+    assert 'validation_failed' not in s.candidates[0].acceptance_blockers
+
+
+def test_structured_review_retries_and_normalizes_null_strings(tmp_path):
+    class RetryReviewer:
+        name='fake-retry-reviewer'
+        def __init__(self): self.calls=[]
+        def review(self, *, state, attempt, scope):
+            self.calls.append(attempt)
+            if len(self.calls) == 1:
+                raise RuntimeError('HTTP 400 provider request rejected')
+            return {'decision':'pass','recommended_action':'accept','score':1.0,'summary':'ok','evidence':['ok'],'issues':[],'subtask_passed':'null','integration_risk':'null'}
+    s=state(tmp_path); c=ctx(tmp_path); rr=RetryReviewer(); c.reviewer=rr
+    s.investigation={'summary':'i'}; s.plan={'summary':'p'}; s.execution_path='parallel_candidates'; s.phase='selecting'
+    patch=tmp_path/'run'/'diff.patch'; patch.write_text('diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-a\n+b\n')
+    s.candidates.append(CandidateAttemptState(attempt_id='candidate_001',status='completed',scope='candidate',exit_code=0,patch_path=str(patch),changed_files=['a.py'],validation={'passed':True,'status':'passed','commands':[],'validation_source':'ops_run_validation'},validation_source='ops_run_validation'))
+    res=execute_tool_with_policy(s,'ops_review_attempt',{'attempt_id':'candidate_001','scope':'candidate'},'r',c)
+    assert not res.is_error
+    assert len(rr.calls) == 2
+    assert 'attempt' not in rr.calls[1]  # compact payload
+    assert s.candidates[0].review['subtask_passed'] is None
+    assert s.candidates[0].review_status == 'passed'
+
+
+def test_selected_patch_path_autofills_on_accept(tmp_path):
+    s=state(tmp_path); c=ctx(tmp_path); s.investigation={'summary':'i'}; s.plan={'summary':'p'}; s.execution_path='parallel_candidates'; s.phase='selecting'
+    patch=tmp_path/'run'/'diff.patch'; patch.write_text('diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-a\n+b\n')
+    s.candidates.append(CandidateAttemptState(attempt_id='candidate_001',status='reviewed',scope='candidate',exit_code=0,patch_path=str(patch),changed_files=['a.py'],review={'decision':'pass','recommended_action':'accept','score':1,'summary':'ok','evidence':['ok'],'issues':[]},validation={'passed':True,'status':'passed','commands':[],'validation_source':'ops_run_validation'},validation_source='ops_run_validation',review_status='passed',acceptance_eligible=True))
+    sel=execute_tool_with_policy(s,'ops_select_winner',{'selected_attempt_id':'candidate_001','decision':'select','summary':'ok','confidence':1},'s',c)
+    assert not sel.is_error
+    fin=execute_tool_with_policy(s,'ops_finalize_run',{'decision':'accepted','summary':'ok','selected_attempt_id':'candidate_001'},'f',c)
+    assert not fin.is_error, fin.content
+    assert s.final_decision['selected_patch_path'] == str(patch)
+    assert 'a.py' in s.final_decision['summary']
+
+
+def test_scratch_artifact_blocks_acceptance(tmp_path):
+    s=state(tmp_path)
+    patch=tmp_path/'run'/'diff.patch'; patch.write_text('diff --git a/_fix.py b/_fix.py\nnew file mode 100644\n--- /dev/null\n+++ b/_fix.py\n@@ -0,0 +1 @@\n+x\n')
+    a=CandidateAttemptState(attempt_id='candidate_001',status='reviewed',scope='candidate',exit_code=0,patch_path=str(patch),changed_files=['_fix.py'],review={'decision':'pass','recommended_action':'accept','score':1,'summary':'ok','evidence':['ok'],'issues':[]},validation={'passed':True,'status':'passed','commands':[],'validation_source':'ops_run_validation'},validation_source='ops_run_validation',review_status='passed')
+    from villani_ops.core.acceptance import is_attempt_acceptance_eligible
+    ok, blockers=is_attempt_acceptance_eligible(a,state=s)
+    assert not ok
+    assert {'scratch_artifact_in_patch','patch_hygiene_failed'} <= set(blockers)
 
 
 def test_recovery_recommends_single_task_path_and_runner(tmp_path):

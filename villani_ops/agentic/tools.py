@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any, Callable, Literal
 from pydantic import BaseModel, Field, ConfigDict, model_validator
 from .state import CandidateAttemptState, SubtaskState, detect_decomposition_deadlock
-from .git_artifacts import capture_git_patch, ensure_git_baseline, clean_runner_artifacts_from_worktree, DEFAULT_PATCH_EXCLUDES, is_git_compatible_patch, patch_contains_internal_artifacts
+from .git_artifacts import capture_git_patch, ensure_git_baseline, clean_runner_artifacts_from_worktree, DEFAULT_PATCH_EXCLUDES, is_git_compatible_patch, patch_contains_internal_artifacts, clean_untracked_scratch_artifacts, is_scratch_artifact_path
 from villani_ops.core.acceptance import is_attempt_acceptance_eligible, attempt_requires_patch
 import subprocess, json, time, shutil, os, re
 from .artifacts import read_text_utf8, write_text_utf8, write_json_utf8
@@ -100,6 +100,13 @@ def _attempt_to_dict(a):
 def build_agentic_review_payload(state, attempt, scope, subtask=None):
     data=_attempt_to_dict(attempt)
     validation=data.get('validation') or {}
+    current_validation=validation if validation.get('validation_source')!='villani_code_debug_trace' else {}
+    debug_hist=[r for r in (data.get('validation_results') or []) if r.get('validation_source')=='villani_code_debug_trace']
+    debug_cmds=[c for r in debug_hist for c in (r.get('commands') or [])]
+    debug_summary={'source':'villani_code_debug_trace','status':'historical','validation_like_command_count':len(debug_cmds)}
+    if debug_cmds:
+        first, final=debug_cmds[0], debug_cmds[-1]
+        debug_summary.update({'first_relevant_validation':{'status':first.get('status'),'passed':first.get('passed'),'cmd':first.get('cmd')},'final_relevant_validation':{'status':final.get('status'),'passed':final.get('passed'),'cmd':final.get('cmd')},'final_command':final.get('cmd')})
     validation_tails=[]
     for item in validation.get('commands') or []:
         validation_tails.append({**item, 'stdout_tail':_read_text_tail(item.get('stdout_path'), max_chars=4000), 'stderr_tail':_read_text_tail(item.get('stderr_path'), max_chars=4000)})
@@ -114,8 +121,10 @@ def build_agentic_review_payload(state, attempt, scope, subtask=None):
         'stdout_tail':_read_text_tail(data.get('stdout_path')),
         'stderr_tail':_read_text_tail(data.get('stderr_path')),
         'transcript_tail':_read_text_tail(data.get('transcript_path')),
-        'validation':{**validation, 'commands':validation_tails},
-        'imported_debug_validation': [r for r in (data.get('validation_results') or []) if r.get('validation_source')=='villani_code_debug_trace'],
+        'validation':{**current_validation, 'commands':validation_tails, 'authoritative': bool(current_validation)},
+        'current_validation':{**current_validation, 'source':'ops_run_validation'} if current_validation else {},
+        'debug_validation_history':debug_summary,
+        'imported_debug_validation': debug_hist[:1],
         'scope_assessment': data.get('scope_assessment'),
         'failure_reason':data.get('failure_reason') or data.get('error'),
         'exit_code':data.get('exit_code'),
@@ -219,7 +228,9 @@ def _attach_imported_validation(state, attempt:CandidateAttemptState):
     if not ev: return []
     passed=any(e.get('passed') for e in ev) and not any(not e.get('passed') for e in ev)
     result={'passed':passed,'status':'passed' if passed else 'failed','commands':ev,'target':attempt.scope,'target_id':attempt.attempt_id,'validation_source':'villani_code_debug_trace'}
-    attempt.validation=result; attempt.validation_results=list(attempt.validation_results or [])+[result]; attempt.validation_status=result['status']; attempt.validation_source='villani_code_debug_trace'
+    attempt.validation_results=list(attempt.validation_results or [])+[result]
+    if not attempt.validation or attempt.validation_source!='ops_run_validation':
+        attempt.validation=result; attempt.validation_status=result['status']; attempt.validation_source='villani_code_debug_trace'
     return ev
 
 def _set_acceptance_from_gate(state, attempt):
@@ -356,10 +367,16 @@ def _run_attempt(state, ctx, aid, scope, task, success, subtask_id=None, backend
         ensure_git_baseline(wtree)
         res=ctx.runner_adapter.run_task(repo_path=wtree,task=task,success_criteria=success,backend_name=a.backend_name or '',backend_config=backend,timeout_seconds=ctx.timeout_seconds,context={'attempt_id':aid,'subtask_id':subtask_id,'parent_task':state.task},artifacts_dir=adir)
         write_text_utf8(adir/'stdout.log', getattr(res,'stdout','') or ''); write_text_utf8(adir/'stderr.log', getattr(res,'stderr','') or '')
+        removed_scratch=clean_untracked_scratch_artifacts(wtree)
         cap=capture_git_patch(wtree, adir/'diff.patch', exclude_patterns=DEFAULT_PATCH_EXCLUDES)
         a.stdout_path=str(adir/'stdout.log'); a.stderr_path=str(adir/'stderr.log'); a.patch_path=cap.patch_path; a.transcript_path=getattr(res,'telemetry_path',None)
         a.changed_files=cap.changed_files; a.added_files=cap.added_files; a.deleted_files=cap.deleted_files; a.modified_files=cap.modified_files; a.renamed_files=cap.renamed_files
-        a.patch_hygiene={'format_valid': bool(cap.patch_path and is_git_compatible_patch(cap.patch_path)), 'contains_internal_artifacts': bool(cap.patch_path and patch_contains_internal_artifacts(cap.patch_path)), 'apply_check_passed': None, 'capture_failure_reason': cap.failure_reason, 'changed_files_after_filtering': cap.changed_files}
+        scratch_in_patch=[p for p in cap.changed_files if is_scratch_artifact_path(p)]
+        a.patch_hygiene={'format_valid': bool(cap.patch_path and is_git_compatible_patch(cap.patch_path)), 'contains_internal_artifacts': bool(cap.patch_path and patch_contains_internal_artifacts(cap.patch_path)), 'apply_check_passed': None, 'capture_failure_reason': cap.failure_reason, 'changed_files_after_filtering': cap.changed_files, 'removed_scratch_artifacts':removed_scratch, 'scratch_artifacts_in_patch':scratch_in_patch, 'scratch_hygiene_passed':not scratch_in_patch}
+        if scratch_in_patch:
+            a.acceptance_blockers=sorted(set(a.acceptance_blockers+['scratch_artifact_in_patch','patch_hygiene_failed']))
+        if removed_scratch and record_events:
+            ctx.recorder.record('scratch_artifacts_removed', payload={'attempt_id':aid,'removed_scratch_artifacts':removed_scratch})
         if cap.patch_path:
             chk=subprocess.run(['git','apply','--check','--cached',cap.patch_path],cwd=wtree,text=True,capture_output=True)
             a.patch_hygiene['apply_check_passed']=chk.returncode==0
@@ -444,7 +461,8 @@ def h_launch_candidates(state, inp, ctx):
 def _default_validation_commands(state):
     vp=((state.investigation or {}).get('validation_plan') or {})
     cmds=vp.get('commands') or []
-    return [ValidationCommand.model_validate(c) for c in cmds if isinstance(c, dict) and c.get('cmd')]
+    out=[ValidationCommand.model_validate(c) for c in cmds if isinstance(c, dict) and c.get('cmd')]
+    return out or [ValidationCommand(cmd='python -m pytest --tb=short -v', purpose='Default cross-platform candidate validation', timeout_seconds=900)]
 
 def h_run_single_task_attempts(state, inp, ctx):
     if state.execution_path!='single_task':
@@ -457,7 +475,7 @@ def h_run_single_task_attempts(state, inp, ctx):
         aid=f'candidate_{i:03d}'; made.append(aid); state.attempts_started=len(made)
         a=_run_attempt(state,ctx,aid,'candidate',state.task,state.success_criteria,None,inp.backend_name or ctx.coding_backend_name or ctx.backend_name,True)
         state.candidates.append(a)
-        if a.status=='completed' and not a.validation:
+        if a.status=='completed':
             cmds=_default_validation_commands(state)
             if cmds:
                 h_validation(state, OpsRunValidationInput(target='candidate', target_id=aid, commands=cmds), ctx)
@@ -580,21 +598,53 @@ def h_review_attempt(state, inp, ctx):
     if isinstance(a, dict) and a.get('status')=='running': raise ValueError('cannot review running attempt')
     if ctx.reviewer is None: raise ValueError('agentic_real_reviewer_not_configured')
     if ctx.production and not ctx.allow_fake_dependencies and _is_fake_dependency(ctx.reviewer): raise ValueError('fake reviewer dependency forbidden in production agentic mode')
+    def _normalize_nulls(x):
+        if isinstance(x,dict):
+            return {k:(None if k in {'subtask_passed','integration_risk'} and isinstance(v,str) and v in {'null','None','none','NULL'} else _normalize_nulls(v)) for k,v in x.items()}
+        if isinstance(x,list): return [_normalize_nulls(v) for v in x]
+        return x
+    def _compact_payload(payload, minimal=False):
+        data=_attempt_to_dict(a)
+        base={'task':state.task,'success_criteria':state.success_criteria,'changed_files':data.get('changed_files') or [],'current_validation':payload.get('current_validation') or payload.get('validation') or {},'patch_hygiene':data.get('patch_hygiene') or {},'scope':inp.scope,'known_blockers':data.get('acceptance_blockers') or []}
+        if minimal:
+            base['question']='Based only on this evidence, should this attempt be accepted, rejected, retried, or repaired?'
+        else:
+            base.update({'patch_excerpt':_read_patch_excerpt(data.get('patch_path'), max_chars=8000),'validation_output_summary':payload.get('validation',{}),'scope_assessment':data.get('scope_assessment')})
+        return base
     payload=build_agentic_review_payload(state, a, inp.scope, st)
-    raw=None
-    try:
+    raw=None; res=None; last_error=None; failure_kind=None
+    payloads=[('full',payload),('compact',_compact_payload(payload)),('minimal',_compact_payload(payload, True))]
+    for idx,(kind,attempt_payload) in enumerate(payloads,1):
         try:
-            raw=ctx.reviewer.review(state=state, attempt=payload, scope=inp.scope) if hasattr(ctx.reviewer,'review') else ctx.reviewer(state,payload,inp.scope)
+            raw=ctx.reviewer.review(state=state, attempt=attempt_payload, scope=inp.scope) if hasattr(ctx.reviewer,'review') else ctx.reviewer(state,attempt_payload,inp.scope)
         except TypeError:
-            raw=ctx.reviewer.review(state=state, attempt=a, scope=inp.scope) if hasattr(ctx.reviewer,'review') else ctx.reviewer(state,a,inp.scope)
-        res=OpsReviewResult.model_validate(raw)
-    except Exception as e:
-        res=OpsReviewResult(decision='fail',recommended_action='reject',score=0.0,summary='structured review failed',evidence=[],issues=[f'{type(e).__name__}: {e}'],blockers=['review_malformed'],confidence=0.0)
+            try:
+                raw=ctx.reviewer.review(state=state, attempt=a, scope=inp.scope) if hasattr(ctx.reviewer,'review') else ctx.reviewer(state,a,inp.scope)
+            except Exception as e:
+                last_error=e; raw=None
+        except Exception as e:
+            last_error=e; raw=None
+        try:
+            res=OpsReviewResult.model_validate(_normalize_nulls(raw))
+            failure_kind=None
+            break
+        except Exception as e:
+            last_error=e
+            msg=str(e).lower()
+            failure_kind='provider_error' if any(s in msg for s in ['http 400','provider','request rejected','payload too large']) else 'malformed'
+            if idx < len(payloads):
+                ctx.recorder.record('review_retrying', payload={'attempt_id':inp.attempt_id,'failed_payload':kind,'next_payload':payloads[idx][0],'review_error_type':failure_kind,'message':str(e)[:500]})
+                continue
+    if res is None:
+        e=last_error or Exception('unknown structured review failure')
+        res=OpsReviewResult(decision='fail',recommended_action='retry',score=0.0,summary='structured review unavailable after retries',evidence=[],issues=[f'{type(e).__name__}: {e}'],blockers=['review_infrastructure_failed','review_malformed'],confidence=0.0)
         rdir=Path(state.run_dir)/'reviews'; rdir.mkdir(parents=True,exist_ok=True)
         raw_path=rdir/f'{inp.attempt_id}_malformed_review.json'
         write_json_utf8(raw_path, {'raw_response':raw,'error':f'{type(e).__name__}: {e}'})
         if isinstance(a, dict): a.setdefault('review_artifacts',[]).append(str(raw_path))
-        else: a.acceptance_blockers=sorted(set(a.acceptance_blockers+['review_malformed']))
+        else:
+            a.acceptance_blockers=sorted(set(a.acceptance_blockers+['review_infrastructure_failed','review_malformed']))
+            a.review_status=failure_kind or 'unavailable'; a.review_error_type=type(e).__name__; a.review_error_message=str(e); a.review_retry_count=len(payloads)
     if isinstance(a, dict):
         a['review']=res.model_dump(); a['status']='reviewed' if a.get('status') not in {'failed','completed'} else a.get('status')
         eligible, blockers=_set_acceptance_from_gate(state, a)
@@ -602,6 +652,13 @@ def h_review_attempt(state, inp, ctx):
             blockers=sorted(set(blockers+res.blockers)); a['acceptance_blockers']=blockers; eligible=False; a['acceptance_eligible']=False
     else:
         a.review=res.model_dump(); a.status='reviewed' if a.status!='failed' else 'rejected'
+        if res.decision=='pass' and res.recommended_action=='accept' and not res.blockers:
+            a.review_status='passed'
+        elif 'review_infrastructure_failed' in res.blockers:
+            a.review_status=failure_kind or 'unavailable'
+        else:
+            a.review_status='failed'
+        a.review_retry_count=max(a.review_retry_count, (len(payloads) if 'review_infrastructure_failed' in res.blockers else 1))
         evidence_text=' '.join(str(x) for x in [res.summary, res.evidence, res.issues, _read_text_tail(a.stdout_path), _read_text_tail(a.stderr_path)])
         if inp.scope=='subtask' and 'impossible_in_isolation' in evidence_text:
             a.acceptance_blockers=sorted(set(a.acceptance_blockers+['subtask_impossible_in_isolation']))
@@ -785,8 +842,9 @@ def _platform_command_error(cmd: str) -> tuple[str,str] | None:
 
 def _attach_validation(state, target_obj, target, result):
     status=result.get('status') or ('passed' if result.get('passed') else 'failed')
+    result['validation_source']='ops_run_validation'
     if target=='candidate' and target_obj is not None:
-        target_obj.validation=result; target_obj.validation_status=status; target_obj.validation_results=list(getattr(target_obj,'validation_results',[]) or [])+[result]
+        target_obj.validation=result; target_obj.validation_status=status; target_obj.validation_source='ops_run_validation'; target_obj.validation_results=list(getattr(target_obj,'validation_results',[]) or [])+[result]
         _set_acceptance_from_gate(state,target_obj)
     elif target=='integration' and isinstance(target_obj,dict):
         target_obj['validation']=result; target_obj['validation_status']=status; target_obj['validation_results']=(target_obj.get('validation_results') or [])+[result]
@@ -836,7 +894,9 @@ def h_validation(state, inp, ctx):
 def h_select_winner(state, inp, ctx):
     if inp.decision=='reject_all':
         if not inp.reasons: raise ValueError('reject_all requires reasons')
-        state.selection=inp.model_dump(); state.phase='finalizing'; return state.selection
+        if state.selection and state.selection.get('decision')=='reject_all':
+            state.phase='finalizing'; return state.selection
+        state.selection=inp.model_dump(); state.phase='finalizing'; ctx.recorder.record('selection_completed', payload=state.selection); return state.selection
     if not inp.selected_attempt_id: raise ValueError('selected_attempt_id is required')
     a, st=_find_attempt(state, inp.selected_attempt_id)
     if not a: raise ValueError(f'selected attempt {inp.selected_attempt_id} does not exist')
@@ -857,10 +917,15 @@ def h_select_winner(state, inp, ctx):
         state.blockers=sorted(set(state.blockers+blockers))
         ctx.recorder.record('selection_rejected', payload={'selected_attempt_id':inp.selected_attempt_id,'stored_acceptance_eligible':stored,'recomputed_acceptance_eligible':eligible,'acceptance_blockers':blockers})
         raise ValueError('selected attempt is not acceptance eligible: '+', '.join(blockers))
-    state.selection={**inp.model_dump(),'selection_evidence':{'stored_acceptance_eligible':stored,'recomputed_acceptance_eligible':eligible,'acceptance_blockers':blockers}}
-    state.phase='finalizing'; ctx.recorder.record('winner_selected', payload=state.selection); return state.selection
+    new_selection={**inp.model_dump(),'selection_evidence':{'stored_acceptance_eligible':stored,'recomputed_acceptance_eligible':eligible,'acceptance_blockers':blockers}}
+    if state.selection and state.selection.get('decision')=='select' and state.selection.get('selected_attempt_id')==inp.selected_attempt_id:
+        state.phase='finalizing'; return state.selection
+    state.selection=new_selection
+    state.phase='finalizing'; ctx.recorder.record('selection_completed', payload=state.selection); return state.selection
 
 def h_finalize(state, inp, ctx):
+    if state.is_terminal() and state.final_decision and state.final_decision.get('decision')==inp.decision:
+        return state.final_decision
     if inp.decision!='accepted':
         pending=[]
         for c in state.candidates:
@@ -915,6 +980,14 @@ def h_finalize(state, inp, ctx):
             raise ValueError('selected attempt is not acceptance eligible: '+', '.join(blockers))
         if inp.selected_patch_path and (a.get('patch_path') if isinstance(a,dict) else a.patch_path) != inp.selected_patch_path:
             raise ValueError('final selected patch does not match selected attempt')
+        patch_path=a.get('patch_path') if isinstance(a,dict) else a.patch_path
+        if not final_payload.get('selected_patch_path') and patch_path:
+            if not Path(patch_path).exists(): raise ValueError('selected patch path does not exist')
+            final_payload['selected_patch_path']=patch_path
+        # Evidence-based summary prefix prevents over-claiming files not in the selected patch.
+        changed=a.get('changed_files') if isinstance(a,dict) else a.changed_files
+        val=a.get('validation') if isinstance(a,dict) else a.validation
+        final_payload['summary']=f"Selected {aid} changed {', '.join(changed or []) or 'no files'}; current validation {((val or {}).get('status') or 'not_run')}." + ((' '+final_payload.get('summary','')) if final_payload.get('summary') else '')
     state.final_decision=final_payload; state.status='completed' if inp.decision=='accepted' else 'failed'; state.phase='completed' if state.status=='completed' else 'failed'; ctx.recorder.record('run_finalized', payload=state.final_decision); return state.final_decision
 OPS_TOOLS={
 'ops_get_state':ToolSpec('ops_get_state','Inspect canonical run state',OpsGetStateInput,h_get_state,True),
