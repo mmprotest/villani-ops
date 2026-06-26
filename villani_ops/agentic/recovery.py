@@ -37,6 +37,10 @@ def _has_active_subtask_attempts(state):
     return any(a.status in {'scheduled','running'} for s in state.subtasks for a in s.attempts)
 
 def recommend_next_agentic_action(state):
+    if (state.plan or {}).get('strategy')=='single_task' and state.execution_path=='unknown':
+        return RecoveryRecommendation(action='select_single_task_execution_path',tool_name='ops_select_execution_path',tool_input={'path':'single_task','reason':'Planner selected single_task; run sequential attempts with validation/review after each attempt.'},reason='single_task plan has no selected execution path',can_execute_deterministically=True)
+    if state.execution_path=='single_task' and not state.candidates:
+        return RecoveryRecommendation(action='run_single_task_attempts',tool_name='ops_run_single_task_attempts',tool_input={'attempts':state.candidate_attempts,'reason':'Run sequential single-task attempts, stopping once an attempt passes validation and review.'},reason='single_task execution path selected but no attempts have launched',can_execute_deterministically=True)
     if state.decomposition_validated and state.decomposition_accepted is True and state.execution_path=='unknown' and state.subtasks:
         return RecoveryRecommendation(action='select_decomposed_execution_path',tool_name='ops_select_execution_path',tool_input={'path':'decomposed_subtasks','reason':'Decomposition has been validated and accepted.'},reason='Accepted decomposition has no selected execution path.',can_execute_deterministically=True)
     if state.execution_path=='decomposed_subtasks' and state.decomposition_accepted is True and state.subtasks and not _has_active_subtask_attempts(state) and all(s.status=='pending' and not s.attempts for s in state.subtasks):
@@ -83,6 +87,10 @@ def handle_no_tool_call(state, reason='no_tool_call', max_recovery_attempts:int=
         content=f"Call {rec.tool_name} with this input: {rec.tool_input}. Reason: {rec.reason}"
         if rec.tool_name=='ops_select_execution_path' and rec.tool_input and rec.tool_input.get('path')=='decomposed_subtasks':
             content='Call ops_select_execution_path with path="decomposed_subtasks".'
+        if rec.tool_name=='ops_select_execution_path' and rec.tool_input and rec.tool_input.get('path')=='single_task':
+            content='Call ops_select_execution_path with path="single_task".'
+        if rec.tool_name=='ops_run_single_task_attempts':
+            content='Call ops_run_single_task_attempts to run sequential single-task attempts. Do not call ops_launch_candidates.'
         if rec.tool_name=='ops_select_winner' and rec.tool_input and rec.tool_input.get('selected_attempt_id'):
             content=f"There is a reviewed and validated eligible candidate: {rec.tool_input['selected_attempt_id']}. Call ops_select_winner."
         if rec.tool_name=='ops_run_validation' and rec.tool_input:

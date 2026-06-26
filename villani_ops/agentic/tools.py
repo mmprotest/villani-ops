@@ -252,8 +252,9 @@ class OpsSubmitDecompositionInput(StrictModel):
         return self
 class OpsValidateDecompositionInput(StrictModel): decomposition_id:str='current'; semantic:bool=True
 class DecompositionValidationResult(StrictModel): accepted:bool; deterministic_accepted:bool; semantic_accepted:bool|None=None; failures:list[str]=Field(default_factory=list); required_revisions:list[str]=Field(default_factory=list); warnings:list[str]=Field(default_factory=list); computed_acceptance_reason:str
-class OpsSelectExecutionPathInput(StrictModel): path:Literal['parallel_candidates','decomposed_subtasks']; reason:str
+class OpsSelectExecutionPathInput(StrictModel): path:Literal['single_task','parallel_candidates','decomposed_subtasks']; reason:str
 class OpsLaunchCandidatesInput(StrictModel): attempts:int; backend_name:str|None=None; reason:str
+class OpsRunSingleTaskAttemptsInput(StrictModel): attempts:int; backend_name:str|None=None; reason:str
 class OpsStartCandidateFallbackInput(StrictModel): reason:str; attempts:int|None=None
 class OpsLaunchSubtasksInput(StrictModel): subtask_ids:list[str]; backend_name:str|None=None; attempts_per_subtask:int; reason:str
 class OpsReviewAttemptInput(StrictModel): attempt_id:str; scope:Literal['candidate','subtask','integration']
@@ -308,8 +309,14 @@ def h_validate_decomposition(state, inp, ctx):
     state.decomposition_validated=True; state.decomposition_accepted=accepted; state.phase='choosing_execution_path'; return res.model_dump()
 
 def h_select_path(state, inp, ctx):
+    strategy=(state.plan or {}).get('strategy')
+    if strategy=='single_task' and inp.path=='parallel_candidates':
+        raise ValueError('plan strategy is single_task; use execution_path=single_task for sequential attempts, not parallel_candidates')
+    if strategy=='parallel_candidates' and inp.path=='single_task':
+        raise ValueError('plan strategy is parallel_candidates; use execution_path=parallel_candidates')
     state.execution_path=inp.path
     state.phase='running_subtasks' if inp.path=='decomposed_subtasks' else 'running_candidates'
+    state.candidate_execution_mode='sequential' if inp.path=='single_task' else ('parallel' if inp.path=='parallel_candidates' else state.candidate_execution_mode)
     state.decomposition_executed=inp.path=='decomposed_subtasks'
     if inp.path=='decomposed_subtasks': state.decomposed_execution_status='running'
     if inp.path=='parallel_candidates' and state.decomposition is not None and state.decomposition_accepted is not True:
@@ -343,7 +350,7 @@ def _run_attempt(state, ctx, aid, scope, task, success, subtask_id=None, backend
     a=_attempt(aid,scope,subtask_id=subtask_id,backend=backend_name or ctx.coding_backend_name or getattr(backend,'name',None),artifacts=adir)
     a.status='running'; a.worktree_path=str(wtree); a.started_at=str(time.time())
     if record_events:
-        ctx.recorder.record(f'{scope}_attempt_started', payload={'attempt_id':aid,'subtask_id':subtask_id,'status':'running','artifact_paths':{'artifacts_dir':str(adir)}})
+        ctx.recorder.record(f'{scope}_attempt_started', payload={'attempt_id':aid,'subtask_id':subtask_id,'status':'running','execution_path':state.execution_path,'artifact_paths':{'artifacts_dir':str(adir)}})
     try:
         _copy_worktree(Path(state.repo_path), wtree)
         ensure_git_baseline(wtree)
@@ -376,14 +383,14 @@ def _run_attempt(state, ctx, aid, scope, task, success, subtask_id=None, backend
         if not ok: a.failure_reason=(getattr(res,'stderr','') or getattr(res,'status',None) or f'runner exit code is {a.exit_code}')[:1000]
         ev=f'{scope}_attempt_completed' if ok else f'{scope}_attempt_failed'
         if record_events:
-            ctx.recorder.record(ev, payload={'attempt_id':aid,'subtask_id':subtask_id,'status':a.status,'exit_code':getattr(res,'exit_code',None),'failure_reason':getattr(res,'stderr','') if not ok else None,'artifact_paths':{'stdout':a.stdout_path,'stderr':a.stderr_path,'patch':a.patch_path}})
+            ctx.recorder.record(ev, payload={'attempt_id':aid,'subtask_id':subtask_id,'status':a.status,'exit_code':getattr(res,'exit_code',None),'failure_reason':getattr(res,'stderr','') if not ok else None,'execution_path':state.execution_path,'artifact_paths':{'stdout':a.stdout_path,'stderr':a.stderr_path,'patch':a.patch_path}})
     except Exception as e:
         a.status='failed'; a.completed_at=str(time.time()); a.duration_seconds=float(a.completed_at)-float(a.started_at or a.completed_at); a.failure_reason=f'{type(e).__name__}: {e}'; a.runner_error_type=type(e).__name__; a.runner_status='exception'; a.acceptance_eligible=False; a.acceptance_blockers=['runner_exception', f'runner_exception: {type(e).__name__}: {e}']
         a.stdout_path=str(adir/'stdout.log'); a.stderr_path=str(adir/'stderr.log')
         if not Path(a.stdout_path).exists(): write_text_utf8(Path(a.stdout_path), '')
         write_text_utf8(Path(a.stderr_path), f'{type(e).__name__}: {e}\n')
         if record_events:
-            ctx.recorder.record(f'{scope}_attempt_failed', payload={'attempt_id':aid,'subtask_id':subtask_id,'status':'failed','failure_reason':a.acceptance_blockers[0],'artifact_paths':{'stdout':a.stdout_path,'stderr':a.stderr_path,'artifacts_dir':str(adir)}})
+            ctx.recorder.record(f'{scope}_attempt_failed', payload={'attempt_id':aid,'subtask_id':subtask_id,'status':'failed','failure_reason':a.acceptance_blockers[0],'execution_path':state.execution_path,'artifact_paths':{'stdout':a.stdout_path,'stderr':a.stderr_path,'artifacts_dir':str(adir)}})
     if a.completed_at and a.started_at and a.duration_seconds is None:
         a.duration_seconds=float(a.completed_at)-float(a.started_at)
     _set_acceptance_from_gate(state,a)
@@ -399,6 +406,7 @@ def h_start_candidate_fallback(state, inp, ctx):
 
 def h_launch_candidates(state, inp, ctx):
     fallback_active=state.fallback_execution_path=='parallel_candidates_after_decomposition_deadlock'
+    if state.execution_path=='single_task': raise ValueError('single_task execution uses sequential attempts; call ops_run_single_task_attempts')
     if state.execution_path!='parallel_candidates' and not fallback_active: raise ValueError('candidates require parallel_candidates execution path or explicit decomposition-deadlock fallback')
     made=[]; maxp=max(1, int(getattr(ctx.coding_backend or ctx.backend,'max_parallel',None) or ctx.max_parallel or 1))
     state.max_parallel=maxp
@@ -431,6 +439,40 @@ def h_launch_candidates(state, inp, ctx):
     state.candidate_concurrency={'concurrency_mode':final_mode,'max_parallel':maxp,'batch_count':batch_count,'worker_state_mutation':'disabled'}
     state.execution_concurrency={'candidate_concurrency_mode':final_mode,'max_parallel':maxp,'candidate_batch_count':batch_count}
     state.phase='validating'; return {'launched':made,'max_parallel':maxp,'batch_count':batch_count,'concurrency_mode':final_mode,'semantics':'attempts execute in isolated worktrees; main thread mutates OpsRunState; batches never exceed max_parallel'}
+
+
+def _default_validation_commands(state):
+    vp=((state.investigation or {}).get('validation_plan') or {})
+    cmds=vp.get('commands') or []
+    return [ValidationCommand.model_validate(c) for c in cmds if isinstance(c, dict) and c.get('cmd')]
+
+def h_run_single_task_attempts(state, inp, ctx):
+    if state.execution_path!='single_task':
+        raise ValueError('ops_run_single_task_attempts requires execution_path=single_task')
+    if state.candidates:
+        return {'launched':[], 'attempts_requested':state.attempts_requested or inp.attempts, 'attempts_started':state.attempts_started, 'stopped_early':state.stopped_early, 'stop_reason':state.stop_reason or 'already_started'}
+    state.candidate_execution_mode='sequential'; state.attempts_requested=int(inp.attempts); state.phase='running_candidates'
+    made=[]
+    for i in range(1, int(inp.attempts)+1):
+        aid=f'candidate_{i:03d}'; made.append(aid); state.attempts_started=len(made)
+        a=_run_attempt(state,ctx,aid,'candidate',state.task,state.success_criteria,None,inp.backend_name or ctx.coding_backend_name or ctx.backend_name,True)
+        state.candidates.append(a)
+        if a.status=='completed' and not a.validation:
+            cmds=_default_validation_commands(state)
+            if cmds:
+                h_validation(state, OpsRunValidationInput(target='candidate', target_id=aid, commands=cmds), ctx)
+        if ctx.reviewer is not None and a.status in {'completed','reviewed'} and not a.review:
+            h_review_attempt(state, OpsReviewAttemptInput(attempt_id=aid, scope='candidate'), ctx)
+        eligible, blockers=_set_acceptance_from_gate(state,a)
+        state.save(Path(state.run_dir)/'state.json')
+        if eligible:
+            state.stopped_early=True; state.stop_reason='accepted_attempt'; state.phase='selecting'
+            ctx.recorder.record('single_task_attempt_accepted', payload={'attempt_id':aid,'attempts_started':state.attempts_started,'attempts_requested':state.attempts_requested,'stop_reason':state.stop_reason})
+            h_select_winner(state, OpsSelectWinnerInput(decision='select', selected_attempt_id=aid, summary='Single-task sequential attempt passed review and validation.', reasons=['central acceptance gate passed'], confidence=0.95), ctx)
+            return {'launched':made,'accepted_attempt_id':aid,'attempts_requested':state.attempts_requested,'attempts_started':state.attempts_started,'stopped_early':True,'stop_reason':'accepted_attempt','candidate_execution_mode':'sequential'}
+        ctx.recorder.record('single_task_attempt_rejected', payload={'attempt_id':aid,'attempts_started':state.attempts_started,'acceptance_blockers':blockers,'retry':i<int(inp.attempts)})
+    state.stopped_early=False; state.stop_reason='attempts_exhausted'; state.phase='selecting'
+    return {'launched':made,'accepted_attempt_id':None,'attempts_requested':state.attempts_requested,'attempts_started':state.attempts_started,'stopped_early':False,'stop_reason':'attempts_exhausted','candidate_execution_mode':'sequential'}
 
 def _update_decomposed_execution_state(state, ctx=None):
     if state.execution_path!='decomposed_subtasks': return None
@@ -572,7 +614,7 @@ def h_review_attempt(state, inp, ctx):
     state.reviews.append({'attempt_id':inp.attempt_id,**res.model_dump(),'acceptance_eligible':eligible,'acceptance_blockers':blockers})
     if not eligible and blockers:
         state.blockers=sorted(set(state.blockers+blockers))
-    ctx.recorder.record(f'{inp.scope}_attempt_reviewed', payload={'attempt_id':inp.attempt_id,'review_decision':res.decision,'review_recommended_action':res.recommended_action,'central_acceptance_eligible':eligible,'acceptance_eligible':eligible,'acceptance_blockers':blockers,'validation_blocked':any(b.startswith('validation_') for b in blockers),'artifact_blocked':any(b in {'missing_patch','empty_changed_files','patch_unreadable'} for b in blockers)})
+    ctx.recorder.record(f'{inp.scope}_attempt_reviewed', payload={'attempt_id':inp.attempt_id,'review_decision':res.decision,'review_recommended_action':res.recommended_action,'central_acceptance_eligible':eligible,'acceptance_eligible':eligible,'acceptance_blockers':blockers,'execution_path':state.execution_path,'validation_blocked':any(b.startswith('validation_') for b in blockers),'artifact_blocked':any(b in {'missing_patch','empty_changed_files','patch_unreadable'} for b in blockers)})
     return {**res.model_dump(),'acceptance_eligible':eligible,'acceptance_blockers':blockers,'review_payload_included':['patch_excerpt','stdout_tail','stderr_tail','validation']}
 def _accepted_subtask_attempt(state, st):
     for a in st.attempts:
@@ -883,7 +925,8 @@ OPS_TOOLS={
 'ops_submit_decomposition':ToolSpec('ops_submit_decomposition','Submit decomposition',OpsSubmitDecompositionInput,h_decomposition),
 'ops_validate_decomposition':ToolSpec('ops_validate_decomposition','Validate decomposition',OpsValidateDecompositionInput,h_validate_decomposition),
 'ops_select_execution_path':ToolSpec('ops_select_execution_path','Select execution path',OpsSelectExecutionPathInput,h_select_path),
-'ops_launch_candidates':ToolSpec('ops_launch_candidates','Launch candidates',OpsLaunchCandidatesInput,h_launch_candidates),
+'ops_launch_candidates':ToolSpec('ops_launch_candidates','Launch full-task candidates in parallel/batches. Only valid for execution_path=parallel_candidates or explicit decomposition-deadlock fallback; never for single_task.',OpsLaunchCandidatesInput,h_launch_candidates),
+'ops_run_single_task_attempts':ToolSpec('ops_run_single_task_attempts','Run full-task attempts sequentially for execution_path=single_task. candidate_attempts is a retry budget; validate/review each attempt and stop immediately once centrally accepted.',OpsRunSingleTaskAttemptsInput,h_run_single_task_attempts),
 'ops_start_candidate_fallback':ToolSpec('ops_start_candidate_fallback','Start full-task candidate fallback after decomposition deadlock',OpsStartCandidateFallbackInput,h_start_candidate_fallback),
 'ops_launch_subtasks':ToolSpec('ops_launch_subtasks','Launch subtasks',OpsLaunchSubtasksInput,h_launch_subtasks),
 'ops_review_attempt':ToolSpec('ops_review_attempt','Review attempt',OpsReviewAttemptInput,h_review_attempt),
