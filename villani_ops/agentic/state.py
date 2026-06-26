@@ -123,7 +123,7 @@ class OpsRunState(BaseModel):
         if self.decomposition_requested and not self.decomposition: a.append('ops_submit_decomposition'); return a
         if self.decomposition and not self.decomposition_validated: a.append('ops_validate_decomposition'); return a
         if self.execution_path=='unknown': a.append('ops_select_execution_path'); return a
-        if self.execution_path=='single_task' and len(self.candidates) < max(1,int(self.candidate_attempts or 1)): a += ['ops_run_next_candidate_attempt','ops_run_single_task_attempts']; return list(dict.fromkeys(a))
+        if self.execution_path=='single_task' and len(self.candidates) < max(1,int(self.candidate_attempts or 1)): a += ['ops_run_next_candidate_attempt']; return list(dict.fromkeys(a))
         if self.execution_path=='single_task':
             a += ['ops_run_next_candidate_attempt','ops_review_attempt','ops_run_validation','ops_select_winner','ops_finalize_run']; return list(dict.fromkeys(a))
         if self.execution_path=='parallel_candidates' and not self.candidates: a.append('ops_launch_candidates'); return a

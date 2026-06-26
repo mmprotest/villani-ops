@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from villani_ops.agentic.state import OpsRunState, CandidateAttemptState
 from villani_ops.agentic.event_recorder import OpsEventRecorder
 from villani_ops.agentic.state_tooling import execute_tool_with_policy, OpsToolContext
+from villani_ops.agentic.tools import h_run_single_task_attempts, OpsRunSingleTaskAttemptsInput, openai_tool_specs
 
 class FakeBackend:
     name='fake-backend'
@@ -137,11 +138,13 @@ def test_single_task_path_rejects_parallel_and_allows_sequential_tool(tmp_path):
     ok=execute_tool_with_policy(s,'ops_select_execution_path',{'path':'single_task','reason':'ok'},'s',c)
     assert not ok.is_error
     assert s.execution_path == 'single_task'
-    assert 'ops_run_single_task_attempts' in s.allowed_next_actions()
+    assert 'ops_run_next_candidate_attempt' in s.allowed_next_actions()
+    assert 'ops_run_single_task_attempts' not in s.allowed_next_actions()
     assert 'ops_launch_candidates' not in s.allowed_next_actions()
     launch=execute_tool_with_policy(s,'ops_launch_candidates',{'attempts':3,'reason':'bad'},'l',c)
     assert launch.is_error
-    assert 'ops_run_single_task_attempts' in launch.content
+    assert 'ops_run_next_candidate_attempt' in launch.content
+    assert 'ops_run_single_task_attempts' not in {t['function']['name'] for t in openai_tool_specs()}
 
 
 def test_single_task_attempts_retry_sequentially_and_stop_once_accepted(tmp_path):
@@ -151,8 +154,9 @@ def test_single_task_attempts_retry_sequentially_and_stop_once_accepted(tmp_path
     s.investigation={'summary':'i','validation_plan':{'commands':[{'cmd':'python -c "import sys; sys.exit(0)"','purpose':'ok'}]}}
     s.plan={'summary':'p','strategy':'single_task','candidate_attempts':3}
     s.execution_path='single_task'
-    res=execute_tool_with_policy(s,'ops_run_single_task_attempts',{'attempts':3,'reason':'go'},'seq',c)
-    assert not res.is_error, res.content
+    blocked=execute_tool_with_policy(s,'ops_run_single_task_attempts',{'attempts':3,'reason':'go'},'seq',c)
+    assert blocked.is_error
+    res=h_run_single_task_attempts(s, OpsRunSingleTaskAttemptsInput(attempts=3, reason='go'), c)
     assert runner.calls == ['candidate_001','candidate_002']
     assert len(s.candidates) == 2
     assert s.candidates[0].acceptance_eligible is False
@@ -166,6 +170,8 @@ def test_single_task_attempts_retry_sequentially_and_stop_once_accepted(tmp_path
     assert events.index('candidate_001') < events.index('candidate_002')
     assert events.index('"type": "validation_started"') < events.index('"type": "candidate_attempt_reviewed"')
     assert s.candidates[0].validation_source == 'ops_run_validation'
+    assert {o.attempt_id for o in s.attempt_observations} == {'candidate_001','candidate_002'}
+    assert s.backend_assessments
 
 
 def test_fresh_validation_overrides_debug_history_in_review_payload(tmp_path):

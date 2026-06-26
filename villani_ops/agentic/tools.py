@@ -268,6 +268,7 @@ class OpsSelectExecutionPathInput(StrictModel): path:Literal['single_task','para
 class OpsLaunchCandidatesInput(StrictModel): attempts:int; backend_name:str|None=None; reason:str
 class OpsRunSingleTaskAttemptsInput(StrictModel): attempts:int; backend_name:str|None=None; reason:str
 class OpsRunNextCandidateAttemptInput(StrictModel): backend_name:str|None=None; base_attempt_id:str|None=None; repair:bool=False; reason:str
+class OpsObserveCompletedAttemptInput(StrictModel): attempt_id:str; reason:str='Create missing adaptive observation before retry.'
 class OpsStartCandidateFallbackInput(StrictModel): reason:str; attempts:int|None=None
 class OpsLaunchSubtasksInput(StrictModel): subtask_ids:list[str]; backend_name:str|None=None; attempts_per_subtask:int; reason:str
 class OpsReviewAttemptInput(StrictModel): attempt_id:str; scope:Literal['candidate','subtask','integration']
@@ -532,7 +533,7 @@ def h_start_candidate_fallback(state, inp, ctx):
 
 def h_launch_candidates(state, inp, ctx):
     fallback_active=state.fallback_execution_path=='parallel_candidates_after_decomposition_deadlock'
-    if state.execution_path=='single_task': raise ValueError('single_task execution uses sequential attempts; call ops_run_single_task_attempts')
+    if state.execution_path=='single_task': raise ValueError('single_task execution uses adaptive sequential attempts; call ops_run_next_candidate_attempt')
     if state.execution_path!='parallel_candidates' and not fallback_active: raise ValueError('candidates require parallel_candidates execution path or explicit decomposition-deadlock fallback')
     made=[]; maxp=max(1, int(getattr(ctx.coding_backend or ctx.backend,'max_parallel',None) or ctx.max_parallel or 1))
     state.max_parallel=maxp
@@ -573,6 +574,23 @@ def _default_validation_commands(state):
     out=[ValidationCommand.model_validate(c) for c in cmds if isinstance(c, dict) and c.get('cmd')]
     return out or [ValidationCommand(cmd='python -m pytest --tb=short -v', purpose='Default cross-platform candidate validation', timeout_seconds=900)]
 
+
+def _observe_completed_attempt(state, attempt, ctx=None):
+    obs=create_attempt_observation(state,attempt)
+    update_backend_runner_assessments(state,obs,attempt)
+    if ctx is not None:
+        ctx.recorder.record('attempt_observation_created', payload=obs.model_dump())
+    return obs
+
+def h_observe_completed_attempt(state, inp, ctx):
+    a=next((c for c in state.candidates if c.attempt_id==inp.attempt_id), None)
+    if not a:
+        raise ValueError(f'unknown candidate attempt {inp.attempt_id}')
+    if a.status not in {'completed','failed','reviewed','rejected','accepted'}:
+        raise ValueError(f'attempt {inp.attempt_id} is not complete')
+    obs=_observe_completed_attempt(state,a,ctx)
+    return {'attempt_id':a.attempt_id,'observation':obs.model_dump(),'backend_assessment':state.backend_assessments.get(a.backend_name or 'unknown'),'reason':inp.reason}
+
 def h_run_single_task_attempts(state, inp, ctx):
     if state.execution_path!='single_task':
         raise ValueError('ops_run_single_task_attempts requires execution_path=single_task')
@@ -591,6 +609,7 @@ def h_run_single_task_attempts(state, inp, ctx):
         if ctx.reviewer is not None and a.status in {'completed','reviewed'} and not a.review:
             h_review_attempt(state, OpsReviewAttemptInput(attempt_id=aid, scope='candidate'), ctx)
         eligible, blockers=_set_acceptance_from_gate(state,a)
+        obs=_observe_completed_attempt(state,a,ctx)
         state.save(Path(state.run_dir)/'state.json')
         if eligible:
             state.stopped_early=True; state.stop_reason='accepted_attempt'; state.phase='selecting'
@@ -618,14 +637,13 @@ def h_run_next_candidate_attempt(state, inp, ctx):
     if ctx.reviewer is not None and a.status in {'completed','reviewed'} and not a.review:
         h_review_attempt(state, OpsReviewAttemptInput(attempt_id=aid, scope='candidate'), ctx)
     eligible, blockers=_set_acceptance_from_gate(state,a)
-    obs=create_attempt_observation(state,a); update_backend_runner_assessments(state,obs,a)
+    obs=_observe_completed_attempt(state,a,ctx)
     if eligible:
         state.stopped_early=True; state.stop_reason='accepted_attempt'; state.phase='selecting'
     elif len(state.candidates)>=budget:
         state.stopped_early=False; state.stop_reason='attempts_exhausted'; state.phase='selecting'
     else:
         state.phase='running_candidates'
-    ctx.recorder.record('attempt_observation_created', payload=obs.model_dump())
     return {'launched':[aid],'attempt_id':aid,'attempts_started':state.attempts_started,'attempts_requested':budget,'observation':obs.model_dump(),'backend_assessment':state.backend_assessments.get(a.backend_name or 'unknown'),'next_allowed_actions':state.allowed_next_actions()}
 
 def _update_decomposed_execution_state(state, ctx=None):
@@ -1157,7 +1175,8 @@ OPS_TOOLS={
 'ops_select_execution_path':ToolSpec('ops_select_execution_path','Select execution path',OpsSelectExecutionPathInput,h_select_path),
 'ops_launch_candidates':ToolSpec('ops_launch_candidates','Launch full-task candidates in parallel/batches. Only valid for execution_path=parallel_candidates or explicit decomposition-deadlock fallback; never for single_task.',OpsLaunchCandidatesInput,h_launch_candidates),
 'ops_run_next_candidate_attempt':ToolSpec('ops_run_next_candidate_attempt','Run exactly one adaptive full-task candidate attempt, then validate/review/observe it automatically.',OpsRunNextCandidateAttemptInput,h_run_next_candidate_attempt),
-'ops_run_single_task_attempts':ToolSpec('ops_run_single_task_attempts','Compatibility legacy bulk sequential attempts. Agentic controllers should prefer ops_run_next_candidate_attempt.',OpsRunSingleTaskAttemptsInput,h_run_single_task_attempts),
+'ops_observe_completed_attempt':ToolSpec('ops_observe_completed_attempt','Internal recovery: create an AttemptObservation for an existing completed attempt before any retry.',OpsObserveCompletedAttemptInput,h_observe_completed_attempt),
+'ops_run_single_task_attempts':ToolSpec('ops_run_single_task_attempts','LEGACY compatibility bulk sequential attempts. Hidden from normal agentic tool lists; do not use for adaptive orchestration. Use ops_run_next_candidate_attempt instead.',OpsRunSingleTaskAttemptsInput,h_run_single_task_attempts),
 'ops_start_candidate_fallback':ToolSpec('ops_start_candidate_fallback','Start full-task candidate fallback after decomposition deadlock',OpsStartCandidateFallbackInput,h_start_candidate_fallback),
 'ops_launch_subtasks':ToolSpec('ops_launch_subtasks','Launch subtasks',OpsLaunchSubtasksInput,h_launch_subtasks),
 'ops_review_attempt':ToolSpec('ops_review_attempt','Review attempt',OpsReviewAttemptInput,h_review_attempt),
@@ -1167,4 +1186,5 @@ OPS_TOOLS={
 'ops_finalize_run':ToolSpec('ops_finalize_run','Finalize run',OpsFinalizeRunInput,h_finalize),
 }
 def openai_tool_specs():
-    return [{'type':'function','function':{'name':n,'description':s.description,'parameters':s.input_model.model_json_schema(),'strict':True}} for n,s in OPS_TOOLS.items()]
+    hidden={'ops_run_single_task_attempts','ops_observe_completed_attempt'}
+    return [{'type':'function','function':{'name':n,'description':s.description,'parameters':s.input_model.model_json_schema(),'strict':True}} for n,s in OPS_TOOLS.items() if n not in hidden]
