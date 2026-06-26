@@ -1,4 +1,9 @@
 from villani_ops.controller.state_machine import *
+from pathlib import Path
+import tempfile
+
+_PATCH = Path(tempfile.gettempdir()) / "villani_ops_test_git.patch"
+_PATCH.write_text("diff --git a/hello.txt b/hello.txt\nindex 7898192..6178079 100644\n--- a/hello.txt\n+++ b/hello.txt\n@@ -1 +1 @@\n-old\n+new\n")
 from villani_ops.policy_engine.engine import ExecutionStrategy
 from villani_ops.review.reviewer import ReviewResult
 
@@ -7,7 +12,7 @@ def strat(): return ExecutionStrategy(profile='balanced', attempts=[])
 def review(decision='pass', passed=True, rec='accept'):
     return ReviewResult(decision=decision, passed=passed, recommended_action=rec)
 def attempt(exit_code=0, status='validated', r=None):
-    return {'attempt_id':'attempt_001','exit_code':exit_code,'status':status,'patch_path':__file__,'changed_files':['hello.txt'],'review':(r or review()).model_dump(mode='json')}
+    return {'attempt_id':'attempt_001','exit_code':exit_code,'status':status,'patch_path':str(_PATCH),'changed_files':['hello.txt'],'review':(r or review()).model_dump(mode='json')}
 def ctx(**kw):
     data=dict(run_id='r', attempt=attempt(), review=review(), strategy=strat(), attempts_remaining_for_backend=0, escalation_available=False, non_interactive=True)
     data.update(kw); return ControllerDecisionContext(**data)

@@ -1,6 +1,20 @@
 from __future__ import annotations
 from typing import Any
 from pathlib import Path
+def _is_excluded(path: str) -> bool:
+    p=str(path).replace('\\','/')
+    if p.startswith('./'): p=p[2:]
+    return p.startswith(('.villani/', '.villani_code/')) or p in {'.villani','.villani_code'}
+
+def patch_contains_internal_artifacts(patch_path: Any) -> bool:
+    try: text=Path(patch_path).read_text(errors='replace')
+    except Exception: return True
+    return any(x in text for x in ('.villani','.villani_code','context_state.json','mission_state.json','transcript','checkpoint'))
+
+def is_git_compatible_patch(patch_path: Any) -> bool:
+    try: text=Path(patch_path).read_text(errors='replace').lstrip()
+    except Exception: return False
+    return text.startswith('diff --git ') and 'Added file:' not in text and 'Removed file:' not in text and 'Deleted file:' not in text
 
 
 def _get(attempt: Any, key: str, default=None):
@@ -124,8 +138,24 @@ def is_attempt_acceptance_eligible(attempt: Any, human_approval: Any | None = No
             blockers.append("patch_unreadable")
         elif not has_non_empty_patch(patch_path):
             blockers.append("missing_patch")
-        if not (_get(attempt, "changed_files") or []):
+        changed_files = _get(attempt, "changed_files") or []
+        if not changed_files:
             blockers.append("empty_changed_files")
+        elif all(_is_excluded(str(f)) for f in changed_files):
+            blockers.append("internal_artifacts_only")
+        if patch_path and _patch_readable(patch_path):
+            if patch_contains_internal_artifacts(patch_path):
+                blockers.append("patch_contains_internal_artifacts")
+            if not is_git_compatible_patch(patch_path):
+                blockers.append("invalid_patch_format")
+        hygiene = _get(attempt, "patch_hygiene") or {}
+        if isinstance(hygiene, dict):
+            if hygiene.get("apply_check_passed") is False:
+                blockers.append("patch_apply_check_failed")
+            if hygiene.get("contains_internal_artifacts") is True:
+                blockers.append("patch_contains_internal_artifacts")
+            if hygiene.get("format_valid") is False and patch_path:
+                blockers.append("invalid_patch_format")
 
     review = _get(attempt, "review")
     if not review:
