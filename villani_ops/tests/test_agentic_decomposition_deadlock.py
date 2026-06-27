@@ -35,13 +35,13 @@ def test_allowed_actions_after_deadlock_include_fallback_not_integration(tmp_pat
     s=deadlocked_state(tmp_path)
     actions=s.allowed_next_actions()
     assert 'ops_start_candidate_fallback' in actions
-    assert 'ops_launch_candidates' in actions
+    assert 'ops_launch_candidates' not in actions
     assert 'ops_finalize_run' in actions
     assert 'ops_integrate_subtasks' not in actions
     assert actions != ['ops_get_state','ops_launch_subtasks']
 
 
-def test_start_candidate_fallback_preserves_subtasks_and_allows_candidates(tmp_path):
+def test_start_candidate_fallback_preserves_subtasks_and_immediately_launches_candidate(tmp_path):
     s=deadlocked_state(tmp_path); c=ctx(tmp_path)
     res=execute_tool_with_policy(s,'ops_start_candidate_fallback',{'reason':'required subtask failed and dependent subtasks are blocked'},'fb',c)
     assert not res.is_error, res.content
@@ -49,18 +49,16 @@ def test_start_candidate_fallback_preserves_subtasks_and_allows_candidates(tmp_p
     assert s.fallback_from_execution_path == 'decomposed_subtasks'
     assert s.fallback_execution_path == 'parallel_candidates_after_decomposition_deadlock'
     assert [st.subtask_id for st in s.subtasks] == ['a','b','c']
-    res=execute_tool_with_policy(s,'ops_launch_candidates',{'attempts':1,'reason':'fallback'},'lc',c)
-    assert not res.is_error, res.content
     assert s.candidates[0].attempt_id == 'candidate_001'
+    assert res.content['immediate_candidate_launch']['launched'] == ['candidate_001']
 
 
 def test_recovery_recommends_fallback_then_launch(tmp_path):
     s=deadlocked_state(tmp_path)
     rec=recommend_next_agentic_action(s)
     assert rec.tool_name == 'ops_start_candidate_fallback'
-    s.fallback_execution_path='parallel_candidates_after_decomposition_deadlock'; s.fallback_used=True
-    rec=recommend_next_agentic_action(s)
-    assert rec.tool_name == 'ops_launch_candidates'
+    # The fallback tool now launches the first candidate in the same deterministic step,
+    # so a normal state should not sit in fallback-started/no-candidate limbo.
 
 
 def test_failed_finalize_clears_raw_subtask_selected_attempt(tmp_path):

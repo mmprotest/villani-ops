@@ -108,5 +108,5 @@ def test_no_tool_call_after_decomposed_path_launches_ready_subtasks(tmp_path):
     assert r.state.subtasks[1].status == 'pending'
     assert (r.state.final_decision or {}).get('blockers') != ['agentic_orchestrator_no_progress']
     events=(Path(r.run_dir)/'runtime_events.jsonl').read_text()
-    assert 'ops_launch_subtasks' in events
+    assert 'ops_run_next_subtask_attempt' in events
     assert 'agentic_orchestrator_no_progress' not in events

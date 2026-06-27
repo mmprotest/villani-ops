@@ -109,12 +109,22 @@ def recommend_next_agentic_action(state):
     if state.execution_path=='decomposed_subtasks' and state.decomposition_accepted is True and state.subtasks and not _has_active_subtask_attempts(state) and all(s.status=='pending' and not s.attempts for s in state.subtasks):
         ready=_ready_subtask_ids(state)
         if ready:
-            return RecoveryRecommendation(action='launch_decomposition_subtasks',tool_name='ops_launch_subtasks',tool_input={'subtask_ids':ready,'attempts_per_subtask':state.candidate_attempts,'reason':'Launch accepted decomposition subtasks.'},reason='Accepted decomposition execution path selected but no subtasks have launched.',can_execute_deterministically=True)
+            return RecoveryRecommendation(action='run_next_subtask_attempt',tool_name='ops_run_next_subtask_attempt',tool_input={'subtask_id':ready[0],'reason':'Run the first adaptive subtask attempt.'},reason='Accepted decomposition execution path selected; run one ready subtask attempt.',can_execute_deterministically=True)
     dead=detect_decomposition_deadlock(state)
     if dead and state.fallback_execution_path!='parallel_candidates_after_decomposition_deadlock' and not state.candidates:
         return RecoveryRecommendation(action='start_candidate_fallback',tool_name='ops_start_candidate_fallback',tool_input={'reason':'required subtask failed and dependent subtasks are blocked'},reason='decomposition deadlock detected; full-task candidate fallback is available',can_execute_deterministically=True)
     if state.fallback_execution_path=='parallel_candidates_after_decomposition_deadlock' and not state.candidates:
         return RecoveryRecommendation(action='launch_fallback_candidates',tool_name='ops_launch_candidates',tool_input={'attempts':state.candidate_attempts,'reason':'fallback after decomposition deadlock'},reason='candidate fallback is started but no fallback candidates have launched',can_execute_deterministically=False)
+    if state.execution_path=='decomposed_subtasks':
+        for st in state.subtasks:
+            if st.status=='pending' and st.attempts and len(st.attempts) < max(1,int(state.candidate_attempts or 1)):
+                obs=[o for o in state.attempt_observations if o.scope=='subtask' and o.subtask_id==st.subtask_id]
+                last=obs[-1] if obs else None
+                if last and last.outcome!='accepted':
+                    return RecoveryRecommendation(action=f'focused_subtask_retry_{last.outcome}',tool_name='ops_run_next_subtask_attempt',tool_input={'subtask_id':st.subtask_id,'base_attempt_id':last.attempt_id,'repair':bool(last.should_repair),'reason':f'Retry subtask adaptively using prior {last.outcome} observation feedback.'},reason='failed subtask has budget remaining; retry with curated observation feedback',can_execute_deterministically=True)
+        ready=_ready_subtask_ids(state)
+        if ready:
+            return RecoveryRecommendation(action='run_next_ready_subtask_attempt',tool_name='ops_run_next_subtask_attempt',tool_input={'subtask_id':ready[0],'reason':'Run one ready adaptive subtask attempt.'},reason='ready subtask exists',can_execute_deterministically=True)
     if state.execution_path=='single_task':
         # Evidence-first recovery: never retry until current completed attempts have
         # validation/review and a fresh idempotent observation when those are possible.
