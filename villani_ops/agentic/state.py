@@ -9,6 +9,7 @@ class CandidateAttemptState(BaseModel):
     attempt_id:str; backend_name:str|None=None; model:str|None=None
     status:Literal['scheduled','running','completed','failed','reviewed','accepted','rejected']
     scope:Literal['candidate','subtask','integration']; subtask_id:str|None=None
+    candidate_kind:Literal['normal','fallback']|None=None
     worktree_path:str|None=None; artifacts_dir:str|None=None; patch_path:str|None=None
     changed_files:list[str]=Field(default_factory=list); stdout_path:str|None=None; stderr_path:str|None=None; transcript_path:str|None=None
     review:dict|None=None; acceptance_eligible:bool=False; acceptance_blockers:list[str]=Field(default_factory=list)
@@ -154,12 +155,30 @@ class OpsRunState(BaseModel):
             if len(self.candidates) < budget: a += ['ops_run_next_candidate_attempt']; return list(dict.fromkeys(a))
             a += ['ops_select_winner','ops_finalize_run']; return list(dict.fromkeys(a))
         if self.execution_path=='parallel_candidates' and not self.candidates: a.append('ops_launch_candidates'); return a
-        if self.fallback_execution_path=='parallel_candidates_after_decomposition_deadlock' and not self.candidates: a.append('ops_launch_candidates'); return a
-        if self.fallback_execution_path=='parallel_candidates_after_decomposition_deadlock' and self.candidates:
-            a += ['ops_review_attempt','ops_run_validation','ops_select_winner','ops_finalize_run']; return list(dict.fromkeys(a))
+        if self.fallback_execution_path=='parallel_candidates_after_decomposition_deadlock':
+            budget=max(1,int(self.candidate_attempts or 1))
+            obs_by_id={o.attempt_id:o for o in self.attempt_observations}
+            complete=[c for c in self.candidates if c.status in {'completed','failed','reviewed','rejected','accepted'}]
+            eligible=[]; needs_validation=[]; needs_review=[]; needs_observation=[]
+            for c in complete:
+                try:
+                    from villani_ops.core.acceptance import is_attempt_acceptance_eligible
+                    if is_attempt_acceptance_eligible(c,state=self)[0]: eligible.append(c)
+                except Exception:
+                    pass
+                if c.patch_path and c.changed_files and not c.validation: needs_validation.append(c)
+                if c.patch_path and c.changed_files and not c.review and not c.failure_reason: needs_review.append(c)
+                o=obs_by_id.get(c.attempt_id); val_snap=f"{c.validation_status}:{len(c.validation_results or [])}"; rev_snap=f"{c.review_status}:{c.review_retry_count}:{bool(c.review)}"
+                if o is None or o.validation_snapshot_id!=val_snap or o.review_snapshot_id!=rev_snap: needs_observation.append(c)
+            if eligible: a += ['ops_select_winner','ops_finalize_run']; return list(dict.fromkeys(a))
+            if needs_validation: a.append('ops_run_validation'); return list(dict.fromkeys(a))
+            if needs_review: a.append('ops_review_attempt'); return list(dict.fromkeys(a))
+            if needs_observation: a.append('ops_observe_completed_attempt'); return list(dict.fromkeys(a))
+            if len(complete) < budget: a.append('ops_run_next_fallback_candidate_attempt'); return list(dict.fromkeys(a))
+            a.append('ops_finalize_run'); return list(dict.fromkeys(a))
         if self.execution_path=='decomposed_subtasks' and self.decomposed_execution_status in {'blocked','failed'}:
             if not self.candidates: a.append('ops_start_candidate_fallback')
-            a += ['ops_review_attempt','ops_select_winner','ops_finalize_run']; return list(dict.fromkeys(a))
+            a += ['ops_select_winner','ops_finalize_run']; return list(dict.fromkeys(a))
         if self.execution_path=='decomposed_subtasks':
             if any(s.status=='pending' for s in self.subtasks): a += ['ops_run_next_subtask_attempt']; return list(dict.fromkeys(a))
             if all(s.status in {'accepted','skipped'} for s in self.subtasks) and not self.integration: a.append('ops_integrate_subtasks'); return a

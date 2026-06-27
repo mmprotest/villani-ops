@@ -116,7 +116,7 @@ def recommend_next_agentic_action(state):
     if dead and state.fallback_execution_path!='parallel_candidates_after_decomposition_deadlock' and not state.candidates:
         return RecoveryRecommendation(action='start_candidate_fallback',tool_name='ops_start_candidate_fallback',tool_input={'reason':'required subtask failed and dependent subtasks are blocked'},reason='decomposition deadlock detected; full-task candidate fallback is available',can_execute_deterministically=True)
     if state.fallback_execution_path=='parallel_candidates_after_decomposition_deadlock' and not state.candidates:
-        return RecoveryRecommendation(action='start_candidate_fallback',tool_name='ops_start_candidate_fallback',tool_input={'reason':'continue immediate fallback after decomposition deadlock'},reason='fallback should launch exactly one candidate deterministically',can_execute_deterministically=True)
+        return RecoveryRecommendation(action='run_next_fallback_candidate_attempt',tool_name='ops_run_next_fallback_candidate_attempt',tool_input={'reason':'Run the first adaptive fallback candidate after decomposition deadlock with decomposition learnings.'},reason='fallback mode is active; run exactly one adaptive fallback candidate',can_execute_deterministically=True)
     if state.execution_path=='decomposed_subtasks' and state.integration and (state.integration.get('validation') or {}).get('passed') is False:
         return RecoveryRecommendation(action='run_next_integration_repair_attempt',tool_name='ops_run_next_integration_repair_attempt',tool_input={'reason':'Full integration validation failed; run one adaptive integration repair with accepted subtask context.'},reason='integration validation failed after accepted subtasks',can_execute_deterministically=True)
     if state.execution_path=='decomposed_subtasks':
@@ -149,6 +149,27 @@ def recommend_next_agentic_action(state):
         eligible, blockers=is_attempt_acceptance_eligible(a,state=state)
         if eligible:
             return RecoveryRecommendation(action='select_winner',tool_name='ops_select_winner',tool_input={'decision':'select','selected_attempt_id':aid,'summary':'Candidate passed review and validation and is centrally acceptance eligible.','reasons':['central acceptance gate passed'],'confidence':0.95},reason='eligible candidate/integration exists',can_execute_deterministically=True)
+    if state.fallback_execution_path=='parallel_candidates_after_decomposition_deadlock' and state.candidates:
+        budget=max(1,int(state.candidate_attempts or 1))
+        for a in state.candidates:
+            if _validation_missing(a):
+                return RecoveryRecommendation(action='run_fallback_validation',tool_name='ops_run_validation',tool_input={'target':'candidate','target_id':_aid(a),'commands':[{'cmd':'python -m pytest --tb=short -v','purpose':'Validate fallback candidate before observation/retry','timeout_seconds':900}]},reason='completed fallback candidate needs validation before observation or retry',can_execute_deterministically=False)
+        for a in state.candidates:
+            if _review_missing(a):
+                return RecoveryRecommendation(action='review_fallback_candidate',tool_name='ops_review_attempt',tool_input={'attempt_id':_aid(a),'scope':'candidate'},reason='completed fallback candidate needs review before observation or retry',can_execute_deterministically=True)
+        for a in state.candidates:
+            if _complete(a) and not _obs_fresh(a, _obs_for(state,_aid(a))):
+                return RecoveryRecommendation(action='observe_fallback_candidate',tool_name='ops_observe_completed_attempt',tool_input={'attempt_id':_aid(a),'reason':'Create or refresh fallback AttemptObservation from current validation/review evidence.'},reason='fallback candidate lacks a current observation',can_execute_deterministically=True)
+        observations=[o for o in getattr(state,'attempt_observations',[]) or [] if getattr(o,'scope',None)=='candidate']
+        last=observations[-1] if observations else None
+        if last and last.outcome=='accepted':
+            return RecoveryRecommendation(action='select_winner',tool_name='ops_select_winner',tool_input={'decision':'select','selected_attempt_id':last.attempt_id,'summary':'Observed accepted fallback candidate is eligible for selection.','reasons':['fallback attempt observation accepted'],'confidence':0.95},reason='latest fallback observation is accepted',can_execute_deterministically=True)
+        if last and len(state.candidates) < budget:
+            return RecoveryRecommendation(action=f'focused_fallback_retry_{last.outcome}',tool_name='ops_run_next_fallback_candidate_attempt',tool_input={'reason':'Retry fallback adaptively using previous fallback attempt failure feedback: changed files, validation failures, review blockers, patch/scope/hygiene blockers, and commands to rerun.','base_attempt_id':last.attempt_id,'repair':bool(last.should_repair or last.outcome in {'validation_failed','review_failed','patch_failed','scope_failed'})},reason=f'latest fallback observation outcome={last.outcome}; retry one fallback candidate with curated feedback',can_execute_deterministically=True)
+        if len(state.candidates) >= budget:
+            structured=_exhausted_failure_summary(state, observations)
+            return RecoveryRecommendation(action='finalize_failed',tool_name='ops_finalize_run',tool_input={'decision':'failed','summary':'Decomposed execution deadlocked and fallback candidate budget is exhausted.','blockers':['decomposition_deadlocked','fallback_candidate_budget_exhausted'],'failure_observations':structured},reason='fallback budget exhausted; fail with observations and blockers',can_execute_deterministically=True)
+
     if state.execution_path=='single_task' and state.candidates:
         budget=max(1,int(state.candidate_attempts or 1))
         observations=[o for o in getattr(state,'attempt_observations',[]) or [] if getattr(o,'scope',None)=='candidate']
@@ -211,6 +232,8 @@ def handle_no_tool_call(state, reason='no_tool_call', max_recovery_attempts:int=
             content='Call ops_select_execution_path with path="single_task".'
         if rec.tool_name=='ops_run_next_candidate_attempt':
             content='Call ops_run_next_candidate_attempt to run exactly one adaptive candidate attempt. Do not call bulk attempt tools.'
+        if rec.tool_name=='ops_run_next_fallback_candidate_attempt':
+            content='Call ops_run_next_fallback_candidate_attempt to run exactly one adaptive fallback candidate attempt. Do not call ops_launch_candidates or other bulk launch tools.'
         if rec.tool_name=='ops_select_winner' and rec.tool_input and rec.tool_input.get('selected_attempt_id'):
             content=f"There is a reviewed and validated eligible candidate: {rec.tool_input['selected_attempt_id']}. Call ops_select_winner."
         if rec.tool_name=='ops_run_validation' and rec.tool_input:

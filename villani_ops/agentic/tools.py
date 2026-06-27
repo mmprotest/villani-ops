@@ -291,6 +291,7 @@ class OpsSelectExecutionPathInput(StrictModel): path:Literal['single_task','para
 class OpsLaunchCandidatesInput(StrictModel): attempts:int; backend_name:str|None=None; reason:str
 class OpsRunSingleTaskAttemptsInput(StrictModel): attempts:int; backend_name:str|None=None; reason:str
 class OpsRunNextCandidateAttemptInput(StrictModel): backend_name:str|None=None; base_attempt_id:str|None=None; repair:bool=False; reason:str
+class OpsRunNextFallbackCandidateAttemptInput(StrictModel): backend_name:str|None=None; base_attempt_id:str|None=None; repair:bool=False; reason:str
 class OpsRunNextSubtaskAttemptInput(StrictModel): subtask_id:str|None=None; backend_name:str|None=None; base_attempt_id:str|None=None; repair:bool=False; reason:str
 class OpsObserveCompletedAttemptInput(StrictModel): attempt_id:str; reason:str='Create missing adaptive observation before retry.'
 class OpsRunNextIntegrationRepairAttemptInput(StrictModel): backend_name:str|None=None; base_attempt_id:str|None=None; repair:bool=True; reason:str
@@ -650,23 +651,31 @@ def h_start_candidate_fallback(state, inp, ctx):
     state.fallback_used=True; state.fallback_from_execution_path='decomposed_subtasks'; state.fallback_execution_path='parallel_candidates_after_decomposition_deadlock'
     state.fallback_reason=inp.reason or 'required subtask failed and dependent subtasks are blocked'; state.fallback_started_at=str(time.time()); state.phase='running_candidates'
     ctx.recorder.record('candidate_fallback_started', payload={'reason':state.fallback_reason,'fallback_from_execution_path':state.fallback_from_execution_path,'fallback_execution_path':state.fallback_execution_path})
-    launched=None
-    if not state.candidates and (inp.attempts or state.candidate_attempts or 0) > 0:
-        launched=h_launch_candidates(state, OpsLaunchCandidatesInput(attempts=1, reason='Immediate full-task fallback after decomposition deadlock with decomposition learnings.'), ctx)
-    return {'fallback_used':state.fallback_used,'fallback_execution_path':state.fallback_execution_path,'fallback_reason':state.fallback_reason,'attempts':inp.attempts,'immediate_candidate_launch':launched}
+    return {'fallback_used':state.fallback_used,'fallback_execution_path':state.fallback_execution_path,'fallback_reason':state.fallback_reason,'next_allowed_actions':state.allowed_next_actions()}
 
-def build_decomposition_fallback_prompt(state)->str:
-    obs=[o.model_dump(mode='json') for o in state.attempt_observations if o.scope=='subtask']
-    accepted=[{'subtask_id':s.subtask_id,'accepted_attempt_id':s.accepted_attempt_id,'attempts':[a.attempt_id for a in s.attempts]} for s in state.subtasks if s.status=='accepted']
-    failed=[{'subtask_id':s.subtask_id,'status':s.status,'attempts':[a.attempt_id for a in s.attempts]} for s in state.subtasks if s.status in {'failed','skipped'}]
-    return '\n\n'.join([
+def build_decomposition_fallback_prompt(state, *, reason:str|None=None, repair:bool=False, base_attempt_id:str|None=None)->str:
+    sub_obs=[o.model_dump(mode='json') for o in state.attempt_observations if o.scope=='subtask']
+    fb_obs=[o for o in state.attempt_observations if o.scope=='candidate']
+    accepted=[{'subtask_id':st.subtask_id,'accepted_attempt_id':st.accepted_attempt_id,'changed_files':(_accepted_subtask_attempt(state,st).changed_files if _accepted_subtask_attempt(state,st) else []),'summary':st.objective} for st in state.subtasks if st.status=='accepted']
+    failed=[{'subtask_id':st.subtask_id,'status':st.status,'attempts':[a.attempt_id for a in st.attempts],'observations':[o for o in sub_obs if o.get('subtask_id')==st.subtask_id]} for st in state.subtasks if st.status in {'failed','skipped'}]
+    dead=detect_decomposition_deadlock(state)
+    cmds=_validation_plan_commands(state)
+    sections=[
         f'TASK\n{state.task}',
         f'SUCCESS CRITERIA\n{state.success_criteria or "Complete the task with a minimal correct patch."}',
-        'DECOMPOSITION FALLBACK CONTEXT\nThe decomposed path deadlocked. Run exactly one full-task adaptive fallback candidate. Preserve useful accepted subtask work, fix what remains broken, and avoid repeating failed subtask approaches.',
-        'DECOMPOSITION SUMMARY\n'+json.dumps({'decomposition':state.decomposition,'accepted_subtasks':accepted,'failed_or_blocked_subtasks':failed}, ensure_ascii=False, indent=2),
-        'FAILED SUBTASK OBSERVATIONS\n'+json.dumps(obs, ensure_ascii=False, indent=2),
-        'FALLBACK DIRECTIVES\n- Produce one integrated product-code patch for the original task.\n- Preserve accepted subtask behavior where compatible.\n- Address validation/review evidence from failed subtasks.\n- Do not do unrelated rewrites or create scratch/internal artifacts.'
-    ])
+        'DECOMPOSITION FALLBACK CONTEXT\nThe decomposed path deadlocked. Run exactly one full-task adaptive fallback candidate. This is not a cold start.',
+        'DECOMPOSITION SUMMARY\n'+json.dumps({'decomposition':state.decomposition,'deadlock':dead.model_dump() if dead else None,'partial_progress':state.partial_progress}, ensure_ascii=False, indent=2),
+        'ACCEPTED SUBTASK SUMMARIES AND CHANGED FILES\n'+json.dumps(accepted, ensure_ascii=False, indent=2),
+        'FAILED SUBTASK OBSERVATIONS AND BLOCKED DEPENDENTS\n'+json.dumps({'failed_or_blocked_subtasks':failed,'blocked_dependents':state.decomposed_execution_blocked_subtasks,'remaining_broken_areas':state.decomposed_execution_blockers}, ensure_ascii=False, indent=2),
+        'FOCUSED VALIDATION FAILURES AND REVIEW BLOCKERS\n'+json.dumps(sub_obs, ensure_ascii=False, indent=2),
+        'PRESERVE / DO NOT REGRESS\n- Preserve accepted subtask work and behavior where compatible.\n- Do not regress accepted changed files listed above.\n- Do not repeat failed subtask approaches or broad unrelated rewrites.',
+    ]
+    if fb_obs:
+        sections.append('PREVIOUS FALLBACK ATTEMPT FEEDBACK\n'+build_attempt_learning_brief(state))
+    sections.append('WHAT TO FOCUS ON NEXT\n- Produce one integrated product-code patch for the original task.\n- Fix remaining broken areas, validation failures, review blockers, patch/scope/hygiene blockers.\n- Rerun known relevant commands where possible.\n'+'\n'.join(f'- Rerun: {c}' for c in cmds))
+    if repair and base_attempt_id: sections.append(f'REPAIR MODE\nRepair previous fallback attempt {base_attempt_id}; do not repeat its failed strategy.')
+    if reason: sections.append(f'REASON FOR THIS FALLBACK ATTEMPT\n{reason}')
+    return '\n\n'.join(sections)
 
 def h_launch_candidates(state, inp, ctx):
     fallback_active=state.fallback_execution_path=='parallel_candidates_after_decomposition_deadlock'
@@ -684,6 +693,7 @@ def h_launch_candidates(state, inp, ctx):
                 aid=f'candidate_{next_index:03d}'; next_index+=1
                 ids.append(aid); made.append(aid)
                 scheduled=_attempt(aid,'candidate',backend=inp.backend_name or ctx.coding_backend_name or ctx.backend_name,artifacts=Path(state.run_dir)/'attempts'/aid)
+                if fallback_active: scheduled.candidate_kind='fallback'
                 scheduled.status='running'; scheduled.started_at=str(time.time()); scheduled.worktree_path=str(Path(state.run_dir)/'attempts'/aid/'worktree')
                 state.candidates.append(scheduled)
                 ctx.recorder.record('candidate_attempt_started', payload={'attempt_id':aid,'status':'running','batch_index':batch_count,'fallback':fallback_active,'artifact_paths':{'artifacts_dir':scheduled.artifacts_dir}})
@@ -817,6 +827,34 @@ def h_run_next_candidate_attempt(state, inp, ctx):
     else:
         state.phase='running_candidates'
     return {'launched':[aid],'attempt_id':aid,'attempts_started':state.attempts_started,'attempts_requested':budget,'observation':obs.model_dump(),'backend_assessment':state.backend_assessments.get(a.backend_name or 'unknown'),'next_allowed_actions':state.allowed_next_actions()}
+
+def h_run_next_fallback_candidate_attempt(state, inp, ctx):
+    if state.fallback_execution_path!='parallel_candidates_after_decomposition_deadlock':
+        raise ValueError('ops_run_next_fallback_candidate_attempt requires decomposition-deadlock fallback mode')
+    budget=max(1,int(state.candidate_attempts or 1))
+    complete=[c for c in state.candidates if c.status in {'completed','failed','reviewed','rejected','accepted'}]
+    if len(complete) >= budget:
+        raise ValueError(f'fallback candidate budget exhausted ({len(complete)}/{budget})')
+    state.candidate_execution_mode='sequential'; state.attempts_requested=budget; state.phase='running_candidates'
+    aid=f'candidate_{len(state.candidates)+1:03d}'
+    prompt=build_decomposition_fallback_prompt(state, reason=inp.reason, repair=inp.repair, base_attempt_id=inp.base_attempt_id)
+    a=_run_attempt(state,ctx,aid,'candidate',prompt,state.success_criteria,None,inp.backend_name,True)
+    a.candidate_kind='fallback'
+    state.candidates.append(a); state.attempts_started=len(state.candidates)
+    if a.status=='completed':
+        cmds=_default_validation_commands(state)
+        if cmds: h_validation(state, OpsRunValidationInput(target='candidate', target_id=aid, commands=cmds), ctx)
+    if ctx.reviewer is not None and a.status in {'completed','reviewed'} and not a.review:
+        h_review_attempt(state, OpsReviewAttemptInput(attempt_id=aid, scope='candidate'), ctx)
+    eligible, blockers=_set_acceptance_from_gate(state,a)
+    obs=_observe_completed_attempt(state,a,ctx)
+    if eligible:
+        state.stopped_early=True; state.stop_reason='accepted_fallback_attempt'; state.phase='selecting'
+    elif len(state.candidates)>=budget:
+        state.stopped_early=False; state.stop_reason='fallback_attempts_exhausted'; state.phase='selecting'
+    else:
+        state.phase='running_candidates'
+    return {'launched':[aid],'attempt_id':aid,'candidate_kind':'fallback','attempts_started':state.attempts_started,'attempts_requested':budget,'observation':obs.model_dump(),'backend_assessment':state.backend_assessments.get(a.backend_name or 'unknown'),'next_allowed_actions':state.allowed_next_actions()}
 
 def h_run_next_subtask_attempt(state, inp, ctx):
     if state.execution_path!='decomposed_subtasks':
@@ -1442,6 +1480,7 @@ OPS_TOOLS={
 'ops_select_execution_path':ToolSpec('ops_select_execution_path','Select execution path',OpsSelectExecutionPathInput,h_select_path),
 'ops_launch_candidates':ToolSpec('ops_launch_candidates','Launch full-task candidates in parallel/batches. Only valid for execution_path=parallel_candidates or explicit decomposition-deadlock fallback; never for single_task.',OpsLaunchCandidatesInput,h_launch_candidates),
 'ops_run_next_candidate_attempt':ToolSpec('ops_run_next_candidate_attempt','Run exactly one adaptive full-task candidate attempt, then validate/review/observe it automatically.',OpsRunNextCandidateAttemptInput,h_run_next_candidate_attempt),
+'ops_run_next_fallback_candidate_attempt':ToolSpec('ops_run_next_fallback_candidate_attempt','Run exactly one adaptive full-task fallback candidate after decomposition deadlock, then validate/review/observe it automatically.',OpsRunNextFallbackCandidateAttemptInput,h_run_next_fallback_candidate_attempt),
 'ops_run_next_subtask_attempt':ToolSpec('ops_run_next_subtask_attempt','Run exactly one adaptive subtask attempt selected from current decomposition state, then focused-validate/review/observe it automatically.',OpsRunNextSubtaskAttemptInput,h_run_next_subtask_attempt),
 'ops_run_next_integration_repair_attempt':ToolSpec('ops_run_next_integration_repair_attempt','Run exactly one adaptive integration repair attempt after accepted subtasks fail full validation.',OpsRunNextIntegrationRepairAttemptInput,h_run_next_integration_repair_attempt),
 'ops_observe_completed_attempt':ToolSpec('ops_observe_completed_attempt','Internal recovery: create an AttemptObservation for an existing completed attempt before any retry.',OpsObserveCompletedAttemptInput,h_observe_completed_attempt),

@@ -77,7 +77,7 @@ def test_subtask_observation_refresh_idempotent_and_distinct_attempts_count(tmp_
     assert s.backend_assessments['b1']['attempts'] == 2
 
 
-def test_deadlock_fallback_starts_and_immediately_launches_candidate_with_learnings(tmp_path):
+def test_deadlock_fallback_runs_adaptive_candidate_with_learnings(tmp_path):
     s=make_state(tmp_path); runner=SubtaskRunner(); c=make_ctx(tmp_path, runner)
     st=s.subtasks[0]; st.status='failed'
     st.attempts=[]
@@ -88,8 +88,27 @@ def test_deadlock_fallback_starts_and_immediately_launches_candidate_with_learni
     st.attempts=[CandidateAttemptState(attempt_id=f'pricing_attempt_{i:03d}',status='failed',scope='subtask',subtask_id='pricing') for i in range(1,4)]
     res=execute_tool_with_policy(s,'ops_start_candidate_fallback',{'reason':'deadlock'},'fb',c)
     assert not res.is_error, res.content
+    assert len(s.candidates) == 0
+    res=execute_tool_with_policy(s,'ops_run_next_fallback_candidate_attempt',{'reason':'deadlock'},'fb2',c)
+    assert not res.is_error, res.content
     assert len(s.candidates) == 1
     assert runner.calls[-1]['subtask_id'] is None
     assert 'DECOMPOSITION FALLBACK CONTEXT' in runner.calls[-1]['task']
     assert 'discount_order_wrong' in runner.calls[-1]['task']
     assert 'ops_launch_candidates' not in s.allowed_next_actions()
+
+
+def test_fallback_retry_prompt_includes_previous_failure_feedback(tmp_path):
+    s=make_state(tmp_path); runner=SubtaskRunner(); c=make_ctx(tmp_path, runner)
+    st=s.subtasks[0]; st.status='failed'
+    from villani_ops.agentic.state import CandidateAttemptState
+    st.attempts=[CandidateAttemptState(attempt_id=f'pricing_attempt_{i:03d}',status='failed',scope='subtask',subtask_id='pricing') for i in range(1,4)]
+    s.decomposed_execution_status='blocked'; s.decomposed_execution_blockers=['decomposition_deadlocked']
+    execute_tool_with_policy(s,'ops_start_candidate_fallback',{'reason':'deadlock'},'fb',c)
+    execute_tool_with_policy(s,'ops_run_next_fallback_candidate_attempt',{'reason':'first'},'fb1',c)
+    assert len(s.attempt_observations) == 1
+    execute_tool_with_policy(s,'ops_run_next_fallback_candidate_attempt',{'reason':'retry','base_attempt_id':'candidate_001','repair':True},'fb2',c)
+    assert len(s.candidates) == 2
+    assert 'PREVIOUS FALLBACK ATTEMPT FEEDBACK' in runner.calls[-1]['task']
+    assert 'candidate_001' in runner.calls[-1]['task']
+    assert s.candidates[-1].candidate_kind == 'fallback'
