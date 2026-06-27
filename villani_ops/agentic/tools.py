@@ -359,8 +359,31 @@ def h_inspect_repo(state, inp, ctx):
     return {'tree_summary':files[:50],'likely_source_files':[f for f in files if f.endswith(('.py','.js','.ts','.rs','.go'))][:50],'likely_test_files':[f for f in files if 'test' in f.lower()][:50],'package_build_config_files':cfg,'detected_validation_commands':[]}
 def h_classification(state, inp, ctx): state.classification=inp.model_dump(); return state.classification
 def h_investigation(state, inp, ctx): state.investigation=inp.model_dump(); state.phase='planning'; return state.investigation
-def h_plan(state, inp, ctx): state.plan=inp.model_dump(); state.decomposition_requested=inp.should_decompose; state.phase='decomposing' if inp.should_decompose else 'choosing_execution_path'; return state.plan
+def _adaptive_warning(state, ctx, message, payload=None):
+    state.warnings.append(message)
+    if ctx is not None and getattr(ctx, 'recorder', None) is not None:
+        ctx.recorder.record('adaptive_plan_constraint_warning', payload={'warning': message, **(payload or {})})
+
+def _is_adaptive(state):
+    return getattr(state, 'orchestrator', None) == 'adaptive'
+
+def h_plan(state, inp, ctx):
+    plan=inp.model_dump()
+    if _is_adaptive(state):
+        invalid=bool(inp.should_decompose or inp.strategy!='single_task')
+        if invalid:
+            _adaptive_warning(state, ctx, 'adaptive_orchestrator_forced_single_task_plan', {'original_plan': plan})
+        plan.update({'strategy':'single_task','should_decompose':False,'decomposition_reason':None,'candidate_attempts':state.candidate_attempts})
+        plan['execution_path']='single_task'
+        plan['plan_kind']='single_task'
+        state.subtasks=[]; state.decomposition=None; state.decomposition_requested=False; state.decomposition_validated=False; state.decomposition_accepted=None; state.decomposition_executed=False
+        state.plan=plan; state.phase='choosing_execution_path'; return state.plan
+    state.plan=plan; state.decomposition_requested=inp.should_decompose; state.phase='decomposing' if inp.should_decompose else 'choosing_execution_path'; return state.plan
 def h_decomposition(state, inp, ctx):
+    if _is_adaptive(state):
+        _adaptive_warning(state, ctx, 'adaptive_orchestrator_rejected_decomposition', {'requested_decomposition': inp.model_dump()})
+        state.decomposition=None; state.subtasks=[]; state.decomposition_requested=False; state.decomposition_executed=False; state.phase='choosing_execution_path'
+        raise ValueError('adaptive orchestrator cannot decompose; use execution_path=single_task')
     state.decomposition=inp.model_dump(); state.phase='choosing_execution_path'; state.subtasks=[SubtaskState(subtask_id=s.id,title=s.title,objective=s.objective,success_criteria=s.success_criteria,relevant_files=s.relevant_files,dependencies=s.dependencies,expected_difficulty=s.expected_difficulty,risk=s.risk) for s in inp.subtasks]; return state.decomposition
 def h_validate_decomposition(state, inp, ctx):
     failures=[]; ids=[s.subtask_id for s in state.subtasks]
@@ -395,6 +418,10 @@ def h_validate_decomposition(state, inp, ctx):
     state.decomposition_validated=True; state.decomposition_accepted=accepted; state.phase='choosing_execution_path'; return res.model_dump()
 
 def h_select_path(state, inp, ctx):
+    if _is_adaptive(state) and inp.path!='single_task':
+        _adaptive_warning(state, ctx, 'adaptive_orchestrator_forced_single_task_execution_path', {'requested_path': inp.path, 'reason': inp.reason})
+        state.execution_path='single_task'; state.phase='running_candidates'; state.candidate_execution_mode='sequential'; state.decomposition_executed=False; state.subtasks=[]; state.decomposition=None
+        return {'execution_path':state.execution_path,'reason':'adaptive forced single_task','decomposition_fallback_used':False,'warning':'adaptive_orchestrator_forced_single_task_execution_path'}
     strategy=(state.plan or {}).get('strategy')
     if strategy=='single_task' and inp.path=='parallel_candidates':
         raise ValueError('plan strategy is single_task; use execution_path=single_task for sequential attempts, not parallel_candidates')
@@ -1744,6 +1771,8 @@ OPS_TOOLS={
 'ops_select_winner':ToolSpec('ops_select_winner','Select winner',OpsSelectWinnerInput,h_select_winner),
 'ops_finalize_run':ToolSpec('ops_finalize_run','Finalize run',OpsFinalizeRunInput,h_finalize),
 }
-def openai_tool_specs():
+def openai_tool_specs(adaptive:bool=False):
     hidden={'ops_run_single_task_attempts','ops_observe_completed_attempt','ops_launch_subtasks'}
+    if adaptive:
+        hidden |= {'ops_submit_decomposition','ops_validate_decomposition','ops_launch_candidates','ops_run_next_fallback_candidate_attempt','ops_run_next_subtask_attempt','ops_run_next_integration_repair_attempt','ops_start_candidate_fallback','ops_integrate_subtasks'}
     return [{'type':'function','function':{'name':n,'description':s.description,'parameters':s.input_model.model_json_schema(),'strict':True}} for n,s in OPS_TOOLS.items() if n not in hidden]

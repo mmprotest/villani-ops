@@ -125,7 +125,7 @@ def policy_create_default(name: str=typer.Option('balanced'), workspace: str='.v
     pol=Policy(name=name, attempts=attempts); path=s.workspace/'policies'/f'{name}.yaml'; pol.save(path); console.print(f'Created policy at {path}')
 
 @app.command(context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
-def run(ctx: typer.Context, repo: str|None=None, task: str|None=typer.Option(None,'--task'), task_id: str|None=None, success_criteria: str|None=None, mode: str=typer.Option('performance', '--mode', help='Execution mode: performance, cheap, balanced, or quality'), runner: str=typer.Option('villani-code', '--runner'), candidate_attempts: int=typer.Option(3, '--candidate-attempts', min=1, max=8), timeout_seconds: int|None=None, classify: bool=typer.Option(True, '--classify/--no-classify'), non_interactive: bool=False, quiet: bool=typer.Option(False, '--quiet'), verbose: bool=typer.Option(False, '--verbose'), orchestrator: str=typer.Option('agentic', '--orchestrator', help='Orchestrator architecture: agentic (default adaptive) or graph (explicit legacy)'), ui: bool=typer.Option(False, '--ui', help='Start local run viewer'), no_ui: bool=typer.Option(False, '--no-ui', help='Disable local run viewer'), ui_port: int=typer.Option(8765, '--ui-port'), open_ui: bool=typer.Option(False, '--open-ui'), workspace: str='.villani-ops'):
+def run(ctx: typer.Context, repo: str|None=None, task: str|None=typer.Option(None,'--task'), task_id: str|None=None, success_criteria: str|None=None, mode: str=typer.Option('performance', '--mode', help='Execution mode: performance, cheap, balanced, or quality'), runner: str=typer.Option('villani-code', '--runner'), candidate_attempts: int=typer.Option(3, '--candidate-attempts', min=1, max=8), timeout_seconds: int|None=None, classify: bool=typer.Option(True, '--classify/--no-classify'), non_interactive: bool=False, quiet: bool=typer.Option(False, '--quiet'), verbose: bool=typer.Option(False, '--verbose'), orchestrator: str=typer.Option('adaptive', '--orchestrator', help='Orchestrator architecture: adaptive (default; agentic single-task constrained), agentic (decomposition-capable), or graph (explicit legacy). adaptive: Agentic orchestration constrained to the single-task execution path. The orchestrator investigates, plans, attempts, validates, reviews, observes, and retries within the candidate-attempt budget, but cannot decompose the task.'), ui: bool=typer.Option(False, '--ui', help='Start local run viewer'), no_ui: bool=typer.Option(False, '--no-ui', help='Disable local run viewer'), ui_port: int=typer.Option(8765, '--ui-port'), open_ui: bool=typer.Option(False, '--open-ui'), workspace: str='.villani-ops'):
     forbidden = {
         '--policy': '--policy has been replaced by --mode. Use --mode performance|cheap|balanced|quality. Cost policies moved to villani-ops cost-run.',
         '--backend': 'Backend assignment is controlled by the execution policy. Configure backends, then use --mode. Performance orchestration always uses the most capable enabled backend in performance mode.',
@@ -168,15 +168,15 @@ def run(ctx: typer.Context, repo: str|None=None, task: str|None=typer.Option(Non
         t=Task(repo_path=str(Path(repo).resolve()), objective=task, success_criteria=success_criteria)
     if mode not in {'performance','cheap','balanced','quality'}:
         raise typer.BadParameter('Invalid mode. Choose one of: performance, cheap, balanced, quality')
-    if orchestrator not in {'graph','agentic'}:
-        raise typer.BadParameter('Invalid orchestrator. Choose one of: graph, agentic')
+    if orchestrator not in {'graph','agentic','adaptive'}:
+        raise typer.BadParameter('Invalid orchestrator. Choose one of: adaptive, agentic, graph')
     if runner != 'villani-code':
         raise typer.BadParameter(f"Runner '{runner}' is registered but not implemented yet." if runner in {"claude-code","pi","aider","codex"} else f"Unsupported runner '{runner}'. Supported runner: villani-code.")
-    if orchestrator == 'agentic':
+    if orchestrator in {'agentic','adaptive'}:
         from villani_ops.agentic import OpsRunner, OpsRunRequest
         
         s.init_workspace(); backends=s.load_backends()
-        result=OpsRunner(s, backends=backends, progress_reporter=AgenticProgressReporter(not quiet, verbose=verbose, console=console)).run(OpsRunRequest(repo_path=str(Path(repo).resolve()), task=t.objective, success_criteria=t.success_criteria, mode=mode, runner=runner, candidate_attempts=candidate_attempts, timeout_seconds=timeout_seconds, workspace=workspace, backends=backends))
+        result=OpsRunner(s, backends=backends, progress_reporter=AgenticProgressReporter(not quiet, verbose=verbose, console=console)).run(OpsRunRequest(repo_path=str(Path(repo).resolve()), task=t.objective, success_criteria=t.success_criteria, mode=mode, runner=runner, candidate_attempts=candidate_attempts, timeout_seconds=timeout_seconds, workspace=workspace, orchestrator=orchestrator, backends=backends))
     else:
         result=VillaniOps(s, progress_reporter=RunProgressReporter(not quiet, verbose=verbose)).run(repo=repo, task=t, candidate_attempts=candidate_attempts, timeout_seconds=timeout_seconds, classify=classify, non_interactive=(non_interactive or not sys.stdin.isatty()), mode=mode, runner=runner)
     d=result.decision

@@ -8,7 +8,7 @@ from .state import OpsRunState
 from .event_recorder import OpsEventRecorder
 from .tools import openai_tool_specs
 from .state_tooling import execute_tool_with_policy, OpsToolContext
-from .prompts import SYSTEM_PROMPT, initial_user_message
+from .prompts import SYSTEM_PROMPT, ADAPTIVE_SYSTEM_APPENDIX, initial_user_message
 from .recovery import handle_no_tool_call, recommend_next_agentic_action
 from .artifacts import write_artifacts
 from .client import ToolCallingLLMClient
@@ -67,7 +67,7 @@ def _state_aware_no_progress_summary(state):
 
 class OpsRunRequest(BaseModel):
     model_config=ConfigDict(extra='forbid', arbitrary_types_allowed=True)
-    repo_path:str; task:str; success_criteria:str|None=None; mode:str='performance'; runner:str='villani-code'; candidate_attempts:int=3; timeout_seconds:int|None=None; workspace:str='.villani-ops'; backend:object|None=None; backends:object|None=None; runner_adapter:object|None=None; reviewer:object|None=None; production:bool=True; allow_fake_dependencies:bool=False
+    repo_path:str; task:str; success_criteria:str|None=None; mode:str='performance'; runner:str='villani-code'; candidate_attempts:int=3; timeout_seconds:int|None=None; workspace:str='.villani-ops'; orchestrator:str='agentic'; backend:object|None=None; backends:object|None=None; runner_adapter:object|None=None; reviewer:object|None=None; production:bool=True; allow_fake_dependencies:bool=False
 class OpsRunResult(BaseModel):
     model_config=ConfigDict(arbitrary_types_allowed=True)
     run_id:str; run_dir:str; state:OpsRunState; decision:Decision
@@ -76,7 +76,7 @@ class OpsRunner:
     def run(self, request:OpsRunRequest)->OpsRunResult:
         rid=datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')+'-'+secrets.token_hex(3)
         run_dir=(self.storage.create_run_dir(rid) if self.storage else Path(request.workspace)/'runs'/rid); run_dir.mkdir(parents=True,exist_ok=True)
-        state=OpsRunState(run_id=rid,run_dir=str(run_dir),repo_path=request.repo_path,task=request.task,success_criteria=request.success_criteria,mode=request.mode,runner=request.runner,candidate_attempts=request.candidate_attempts)
+        state=OpsRunState(run_id=rid,run_dir=str(run_dir),repo_path=request.repo_path,task=request.task,success_criteria=request.success_criteria,mode=request.mode,runner=request.runner,candidate_attempts=request.candidate_attempts,orchestrator=request.orchestrator)
         rec=OpsEventRecorder(run_dir,rid,on_event=(self.progress_reporter.on_event if self.progress_reporter else None)); usage_rec=UsageRecorder(run_dir,rid); transcript=[]; state.save(run_dir/'state.json'); rec.record('run_started',payload={'run_dir':str(run_dir)},phase=state.phase); usage_rec.write_artifacts()
         def _update_usage_state():
             summary=usage_rec.summarize(); state.usage_summary=summary.model_dump(mode='json'); state.usage_records_count=summary.calls_count; state.total_input_tokens=summary.input_tokens; state.total_output_tokens=summary.output_tokens; state.total_tokens=summary.total_tokens; state.total_cost=summary.total_cost; state.usage_unavailable_count=summary.unavailable_calls_count; state.input_tokens=summary.input_tokens; state.output_tokens=summary.output_tokens; state.costs={'total':summary.total_cost,'input':summary.input_cost,'output':summary.output_cost}
@@ -109,11 +109,12 @@ class OpsRunner:
             res=execute_tool_with_policy(state,recobj.tool_name,recobj.tool_input or {},tool_use_id,_ctx())
             block={'type':'tool_result','tool_use_id':res.tool_use_id,'content':res.content,'is_error':res.is_error}; transcript.append(block); messages.append({'role':'tool','tool_call_id':res.tool_use_id,'content':str(res.content)}); rec.record('tool_result_appended',tool_name=res.tool_name,payload=block)
             return res
-        messages=[initial_user_message(task=request.task,success_criteria=request.success_criteria,mode=request.mode,runner=request.runner,candidate_attempts=request.candidate_attempts,repo_path=request.repo_path)]
+        messages=[initial_user_message(task=request.task,success_criteria=request.success_criteria,mode=request.mode,runner=request.runner,candidate_attempts=request.candidate_attempts,repo_path=request.repo_path,orchestrator=request.orchestrator)]
+        system_prompt=SYSTEM_PROMPT + (ADAPTIVE_SYSTEM_APPENDIX if request.orchestrator=='adaptive' else '')
         for _ in range(self.max_turns):
             if state.is_terminal(): break
             rec.record('model_request_started',phase=state.phase)
-            resp=self.client.create_message(backend=backend,messages=messages,system=SYSTEM_PROMPT,tools=openai_tool_specs(),tool_choice='auto',strict=True)
+            resp=self.client.create_message(backend=backend,messages=messages,system=system_prompt,tools=openai_tool_specs(adaptive=(request.orchestrator=='adaptive')),tool_choice='auto',strict=True)
             assistant_msg={'role':'assistant','content':resp.content,'raw_response':getattr(resp,'raw_response',{})}; transcript.append(assistant_msg)
             urec=usage_record_from_response(run_id=rid,phase=state.phase,role='orchestration',backend=backend,response=resp); usage_rec.record(urec); _update_usage_state(); usage_payload={k:getattr(urec,k) for k in ['input_tokens','output_tokens','total_tokens','total_cost','usage_source']}
             rec.record('model_response_received',payload={'finish_reason':getattr(resp,'finish_reason',None),'content':resp.content,'raw_response':getattr(resp,'raw_response',{}),**usage_payload})
