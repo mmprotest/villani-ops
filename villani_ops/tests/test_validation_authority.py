@@ -179,3 +179,40 @@ def test_recovery_commits_review_accepted_focused_passing_subtask_instead_of_ret
     rec=recommend_next_agentic_action(s)
     assert rec.action=='commit_ready_subtask_acceptance'
     assert rec.tool_name=='ops_run_next_subtask_attempt'
+
+
+def test_runner_trace_failures_are_diagnostic_and_do_not_poison_attempt_validation(tmp_path):
+    from villani_ops.agentic.tools import _attach_imported_validation
+    s=_state(tmp_path); a=_attempt(tmp_path,s); c=_ctx(s)
+    trace_dir=Path(a.artifacts_dir or tmp_path/'artifacts'); trace_dir.mkdir(exist_ok=True)
+    a.artifacts_dir=str(trace_dir)
+    (trace_dir/'transcript.json').write_text('{"commands":[{"cmd":"python -m pytest","passed":false,"status":"failed"}]}')
+    ev=_attach_imported_validation(s,a)
+    assert ev
+    assert a.validation_status=='inconclusive'
+    assert a.validation['commands'][0]['source']=='runner_trace'
+    assert a.validation['commands'][0]['authority']=='diagnostic_only'
+    assert a.validation['decision']['status']=='inconclusive'
+    ok, blockers=is_attempt_acceptance_eligible(a, state=s)
+    assert ok is True
+    assert 'validation_failed' not in blockers
+    h_validation(s, OpsRunValidationInput(target='candidate', target_id=a.attempt_id, commands=[
+        ValidationCommand(cmd='python -c "import sys; sys.exit(0)"', source='subtask_focused', authority='acceptance_blocking', scope='subtask', subtask_id='part'),
+    ]), c)
+    assert a.validation_source=='ops_run_validation'
+    assert a.validation['decision']['status']=='passed'
+    ok, blockers=is_attempt_acceptance_eligible(a, state=s)
+    assert ok is True
+
+
+def test_runner_trace_history_is_labelled_non_blocking_in_review_payload(tmp_path):
+    s=_state(tmp_path); a=_attempt(tmp_path,s)
+    a.validation_results=[{'validation_source':'villani_code_debug_trace','commands':[{'cmd':'python -m pytest','passed':False,'status':'failed','source':'runner_trace','authority':'diagnostic_only'}]}]
+    h_validation(s, OpsRunValidationInput(target='candidate', target_id=a.attempt_id, commands=[
+        ValidationCommand(cmd='python -c "import sys; sys.exit(0)"', source='subtask_focused', authority='acceptance_blocking', scope='subtask', subtask_id='part'),
+    ]), _ctx(s))
+    payload=build_agentic_review_payload(s,a,'subtask',s.subtasks[0])
+    hist=payload['non_blocking_runner_trace_history']
+    assert hist['label']=='NON-BLOCKING RUNNER TRACE HISTORY'
+    assert hist['authority']=='diagnostic_only'
+    assert payload['validation_decision']['status']=='passed'

@@ -100,7 +100,7 @@ def _has_active_subtask_attempts(state):
 def _subtask_commit_ready(st):
     for a in reversed(getattr(st,'attempts',[]) or []):
         val=(_validation(a) or {}).get('decision') or {}
-        if (val.get('status')=='passed' or val.get('status')=='inconclusive') and _review_status(a)=='passed':
+        if val.get('status')=='passed' and _review_status(a)=='passed':
             return a
     return None
 

@@ -105,7 +105,7 @@ def build_agentic_review_payload(state, attempt, scope, subtask=None):
     current_validation=validation if validation.get('validation_source')!='villani_code_debug_trace' else {}
     debug_hist=[r for r in (data.get('validation_results') or []) if r.get('validation_source')=='villani_code_debug_trace']
     debug_cmds=[c for r in debug_hist for c in (r.get('commands') or [])]
-    debug_summary={'source':'villani_code_debug_trace','status':'historical','validation_like_command_count':len(debug_cmds)}
+    debug_summary={'label':'NON-BLOCKING RUNNER TRACE HISTORY','instruction':'These commands were executed during the runner repair process. They are diagnostic only and must not be used as the sole reason to reject the final patch.','source':'runner_trace','authority':'diagnostic_only','status':'historical','validation_like_command_count':len(debug_cmds)}
     if debug_cmds:
         first, final=debug_cmds[0], debug_cmds[-1]
         debug_summary.update({'first_relevant_validation':{'status':first.get('status'),'passed':first.get('passed'),'cmd':first.get('cmd')},'final_relevant_validation':{'status':final.get('status'),'passed':final.get('passed'),'cmd':final.get('cmd')},'final_command':final.get('cmd')})
@@ -127,6 +127,7 @@ def build_agentic_review_payload(state, attempt, scope, subtask=None):
         'validation_decision':(current_validation or {}).get('decision') or {},
         'current_validation':{**current_validation, 'source':'ops_run_validation'} if current_validation else {},
         'debug_validation_history':debug_summary,
+        'non_blocking_runner_trace_history': debug_summary if debug_cmds else {},
         'imported_debug_validation': debug_hist[:1],
         'scope_assessment': data.get('scope_assessment'),
         'failure_reason':data.get('failure_reason') or data.get('error'),
@@ -259,11 +260,18 @@ def import_villani_code_debug_evidence(attempt: CandidateAttemptState)->list[dic
 def _attach_imported_validation(state, attempt:CandidateAttemptState):
     ev=import_villani_code_debug_evidence(attempt)
     if not ev: return []
-    passed=any(e.get('passed') for e in ev) and not any(not e.get('passed') for e in ev)
-    result={'passed':passed,'status':'passed' if passed else 'failed','commands':ev,'target':attempt.scope,'target_id':attempt.attempt_id,'validation_source':'villani_code_debug_trace'}
+    commands=[]
+    for item in ev:
+        row=dict(item)
+        row['source']='runner_trace'
+        row['authority']='diagnostic_only'
+        row.setdefault('scope', attempt.scope)
+        commands.append(row)
+    result={'passed':False,'status':'inconclusive','commands':commands,'target':attempt.scope,'target_id':attempt.attempt_id,'validation_source':'villani_code_debug_trace'}
+    result['decision']=make_validation_decision(result); result['decision_status']=result['decision']['status']
     attempt.validation_results=list(attempt.validation_results or [])+[result]
     if not attempt.validation or attempt.validation_source!='ops_run_validation':
-        attempt.validation=result; attempt.validation_status=result['status']; attempt.validation_source='villani_code_debug_trace'
+        attempt.validation=result; attempt.validation_status='inconclusive'; attempt.validation_source='villani_code_debug_trace'
     return ev
 
 def _set_acceptance_from_gate(state, attempt):
@@ -623,6 +631,11 @@ def update_backend_runner_assessments(state, obs=None, attempt=None):
 
 
 def _commit_subtask_acceptance(state, st, attempt, ctx=None, reason='accepted'):
+    existing=(state.accepted_patch_application_status or {}).get(st.subtask_id)
+    already=st.status=='accepted' and st.accepted_attempt_id==attempt.attempt_id and existing and existing.get('status')=='applied'
+    if already:
+        attempt.status='accepted'; attempt.acceptance_eligible=True; attempt.acceptance_blockers=[]
+        return True, [], existing
     st.status='accepted'; st.accepted_attempt_id=attempt.attempt_id
     attempt.status='accepted'; attempt.acceptance_eligible=True; attempt.acceptance_blockers=[]
     app=_apply_accepted_patch_to_integration(state, st, attempt, ctx)
@@ -638,7 +651,7 @@ def _commit_subtask_acceptance(state, st, attempt, ctx=None, reason='accepted'):
 def _subtask_commit_ready(state, st):
     for a in reversed(st.attempts or []):
         vdec=((a.validation or {}).get('decision') or {})
-        validation_ok=vdec.get('status')=='passed' or (vdec.get('status')=='inconclusive' and a.review_status=='passed')
+        validation_ok=vdec.get('status')=='passed'
         if validation_ok and a.review_status=='passed' and not ((a.scope_assessment or {}).get('blockers')):
             return a
     return None
@@ -1454,6 +1467,7 @@ def _attach_validation(state, target_obj, target, result):
 def _default_validation_metadata(command, *, target, target_obj, subtask):
     scope=getattr(command,'scope',None)
     source=getattr(command,'source',None)
+    source_was_explicit=source is not None
     authority=getattr(command,'authority',None)
     subtask_id=getattr(command,'subtask_id',None)
     attempt_scope=getattr(target_obj,'scope',None) if target_obj is not None and not isinstance(target_obj,dict) else (target_obj or {}).get('scope') if isinstance(target_obj,dict) else None
@@ -1471,8 +1485,8 @@ def _default_validation_metadata(command, *, target, target_obj, subtask):
     if authority is None:
         # Authority must come from an explicit validation plan/command contract.
         # Discovered or merely related commands are non-blocking by default.
-        authority='diagnostic_only' if source in {'diagnostic','exploratory'} else 'supporting_evidence'
-        if (scope=='candidate' and source=='user_success_criteria') or (scope in {'integration','final'} and source in {'integration','final'}):
+        authority='diagnostic_only' if source in {'diagnostic','exploratory','runner_trace','villani_code_debug_trace'} else 'supporting_evidence'
+        if not source_was_explicit and target in {'candidate','integration'}:
             authority='acceptance_blocking'
     return source, authority, scope, subtask_id
 
@@ -1542,6 +1556,8 @@ def h_validation(state, inp, ctx):
         res['passed']=False
         if res['status'] not in {'command_rejected','timed_out','error'}:
             res['status']='failed'
+    else:
+        res['passed']=False; res['status']='inconclusive'
     _attach_validation(state,target_obj,inp.target,res)
     ctx.recorder.record('validation_attached', payload={'target':inp.target,'target_id':inp.target_id,'passed':all_pass,'status':res['status'],'command_count':len(inp.commands),'cwd':res['cwd'],'artifact_paths':[p for r in results for p in [r.get('stdout_path'),r.get('stderr_path')] if p]})
     if inp.target=='candidate' and target_obj is not None and any(o.attempt_id==inp.target_id for o in state.attempt_observations):
