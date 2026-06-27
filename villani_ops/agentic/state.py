@@ -112,7 +112,9 @@ class OpsRunState(BaseModel):
     best_partial_attempt_id:str|None=None; partial_progress:dict|None=None
     candidates:list[CandidateAttemptState]=Field(default_factory=list); subtasks:list[SubtaskState]=Field(default_factory=list)
     attempt_observations:list[AttemptObservation]=Field(default_factory=list); backend_assessments:dict[str,dict]=Field(default_factory=dict); runner_assessment:dict=Field(default_factory=dict); adaptive_context:dict=Field(default_factory=dict)
-    integration:dict|None=None; reviews:list[dict]=Field(default_factory=list); repo_validation_results:list[dict]=Field(default_factory=list); selection:dict|None=None; final_decision:dict|None=None
+    integration:dict|None=None; decomposition_integration_worktree:str|None=None; integration_base_revision:str|None=None
+    accepted_patch_application_status:dict[str,dict]=Field(default_factory=dict)
+    reviews:list[dict]=Field(default_factory=list); repo_validation_results:list[dict]=Field(default_factory=list); selection:dict|None=None; final_decision:dict|None=None
     active_nodes:list[str]=Field(default_factory=list); completed_nodes:list[str]=Field(default_factory=list); failed_nodes:list[str]=Field(default_factory=list)
     costs:dict[str,float]=Field(default_factory=dict); input_tokens:int=0; output_tokens:int=0
     usage_summary:dict=Field(default_factory=dict); usage_records_count:int=0; total_input_tokens:int=0; total_output_tokens:int=0; total_tokens:int=0; total_cost:float=0.0; usage_unavailable_count:int=0

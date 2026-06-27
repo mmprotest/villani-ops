@@ -37,7 +37,13 @@ class VillaniCodeRunner:
         debug_dir = Path(context.run_dir) / 'villani_code_debug'
         debug_dir.mkdir(parents=True, exist_ok=True)
         telemetry_path = Path(context.run_dir) / 'runner_telemetry.json'
-        cmd=[command_name,'run',prompt,'--base-url',context.backend.base_url or '', '--model',context.backend.model,'--repo',context.repo_path,'--provider',cli_provider,'--api-key',api_key,'--auto-approve','--no-stream','--max-tokens',max_tokens,'--debug','trace','--debug-dir',str(debug_dir)]
+        prompt_path = Path(context.run_dir) / 'villani_code_prompt.txt'
+        prompt_path.write_text(prompt, encoding='utf-8')
+        safe_inline_limit = int(os.environ.get('VILLANI_CODE_INLINE_PROMPT_LIMIT', '12000'))
+        if len(prompt) > safe_inline_limit:
+            cmd=[command_name,'run','--task-file',str(prompt_path),'--base-url',context.backend.base_url or '', '--model',context.backend.model,'--repo',context.repo_path,'--provider',cli_provider,'--api-key',api_key,'--auto-approve','--no-stream','--max-tokens',max_tokens,'--debug','trace','--debug-dir',str(debug_dir)]
+        else:
+            cmd=[command_name,'run',prompt,'--base-url',context.backend.base_url or '', '--model',context.backend.model,'--repo',context.repo_path,'--provider',cli_provider,'--api-key',api_key,'--auto-approve','--no-stream','--max-tokens',max_tokens,'--debug','trace','--debug-dir',str(debug_dir)]
         red=[('***REDACTED***' if x==api_key else x) for x in cmd]
         Path(context.run_dir,'villani_code_command.json').write_text(json.dumps(red, indent=2))
         def _result(exit_code:int, stdout='', stderr=''):

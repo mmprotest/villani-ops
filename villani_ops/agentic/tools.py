@@ -358,7 +358,9 @@ def h_select_path(state, inp, ctx):
     state.phase='running_subtasks' if inp.path=='decomposed_subtasks' else 'running_candidates'
     state.candidate_execution_mode='sequential' if inp.path=='single_task' else ('parallel' if inp.path=='parallel_candidates' else state.candidate_execution_mode)
     state.decomposition_executed=inp.path=='decomposed_subtasks'
-    if inp.path=='decomposed_subtasks': state.decomposed_execution_status='running'
+    if inp.path=='decomposed_subtasks':
+        state.decomposed_execution_status='running'
+        _ensure_decomposition_integration_worktree(state, ctx)
     if inp.path=='parallel_candidates' and state.decomposition is not None and state.decomposition_accepted is not True:
         state.decomposition_fallback_used=True; state.decomposition_fallback_reason=inp.reason; state.decomposition_executed=False
     return {'execution_path':state.execution_path,'reason':inp.reason,'decomposition_fallback_used':state.decomposition_fallback_used}
@@ -367,6 +369,70 @@ def _attempt(aid, scope, subtask_id=None, backend=None, artifacts=None):
 def _copy_worktree(src:Path, dst:Path):
     ignore=shutil.ignore_patterns('.git','.villani-ops','.v','__pycache__')
     shutil.copytree(src,dst,ignore=ignore,dirs_exist_ok=True)
+
+
+
+def _ensure_decomposition_integration_worktree(state, ctx=None):
+    if state.execution_path != 'decomposed_subtasks':
+        return None
+    if state.decomposition_integration_worktree and Path(state.decomposition_integration_worktree).exists():
+        return Path(state.decomposition_integration_worktree)
+    root=Path(state.run_dir)/'decomposition'/'rolling_integration_worktree'
+    if root.exists():
+        shutil.rmtree(root)
+    _copy_worktree(Path(state.repo_path), root)
+    ensure_git_baseline(root)
+    rev=subprocess.run(['git','rev-parse','HEAD'],cwd=root,text=True,capture_output=True)
+    state.decomposition_integration_worktree=str(root)
+    state.integration_base_revision=(rev.stdout or '').strip() or None
+    state.accepted_patch_application_status=state.accepted_patch_application_status or {}
+    if ctx is not None:
+        ctx.recorder.record('decomposition_integration_worktree_initialized', payload={'worktree_path':str(root),'base_revision':state.integration_base_revision})
+    return root
+
+def _attempt_base_worktree(state, scope):
+    if state.execution_path=='decomposed_subtasks' and scope in {'subtask','integration'} and state.decomposition_integration_worktree:
+        p=Path(state.decomposition_integration_worktree)
+        if p.exists(): return p
+    if state.fallback_execution_path=='parallel_candidates_after_decomposition_deadlock' and state.decomposition_integration_worktree:
+        p=Path(state.decomposition_integration_worktree)
+        if p.exists(): return p
+    return Path(state.repo_path)
+
+def _patch_hash(path):
+    import hashlib
+    try: return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except Exception: return None
+
+def _apply_accepted_patch_to_integration(state, st, attempt, ctx=None):
+    wtree=_ensure_decomposition_integration_worktree(state, ctx)
+    sid=st.subtask_id
+    existing=(state.accepted_patch_application_status or {}).get(sid)
+    if existing and existing.get('status')=='applied' and existing.get('attempt_id')==attempt.attempt_id:
+        return existing
+    idir=Path(state.run_dir)/'decomposition'/'patch_applications'; idir.mkdir(parents=True,exist_ok=True)
+    row={'subtask_id':sid,'attempt_id':attempt.attempt_id,'patch_path':attempt.patch_path,'files_changed':attempt.changed_files,'patch_hash':_patch_hash(attempt.patch_path) if attempt.patch_path else None,'integration_worktree_path':str(wtree),'applied_at':None,'status':'pending'}
+    if not attempt.patch_path or not Path(attempt.patch_path).exists():
+        row.update({'status':'failed','patch_application_error':'accepted patch missing','recommended_next_action':'rerun or repair the accepted subtask before downstream subtasks'})
+    elif patch_contains_internal_artifacts(attempt.patch_path) or not is_git_compatible_patch(attempt.patch_path):
+        row.update({'status':'failed','patch_application_error':'accepted patch is not a clean git-compatible product patch','recommended_next_action':'repair patch hygiene before continuing'})
+    else:
+        check=subprocess.run(['git','apply','--check','--whitespace=nowarn',attempt.patch_path],cwd=wtree,text=True,capture_output=True)
+        if check.returncode!=0:
+            row.update({'status':'failed','exit_code':check.returncode,'patch_application_error':(check.stderr or check.stdout or '')[-4000:],'conflicting_files':attempt.changed_files,'recommended_next_action':'stop decomposed execution and run integration repair from rolling worktree'})
+        else:
+            proc=subprocess.run(['git','apply','--whitespace=nowarn',attempt.patch_path],cwd=wtree,text=True,capture_output=True)
+            if proc.returncode==0:
+                row.update({'status':'applied','applied_at':datetime.now(timezone.utc).isoformat(),'stdout':proc.stdout,'stderr':proc.stderr})
+                ctx.recorder.record('accepted_subtask_patch_applied', payload=row) if ctx is not None else None
+            else:
+                row.update({'status':'failed','exit_code':proc.returncode,'patch_application_error':(proc.stderr or proc.stdout or '')[-4000:],'conflicting_files':attempt.changed_files,'recommended_next_action':'stop decomposed execution and run integration repair from rolling worktree'})
+    state.accepted_patch_application_status[sid]=row
+    write_json_utf8(idir/f'{sid}.json', row, atomic=True)
+    if row.get('status')!='applied':
+        state.decomposed_execution_status='blocked'; state.decomposed_execution_blockers=sorted(set(state.decomposed_execution_blockers+['accepted_patch_integration_failed', sid])); state.last_error=row.get('patch_application_error')
+        if ctx is not None: ctx.recorder.record('accepted_subtask_patch_application_failed', payload=row)
+    return row
 
 def _is_fake_dependency(obj):
     name=(getattr(obj,'name',None) or getattr(obj,'__class__',type('',(),{})).__name__ or '').lower()
@@ -588,7 +654,7 @@ def _run_attempt(state, ctx, aid, scope, task, success, subtask_id=None, backend
     if record_events:
         ctx.recorder.record(f'{scope}_attempt_started', payload={'attempt_id':aid,'subtask_id':subtask_id,'status':'running','execution_path':state.execution_path,'artifact_paths':{'artifacts_dir':str(adir)}})
     try:
-        _copy_worktree(Path(state.repo_path), wtree)
+        _copy_worktree(_attempt_base_worktree(state, scope), wtree)
         ensure_git_baseline(wtree)
         res=ctx.runner_adapter.run_task(repo_path=wtree,task=task,success_criteria=success,backend_name=a.backend_name or '',backend_config=backend,timeout_seconds=ctx.timeout_seconds,context={'attempt_id':aid,'subtask_id':subtask_id,'parent_task':state.task},artifacts_dir=adir)
         usage_record=None
@@ -653,8 +719,24 @@ def h_start_candidate_fallback(state, inp, ctx):
     ctx.recorder.record('candidate_fallback_started', payload={'reason':state.fallback_reason,'fallback_from_execution_path':state.fallback_from_execution_path,'fallback_execution_path':state.fallback_execution_path})
     return {'fallback_used':state.fallback_used,'fallback_execution_path':state.fallback_execution_path,'fallback_reason':state.fallback_reason,'next_allowed_actions':state.allowed_next_actions()}
 
+
+
+def _compact_text(value, limit=1200):
+    text=value if isinstance(value,str) else json.dumps(value, ensure_ascii=False, default=str)
+    return text if len(text)<=limit else text[:limit]+chr(10)+'...[truncated]'
+
+def _budget_prompt(sections, max_chars=20000):
+    out=[]; used=0
+    for sec in sections:
+        if used+len(sec)+2 > max_chars:
+            remain=max_chars-used-80
+            if remain>200: out.append(sec[:remain]+chr(10)+'...[context budget reached]')
+            break
+        out.append(sec); used += len(sec)+2
+    return (chr(10)*2).join(out)
+
 def build_decomposition_fallback_prompt(state, *, reason:str|None=None, repair:bool=False, base_attempt_id:str|None=None)->str:
-    sub_obs=[o.model_dump(mode='json') for o in state.attempt_observations if o.scope=='subtask']
+    sub_obs=[o.model_dump(mode='json') for o in state.attempt_observations if o.scope=='subtask'][-8:]
     fb_obs=[o for o in state.attempt_observations if o.scope=='candidate']
     accepted=[{'subtask_id':st.subtask_id,'accepted_attempt_id':st.accepted_attempt_id,'changed_files':(_accepted_subtask_attempt(state,st).changed_files if _accepted_subtask_attempt(state,st) else []),'summary':st.objective} for st in state.subtasks if st.status=='accepted']
     failed=[{'subtask_id':st.subtask_id,'status':st.status,'attempts':[a.attempt_id for a in st.attempts],'observations':[o for o in sub_obs if o.get('subtask_id')==st.subtask_id]} for st in state.subtasks if st.status in {'failed','skipped'}]
@@ -664,10 +746,10 @@ def build_decomposition_fallback_prompt(state, *, reason:str|None=None, repair:b
         f'TASK\n{state.task}',
         f'SUCCESS CRITERIA\n{state.success_criteria or "Complete the task with a minimal correct patch."}',
         'DECOMPOSITION FALLBACK CONTEXT\nThe decomposed path deadlocked. Run exactly one full-task adaptive fallback candidate. This is not a cold start.',
-        'DECOMPOSITION SUMMARY\n'+json.dumps({'decomposition':state.decomposition,'deadlock':dead.model_dump() if dead else None,'partial_progress':state.partial_progress}, ensure_ascii=False, indent=2),
-        'ACCEPTED SUBTASK SUMMARIES AND CHANGED FILES\n'+json.dumps(accepted, ensure_ascii=False, indent=2),
-        'FAILED SUBTASK OBSERVATIONS AND BLOCKED DEPENDENTS\n'+json.dumps({'failed_or_blocked_subtasks':failed,'blocked_dependents':state.decomposed_execution_blocked_subtasks,'remaining_broken_areas':state.decomposed_execution_blockers}, ensure_ascii=False, indent=2),
-        'FOCUSED VALIDATION FAILURES AND REVIEW BLOCKERS\n'+json.dumps(sub_obs, ensure_ascii=False, indent=2),
+        'DECOMPOSITION SUMMARY\n'+_compact_text({'decomposition':state.decomposition,'deadlock':dead.model_dump() if dead else None,'partial_progress':state.partial_progress}, 2500),
+        'ACCEPTED SUBTASK SUMMARIES AND CHANGED FILES\n'+_compact_text(accepted, 2500),
+        'FAILED SUBTASK OBSERVATIONS AND BLOCKED DEPENDENTS\n'+_compact_text({'failed_or_blocked_subtasks':failed,'blocked_dependents':state.decomposed_execution_blocked_subtasks,'remaining_broken_areas':state.decomposed_execution_blockers}, 3500),
+        'FOCUSED VALIDATION FAILURES AND REVIEW BLOCKERS\n'+_compact_text(sub_obs, 5000),
         'PRESERVE / DO NOT REGRESS\n- Preserve accepted subtask work and behavior where compatible.\n- Do not regress accepted changed files listed above.\n- Do not repeat failed subtask approaches or broad unrelated rewrites.',
     ]
     if fb_obs:
@@ -675,7 +757,8 @@ def build_decomposition_fallback_prompt(state, *, reason:str|None=None, repair:b
     sections.append('WHAT TO FOCUS ON NEXT\n- Produce one integrated product-code patch for the original task.\n- Fix remaining broken areas, validation failures, review blockers, patch/scope/hygiene blockers.\n- Rerun known relevant commands where possible.\n'+'\n'.join(f'- Rerun: {c}' for c in cmds))
     if repair and base_attempt_id: sections.append(f'REPAIR MODE\nRepair previous fallback attempt {base_attempt_id}; do not repeat its failed strategy.')
     if reason: sections.append(f'REASON FOR THIS FALLBACK ATTEMPT\n{reason}')
-    return '\n\n'.join(sections)
+    max_chars=int((state.adaptive_context or {}).get('fallback_prompt_max_chars') or 20000)
+    return _budget_prompt(sections, max_chars=max_chars)
 
 def h_launch_candidates(state, inp, ctx):
     fallback_active=state.fallback_execution_path=='parallel_candidates_after_decomposition_deadlock'
@@ -751,6 +834,7 @@ def build_adaptive_subtask_runner_prompt(state, subtask:SubtaskState, *, reason:
     extras=[]
     if progress: extras.append(progress)
     if learning: extras.append(learning)
+    extras.append('UPSTREAM INTEGRATION BASE\nThis subtask is running on top of previously accepted subtask patches.\nPreserve accepted upstream behaviour.\nDo not reimplement already accepted subtasks unless validation proves integration requires it.')
     extras.append('NEXT SUBTASK ATTEMPT DIRECTIVES\n- Run exactly this subtask attempt; do not solve unrelated sibling subtasks.\n- Use focused validation for this subtask when available.\n- Do not repeat previous validation, review, patch hygiene, or scope mistakes.')
     if repair and base_attempt_id:
         extras.append(f'REPAIR MODE\nRepair prior subtask attempt {base_attempt_id} using the learning above.')
@@ -898,6 +982,9 @@ def h_run_next_subtask_attempt(state, inp, ctx):
         eligible=False; blockers=sorted(set(blockers+['validation_failed'])); a.acceptance_eligible=False; a.acceptance_blockers=blockers
     if eligible:
         st.status='accepted'; st.accepted_attempt_id=aid
+        app=_apply_accepted_patch_to_integration(state, st, a, ctx)
+        if app.get('status')!='applied':
+            eligible=False; blockers=sorted(set(blockers+['accepted_patch_integration_failed'])); a.acceptance_eligible=False; a.acceptance_blockers=blockers
     elif len([x for x in st.attempts if x.status in {'completed','failed','reviewed','rejected','accepted'}]) >= budget:
         st.status='failed'
     else:

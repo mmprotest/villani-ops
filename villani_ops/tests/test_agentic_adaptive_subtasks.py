@@ -112,3 +112,57 @@ def test_fallback_retry_prompt_includes_previous_failure_feedback(tmp_path):
     assert 'PREVIOUS FALLBACK ATTEMPT FEEDBACK' in runner.calls[-1]['task']
     assert 'candidate_001' in runner.calls[-1]['task']
     assert s.candidates[-1].candidate_kind == 'fallback'
+
+class AcceptReviewer:
+    def review(self, *, state, attempt, scope):
+        return {'decision':'pass','recommended_action':'accept','score':1.0,'summary':'ok','evidence':['scoped'], 'issues':[]}
+
+class MultiFileRunner:
+    def __init__(self): self.calls=[]
+    def run_task(self, *, repo_path, task, success_criteria, backend_name, backend_config, timeout_seconds, context, artifacts_dir):
+        self.calls.append({'repo_path': Path(repo_path), 'task': task, 'subtask_id': context.get('subtask_id')})
+        sid=context.get('subtask_id') or context.get('attempt_id')
+        target=Path(repo_path)/('src/parser.py' if sid=='parser' else 'src/checkout.py')
+        target.parent.mkdir(parents=True, exist_ok=True)
+        prior=(Path(repo_path)/'src/parser.py').read_text() if (Path(repo_path)/'src/parser.py').exists() else ''
+        target.write_text((prior if sid!='parser' else '') + f'\n# {sid} accepted\n')
+        return SimpleNamespace(stdout='ok', stderr='', exit_code=0, telemetry_path=None, total_file_reads=1, total_file_writes=1)
+
+
+def make_two_subtask_state(tmp_path):
+    repo=tmp_path/'repo'; run=tmp_path/'run'; repo.mkdir(); run.mkdir()
+    (repo/'src').mkdir(); (repo/'src'/'parser.py').write_text('# base parser\n'); (repo/'src'/'checkout.py').write_text('# base checkout\n')
+    return OpsRunState(run_id='r',run_dir=str(run),repo_path=str(repo),task='fix parser then checkout',success_criteria='all behaviours pass',mode='performance',runner='villani-code',candidate_attempts=1,investigation={'summary':'multi'},plan={'summary':'decompose','strategy':'decompose_then_execute'},decomposition={'merge_strategy':'merge minimal patches'},decomposition_validated=True,decomposition_accepted=True,execution_path='decomposed_subtasks',subtasks=[SubtaskState(subtask_id='parser',title='parser',objective='fix parser',relevant_files=['src/parser.py']), SubtaskState(subtask_id='checkout',title='checkout',objective='integrate checkout',relevant_files=['src/checkout.py'],dependencies=['parser'])])
+
+
+def test_accepted_subtask_patch_applies_to_rolling_integration_and_next_base(tmp_path):
+    s=make_two_subtask_state(tmp_path); runner=MultiFileRunner(); c=make_ctx(tmp_path, runner, AcceptReviewer())
+    res=execute_tool_with_policy(s,'ops_run_next_subtask_attempt',{'subtask_id':'parser','reason':'first'},'p',c)
+    assert not res.is_error, res.content
+    assert s.decomposition_integration_worktree
+    assert s.accepted_patch_application_status['parser']['status']=='applied'
+    assert '# parser accepted' in (Path(s.decomposition_integration_worktree)/'src/parser.py').read_text()
+    res=execute_tool_with_policy(s,'ops_run_next_subtask_attempt',{'subtask_id':'checkout','reason':'downstream'},'c',c)
+    assert not res.is_error, res.content
+    assert '# parser accepted' in (runner.calls[-1]['repo_path']/ 'src/parser.py').read_text()
+    assert 'This subtask is running on top of previously accepted subtask patches.' in runner.calls[-1]['task']
+
+
+def test_accepted_patch_application_is_not_duplicated(tmp_path):
+    s=make_two_subtask_state(tmp_path); runner=MultiFileRunner(); c=make_ctx(tmp_path, runner, AcceptReviewer())
+    execute_tool_with_policy(s,'ops_run_next_subtask_attempt',{'subtask_id':'parser','reason':'first'},'p',c)
+    first=s.accepted_patch_application_status['parser'].copy()
+    from villani_ops.agentic.tools import _apply_accepted_patch_to_integration
+    row=_apply_accepted_patch_to_integration(s, s.subtasks[0], s.subtasks[0].attempts[0], c)
+    assert row == first
+    assert (Path(s.decomposition_integration_worktree)/'src/parser.py').read_text().count('# parser accepted') == 1
+
+def test_fallback_prompt_is_budgeted(tmp_path):
+    from villani_ops.agentic.tools import build_decomposition_fallback_prompt
+    s=make_state(tmp_path)
+    s.adaptive_context={'fallback_prompt_max_chars':12000}
+    s.decomposed_execution_status='blocked'; s.decomposed_execution_blockers=['x'*5000]
+    s.attempt_observations=[AttemptObservation(attempt_id=f'a{i}',scope='subtask',subtask_id='pricing',outcome='review_failed',evidence=['e'*5000],blockers=['b'*5000]) for i in range(20)]
+    prompt=build_decomposition_fallback_prompt(s, reason='deadlock')
+    assert len(prompt) <= 12000
+    assert 'DECOMPOSITION FALLBACK CONTEXT' in prompt
