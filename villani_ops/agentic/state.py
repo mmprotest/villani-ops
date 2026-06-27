@@ -158,10 +158,12 @@ class OpsRunState(BaseModel):
         if self.fallback_execution_path=='parallel_candidates_after_decomposition_deadlock' and self.candidates:
             a += ['ops_review_attempt','ops_run_validation','ops_select_winner','ops_finalize_run']; return list(dict.fromkeys(a))
         if self.execution_path=='decomposed_subtasks' and self.decomposed_execution_status in {'blocked','failed'}:
-            a += ['ops_start_candidate_fallback','ops_run_validation','ops_review_attempt','ops_select_winner','ops_finalize_run']; return list(dict.fromkeys(a))
+            if not self.candidates: a.append('ops_start_candidate_fallback')
+            a += ['ops_review_attempt','ops_select_winner','ops_finalize_run']; return list(dict.fromkeys(a))
         if self.execution_path=='decomposed_subtasks':
-            if any(s.status=='pending' for s in self.subtasks): a += ['ops_run_next_subtask_attempt','ops_launch_subtasks']; return list(dict.fromkeys(a))
+            if any(s.status=='pending' for s in self.subtasks): a += ['ops_run_next_subtask_attempt']; return list(dict.fromkeys(a))
             if all(s.status in {'accepted','skipped'} for s in self.subtasks) and not self.integration: a.append('ops_integrate_subtasks'); return a
+            if self.integration and (self.integration.get('validation') or {}).get('passed') is False: a.append('ops_run_next_integration_repair_attempt'); return list(dict.fromkeys(a))
         a += ['ops_review_attempt','ops_run_validation','ops_select_winner','ops_finalize_run']
         return a
     def save(self,path:Path)->None:
