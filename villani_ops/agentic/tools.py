@@ -679,6 +679,8 @@ def build_decomposition_fallback_prompt(state, *, reason:str|None=None, repair:b
 
 def h_launch_candidates(state, inp, ctx):
     fallback_active=state.fallback_execution_path=='parallel_candidates_after_decomposition_deadlock'
+    if fallback_active and not (getattr(state,'adaptive_context',{}) or {}).get('legacy_ops_launch_candidates_enabled'):
+        raise ValueError('ops_launch_candidates is legacy/batch execution and is disabled during adaptive fallback. Use ops_run_next_fallback_candidate_attempt.')
     if state.execution_path=='single_task': raise ValueError('single_task execution uses adaptive sequential attempts; call ops_run_next_candidate_attempt')
     if state.execution_path!='parallel_candidates' and not fallback_active: raise ValueError('candidates require parallel_candidates execution path or explicit decomposition-deadlock fallback')
     made=[]; maxp=max(1, int(getattr(ctx.coding_backend or ctx.backend,'max_parallel',None) or ctx.max_parallel or 1))
@@ -704,6 +706,7 @@ def h_launch_candidates(state, inp, ctx):
                 res=fut.result(); byid[res.attempt_id]=res
         for aid in ids:
             res=byid[aid]
+            if fallback_active: res.candidate_kind='fallback'
             for idx,c in enumerate(state.candidates):
                 if c.attempt_id==aid:
                     state.candidates[idx]=res; break
@@ -1478,7 +1481,7 @@ OPS_TOOLS={
 'ops_submit_decomposition':ToolSpec('ops_submit_decomposition','Submit decomposition',OpsSubmitDecompositionInput,h_decomposition),
 'ops_validate_decomposition':ToolSpec('ops_validate_decomposition','Validate decomposition',OpsValidateDecompositionInput,h_validate_decomposition),
 'ops_select_execution_path':ToolSpec('ops_select_execution_path','Select execution path',OpsSelectExecutionPathInput,h_select_path),
-'ops_launch_candidates':ToolSpec('ops_launch_candidates','Launch full-task candidates in parallel/batches. Only valid for execution_path=parallel_candidates or explicit decomposition-deadlock fallback; never for single_task.',OpsLaunchCandidatesInput,h_launch_candidates),
+'ops_launch_candidates':ToolSpec('ops_launch_candidates','Launch full-task candidates in parallel/batches. Legacy batch fallback is disabled during adaptive decomposition-deadlock fallback unless legacy_ops_launch_candidates_enabled is explicitly set; use ops_run_next_fallback_candidate_attempt there. Never valid for single_task.',OpsLaunchCandidatesInput,h_launch_candidates),
 'ops_run_next_candidate_attempt':ToolSpec('ops_run_next_candidate_attempt','Run exactly one adaptive full-task candidate attempt, then validate/review/observe it automatically.',OpsRunNextCandidateAttemptInput,h_run_next_candidate_attempt),
 'ops_run_next_fallback_candidate_attempt':ToolSpec('ops_run_next_fallback_candidate_attempt','Run exactly one adaptive full-task fallback candidate after decomposition deadlock, then validate/review/observe it automatically.',OpsRunNextFallbackCandidateAttemptInput,h_run_next_fallback_candidate_attempt),
 'ops_run_next_subtask_attempt':ToolSpec('ops_run_next_subtask_attempt','Run exactly one adaptive subtask attempt selected from current decomposition state, then focused-validate/review/observe it automatically.',OpsRunNextSubtaskAttemptInput,h_run_next_subtask_attempt),

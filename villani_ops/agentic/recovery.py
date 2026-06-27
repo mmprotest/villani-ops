@@ -233,7 +233,7 @@ def handle_no_tool_call(state, reason='no_tool_call', max_recovery_attempts:int=
         if rec.tool_name=='ops_run_next_candidate_attempt':
             content='Call ops_run_next_candidate_attempt to run exactly one adaptive candidate attempt. Do not call bulk attempt tools.'
         if rec.tool_name=='ops_run_next_fallback_candidate_attempt':
-            content='Call ops_run_next_fallback_candidate_attempt to run exactly one adaptive fallback candidate attempt. Do not call ops_launch_candidates or other bulk launch tools.'
+            content='Call ops_run_next_fallback_candidate_attempt to run exactly one adaptive fallback candidate attempt. Do not call bulk launch tools.'
         if rec.tool_name=='ops_select_winner' and rec.tool_input and rec.tool_input.get('selected_attempt_id'):
             content=f"There is a reviewed and validated eligible candidate: {rec.tool_input['selected_attempt_id']}. Call ops_select_winner."
         if rec.tool_name=='ops_run_validation' and rec.tool_input:

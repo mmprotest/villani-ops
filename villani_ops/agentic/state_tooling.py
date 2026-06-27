@@ -12,15 +12,19 @@ class OpsToolResult(BaseModel):
     tool_use_id:str; tool_name:str; content:dict|str; is_error:bool=False
 
 def _allowed(state, name, data):
+    adaptive_context=getattr(state,'adaptive_context',{}) or {}
     if name in {'ops_get_state','ops_inspect_repo','ops_submit_classification'}: return True, None
     if name=='ops_observe_completed_attempt': return True, None
     if name=='ops_run_next_candidate_attempt' and state.execution_path=='single_task': return True, None
     if name=='ops_run_next_fallback_candidate_attempt' and state.fallback_execution_path=='parallel_candidates_after_decomposition_deadlock': return True, None
     if name=='ops_run_next_subtask_attempt' and state.execution_path=='decomposed_subtasks': return True, None
-    if name=='ops_launch_subtasks' and not (getattr(state,'adaptive_context',{}) or {}).get('legacy_ops_launch_subtasks_enabled'):
+    if name=='ops_launch_candidates' and state.fallback_execution_path=='parallel_candidates_after_decomposition_deadlock' and not adaptive_context.get('legacy_ops_launch_candidates_enabled'):
+        return False,'ops_launch_candidates is legacy/batch execution and is disabled during adaptive fallback. Use ops_run_next_fallback_candidate_attempt.'
+    if name=='ops_launch_subtasks' and not adaptive_context.get('legacy_ops_launch_subtasks_enabled'):
         return False,'ops_launch_subtasks is a legacy/internal compatibility tool and is blocked in normal agentic decomposed orchestration; call ops_run_next_subtask_attempt for exactly one adaptive subtask attempt'
-    legacy_subtasks = name=='ops_launch_subtasks' and (getattr(state,'adaptive_context',{}) or {}).get('legacy_ops_launch_subtasks_enabled')
-    if name not in state.allowed_next_actions() and name!='ops_finalize_run' and not legacy_subtasks: return False, f'{name} is not allowed in phase {state.phase}; allowed={state.allowed_next_actions()}'
+    legacy_subtasks = name=='ops_launch_subtasks' and adaptive_context.get('legacy_ops_launch_subtasks_enabled')
+    legacy_fallback_candidates = name=='ops_launch_candidates' and state.fallback_execution_path=='parallel_candidates_after_decomposition_deadlock' and adaptive_context.get('legacy_ops_launch_candidates_enabled')
+    if name not in state.allowed_next_actions() and name!='ops_finalize_run' and not legacy_subtasks and not legacy_fallback_candidates: return False, f'{name} is not allowed in phase {state.phase}; allowed={state.allowed_next_actions()}'
     if name=='ops_submit_decomposition' and not (state.plan or {}).get('should_decompose'): return False,'plan did not request decomposition'
     if name=='ops_validate_decomposition' and not state.decomposition: return False,'no decomposition exists'
     if name=='ops_select_execution_path':

@@ -57,6 +57,42 @@ def test_start_candidate_fallback_preserves_subtasks_and_enables_adaptive_candid
     assert s.candidates[0].candidate_kind == 'fallback'
 
 
+def test_launch_candidates_rejected_during_adaptive_fallback_by_default(tmp_path):
+    s=deadlocked_state(tmp_path); c=ctx(tmp_path)
+    assert not execute_tool_with_policy(s,'ops_start_candidate_fallback',{'reason':'deadlock'},'fb',c).is_error
+    actions=s.allowed_next_actions()
+    assert 'ops_run_next_fallback_candidate_attempt' in actions
+    assert 'ops_launch_candidates' not in actions
+    blocked=execute_tool_with_policy(s,'ops_launch_candidates',{'attempts':1,'reason':'legacy batch'},'lc',c)
+    assert blocked.is_error
+    assert 'ops_launch_candidates is legacy/batch execution and is disabled during adaptive fallback' in str(blocked.content)
+    assert 'ops_run_next_fallback_candidate_attempt' in str(blocked.content)
+    assert s.candidates == []
+
+
+def test_launch_candidates_direct_handler_rejects_adaptive_fallback_without_legacy_gate(tmp_path):
+    from villani_ops.agentic.tools import h_launch_candidates, OpsLaunchCandidatesInput
+    s=deadlocked_state(tmp_path); c=ctx(tmp_path)
+    assert not execute_tool_with_policy(s,'ops_start_candidate_fallback',{'reason':'deadlock'},'fb',c).is_error
+    try:
+        h_launch_candidates(s, OpsLaunchCandidatesInput(attempts=1, reason='direct'), c)
+    except ValueError as exc:
+        assert 'ops_launch_candidates is legacy/batch execution and is disabled during adaptive fallback' in str(exc)
+        assert 'ops_run_next_fallback_candidate_attempt' in str(exc)
+    else:
+        raise AssertionError('direct legacy batch fallback call unexpectedly succeeded')
+
+
+def test_launch_candidates_during_fallback_requires_explicit_legacy_gate(tmp_path):
+    s=deadlocked_state(tmp_path); c=ctx(tmp_path)
+    assert not execute_tool_with_policy(s,'ops_start_candidate_fallback',{'reason':'deadlock'},'fb',c).is_error
+    s.adaptive_context['legacy_ops_launch_candidates_enabled']=True
+    res=execute_tool_with_policy(s,'ops_launch_candidates',{'attempts':1,'reason':'legacy compatibility'},'lc',c)
+    assert not res.is_error, res.content
+    assert len(s.candidates) == 1
+    assert s.candidates[0].candidate_kind == 'fallback'
+
+
 def test_recovery_recommends_fallback_then_launch(tmp_path):
     s=deadlocked_state(tmp_path)
     rec=recommend_next_agentic_action(s)
@@ -98,4 +134,16 @@ def test_recovery_and_guidance_do_not_recommend_legacy_launch_subtasks(tmp_path)
     msg=handle_no_tool_call(s).message['content']
     assert 'ops_launch_subtasks' not in msg
     assert 'ops_run_next_fallback_candidate_attempt' not in s.allowed_next_actions()
+    assert 'ops_launch_candidates' not in s.allowed_next_actions()
+
+
+def test_recovery_and_guidance_do_not_recommend_launch_candidates_during_fallback(tmp_path):
+    from villani_ops.agentic.recovery import handle_no_tool_call
+    s=deadlocked_state(tmp_path)
+    assert not execute_tool_with_policy(s,'ops_start_candidate_fallback',{'reason':'deadlock'},'fb',ctx(tmp_path)).is_error
+    rec=recommend_next_agentic_action(s)
+    assert rec.tool_name == 'ops_run_next_fallback_candidate_attempt'
+    msg=handle_no_tool_call(s).message['content']
+    assert 'ops_run_next_fallback_candidate_attempt' in msg
+    assert 'ops_launch_candidates' not in msg
     assert 'ops_launch_candidates' not in s.allowed_next_actions()
