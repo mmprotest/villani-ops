@@ -114,3 +114,68 @@ def test_integration_validation_failure_remains_acceptance_blocking(tmp_path):
     ok, blockers=is_attempt_acceptance_eligible(s.integration, state=s)
     assert ok is False
     assert 'validation_failed' in blockers
+
+
+def test_discovered_command_defaults_non_blocking_without_explicit_plan(tmp_path):
+    s=_state(tmp_path); a=_attempt(tmp_path,s); c=_ctx(s)
+    res=h_validation(s, OpsRunValidationInput(target='candidate', target_id=a.attempt_id, commands=[
+        ValidationCommand(cmd='python -c "import sys; sys.exit(1)"', source='investigation_discovered', scope='subtask', subtask_id='part', purpose='discovered but not selected'),
+    ]), c)
+    assert res['commands'][0]['authority']=='supporting_evidence'
+    assert res['decision']['status']=='inconclusive'
+    ok, blockers=is_attempt_acceptance_eligible(a, state=s)
+    assert ok is True
+    assert 'validation_failed' not in blockers
+
+
+def test_subtask_name_similarity_does_not_promote_to_blocking(tmp_path):
+    s=_state(tmp_path); a=_attempt(tmp_path,s); c=_ctx(s)
+    res=h_validation(s, OpsRunValidationInput(target='candidate', target_id=a.attempt_id, commands=[
+        ValidationCommand(cmd='python -c "import sys; sys.exit(1)" # part parser test', source='investigation_discovered', scope='subtask', subtask_id='part'),
+    ]), c)
+    assert res['commands'][0]['authority']!='acceptance_blocking'
+    assert res['decision']['status']=='inconclusive'
+
+
+def test_validation_decision_recompute_idempotent_and_late_failures(tmp_path):
+    base={'commands':[{'cmd':'focused','passed':True,'authority':'acceptance_blocking','scope':'subtask'}]}
+    assert make_validation_decision(base)==make_validation_decision(base)
+    with_diag={'commands':base['commands']+[{'cmd':'diag','passed':False,'authority':'diagnostic_only','scope':'subtask'}]}
+    assert make_validation_decision(with_diag)['status']=='passed'
+    with_auth_fail={'commands':with_diag['commands']+[{'cmd':'auth fail','passed':False,'authority':'acceptance_blocking','scope':'subtask'}]}
+    assert make_validation_decision(with_auth_fail)['status']=='failed'
+
+
+def test_review_payload_labels_non_blocking_failures(tmp_path):
+    s=_state(tmp_path); a=_attempt(tmp_path,s); c=_ctx(s)
+    h_validation(s, OpsRunValidationInput(target='candidate', target_id=a.attempt_id, commands=[
+        ValidationCommand(cmd='python -c "import sys; sys.exit(0)"', source='subtask_focused', authority='acceptance_blocking', scope='subtask', subtask_id='part'),
+        ValidationCommand(cmd='python -c "import sys; sys.exit(1)"', source='diagnostic', authority='diagnostic_only', scope='repo'),
+    ]), c)
+    payload=build_agentic_review_payload(s,a,'subtask',s.subtasks[0])
+    nb=payload['non_blocking_diagnostic_supporting_failures']
+    assert nb['label']=='NON-BLOCKING DIAGNOSTIC/SUPPORTING FAILURES'
+    assert 'sole reason' in nb['instruction']
+    assert payload['validation_decision']['status']=='passed'
+
+
+def test_scheduler_prioritizes_commit_ready_before_retry(tmp_path):
+    from villani_ops.agentic.tools import select_next_subtask
+    s=_state(tmp_path); a=_attempt(tmp_path,s)
+    h_validation(s, OpsRunValidationInput(target='candidate', target_id=a.attempt_id, commands=[
+        ValidationCommand(cmd='python -c "import sys; sys.exit(0)"', source='subtask_focused', authority='acceptance_blocking', scope='subtask', subtask_id='part'),
+    ]), _ctx(s))
+    st,last=select_next_subtask(s)
+    assert st.subtask_id=='part'
+    assert last=='commit_ready'
+
+
+def test_recovery_commits_review_accepted_focused_passing_subtask_instead_of_retry(tmp_path):
+    from villani_ops.agentic.recovery import recommend_next_agentic_action
+    s=_state(tmp_path); a=_attempt(tmp_path,s)
+    h_validation(s, OpsRunValidationInput(target='candidate', target_id=a.attempt_id, commands=[
+        ValidationCommand(cmd='python -c "import sys; sys.exit(0)"', source='subtask_focused', authority='acceptance_blocking', scope='subtask', subtask_id='part'),
+    ]), _ctx(s))
+    rec=recommend_next_agentic_action(s)
+    assert rec.action=='commit_ready_subtask_acceptance'
+    assert rec.tool_name=='ops_run_next_subtask_attempt'
