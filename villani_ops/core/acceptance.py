@@ -71,6 +71,21 @@ def _validation_blockers(validation: Any) -> list[str]:
         return ["validation_missing"]
     if not isinstance(validation, dict):
         validation = getattr(validation, "model_dump", lambda **_: {})()
+    decision = validation.get("decision") or {}
+    if decision:
+        status = str(decision.get("status") or "").lower()
+        if status == "passed":
+            return []
+        if status == "failed":
+            failures = decision.get("blocking_failures") or []
+            command_rejected = any(str((f or {}).get("status") or "").lower() == "command_rejected" for f in failures if isinstance(f, dict))
+            non_rejected = any(str((f or {}).get("status") or "").lower() != "command_rejected" for f in failures if isinstance(f, dict))
+            if command_rejected:
+                blockers.append("validation_command_rejected")
+            if non_rejected or not command_rejected:
+                blockers.append("validation_failed")
+            return sorted(set(blockers))
+        return ["validation_inconclusive"]
     overall_status = str(validation.get("status") or "").lower()
     if overall_status == "command_rejected":
         blockers.append("validation_command_rejected")

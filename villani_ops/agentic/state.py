@@ -34,6 +34,12 @@ class AttemptObservation(BaseModel):
     blockers:list[str]=Field(default_factory=list)
     changed_files:list[str]=Field(default_factory=list)
     validation_status:str|None=None
+    validation_decision_status:str|None=None
+    validation_decision_rationale:str|None=None
+    blocking_validation_failures:list[str]=Field(default_factory=list)
+    diagnostic_validation_failures:list[str]=Field(default_factory=list)
+    supporting_validation_failures:list[str]=Field(default_factory=list)
+    passed_blocking_validations:list[str]=Field(default_factory=list)
     review_status:str|None=None
     runner_signals:dict=Field(default_factory=dict)
     backend_signals:dict=Field(default_factory=dict)
