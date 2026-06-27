@@ -64,8 +64,8 @@ villani-ops pr <run-id> --title "Villani Ops changes"
 
 ## Orchestrator default
 
-`villani-ops run ...` now uses the agentic orchestrator by default. The agentic path starts simple, runs one candidate attempt at a time, automatically validates/reviews/observes each attempt, and feeds Villani Code a compact learning brief on later retries instead of dumping raw logs. `--candidate-attempts 3` means up to three adaptive attempts, with the controller regaining control after every attempt.
+`villani-ops run ...` now uses `--orchestrator adaptive` by default. `adaptive` is agentic orchestration constrained to the single-task execution path. The orchestrator investigates, plans, attempts, validates, reviews, observes, and retries within the candidate-attempt budget, but cannot decompose the task. It uses the same single-task candidate attempt machinery as agentic single-task runs and is not a separate runner or a non-agentic retry loop.
 
-Use `--orchestrator agentic` to select this default explicitly. Use `--orchestrator graph` only for the explicit legacy graph path; the graph orchestrator remains available but is not the default.
+Use `--orchestrator adaptive` to select the default explicitly. Use `--orchestrator agentic` for the broader decomposition-capable agentic orchestrator. Use `--orchestrator graph` only for the explicit legacy graph path; the graph orchestrator remains available but is not the default.
 
-Adaptive retries include what changed, validation/review blockers, patch hygiene/scope issues, do-not-repeat directives, and suggested commands to rerun. Decomposition remains available when evidence warrants it, but is not expanded or used eagerly by default. Villani Ops also tracks runner telemetry and backend capability signals during a run so recovery can prefer focused repair or backend escalation when there is repeated no-progress.
+Adaptive retries include what changed, validation/review blockers, patch hygiene/scope issues, do-not-repeat directives, and suggested commands to rerun. Decomposition remains available behind the broader `agentic` orchestrator when evidence warrants it, but adaptive runs force `execution_path=single_task`. Villani Ops also tracks runner telemetry and backend capability signals during a run so recovery can prefer focused repair or backend escalation when there is repeated no-progress.

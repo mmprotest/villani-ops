@@ -101,6 +101,7 @@ def detect_decomposition_deadlock(state:'OpsRunState')->DecompositionDeadlock|No
 class OpsRunState(BaseModel):
     model_config=ConfigDict(extra='forbid')
     run_id:str; run_dir:str; repo_path:str; task:str; success_criteria:str|None=None; mode:str; runner:str; candidate_attempts:int
+    orchestrator:Literal['adaptive','agentic']='agentic'
     status:Literal['active','completed','failed','interrupted']='active'
     phase:Literal['started','investigating','planning','decomposing','choosing_execution_path','running_candidates','running_subtasks','integrating','validating','selecting','finalizing','completed','failed']='started'
     classification:dict|None=None; investigation:dict|None=None; plan:dict|None=None; decomposition:dict|None=None
@@ -133,6 +134,7 @@ class OpsRunState(BaseModel):
         if not self.investigation:
             a += ['ops_inspect_repo','ops_submit_classification','ops_submit_investigation']; return a
         if not self.plan: a.append('ops_submit_plan'); return a
+        if self.orchestrator=='adaptive' and self.execution_path=='unknown': a.append('ops_select_execution_path'); return a
         if self.decomposition_requested and not self.decomposition: a.append('ops_submit_decomposition'); return a
         if self.decomposition and not self.decomposition_validated: a.append('ops_validate_decomposition'); return a
         if self.execution_path=='unknown': a.append('ops_select_execution_path'); return a

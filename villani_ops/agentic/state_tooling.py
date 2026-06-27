@@ -13,6 +13,13 @@ class OpsToolResult(BaseModel):
 
 def _allowed(state, name, data):
     adaptive_context=getattr(state,'adaptive_context',{}) or {}
+    if getattr(state, 'orchestrator', None) == 'adaptive':
+        blocked={'ops_submit_decomposition','ops_validate_decomposition','ops_launch_candidates','ops_run_next_fallback_candidate_attempt','ops_run_next_subtask_attempt','ops_run_next_integration_repair_attempt','ops_start_candidate_fallback','ops_launch_subtasks','ops_integrate_subtasks'}
+        if name in blocked:
+            return False, f'{name} is not allowed in adaptive orchestrator; adaptive is constrained to execution_path=single_task'
+        if name=='ops_select_execution_path' and data.get('path')!='single_task':
+            return True, None
+
     if name in {'ops_get_state','ops_inspect_repo','ops_submit_classification'}: return True, None
     if name=='ops_observe_completed_attempt': return True, None
     if name=='ops_run_next_candidate_attempt' and state.execution_path=='single_task': return True, None
