@@ -139,7 +139,12 @@ def build_agentic_review_payload(state, attempt, scope, subtask=None):
     }
     if subtask is not None:
         payload['subtask']={'id':subtask.subtask_id,'title':subtask.title,'objective':subtask.objective,'success_criteria':subtask.success_criteria,'relevant_files':subtask.relevant_files}
+        dec=(current_validation or {}).get('decision') or {}
+        nonblocking=(dec.get('supporting_failures') or []) + (dec.get('diagnostic_failures') or [])
+        if nonblocking:
+            payload['non_blocking_diagnostic_supporting_failures']={'label':'NON-BLOCKING DIAGNOSTIC/SUPPORTING FAILURES','instruction':'These must not be used as the sole reason to reject this subtask.','failures':nonblocking}
         payload['subtask_review_criteria']=[
+            'Prioritize ValidationDecision.status and failed/passed authoritative validations over raw command failure counts.',
             'Judge only whether this patch satisfies the specific subtask contract.',
             'Do not reject solely because unrelated sibling subtasks or the global suite still fail.',
             'Validation commands have authority levels; only acceptance-blocking validation should block acceptance.',
@@ -290,7 +295,20 @@ class ValidationDecision(StrictModel):
     passed_blocking_checks:list[dict]=Field(default_factory=list)
     passed_supporting_checks:list[dict]=Field(default_factory=list)
     rationale:str
-class ValidationPlan(StrictModel): commands:list[ValidationCommand]=Field(default_factory=list); notes:list[str]=Field(default_factory=list)
+class ValidationPlan(StrictModel):
+    scope:Literal['subtask','integration','candidate','final','repo']='candidate'
+    subtask_id:str|None=None
+    authoritative_commands:list[ValidationCommand]=Field(default_factory=list)
+    supporting_commands:list[ValidationCommand]=Field(default_factory=list)
+    diagnostic_commands:list[ValidationCommand]=Field(default_factory=list)
+    commands:list[ValidationCommand]=Field(default_factory=list)
+    rationale:str='Explicit validation contract for this decision.'
+    confidence:Literal['high','medium','low']='medium'
+    notes:list[str]=Field(default_factory=list)
+
+    def all_commands(self)->list[ValidationCommand]:
+        return [*self.authoritative_commands,*self.supporting_commands,*self.diagnostic_commands,*self.commands]
+
 class OpsSubmitInvestigationInput(StrictModel): summary:str; suspected_root_cause:str|None=None; relevant_files:list[str]=Field(default_factory=list); relevant_tests:list[str]=Field(default_factory=list); implementation_plan:list[str]=Field(default_factory=list); risks:list[str]=Field(default_factory=list); validation_plan:ValidationPlan|None=None; confidence:float
 class OpsSubmitPlanInput(StrictModel): summary:str; strategy:Literal['single_task','parallel_candidates','decompose_then_execute']; should_decompose:bool; decomposition_reason:str|None=None; candidate_attempts:int; risks:list[str]=Field(default_factory=list); expected_difficulty:Literal['easy','medium','hard','unknown']; confidence:float
 class SubtaskInput(StrictModel): id:str; title:str; objective:str; success_criteria:str|None=None; relevant_files:list[str]=Field(default_factory=list); dependencies:list[str]=Field(default_factory=list); expected_difficulty:Literal['easy','medium','hard','unknown']='unknown'; risk:Literal['low','medium','high','unknown']='unknown'; confidence:float; can_run_parallel:bool; parallel_group:str|None=None; merge_contract:str|None=None
@@ -603,13 +621,38 @@ def update_backend_runner_assessments(state, obs=None, attempt=None):
     recompute_adaptive_assessments(state)
 
 
+
+def _commit_subtask_acceptance(state, st, attempt, ctx=None, reason='accepted'):
+    st.status='accepted'; st.accepted_attempt_id=attempt.attempt_id
+    attempt.status='accepted'; attempt.acceptance_eligible=True; attempt.acceptance_blockers=[]
+    app=_apply_accepted_patch_to_integration(state, st, attempt, ctx)
+    if app.get('status')!='applied':
+        blockers=sorted(set((attempt.acceptance_blockers or [])+['accepted_patch_integration_failed']))
+        attempt.acceptance_eligible=False; attempt.acceptance_blockers=blockers
+        return False, blockers, app
+    if ctx is not None:
+        ctx.recorder.record('subtask_accepted', payload={'subtask_id':st.subtask_id,'attempt_id':attempt.attempt_id,'reason':reason,'patch_application_status':app.get('status')})
+    _update_decomposed_execution_state(state, ctx)
+    return True, [], app
+
+def _subtask_commit_ready(state, st):
+    for a in reversed(st.attempts or []):
+        vdec=((a.validation or {}).get('decision') or {})
+        validation_ok=vdec.get('status')=='passed' or (vdec.get('status')=='inconclusive' and a.review_status=='passed')
+        if validation_ok and a.review_status=='passed' and not ((a.scope_assessment or {}).get('blockers')):
+            return a
+    return None
+
 def select_next_subtask(state):
     by={s.subtask_id:s for s in state.subtasks}
     budget=max(1,int(state.candidate_attempts or 1))
     for st in state.subtasks:
+        if st.status!='accepted' and _subtask_commit_ready(state, st) is not None and all(by[d].status=='accepted' for d in st.dependencies):
+            return st, 'commit_ready'
+    for st in state.subtasks:
         complete=[a for a in st.attempts if a.status in {'completed','failed','reviewed','rejected','accepted'}]
         last=next((o for o in reversed(state.attempt_observations) if o.scope=='subtask' and o.subtask_id==st.subtask_id), None)
-        if st.status=='pending' and complete and last and last.outcome!='accepted' and len(complete)<budget and all(by[d].status=='accepted' for d in st.dependencies):
+        if st.status=='pending' and complete and last and last.outcome!='accepted' and len(complete)<budget and all(by[d].status=='accepted' for d in st.dependencies) and _subtask_commit_ready(state, st) is None:
             return st, last
     ready=[st for st in state.subtasks if st.status=='pending' and not st.attempts and all(by[d].status=='accepted' for d in st.dependencies)]
     if ready: return ready[0], None
@@ -825,28 +868,46 @@ def h_launch_candidates(state, inp, ctx):
     state.phase='validating'; return {'launched':made,'max_parallel':maxp,'batch_count':batch_count,'concurrency_mode':final_mode,'semantics':'attempts execute in isolated worktrees; main thread mutates OpsRunState; batches never exceed max_parallel'}
 
 
+def _coerce_validation_plan(raw, *, default_scope='candidate', subtask_id=None):
+    if not raw: return None
+    if isinstance(raw, ValidationPlan): return raw
+    if isinstance(raw, dict):
+        data=dict(raw)
+        data.setdefault('scope', default_scope)
+        if subtask_id is not None: data.setdefault('subtask_id', subtask_id)
+        for old, new, auth in [('commands','commands',None),('authoritative_commands','authoritative_commands','acceptance_blocking'),('supporting_commands','supporting_commands','supporting_evidence'),('diagnostic_commands','diagnostic_commands','diagnostic_only')]:
+            vals=[]
+            for c in data.get(old) or []:
+                vc=ValidationCommand.model_validate(c) if isinstance(c,dict) else c
+                effective_auth=auth
+                if effective_auth is None and old=='commands' and default_scope in {'candidate','integration','final','repo'}:
+                    effective_auth='acceptance_blocking'
+                if effective_auth and vc.authority is None: vc=vc.model_copy(update={'authority':effective_auth})
+                vals.append(vc)
+            data[new]=vals
+        return ValidationPlan.model_validate(data)
+    return None
+
+def _plan_commands(plan:ValidationPlan|None):
+    if not plan: return []
+    out=[]
+    for auth, items in [('acceptance_blocking',plan.authoritative_commands),('supporting_evidence',plan.supporting_commands),('diagnostic_only',plan.diagnostic_commands)]:
+        for c in items:
+            updates={'authority':auth,'scope':c.scope or plan.scope,'subtask_id':c.subtask_id or plan.subtask_id}
+            out.append(c.model_copy(update={k:v for k,v in updates.items() if v is not None}))
+    for c in plan.commands:
+        out.append(c.model_copy(update={'authority':c.authority or 'supporting_evidence','scope':c.scope or plan.scope,'subtask_id':c.subtask_id or plan.subtask_id}))
+    return out
+
 def _default_validation_commands(state):
-    vp=((state.investigation or {}).get('validation_plan') or {})
-    cmds=vp.get('commands') or []
-    out=[ValidationCommand.model_validate(c) for c in cmds if isinstance(c, dict) and c.get('cmd')]
+    plan=_coerce_validation_plan((state.investigation or {}).get('validation_plan') if state.investigation else None, default_scope='candidate')
+    out=_plan_commands(plan)
     return out or [ValidationCommand(cmd='python -m pytest --tb=short -v', purpose='Default candidate validation', timeout_seconds=900, source='user_success_criteria', authority='acceptance_blocking', scope='candidate', reason='Default validation for the candidate decision')]
 
 def _focused_subtask_validation_commands(state, subtask:SubtaskState):
-    rel=[str(x).replace('\\','/') for x in (subtask.relevant_files or [])]
-    tests=[p for p in rel if ('test' in Path(p).name.lower() or '/test' in p.lower())]
-    if not tests:
-        repo=Path(state.repo_path)
-        stems={Path(p).stem for p in rel if Path(p).suffix}
-        found=[]
-        for tdir in ['tests','test']:
-            root=repo/tdir
-            if root.exists():
-                for f in root.rglob('*'):
-                    if f.is_file() and any(stem and stem in f.stem for stem in stems):
-                        found.append(str(f.relative_to(repo)).replace('\\','/'))
-        tests=sorted(dict.fromkeys(found))[:3]
-    if tests:
-        return [ValidationCommand(cmd=f'python -m pytest {t} --tb=short -v', purpose='Validate the subtask contract', timeout_seconds=900, source='subtask_focused', authority='acceptance_blocking', scope='subtask', subtask_id=subtask.subtask_id, reason='This command directly checks the behaviour owned by this subtask') for t in tests[:3]]
+    plan=_coerce_validation_plan((state.investigation or {}).get('validation_plan') if state.investigation else None, default_scope='subtask', subtask_id=subtask.subtask_id)
+    cmds=[c for c in _plan_commands(plan) if (c.scope in {None,'subtask'}) and (c.subtask_id in {None, subtask.subtask_id})]
+    if cmds: return cmds
     return []
 
 def build_adaptive_subtask_runner_prompt(state, subtask:SubtaskState, *, reason:str, repair:bool=False, base_attempt_id:str|None=None)->str:
@@ -976,6 +1037,11 @@ def h_run_next_subtask_attempt(state, inp, ctx):
         st,_last=select_next_subtask(state)
         if not st: raise ValueError('no retryable or ready subtask is available')
     if st.status=='accepted': raise ValueError(f'subtask {inp.subtask_id} is already accepted')
+    ready_attempt=_subtask_commit_ready(state, st)
+    if ready_attempt is not None:
+        ok, blockers, app=_commit_subtask_acceptance(state, st, ready_attempt, ctx, reason='commit_ready_before_retry')
+        obs=_observe_completed_attempt(state,ready_attempt,ctx)
+        return {'launched':[],'attempt_id':ready_attempt.attempt_id,'subtask_id':st.subtask_id,'attempts_started':len(st.attempts),'attempts_requested':max(1,int(state.candidate_attempts or 1)),'observation':obs.model_dump(),'accepted':ok,'acceptance_blockers':blockers,'accepted_patch_application_status':app,'next_allowed_actions':state.allowed_next_actions()}
     by={s.subtask_id:s for s in state.subtasks}
     unmet=[d for d in st.dependencies if by.get(d) and by[d].status!='accepted']
     if unmet: raise ValueError(f'subtask {inp.subtask_id} has unmet dependencies: {unmet}')
@@ -1007,10 +1073,7 @@ def h_run_next_subtask_attempt(state, inp, ctx):
     elif vdec.get('status')=='passed' and 'validation_missing' in blockers:
         blockers=[b for b in blockers if b!='validation_missing']
     if eligible:
-        st.status='accepted'; st.accepted_attempt_id=aid
-        app=_apply_accepted_patch_to_integration(state, st, a, ctx)
-        if app.get('status')!='applied':
-            eligible=False; blockers=sorted(set(blockers+['accepted_patch_integration_failed'])); a.acceptance_eligible=False; a.acceptance_blockers=blockers
+        eligible, blockers, app=_commit_subtask_acceptance(state, st, a, ctx, reason='focused_validation_and_review_accept')
     elif len([x for x in st.attempts if x.status in {'completed','failed','reviewed','rejected','accepted'}]) >= budget:
         st.status='failed'
     else:
@@ -1201,7 +1264,7 @@ def h_review_attempt(state, inp, ctx):
         if res.blockers:
             blockers=sorted(set(blockers+res.blockers)); a.acceptance_blockers=blockers; eligible=False; a.acceptance_eligible=False
         if st and eligible:
-            st.status='accepted'; st.accepted_attempt_id=a.attempt_id
+            eligible, blockers, _app=_commit_subtask_acceptance(state, st, a, ctx, reason='review_accept_commit')
     state.reviews.append({'attempt_id':inp.attempt_id,**res.model_dump(),'acceptance_eligible':eligible,'acceptance_blockers':blockers})
     if not eligible and blockers:
         state.blockers=sorted(set(state.blockers+blockers))
@@ -1406,7 +1469,11 @@ def _default_validation_metadata(command, *, target, target_obj, subtask):
         else:
             source='user_success_criteria'
     if authority is None:
-        authority='acceptance_blocking' if source in {'user_success_criteria','subtask_focused','integration','final'} else ('diagnostic_only' if source in {'diagnostic','exploratory'} else 'supporting_evidence')
+        # Authority must come from an explicit validation plan/command contract.
+        # Discovered or merely related commands are non-blocking by default.
+        authority='diagnostic_only' if source in {'diagnostic','exploratory'} else 'supporting_evidence'
+        if (scope=='candidate' and source=='user_success_criteria') or (scope in {'integration','final'} and source in {'integration','final'}):
+            authority='acceptance_blocking'
     return source, authority, scope, subtask_id
 
 def make_validation_decision(result:dict)->dict:

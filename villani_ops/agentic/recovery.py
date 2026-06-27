@@ -97,6 +97,13 @@ def _ready_subtask_ids(state):
 def _has_active_subtask_attempts(state):
     return any(a.status in {'scheduled','running'} for s in state.subtasks for a in s.attempts)
 
+def _subtask_commit_ready(st):
+    for a in reversed(getattr(st,'attempts',[]) or []):
+        val=(_validation(a) or {}).get('decision') or {}
+        if (val.get('status')=='passed' or val.get('status')=='inconclusive') and _review_status(a)=='passed':
+            return a
+    return None
+
 def recommend_next_agentic_action(state):
     if has_valid_selected_winner(state):
         aid=(state.selection or {}).get('selected_attempt_id')
@@ -120,6 +127,10 @@ def recommend_next_agentic_action(state):
     if state.execution_path=='decomposed_subtasks' and state.integration and (state.integration.get('validation') or {}).get('passed') is False:
         return RecoveryRecommendation(action='run_next_integration_repair_attempt',tool_name='ops_run_next_integration_repair_attempt',tool_input={'reason':'Full integration validation failed; run one adaptive integration repair with accepted subtask context.'},reason='integration validation failed after accepted subtasks',can_execute_deterministically=True)
     if state.execution_path=='decomposed_subtasks':
+        for st in state.subtasks:
+            if st.status!='accepted' and _subtask_commit_ready(st) is not None:
+                a=_subtask_commit_ready(st)
+                return RecoveryRecommendation(action='commit_ready_subtask_acceptance',tool_name='ops_run_next_subtask_attempt',tool_input={'subtask_id':st.subtask_id,'base_attempt_id':_aid(a),'reason':'Commit review-accepted focused-passing subtask before considering retries.'},reason='subtask has passed authoritative/inconclusive validation with accepted review; commit acceptance/apply patch instead of retrying',can_execute_deterministically=True)
         for st in state.subtasks:
             if st.status=='pending' and st.attempts and len(st.attempts) < max(1,int(state.candidate_attempts or 1)):
                 obs=[o for o in state.attempt_observations if o.scope=='subtask' and o.subtask_id==st.subtask_id]
