@@ -16,6 +16,8 @@ def _allowed(state, name, data):
     if name=='ops_observe_completed_attempt': return True, None
     if name=='ops_run_next_candidate_attempt' and state.execution_path=='single_task': return True, None
     if name=='ops_run_next_subtask_attempt' and state.execution_path=='decomposed_subtasks': return True, None
+    if name=='ops_launch_subtasks' and not (getattr(state,'adaptive_context',{}) or {}).get('legacy_ops_launch_subtasks_enabled'):
+        return False,'ops_launch_subtasks is a legacy/internal compatibility tool and is blocked in normal agentic decomposed orchestration; call ops_run_next_subtask_attempt for exactly one adaptive subtask attempt'
     if name not in state.allowed_next_actions() and name!='ops_finalize_run': return False, f'{name} is not allowed in phase {state.phase}; allowed={state.allowed_next_actions()}'
     if name=='ops_submit_decomposition' and not (state.plan or {}).get('should_decompose'): return False,'plan did not request decomposition'
     if name=='ops_validate_decomposition' and not state.decomposition: return False,'no decomposition exists'
@@ -30,6 +32,8 @@ def _allowed(state, name, data):
     if name=='ops_launch_candidates' and state.execution_path!='parallel_candidates' and state.fallback_execution_path!='parallel_candidates_after_decomposition_deadlock': return False,'candidates require parallel_candidates execution path or fallback'
     if name=='ops_run_next_candidate_attempt' and state.execution_path!='single_task': return False,'ops_run_next_candidate_attempt requires execution_path=single_task'
     if name=='ops_run_single_task_attempts': return False,'ops_run_single_task_attempts is a legacy compatibility tool and is not available in normal agentic flow; call ops_run_next_candidate_attempt'
+    if name=='ops_launch_subtasks' and not (getattr(state,'adaptive_context',{}) or {}).get('legacy_ops_launch_subtasks_enabled'):
+        return False,'ops_launch_subtasks is a legacy/internal compatibility tool and is blocked in normal agentic decomposed orchestration; call ops_run_next_subtask_attempt for exactly one adaptive subtask attempt'
     if name=='ops_launch_subtasks' and state.execution_path!='decomposed_subtasks': return False,'subtasks require decomposed_subtasks execution path'
     if name=='ops_run_next_subtask_attempt' and state.execution_path!='decomposed_subtasks': return False,'ops_run_next_subtask_attempt requires execution_path=decomposed_subtasks'
     if name=='ops_integrate_subtasks':

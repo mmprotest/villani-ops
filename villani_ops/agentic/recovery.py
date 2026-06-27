@@ -15,6 +15,8 @@ class RecoveryResult(BaseModel):
 
 def _attempts(state):
     yield from state.candidates
+    for st in getattr(state,'subtasks',[]) or []:
+        yield from st.attempts
     if state.integration: yield state.integration
 
 def _aid(a): return a.get('attempt_id') if isinstance(a,dict) else a.attempt_id
@@ -114,7 +116,9 @@ def recommend_next_agentic_action(state):
     if dead and state.fallback_execution_path!='parallel_candidates_after_decomposition_deadlock' and not state.candidates:
         return RecoveryRecommendation(action='start_candidate_fallback',tool_name='ops_start_candidate_fallback',tool_input={'reason':'required subtask failed and dependent subtasks are blocked'},reason='decomposition deadlock detected; full-task candidate fallback is available',can_execute_deterministically=True)
     if state.fallback_execution_path=='parallel_candidates_after_decomposition_deadlock' and not state.candidates:
-        return RecoveryRecommendation(action='launch_fallback_candidates',tool_name='ops_launch_candidates',tool_input={'attempts':state.candidate_attempts,'reason':'fallback after decomposition deadlock'},reason='candidate fallback is started but no fallback candidates have launched',can_execute_deterministically=False)
+        return RecoveryRecommendation(action='start_candidate_fallback',tool_name='ops_start_candidate_fallback',tool_input={'reason':'continue immediate fallback after decomposition deadlock'},reason='fallback should launch exactly one candidate deterministically',can_execute_deterministically=True)
+    if state.execution_path=='decomposed_subtasks' and state.integration and (state.integration.get('validation') or {}).get('passed') is False:
+        return RecoveryRecommendation(action='run_next_integration_repair_attempt',tool_name='ops_run_next_integration_repair_attempt',tool_input={'reason':'Full integration validation failed; run one adaptive integration repair with accepted subtask context.'},reason='integration validation failed after accepted subtasks',can_execute_deterministically=True)
     if state.execution_path=='decomposed_subtasks':
         for st in state.subtasks:
             if st.status=='pending' and st.attempts and len(st.attempts) < max(1,int(state.candidate_attempts or 1)):
@@ -138,6 +142,8 @@ def recommend_next_agentic_action(state):
             if _complete(a) and not _obs_fresh(a, _obs_for(state,_aid(a))):
                 return RecoveryRecommendation(action='create_or_refresh_observation',tool_name='ops_observe_completed_attempt',tool_input={'attempt_id':_aid(a),'reason':'Create or refresh AttemptObservation from current validation/review evidence before deciding whether to retry.'},reason='completed attempt lacks a current observation',can_execute_deterministically=True)
     for a in _attempts(state):
+        if (a.get('scope') if isinstance(a,dict) else getattr(a,'scope',None))=='subtask':
+            continue
         aid=_aid(a)
         if not aid: continue
         eligible, blockers=is_attempt_acceptance_eligible(a,state=state)

@@ -291,8 +291,9 @@ class OpsSelectExecutionPathInput(StrictModel): path:Literal['single_task','para
 class OpsLaunchCandidatesInput(StrictModel): attempts:int; backend_name:str|None=None; reason:str
 class OpsRunSingleTaskAttemptsInput(StrictModel): attempts:int; backend_name:str|None=None; reason:str
 class OpsRunNextCandidateAttemptInput(StrictModel): backend_name:str|None=None; base_attempt_id:str|None=None; repair:bool=False; reason:str
-class OpsRunNextSubtaskAttemptInput(StrictModel): subtask_id:str; backend_name:str|None=None; base_attempt_id:str|None=None; repair:bool=False; reason:str
+class OpsRunNextSubtaskAttemptInput(StrictModel): subtask_id:str|None=None; backend_name:str|None=None; base_attempt_id:str|None=None; repair:bool=False; reason:str
 class OpsObserveCompletedAttemptInput(StrictModel): attempt_id:str; reason:str='Create missing adaptive observation before retry.'
+class OpsRunNextIntegrationRepairAttemptInput(StrictModel): backend_name:str|None=None; base_attempt_id:str|None=None; repair:bool=True; reason:str
 class OpsStartCandidateFallbackInput(StrictModel): reason:str; attempts:int|None=None
 class OpsLaunchSubtasksInput(StrictModel): subtask_ids:list[str]; backend_name:str|None=None; attempts_per_subtask:int; reason:str
 class OpsReviewAttemptInput(StrictModel): attempt_id:str; scope:Literal['candidate','subtask','integration']
@@ -512,6 +513,40 @@ def update_backend_runner_assessments(state, obs=None, attempt=None):
     recompute_adaptive_assessments(state)
 
 
+def select_next_subtask(state):
+    by={s.subtask_id:s for s in state.subtasks}
+    budget=max(1,int(state.candidate_attempts or 1))
+    for st in state.subtasks:
+        complete=[a for a in st.attempts if a.status in {'completed','failed','reviewed','rejected','accepted'}]
+        last=next((o for o in reversed(state.attempt_observations) if o.scope=='subtask' and o.subtask_id==st.subtask_id), None)
+        if st.status=='pending' and complete and last and last.outcome!='accepted' and len(complete)<budget and all(by[d].status=='accepted' for d in st.dependencies):
+            return st, last
+    ready=[st for st in state.subtasks if st.status=='pending' and not st.attempts and all(by[d].status=='accepted' for d in st.dependencies)]
+    if ready: return ready[0], None
+    return None, None
+
+def build_decomposition_progress_brief(state, current_subtask=None):
+    accepted=[]; risky=[]; constraints=[]
+    for st in state.subtasks:
+        if st.status=='accepted':
+            a=_accepted_subtask_attempt(state, st) if '_accepted_subtask_attempt' in globals() else None
+            files=(a.changed_files if a else []) or []
+            accepted.append(f'- {st.subtask_id}: accepted. Changed {", ".join(files) or "no files recorded"}.')
+            constraints.append(f'- Preserve {st.subtask_id} accepted behavior' + ((f' in {", ".join(files)}') if files else '') + '.')
+        obs=[o for o in state.attempt_observations if o.scope=='subtask' and o.subtask_id==st.subtask_id and o.outcome!='accepted']
+        if obs:
+            o=obs[-1]; risky.append(f'- {st.subtask_id}: previous attempt {o.attempt_id} ended {o.outcome}; blockers: {", ".join((o.blockers or o.evidence or [])[:4]) or "unknown"}.')
+    if not accepted and not risky: return ''
+    deps=[]
+    if current_subtask:
+        deps=[f'- Depends on {d}; keep its accepted contract intact.' for d in current_subtask.dependencies]
+    parts=['DECOMPOSITION PROGRESS SO FAR']
+    if accepted: parts += ['', 'Accepted subtasks:'] + accepted
+    if risky: parts += ['', 'Failed or risky subtasks:'] + risky
+    imps=(constraints+deps)[:8]
+    if imps: parts += ['', 'Implications for this subtask:'] + imps
+    return '\n'.join(parts)
+
 def build_attempt_learning_brief(state):
     failed=[o for o in state.attempt_observations if o.scope=='candidate' and o.outcome!='accepted'][-2:]
     if not failed: return ''
@@ -693,13 +728,15 @@ def _focused_subtask_validation_commands(state, subtask:SubtaskState):
         tests=sorted(dict.fromkeys(found))[:3]
     if tests:
         return [ValidationCommand(cmd=f'python -m pytest {t} --tb=short -v', purpose=f'Focused validation for subtask {subtask.subtask_id}', timeout_seconds=900) for t in tests[:3]]
-    return _default_validation_commands(state)
+    return []
 
 def build_adaptive_subtask_runner_prompt(state, subtask:SubtaskState, *, reason:str, repair:bool=False, base_attempt_id:str|None=None)->str:
     accepted=[{'subtask_id':s.subtask_id,'accepted_attempt_id':s.accepted_attempt_id,'changed_files':(_accepted_subtask_attempt(state,s).changed_files if _accepted_subtask_attempt(state,s) else [])} for s in state.subtasks if s.status=='accepted']
     prompt=build_subtask_runner_prompt(parent_task=state.task,parent_success_criteria=state.success_criteria,subtask=subtask,allowed_files=subtask.relevant_files,forbidden_files=['.villani','.villani_code'],validation_commands=_focused_subtask_validation_commands(state, subtask),dependency_context=json.dumps({'dependencies':subtask.dependencies,'accepted_upstream_subtasks':accepted}, ensure_ascii=False),merge_contract=(state.decomposition or {}).get('merge_strategy') or '')
+    progress=build_decomposition_progress_brief(state, subtask)
     learning=build_subtask_attempt_learning_brief(state, subtask)
     extras=[]
+    if progress: extras.append(progress)
     if learning: extras.append(learning)
     extras.append('NEXT SUBTASK ATTEMPT DIRECTIVES\n- Run exactly this subtask attempt; do not solve unrelated sibling subtasks.\n- Use focused validation for this subtask when available.\n- Do not repeat previous validation, review, patch hygiene, or scope mistakes.')
     if repair and base_attempt_id:
@@ -784,8 +821,12 @@ def h_run_next_candidate_attempt(state, inp, ctx):
 def h_run_next_subtask_attempt(state, inp, ctx):
     if state.execution_path!='decomposed_subtasks':
         raise ValueError('ops_run_next_subtask_attempt requires execution_path=decomposed_subtasks')
-    st=next((s for s in state.subtasks if s.subtask_id==inp.subtask_id), None)
-    if not st: raise ValueError(f'unknown subtask {inp.subtask_id}')
+    if inp.subtask_id:
+        st=next((s for s in state.subtasks if s.subtask_id==inp.subtask_id), None)
+        if not st: raise ValueError(f'unknown subtask {inp.subtask_id}')
+    else:
+        st,_last=select_next_subtask(state)
+        if not st: raise ValueError('no retryable or ready subtask is available')
     if st.status=='accepted': raise ValueError(f'subtask {inp.subtask_id} is already accepted')
     by={s.subtask_id:s for s in state.subtasks}
     unmet=[d for d in st.dependencies if by.get(d) and by[d].status!='accepted']
@@ -800,12 +841,18 @@ def h_run_next_subtask_attempt(state, inp, ctx):
     prompt=build_adaptive_subtask_runner_prompt(state, st, reason=inp.reason, repair=inp.repair, base_attempt_id=inp.base_attempt_id)
     a=_run_attempt(state,ctx,aid,'subtask',prompt,st.success_criteria or state.success_criteria,subtask_id=st.subtask_id,backend_name=inp.backend_name,record_events=True)
     st.attempts.append(a)
+    cmds=[]
     if a.status=='completed':
         cmds=_focused_subtask_validation_commands(state, st)
         if cmds: h_validation(state, OpsRunValidationInput(target='candidate', target_id=aid, commands=cmds), ctx)
     if ctx.reviewer is not None and a.status in {'completed','reviewed'} and not a.review:
         h_review_attempt(state, OpsReviewAttemptInput(attempt_id=aid, scope='subtask'), ctx)
     eligible, blockers=_set_acceptance_from_gate(state,a)
+    # Subtask acceptance is scoped to the subtask contract. If no focused
+    # validation is available, do not reject solely because the global
+    # validation gate has not run; integration validation owns full-suite risk.
+    if a.scope=='subtask' and not cmds and a.review_status=='passed' and blockers==['validation_missing']:
+        eligible=True; blockers=[]; a.acceptance_eligible=True; a.acceptance_blockers=[]
     if a.validation and a.validation.get('passed') is False:
         eligible=False; blockers=sorted(set(blockers+['validation_failed'])); a.acceptance_eligible=False; a.acceptance_blockers=blockers
     if eligible:
@@ -1342,6 +1389,48 @@ def h_finalize(state, inp, ctx):
     if consistency_warnings:
         state.warnings=sorted(set(state.warnings+consistency_warnings)); state.final_decision['consistency_warnings']=consistency_warnings
     ctx.recorder.record('run_finalized', payload=state.final_decision); return state.final_decision
+def build_integration_repair_prompt(state, reason, base_attempt_id=None):
+    accepted=[]; files=[]
+    for st in state.subtasks:
+        if st.status=='accepted':
+            a=_accepted_subtask_attempt(state, st)
+            fs=(a.changed_files if a else []) or []
+            files += fs
+            accepted.append({'subtask_id':st.subtask_id,'attempt_id':st.accepted_attempt_id,'changed_files':fs})
+    failed=[o.model_dump(mode='json') for o in state.attempt_observations if o.scope=='subtask' and o.outcome!='accepted'][-6:]
+    val=(state.integration or {}).get('validation') or {}
+    return '\n\n'.join([
+        f'TASK\n{state.task}',
+        f'SUCCESS CRITERIA\n{state.success_criteria or "Complete the task with a minimal correct patch."}',
+        'INTEGRATION REPAIR CONTEXT\nRun exactly one integration repair candidate. Preserve accepted subtask behavior and fix only remaining integration/full-validation blockers.',
+        'ACCEPTED SUBTASKS\n'+json.dumps(accepted, ensure_ascii=False, indent=2),
+        'FILES CHANGED BY ACCEPTED SUBTASKS\n'+'\n'.join(f'- {f}' for f in sorted(set(files))),
+        'FAILED OR BLOCKED SUBTASK EVIDENCE\n'+json.dumps(failed, ensure_ascii=False, indent=2),
+        'FULL VALIDATION FAILURE SUMMARY\n'+json.dumps(val, ensure_ascii=False, indent=2)[:4000],
+        'REPAIR DIRECTIVES\n- Do not regress accepted subtasks.\n- Focus on integration blockers and failing full-validation commands.\n- Do not edit unrelated files or tests unless the original task explicitly requires it.',
+        f'REASON\n{reason}' + ((f'\nBase failed integration attempt: {base_attempt_id}') if base_attempt_id else '')
+    ])
+
+def h_run_next_integration_repair_attempt(state, inp, ctx):
+    if state.execution_path!='decomposed_subtasks': raise ValueError('integration repair requires decomposed_subtasks')
+    if not state.integration: raise ValueError('integration repair requires an integration result')
+    if (state.integration.get('validation') or {}).get('passed') is not False and state.integration.get('status')!='failed':
+        raise ValueError('integration repair requires failed integration validation or failed integration')
+    rid=f"integration_repair_{len([o for o in state.attempt_observations if o.scope=='integration'])+1:03d}"
+    prompt=build_integration_repair_prompt(state, inp.reason, inp.base_attempt_id)
+    a=_run_attempt(state,ctx,rid,'integration',prompt,state.success_criteria,None,inp.backend_name,True)
+    state.candidates.append(a)
+    cmds=_validation_plan_commands(state)
+    if a.status=='completed' and cmds:
+        h_validation(state, OpsRunValidationInput(target='candidate', target_id=rid, commands=cmds), ctx)
+    if ctx.reviewer is not None and a.status in {'completed','reviewed'} and not a.review:
+        h_review_attempt(state, OpsReviewAttemptInput(attempt_id=rid, scope='integration'), ctx)
+    obs=_observe_completed_attempt(state,a,ctx)
+    state.integration.setdefault('repair_attempts',[]).append(a.model_dump())
+    state.integration['repair_used']=True
+    state.integration['latest_repair_attempt_id']=rid
+    return {'attempt_id':rid,'observation':obs.model_dump(),'next_allowed_actions':state.allowed_next_actions()}
+
 OPS_TOOLS={
 'ops_get_state':ToolSpec('ops_get_state','Inspect canonical run state',OpsGetStateInput,h_get_state,True),
 'ops_inspect_repo':ToolSpec('ops_inspect_repo','Inspect repository',OpsInspectRepoInput,h_inspect_repo,True),
@@ -1353,11 +1442,12 @@ OPS_TOOLS={
 'ops_select_execution_path':ToolSpec('ops_select_execution_path','Select execution path',OpsSelectExecutionPathInput,h_select_path),
 'ops_launch_candidates':ToolSpec('ops_launch_candidates','Launch full-task candidates in parallel/batches. Only valid for execution_path=parallel_candidates or explicit decomposition-deadlock fallback; never for single_task.',OpsLaunchCandidatesInput,h_launch_candidates),
 'ops_run_next_candidate_attempt':ToolSpec('ops_run_next_candidate_attempt','Run exactly one adaptive full-task candidate attempt, then validate/review/observe it automatically.',OpsRunNextCandidateAttemptInput,h_run_next_candidate_attempt),
-'ops_run_next_subtask_attempt':ToolSpec('ops_run_next_subtask_attempt','Run exactly one adaptive subtask attempt, then focused-validate/review/observe it automatically.',OpsRunNextSubtaskAttemptInput,h_run_next_subtask_attempt),
+'ops_run_next_subtask_attempt':ToolSpec('ops_run_next_subtask_attempt','Run exactly one adaptive subtask attempt selected from current decomposition state, then focused-validate/review/observe it automatically.',OpsRunNextSubtaskAttemptInput,h_run_next_subtask_attempt),
+'ops_run_next_integration_repair_attempt':ToolSpec('ops_run_next_integration_repair_attempt','Run exactly one adaptive integration repair attempt after accepted subtasks fail full validation.',OpsRunNextIntegrationRepairAttemptInput,h_run_next_integration_repair_attempt),
 'ops_observe_completed_attempt':ToolSpec('ops_observe_completed_attempt','Internal recovery: create an AttemptObservation for an existing completed attempt before any retry.',OpsObserveCompletedAttemptInput,h_observe_completed_attempt),
 'ops_run_single_task_attempts':ToolSpec('ops_run_single_task_attempts','LEGACY compatibility bulk sequential attempts. Hidden from normal agentic tool lists; do not use for adaptive orchestration. Use ops_run_next_candidate_attempt instead.',OpsRunSingleTaskAttemptsInput,h_run_single_task_attempts),
 'ops_start_candidate_fallback':ToolSpec('ops_start_candidate_fallback','Start full-task candidate fallback after decomposition deadlock',OpsStartCandidateFallbackInput,h_start_candidate_fallback),
-'ops_launch_subtasks':ToolSpec('ops_launch_subtasks','Launch subtasks',OpsLaunchSubtasksInput,h_launch_subtasks),
+'ops_launch_subtasks':ToolSpec('ops_launch_subtasks','LEGACY/internal compatibility bulk subtask launcher. Hidden and policy-blocked in normal agentic flow; use ops_run_next_subtask_attempt.',OpsLaunchSubtasksInput,h_launch_subtasks),
 'ops_review_attempt':ToolSpec('ops_review_attempt','Review attempt',OpsReviewAttemptInput,h_review_attempt),
 'ops_integrate_subtasks':ToolSpec('ops_integrate_subtasks','Integrate subtasks',OpsIntegrateSubtasksInput,h_integrate),
 'ops_run_validation':ToolSpec('ops_run_validation','Run validation commands in the selected target workspace automatically. For candidate/integration targets, provide target_id and commands without cd/pushd/Set-Location; cwd defaults to the target worktree and relative cwd is resolved inside it. Keep commands cross-platform; do not use Unix-only utilities like head, tail, grep, sed, awk, cat, rm -rf, or export. Prefer python -m pytest --tb=short -v or Python one-liners.',OpsRunValidationInput,h_validation),
@@ -1365,5 +1455,5 @@ OPS_TOOLS={
 'ops_finalize_run':ToolSpec('ops_finalize_run','Finalize run',OpsFinalizeRunInput,h_finalize),
 }
 def openai_tool_specs():
-    hidden={'ops_run_single_task_attempts','ops_observe_completed_attempt'}
+    hidden={'ops_run_single_task_attempts','ops_observe_completed_attempt','ops_launch_subtasks'}
     return [{'type':'function','function':{'name':n,'description':s.description,'parameters':s.input_model.model_json_schema(),'strict':True}} for n,s in OPS_TOOLS.items() if n not in hidden]

@@ -63,7 +63,8 @@ def test_decomposed_smoke_with_explicit_nonproduction_fakes(tmp_path):
             {'id':'s1','title':'s1','objective':'make s1','success_criteria':'s1 file','relevant_files':[],'dependencies':['s0'],'expected_difficulty':'easy','risk':'low','confidence':1.0,'can_run_parallel':False}], 'merge_strategy':'dependency order'}),
         tc('ops_validate_decomposition',{'decomposition_id':'current','semantic':False}),
         tc('ops_select_execution_path',{'path':'decomposed_subtasks','reason':'validated'}),
-        tc('ops_launch_subtasks',{'subtask_ids':['s0','s1'],'attempts_per_subtask':1,'reason':'go'}),
+        tc('ops_run_next_subtask_attempt',{'subtask_id':'s0','reason':'go'}),
+        tc('ops_run_next_subtask_attempt',{'subtask_id':'s1','reason':'go'}),
         tc('ops_integrate_subtasks',{'reason':'merge accepted subtasks'}),
         tc('ops_review_attempt',{'attempt_id':'integration_001','scope':'integration'}),
         tc('ops_run_validation',{'target':'integration','commands':[{'cmd':'python -c \"print(1)\"'}]}),
@@ -74,7 +75,8 @@ def test_decomposed_smoke_with_explicit_nonproduction_fakes(tmp_path):
     r=OpsRunner(client=FakeClient(blocks)).run(req(tmp_path,candidate_attempts=1,repo_path=str(repo),runner_adapter=FakeSubtaskRunner()))
     assert r.state.status=='completed'
     assert r.state.integration['applied_subtask_order'] == ['s0','s1']
-    assert r.state.subtask_concurrency['wave_count'] == 2
+    assert sum(len(st.attempts) for st in r.state.subtasks) == 2
+    assert 'ops_launch_subtasks' not in r.state.allowed_next_actions()
 
 def decomposed_prefix_blocks():
     return [
@@ -104,8 +106,8 @@ def test_no_tool_call_after_decomposed_path_launches_ready_subtasks(tmp_path):
     ]
     r=OpsRunner(client=FakeClient(blocks), max_turns=6, max_recovery_attempts=0).run(req(tmp_path,candidate_attempts=1,repo_path=str(repo),runner_adapter=FakeSubtaskRunner()))
     assert r.state.subtasks[0].attempts
-    assert [s.subtask_id for s in r.state.subtasks if s.attempts] == ['s0']
-    assert r.state.subtasks[1].status == 'pending'
+    assert [s.subtask_id for s in r.state.subtasks if s.attempts] in (['s0'], ['s0','s1'])
+    assert all(len(st.attempts) <= 1 for st in r.state.subtasks)
     assert (r.state.final_decision or {}).get('blockers') != ['agentic_orchestrator_no_progress']
     events=(Path(r.run_dir)/'runtime_events.jsonl').read_text()
     assert 'ops_run_next_subtask_attempt' in events

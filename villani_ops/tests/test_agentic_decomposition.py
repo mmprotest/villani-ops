@@ -21,12 +21,19 @@ def test_no_advisory_only_rejected_falls_back_explicitly(tmp_path):
     assert not res.is_error and s.decomposition_fallback_used and not s.decomposition_executed
     assert not hasattr(s,'advisory_only')
 
-def test_accepted_decomposition_executes_subtasks_and_blocks_candidates(tmp_path):
+def test_accepted_decomposition_runs_one_subtask_and_blocks_bulk_launchers(tmp_path):
+    from villani_ops.agentic.tools import openai_tool_specs
     s=state(tmp_path); c=ctx(tmp_path); setup_plan(s,c); decomp(s,c); execute_tool_with_policy(s,'ops_validate_decomposition',{},'v',c)
     assert not execute_tool_with_policy(s,'ops_select_execution_path',{'path':'decomposed_subtasks','reason':'ok'},'x',c).is_error
     assert execute_tool_with_policy(s,'ops_launch_candidates',{'attempts':3,'reason':'bad'},'lc',c).is_error
-    res=execute_tool_with_policy(s,'ops_launch_subtasks',{'subtask_ids':['s0','s1'],'attempts_per_subtask':3,'reason':'go'},'ls',c)
-    assert not res.is_error and all(len(st.attempts)==1 for st in s.subtasks)
+    assert 'ops_run_next_subtask_attempt' in s.allowed_next_actions()
+    assert 'ops_launch_subtasks' not in s.allowed_next_actions()
+    assert 'ops_launch_subtasks' not in {t['function']['name'] for t in openai_tool_specs()}
+    bulk=execute_tool_with_policy(s,'ops_launch_subtasks',{'subtask_ids':['s0','s1'],'attempts_per_subtask':3,'reason':'go'},'ls',c)
+    assert bulk.is_error and 'legacy/internal compatibility tool' in str(bulk.content)
+    res=execute_tool_with_policy(s,'ops_run_next_subtask_attempt',{'reason':'go'},'one',c)
+    assert not res.is_error, res.content
+    assert sum(len(st.attempts) for st in s.subtasks)==1
 
 def test_rejected_decomposition_falls_back_then_launches_candidates(tmp_path):
     s=state(tmp_path); c=ctx(tmp_path); setup_plan(s,c); s.decomposition={'bad':True}; execute_tool_with_policy(s,'ops_validate_decomposition',{},'v',c)
