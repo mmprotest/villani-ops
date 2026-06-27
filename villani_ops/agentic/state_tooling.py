@@ -15,6 +15,7 @@ def _allowed(state, name, data):
     if name in {'ops_get_state','ops_inspect_repo','ops_submit_classification'}: return True, None
     if name=='ops_observe_completed_attempt': return True, None
     if name=='ops_run_next_candidate_attempt' and state.execution_path=='single_task': return True, None
+    if name=='ops_run_next_subtask_attempt' and state.execution_path=='decomposed_subtasks': return True, None
     if name not in state.allowed_next_actions() and name!='ops_finalize_run': return False, f'{name} is not allowed in phase {state.phase}; allowed={state.allowed_next_actions()}'
     if name=='ops_submit_decomposition' and not (state.plan or {}).get('should_decompose'): return False,'plan did not request decomposition'
     if name=='ops_validate_decomposition' and not state.decomposition: return False,'no decomposition exists'
@@ -30,6 +31,7 @@ def _allowed(state, name, data):
     if name=='ops_run_next_candidate_attempt' and state.execution_path!='single_task': return False,'ops_run_next_candidate_attempt requires execution_path=single_task'
     if name=='ops_run_single_task_attempts': return False,'ops_run_single_task_attempts is a legacy compatibility tool and is not available in normal agentic flow; call ops_run_next_candidate_attempt'
     if name=='ops_launch_subtasks' and state.execution_path!='decomposed_subtasks': return False,'subtasks require decomposed_subtasks execution path'
+    if name=='ops_run_next_subtask_attempt' and state.execution_path!='decomposed_subtasks': return False,'ops_run_next_subtask_attempt requires execution_path=decomposed_subtasks'
     if name=='ops_integrate_subtasks':
         if state.decomposed_execution_status in {'blocked','failed'}: return False,'cannot integrate blocked decomposed execution'
         if any(s.status=='running' for s in state.subtasks): return False,'subtasks still running'

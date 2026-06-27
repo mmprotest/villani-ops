@@ -58,8 +58,8 @@ def test_recovery_recommends_ready_subtask_launch_after_path_selected(tmp_path):
     s.decomposition_validated=True; s.decomposition_accepted=True; s.execution_path='decomposed_subtasks'
     s.subtasks=[SubtaskState(subtask_id='s0',title='s0',objective='o'),SubtaskState(subtask_id='s1',title='s1',objective='o',dependencies=['s0'])]
     rec=recommend_next_agentic_action(s)
-    assert rec.tool_name == 'ops_launch_subtasks'
-    assert rec.tool_input['subtask_ids'] == ['s0']
+    assert rec.tool_name == 'ops_run_next_subtask_attempt'
+    assert rec.tool_input['subtask_id'] == 's0'
     assert rec.can_execute_deterministically is True
 
 def test_failed_finalize_blocked_while_accepted_decomposition_can_continue(tmp_path):
