@@ -2,6 +2,7 @@ from __future__ import annotations
 from pathlib import Path
 from datetime import datetime, timezone
 import secrets
+import time
 from pydantic import BaseModel, ConfigDict
 from villani_ops.core.decision import Decision
 from .state import OpsRunState
@@ -27,8 +28,8 @@ class AgenticLLMReviewer:
         from .tools import OpsReviewResult
         payload={'task':state.task,'success_criteria':state.success_criteria,'execution_path':state.execution_path,'scope':scope,'review_payload':attempt}
         tool={'type':'function','function':{'name':'agentic_review_decision','description':'Return a structured Villani Ops review decision. Never pass without evidence.','parameters':OpsReviewResult.model_json_schema(),'strict':True}}
-        messages=[{'role':'user','content':'Review this attempt using the forced structured review tool. Fail closed on missing evidence, runner failure, validation failure, or scope mismatch.\n'+__import__('json').dumps(payload,indent=2,default=str)[:120000]}]
-        resp=self.client.create_message(backend=self.review_backend,messages=messages,system='You are a strict production code reviewer for Villani Ops agentic mode. Treat validation infrastructure_error as a command that failed to test the candidate, not proof the candidate is wrong. diagnostic_failed and generated smoke checks are weak evidence only; passing import/signature/file-exists checks is not proof of full success. Verified acceptance requires reliable explicit or high-confidence project validation or similarly strong evidence, and unverified best-candidate selections must be labelled honestly.',tools=[tool],tool_choice={'type':'function','function':{'name':'agentic_review_decision'}},strict=True)
+        messages=[{'role':'user','content':'Review this attempt using the forced structured review tool. Fail for clear code, scope, patch hygiene, runner, or reliable validation issues. Treat missing authoritative validation as uncertainty rather than a patch-quality blocker by itself.\n'+__import__('json').dumps(payload,indent=2,default=str)[:120000]}]
+        resp=self.client.create_message(backend=self.review_backend,messages=messages,system='You are a strict production code reviewer for Villani Ops agentic mode. Review patch quality, scope, runner evidence, and validation evidence separately. Treat validation infrastructure_error as a command that failed to test the candidate, not proof the candidate is wrong. diagnostic_failed and generated smoke checks are weak evidence only; passing import/signature/file-exists checks is not proof of full success. Do not claim verified success without reliable explicit or high-confidence project validation. Lack of authoritative validation belongs to the central acceptance gate: record uncertainty, but do not add validation_missing as a hard review blocker when the patch is otherwise plausible. Allow plausible best-candidate selection as unverified when no reliable validation is available, and distinguish patch-quality rejection from validation-unverified status.',tools=[tool],tool_choice={'type':'function','function':{'name':'agentic_review_decision'}},strict=True)
         self.last_response=resp
         raw={'raw_response':getattr(resp,'raw_response',{}),'content':getattr(resp,'content',[])}
         state_reviews=getattr(state,'reviews',None)
@@ -151,13 +152,47 @@ class OpsRunner:
             return res
         messages=[initial_user_message(task=request.task,success_criteria=request.success_criteria,mode=request.mode,runner=request.runner,candidate_attempts=request.candidate_attempts,repo_path=request.repo_path,orchestrator=request.orchestrator)]
         system_prompt=SYSTEM_PROMPT + (ADAPTIVE_SYSTEM_APPENDIX if request.orchestrator=='adaptive' else '')
+        started_monotonic=time.monotonic()
+        finalization_reserve=60.0
+        if request.timeout_seconds is not None:
+            finalization_reserve=min(max(60.0, float(request.timeout_seconds)*0.05), max(1.0, float(request.timeout_seconds)*0.5))
+        def _remaining_time():
+            if request.timeout_seconds is None:
+                return None
+            return float(request.timeout_seconds) - (time.monotonic()-started_monotonic)
         for _ in range(self.max_turns):
             if state.is_terminal(): break
+            remaining=_remaining_time()
+            if remaining is not None and remaining <= finalization_reserve:
+                state.warnings.append(f'orchestration_deadline_reached_before_model_request: remaining_seconds={remaining:.1f}, reserve_seconds={finalization_reserve:.1f}')
+                rec.record('orchestration_deadline_reached', payload={'remaining_seconds':remaining,'reserve_seconds':finalization_reserve,'phase':state.phase})
+                rec2=recommend_next_agentic_action(state)
+                if rec2.can_execute_deterministically and rec2.tool_name:
+                    res=_execute_recommendation(rec2, 'deadline_finalization')
+                    if not res.is_error and state.is_terminal():
+                        break
+                    if not res.is_error:
+                        rec3=recommend_next_agentic_action(state)
+                        if rec3.can_execute_deterministically and rec3.tool_name:
+                            res=_execute_recommendation(rec3, 'deadline_finalization_2')
+                            if not res.is_error and state.is_terminal():
+                                break
+                if not state.is_terminal():
+                    state.status='failed'; state.phase='failed'; state.final_decision={'decision':'failed','summary':'orchestration deadline reached before model request and deterministic finalization was unavailable','blockers':['orchestration_deadline']}; rec.record('run_finalized',payload=state.final_decision)
+                break
             rec.record('model_request_started',phase=state.phase)
             try:
                 resp=self.client.create_message(backend=backend,messages=messages,system=system_prompt,tools=openai_tool_specs(adaptive=(request.orchestrator=='adaptive')),tool_choice='auto',strict=True)
             except Exception as e:
-                _clean_finalize_after_backend_error(state, rec, error=e)
+                rec2=recommend_next_agentic_action(state)
+                if rec2.can_execute_deterministically and rec2.tool_name:
+                    res=_execute_recommendation(rec2, 'backend_error_finalization')
+                    if not res.is_error and not state.is_terminal():
+                        rec3=recommend_next_agentic_action(state)
+                        if rec3.can_execute_deterministically and rec3.tool_name:
+                            _execute_recommendation(rec3, 'backend_error_finalization_2')
+                if not state.is_terminal():
+                    _clean_finalize_after_backend_error(state, rec, error=e)
                 break
             assistant_msg={'role':'assistant','content':resp.content,'raw_response':getattr(resp,'raw_response',{})}; transcript.append(assistant_msg)
             urec=usage_record_from_response(run_id=rid,phase=state.phase,role='orchestration',backend=backend,response=resp); usage_rec.record(urec); _update_usage_state(); usage_payload={k:getattr(urec,k) for k in ['input_tokens','output_tokens','total_tokens','total_cost','usage_source']}

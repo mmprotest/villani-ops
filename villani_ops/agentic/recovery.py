@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from villani_ops.core.acceptance import is_attempt_acceptance_eligible
+from villani_ops.core.acceptance import is_attempt_acceptance_eligible, validation_is_reliable
 from .state import detect_decomposition_deadlock
 
 class RecoveryRecommendation(BaseModel):
@@ -78,6 +78,32 @@ def has_valid_selected_winner(state):
     except Exception:
         return False
 
+def _has_reliable_validation_failure(a, blockers=None):
+    val=_validation(a) or {}
+    return ((val.get('decision') or {}).get('status')=='failed') or 'validation_failed' in (blockers or [])
+
+def _usable_unverified_candidate(state, a):
+    if _status(a) not in {'completed','reviewed','accepted'}: return False
+    if (a.get('exit_code') if isinstance(a,dict) else getattr(a,'exit_code',None)) not in {None,0}: return False
+    if not _patch(a) or not _changed(a): return False
+    try:
+        ok, blockers=is_attempt_acceptance_eligible(a,state=state)
+    except Exception:
+        return False
+    if ok and validation_is_reliable(_validation(a) or {}): return False
+    fatal={'runner_failed','runner_exception','missing_patch','empty_changed_files','internal_artifacts_only','scratch_artifact_in_patch','patch_hygiene_failed','patch_contains_internal_artifacts','invalid_patch_format','patch_apply_check_failed','scope_failed','review_infrastructure_failed'}
+    if _has_reliable_validation_failure(a, blockers): return False
+    if any(b in fatal or str(b).startswith('attempt_status_invalid') for b in blockers): return False
+    return True
+
+def _best_unverified_candidate(state):
+    usable=[a for a in getattr(state,'candidates',[]) or [] if _usable_unverified_candidate(state,a)]
+    def score(a):
+        r=_review(a) or {}
+        val=_validation(a) or {}
+        return (float(r.get('score') or 0), float(r.get('confidence') or 0), 1 if val.get('status')=='passed' else 0, len(_changed(a) or []))
+    return max(usable, key=score) if usable else None
+
 def build_evidence_based_acceptance_summary(state):
     aid=(state.selection or {}).get('selected_attempt_id')
     a=_find_attempt_by_id(state, aid) if aid else None
@@ -109,6 +135,26 @@ def recommend_next_agentic_action(state):
         aid=(state.selection or {}).get('selected_attempt_id')
         a=_find_attempt_by_id(state, aid)
         return RecoveryRecommendation(action='finalize_selected_winner',tool_name='ops_finalize_run',tool_input={'decision':'accepted','summary':build_evidence_based_acceptance_summary(state),'selected_attempt_id':aid,'selected_patch_path':_patch(a),'blockers':[]},reason='A selected result is centrally acceptance eligible and should be finalized.',can_execute_deterministically=True)
+    sel=state.selection or {}
+    if sel.get('decision')=='select' and sel.get('decision_bucket')=='accepted_unverified' and sel.get('selected_attempt_id'):
+        a=_find_attempt_by_id(state, sel.get('selected_attempt_id'))
+        if a:
+            return RecoveryRecommendation(action='finalize_unverified_selected_winner',tool_name='ops_finalize_run',tool_input={'decision':'accepted','summary':'Selected best unverified candidate; authoritative validation was unavailable or inconclusive.','selected_attempt_id':_aid(a),'selected_patch_path':_patch(a),'blockers':[]},reason='An accepted_unverified selection exists and can be finalized honestly.',can_execute_deterministically=True)
+    if sel.get('decision')=='reject_all':
+        return RecoveryRecommendation(action='finalize_reject_all_selection',tool_name='ops_finalize_run',tool_input={'decision':'rejected','summary':sel.get('summary') or 'No usable candidate was accepted.','blockers':sel.get('reasons') or ['reject_all_selection']},reason='A reject_all selection exists and should be finalized.',can_execute_deterministically=True)
+    if state.phase=='selecting':
+        for a in getattr(state,'candidates',[]) or []:
+            try:
+                ok,_=is_attempt_acceptance_eligible(a,state=state)
+            except Exception:
+                ok=False
+            if ok and validation_is_reliable(_validation(a) or {}):
+                return RecoveryRecommendation(action='select_verified_winner',tool_name='ops_select_winner',tool_input={'decision':'select','selected_attempt_id':_aid(a),'summary':'Deterministically selected centrally eligible verified candidate.','reasons':['central acceptance gate passed'],'confidence':0.95},reason='selecting phase has a verified eligible candidate',can_execute_deterministically=True)
+        best=_best_unverified_candidate(state)
+        if best is not None:
+            return RecoveryRecommendation(action='select_best_unverified_candidate',tool_name='ops_select_winner',tool_input={'decision':'select','selected_attempt_id':_aid(best),'summary':'Best unverified candidate after budget/deadline; not a verified solve.','reasons':['candidate_attempt_budget_exhausted','unverified_best_candidate'],'confidence':0.55},reason='selecting phase has a usable unverified candidate and no verified candidate',can_execute_deterministically=True)
+        if getattr(state,'candidates',None):
+            return RecoveryRecommendation(action='finalize_no_usable_candidate',tool_name='ops_finalize_run',tool_input={'decision':'rejected','summary':'No usable candidate was available for deterministic finalization.','blockers':['no_usable_candidate']},reason='selecting phase has no usable candidate',can_execute_deterministically=True)
     if (state.plan or {}).get('strategy')=='single_task' and state.execution_path=='unknown':
         return RecoveryRecommendation(action='select_single_task_execution_path',tool_name='ops_select_execution_path',tool_input={'path':'single_task','reason':'Planner selected single_task; run sequential attempts with validation/review after each attempt.'},reason='single_task plan has no selected execution path',can_execute_deterministically=True)
     if state.execution_path=='single_task' and not state.candidates:
