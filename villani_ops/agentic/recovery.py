@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from villani_ops.core.acceptance import is_attempt_acceptance_eligible, validation_is_reliable
+from villani_ops.core.acceptance import is_attempt_acceptance_eligible, validation_is_reliable, candidate_ranking_key, explain_candidate_selection
 from .state import detect_decomposition_deadlock
 
 class RecoveryRecommendation(BaseModel):
@@ -98,11 +98,7 @@ def _usable_unverified_candidate(state, a):
 
 def _best_unverified_candidate(state):
     usable=[a for a in getattr(state,'candidates',[]) or [] if _usable_unverified_candidate(state,a)]
-    def score(a):
-        r=_review(a) or {}
-        val=_validation(a) or {}
-        return (float(r.get('score') or 0), float(r.get('confidence') or 0), 1 if val.get('status')=='passed' else 0, len(_changed(a) or []))
-    return max(usable, key=score) if usable else None
+    return max(usable, key=lambda a: candidate_ranking_key(a, state=state)) if usable else None
 
 def build_evidence_based_acceptance_summary(state):
     aid=(state.selection or {}).get('selected_attempt_id')
@@ -152,7 +148,8 @@ def recommend_next_agentic_action(state):
                 return RecoveryRecommendation(action='select_verified_winner',tool_name='ops_select_winner',tool_input={'decision':'select','selected_attempt_id':_aid(a),'summary':'Deterministically selected centrally eligible verified candidate.','reasons':['central acceptance gate passed'],'confidence':0.95},reason='selecting phase has a verified eligible candidate',can_execute_deterministically=True)
         best=_best_unverified_candidate(state)
         if best is not None:
-            return RecoveryRecommendation(action='select_best_unverified_candidate',tool_name='ops_select_winner',tool_input={'decision':'select','selected_attempt_id':_aid(best),'summary':'Best unverified candidate after budget/deadline; not a verified solve.','reasons':['candidate_attempt_budget_exhausted','unverified_best_candidate'],'confidence':0.55},reason='selecting phase has a usable unverified candidate and no verified candidate',can_execute_deterministically=True)
+            e=explain_candidate_selection(best, getattr(state,'candidates',[]) or [], state=state)
+            return RecoveryRecommendation(action='select_best_unverified_candidate',tool_name='ops_select_winner',tool_input={'decision':'select','selected_attempt_id':_aid(best),'summary':e['summary'],'reasons':['candidate_attempt_budget_exhausted','unverified_best_candidate']+e['reasons'],'confidence':0.55},reason='selecting phase has a usable unverified candidate and no verified candidate',can_execute_deterministically=True)
         if getattr(state,'candidates',None):
             return RecoveryRecommendation(action='finalize_no_usable_candidate',tool_name='ops_finalize_run',tool_input={'decision':'rejected','summary':'No usable candidate was available for deterministic finalization.','blockers':['no_usable_candidate']},reason='selecting phase has no usable candidate',can_execute_deterministically=True)
     if (state.plan or {}).get('strategy')=='single_task' and state.execution_path=='unknown':

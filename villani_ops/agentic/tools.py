@@ -5,7 +5,7 @@ from typing import Any, Callable, Literal
 from pydantic import BaseModel, Field, ConfigDict, model_validator
 from .state import CandidateAttemptState, SubtaskState, AttemptObservation, detect_decomposition_deadlock
 from .git_artifacts import capture_git_patch, ensure_git_baseline, clean_runner_artifacts_from_worktree, DEFAULT_PATCH_EXCLUDES, is_git_compatible_patch, patch_contains_internal_artifacts, clean_untracked_scratch_artifacts, is_scratch_artifact_path
-from villani_ops.core.acceptance import is_attempt_acceptance_eligible, attempt_requires_patch, validation_evidence_strength, validation_is_reliable
+from villani_ops.core.acceptance import is_attempt_acceptance_eligible, attempt_requires_patch, validation_evidence_strength, validation_is_reliable, normalized_review_metrics, candidate_ranking_evidence, explain_candidate_selection
 import subprocess, json, time, shutil, os, re
 from villani_ops.agentic.validation import classify_validation_command, run_classified_validation, skipped_validation_result
 from datetime import datetime, timezone
@@ -1387,12 +1387,12 @@ def h_review_attempt(state, inp, ctx):
             a.acceptance_blockers=sorted(set(a.acceptance_blockers+['review_infrastructure_failed','review_malformed']))
             a.review_status=failure_kind or 'unavailable'; a.review_error_type=type(e).__name__; a.review_error_message=str(e); a.review_retry_count=len(payloads)
     if isinstance(a, dict):
-        a['review']={**res.model_dump(), 'validation_snapshot': review_validation_snapshot}; a['review_validation_snapshot']=review_validation_snapshot; a['status']='reviewed' if a.get('status') not in {'failed','completed'} else a.get('status')
+        a['review']={**res.model_dump(), **normalized_review_metrics(res.model_dump()), 'validation_snapshot': review_validation_snapshot}; a['review_validation_snapshot']=review_validation_snapshot; a['status']='reviewed' if a.get('status') not in {'failed','completed'} else a.get('status')
         eligible, blockers=_set_acceptance_from_gate(state, a)
         if res.blockers:
             blockers=sorted(set(blockers+res.blockers)); a['acceptance_blockers']=blockers; eligible=False; a['acceptance_eligible']=False
     else:
-        a.review={**res.model_dump(), 'validation_snapshot': review_validation_snapshot}; a.review_validation_snapshot=review_validation_snapshot; a.status='reviewed' if a.status!='failed' else 'rejected'
+        a.review={**res.model_dump(), **normalized_review_metrics(res.model_dump()), 'validation_snapshot': review_validation_snapshot}; a.review_validation_snapshot=review_validation_snapshot; a.status='reviewed' if a.status!='failed' else 'rejected'
         if res.decision=='pass' and res.recommended_action=='accept' and not res.blockers:
             a.review_status='passed'
         elif 'review_infrastructure_failed' in res.blockers:
@@ -1781,7 +1781,12 @@ def h_select_winner(state, inp, ctx):
         ctx.recorder.record('selection_rejected', payload={'selected_attempt_id':inp.selected_attempt_id,'stored_acceptance_eligible':stored,'recomputed_acceptance_eligible':eligible,'acceptance_blockers':blockers})
         raise ValueError('selected attempt is not acceptance eligible: '+', '.join(blockers))
     decision_bucket='accepted_verified' if eligible and validation_is_reliable(val) else ('accepted_unverified' if unverified_selectable or (eligible and not validation_is_reliable(val)) else 'rejected')
-    new_selection={**inp.model_dump(),'decision_bucket':decision_bucket,'materialization_signal':('verified_accepted' if decision_bucket=='accepted_verified' else 'unverified_best_candidate'),'validation_strength':strength,'validation_authoritative':validation_is_reliable(val),'selection_evidence':{'stored_acceptance_eligible':stored,'recomputed_acceptance_eligible':eligible,'acceptance_blockers':blockers,'validation_strength':strength}}
+    ranking_evidence=candidate_ranking_evidence(a, state=state)
+    selection_explanation=explain_candidate_selection(a, getattr(state,'candidates',[]) or [], state=state) if decision_bucket=='accepted_unverified' else {'winner':ranking_evidence,'nearest_alternatives':[],'reasons':['verified candidate selected through central acceptance gate'],'summary':'verified candidate selected through central acceptance gate'}
+    new_selection={**inp.model_dump(),'decision_bucket':decision_bucket,'materialization_signal':('verified_accepted' if decision_bucket=='accepted_verified' else 'unverified_best_candidate'),'validation_strength':strength,'validation_authoritative':validation_is_reliable(val),'selection_evidence':{'stored_acceptance_eligible':stored,'recomputed_acceptance_eligible':eligible,'acceptance_blockers':blockers,'validation_strength':strength, **ranking_evidence, 'selection_explanation':selection_explanation}}
+    if decision_bucket=='accepted_unverified':
+        new_selection['summary']=(new_selection.get('summary') or '') + ' ' + selection_explanation['summary']
+        new_selection['reasons']=list(dict.fromkeys((new_selection.get('reasons') or []) + selection_explanation['reasons']))
     if state.selection and state.selection.get('decision')=='select' and state.selection.get('selected_attempt_id')==inp.selected_attempt_id:
         state.phase='finalizing'; return {**state.selection, 'already_selected': True}
     state.selection=new_selection
@@ -1869,8 +1874,12 @@ def h_finalize(state, inp, ctx):
         final_payload['materialization_signal']='verified_accepted' if final_payload['decision_bucket']=='accepted_verified' else 'unverified_best_candidate'
         final_payload['validation_strength']=strength
         final_payload['validation_authoritative']=validation_is_reliable(val or {})
+        ranking_evidence=candidate_ranking_evidence(a, state=state)
+        final_payload['selection_evidence']={**((state.selection or {}).get('selection_evidence') or {}), **ranking_evidence}
+        if final_payload['decision_bucket']=='accepted_unverified':
+            final_payload['selection_explanation']=explain_candidate_selection(a, getattr(state,'candidates',[]) or [], state=state)
         prefix='verified' if final_payload['decision_bucket']=='accepted_verified' else 'selected_unverified'
-        final_payload['summary']=f"{prefix}: Selected {aid} changed {', '.join(changed or []) or 'no files'}; current validation {((val or {}).get('status') or 'not_run')} with strength {strength}." + ((' '+final_payload.get('summary','')) if final_payload.get('summary') else '')
+        final_payload['summary']=f"{prefix}: Selected {aid} changed {', '.join(changed or []) or 'no files'}; normalized score {ranking_evidence['normalized_review_score']:.3f}, normalized confidence {ranking_evidence['normalized_confidence']:.3f}; current validation {((val or {}).get('status') or 'not_run')} with strength {strength}." + ((' '+final_payload.get('summary','')) if final_payload.get('summary') else '')
     state.final_decision=final_payload; state.status='completed' if inp.decision=='accepted' else 'failed'; state.phase='completed' if state.status=='completed' else 'failed';
     consistency_warnings=validate_final_state_consistency(state)
     if consistency_warnings:
