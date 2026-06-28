@@ -502,6 +502,62 @@ def candidate_ranking_key(attempt: Any, *, state: Any | None = None) -> tuple:
     return (ev["acceptance_eligible"] and ev["validation_authoritative"], ev["composite_score"], ev["normalized_review_score"], ev["normalized_confidence"], ev["validation_authoritative"], _EVIDENCE_RANK.get(ev["validation_strength"], 0), -len(ev["serious_blockers"]), ev["addressed_prior_feedback"], not ev["repeated_weak_attempt"], -idx)
 
 
+def is_usable_unverified_candidate(state: Any, attempt: Any) -> bool:
+    """Return whether an unverified candidate is usable for adaptive selection."""
+    if _get(attempt, "scope") not in {None, "candidate"}:
+        return False
+    if _get(attempt, "status") not in {"completed", "reviewed", "accepted"}:
+        return False
+    exit_code = _get(attempt, "exit_code")
+    if exit_code is not None and exit_code != 0:
+        return False
+    if not has_non_empty_patch(_get(attempt, "patch_path")) or not (_get(attempt, "changed_files") or []):
+        return False
+    review = _get(attempt, "review") or {}
+    if not isinstance(review, dict):
+        review = getattr(review, "model_dump", lambda **_: {})()
+    if review.get("decision") != "pass" or review.get("recommended_action") != "accept":
+        return False
+    if review.get("blockers") or review.get("blocking_issues") or review.get("fatal_issues") or review.get("severe_issues"):
+        return False
+    try:
+        eligible, blockers = is_attempt_acceptance_eligible(attempt, state=state)
+    except Exception:
+        return False
+    validation = _get(attempt, "validation") or {}
+    if eligible and validation_is_reliable(validation):
+        return False
+    return not serious_unverified_blockers(blockers, attempt)
+
+
+def usable_unverified_candidates(state: Any) -> list[Any]:
+    return [a for a in getattr(state, "candidates", []) or [] if is_usable_unverified_candidate(state, a)]
+
+
+def best_unverified_candidate(state: Any) -> Any | None:
+    usable = usable_unverified_candidates(state)
+    return max(usable, key=lambda a: candidate_ranking_key(a, state=state)) if usable else None
+
+
+def reliable_validation_available_for_candidates(state: Any) -> bool:
+    for a in getattr(state, "candidates", []) or []:
+        validation = _get(a, "validation") or {}
+        if validation_is_reliable(validation):
+            return True
+    return False
+
+
+def has_unverified_selection_opportunity(state: Any) -> bool:
+    usable = usable_unverified_candidates(state)
+    if not usable:
+        return False
+    budget = max(1, int(getattr(state, "candidate_attempts", 1) or 1))
+    deadline_pressure = bool((getattr(state, "adaptive_context", {}) or {}).get("deadline_pressure"))
+    budget_exhausted = len(getattr(state, "candidates", []) or []) >= budget or getattr(state, "phase", None) == "selecting"
+    no_reliable_validation = not reliable_validation_available_for_candidates(state)
+    return deadline_pressure or budget_exhausted or (len(usable) >= 2 and no_reliable_validation)
+
+
 def explain_candidate_selection(winner: Any, alternatives: list[Any], *, state: Any | None = None, limit: int = 3) -> dict[str, Any]:
     win = candidate_ranking_evidence(winner, state=state)
     ranked = sorted((candidate_ranking_evidence(a, state=state) for a in alternatives if _get(a, "attempt_id") != win.get("attempt_id")), key=lambda e: (e["composite_score"], e["normalized_review_score"], e["normalized_confidence"]), reverse=True)[:limit]
