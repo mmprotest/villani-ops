@@ -166,3 +166,23 @@ def test_fallback_prompt_is_budgeted(tmp_path):
     prompt=build_decomposition_fallback_prompt(s, reason='deadlock')
     assert len(prompt) <= 12000
     assert 'DECOMPOSITION FALLBACK CONTEXT' in prompt
+
+
+def test_next_subtask_attempt_attaches_skipped_validation_before_review_when_no_commands(tmp_path, monkeypatch):
+    import villani_ops.agentic.tools as tools
+    monkeypatch.setattr(tools, '_focused_subtask_validation_commands', lambda state, subtask: [])
+    class CapturingReviewer:
+        name='capturing-subtask-reviewer'
+        def __init__(self): self.calls=[]
+        def review(self, *, state, attempt, scope):
+            self.calls.append(attempt)
+            assert scope == 'subtask'
+            assert attempt['current_validation']['validation_status'] == 'skipped_no_reliable_command'
+            return {'decision':'fail','recommended_action':'retry','score':0.3,'summary':'needs work','evidence':['validation visible'],'issues':['quality'],'blockers':['quality']}
+    s=make_state(tmp_path); runner=SubtaskRunner(); c=make_ctx(tmp_path, runner, CapturingReviewer())
+    res=execute_tool_with_policy(s,'ops_run_next_subtask_attempt',{'subtask_id':'pricing','reason':'first'},'x',c)
+    assert not res.is_error, res.content
+    a=s.subtasks[0].attempts[0]
+    assert a.validation is not None
+    assert a.validation_status == 'skipped_no_reliable_command'
+    assert len(c.reviewer.calls) == 1

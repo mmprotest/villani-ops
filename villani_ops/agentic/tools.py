@@ -13,6 +13,7 @@ from .artifacts import read_text_utf8, write_text_utf8, write_json_utf8
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from villani_ops.telemetry.usage import usage_record_from_runner, usage_record_from_response
 
+_UNVERIFIED_FATAL_BLOCKERS={'runner_failed','runner_exception','missing_patch','empty_changed_files','internal_artifacts_only','scratch_artifact_in_patch','patch_hygiene_failed','patch_contains_internal_artifacts','invalid_patch_format','patch_apply_check_failed','scope_failed','review_infrastructure_failed'}
 
 def extract_changed_file_metadata(diff_text:str)->dict[str,list[str]]:
     """Extract stable changed-file metadata from unified/git/binary diffs.
@@ -1051,6 +1052,42 @@ def _observe_completed_attempt(state, attempt, ctx=None):
         ctx.recorder.record('attempt_observation_created', payload=obs.model_dump())
     return obs
 
+def _commands_for_attempt_scope(state, attempt, st=None):
+    if getattr(attempt,'scope',None)=='subtask' and st is not None:
+        return _focused_subtask_validation_commands(state, st)
+    if getattr(attempt,'scope',None)=='integration':
+        return _validation_plan_commands(state)
+    return _default_validation_commands(state)
+
+def _validate_review_observe_attempt(state, attempt, ctx, *, target_id=None, review_scope='candidate', st=None, commands=None):
+    aid=target_id or getattr(attempt,'attempt_id',None)
+    if getattr(attempt,'status',None)=='completed' and not getattr(attempt,'validation',None):
+        cmds=_commands_for_attempt_scope(state, attempt, st) if commands is None else commands
+        h_validation(state, OpsRunValidationInput(target='candidate', target_id=aid, commands=cmds or []), ctx)
+    if ctx.reviewer is not None and getattr(attempt,'status',None) in {'completed','reviewed'} and not getattr(attempt,'review',None):
+        h_review_attempt(state, OpsReviewAttemptInput(attempt_id=aid, scope=review_scope), ctx)
+    eligible, blockers=_set_acceptance_from_gate(state,attempt)
+    obs=_observe_completed_attempt(state,attempt,ctx)
+    return eligible, blockers, obs
+
+def _reliable_validation_failed(attempt, blockers=None):
+    val=_attempt_to_dict(attempt).get('validation') or {}
+    decision=(val.get('decision') or {}).get('status')
+    return decision=='failed' or 'validation_failed' in (blockers or [])
+
+def _is_unverified_candidate_usable(state, attempt):
+    data=_attempt_to_dict(attempt)
+    if data.get('status') not in {'completed','reviewed','accepted'}: return False
+    if data.get('exit_code') not in {None,0}: return False
+    if not data.get('patch_path') or not data.get('changed_files'): return False
+    ok, blockers=is_attempt_acceptance_eligible(attempt,state=state)
+    if ok and validation_is_reliable(data.get('validation') or {}): return False
+    if _reliable_validation_failed(attempt, blockers): return False
+    if any(b in _UNVERIFIED_FATAL_BLOCKERS or b.startswith('attempt_status_invalid') for b in blockers): return False
+    hygiene=data.get('patch_hygiene') or {}
+    if isinstance(hygiene,dict) and (hygiene.get('contains_internal_artifacts') or hygiene.get('format_valid') is False or hygiene.get('apply_check_passed') is False): return False
+    return True
+
 def h_observe_completed_attempt(state, inp, ctx):
     a=next((c for c in state.candidates if c.attempt_id==inp.attempt_id), None)
     if not a:
@@ -1073,14 +1110,7 @@ def h_run_single_task_attempts(state, inp, ctx):
         aid=f'candidate_{i:03d}'; made.append(aid); state.attempts_started=len(made)
         a=_run_attempt(state,ctx,aid,'candidate',state.task,state.success_criteria,None,inp.backend_name or ctx.coding_backend_name or ctx.backend_name,True)
         state.candidates.append(a)
-        if a.status=='completed':
-            cmds=_default_validation_commands(state)
-            if cmds:
-                h_validation(state, OpsRunValidationInput(target='candidate', target_id=aid, commands=cmds), ctx)
-        if ctx.reviewer is not None and a.status in {'completed','reviewed'} and not a.review:
-            h_review_attempt(state, OpsReviewAttemptInput(attempt_id=aid, scope='candidate'), ctx)
-        eligible, blockers=_set_acceptance_from_gate(state,a)
-        obs=_observe_completed_attempt(state,a,ctx)
+        eligible, blockers, obs=_validate_review_observe_attempt(state,a,ctx,target_id=aid,review_scope='candidate')
         state.save(Path(state.run_dir)/'state.json')
         if eligible:
             state.stopped_early=True; state.stop_reason='accepted_attempt'; state.phase='selecting'
@@ -1102,13 +1132,7 @@ def h_run_next_candidate_attempt(state, inp, ctx):
     prompt=build_candidate_runner_prompt(state, reason=inp.reason, repair=inp.repair, base_attempt_id=inp.base_attempt_id)
     a=_run_attempt(state,ctx,aid,'candidate',prompt,state.success_criteria,None,inp.backend_name,True)
     state.candidates.append(a); state.attempts_started=len(state.candidates)
-    if a.status=='completed':
-        cmds=_default_validation_commands(state)
-        if cmds: h_validation(state, OpsRunValidationInput(target='candidate', target_id=aid, commands=cmds), ctx)
-    if ctx.reviewer is not None and a.status in {'completed','reviewed'} and not a.review:
-        h_review_attempt(state, OpsReviewAttemptInput(attempt_id=aid, scope='candidate'), ctx)
-    eligible, blockers=_set_acceptance_from_gate(state,a)
-    obs=_observe_completed_attempt(state,a,ctx)
+    eligible, blockers, obs=_validate_review_observe_attempt(state,a,ctx,target_id=aid,review_scope='candidate')
     if eligible:
         state.stopped_early=True; state.stop_reason='accepted_attempt'; state.phase='selecting'
     elif len(state.candidates)>=budget:
@@ -1130,13 +1154,7 @@ def h_run_next_fallback_candidate_attempt(state, inp, ctx):
     a=_run_attempt(state,ctx,aid,'candidate',prompt,state.success_criteria,None,inp.backend_name,True)
     a.candidate_kind='fallback'
     state.candidates.append(a); state.attempts_started=len(state.candidates)
-    if a.status=='completed':
-        cmds=_default_validation_commands(state)
-        if cmds: h_validation(state, OpsRunValidationInput(target='candidate', target_id=aid, commands=cmds), ctx)
-    if ctx.reviewer is not None and a.status in {'completed','reviewed'} and not a.review:
-        h_review_attempt(state, OpsReviewAttemptInput(attempt_id=aid, scope='candidate'), ctx)
-    eligible, blockers=_set_acceptance_from_gate(state,a)
-    obs=_observe_completed_attempt(state,a,ctx)
+    eligible, blockers, obs=_validate_review_observe_attempt(state,a,ctx,target_id=aid,review_scope='candidate')
     if eligible:
         state.stopped_early=True; state.stop_reason='accepted_fallback_attempt'; state.phase='selecting'
     elif len(state.candidates)>=budget:
@@ -1173,13 +1191,8 @@ def h_run_next_subtask_attempt(state, inp, ctx):
     prompt=build_adaptive_subtask_runner_prompt(state, st, reason=inp.reason, repair=inp.repair, base_attempt_id=inp.base_attempt_id)
     a=_run_attempt(state,ctx,aid,'subtask',prompt,st.success_criteria or state.success_criteria,subtask_id=st.subtask_id,backend_name=inp.backend_name,record_events=True)
     st.attempts.append(a)
-    cmds=[]
-    if a.status=='completed':
-        cmds=_focused_subtask_validation_commands(state, st)
-        if cmds: h_validation(state, OpsRunValidationInput(target='candidate', target_id=aid, commands=cmds), ctx)
-    if ctx.reviewer is not None and a.status in {'completed','reviewed'} and not a.review:
-        h_review_attempt(state, OpsReviewAttemptInput(attempt_id=aid, scope='subtask'), ctx)
-    eligible, blockers=_set_acceptance_from_gate(state,a)
+    cmds=_focused_subtask_validation_commands(state, st) if a.status=='completed' else []
+    eligible, blockers, obs=_validate_review_observe_attempt(state,a,ctx,target_id=aid,review_scope='subtask',st=st,commands=cmds)
     # Subtask acceptance is scoped to the subtask contract. If no focused
     # validation is available, do not reject solely because the global
     # validation gate has not run; integration validation owns full-suite risk.
@@ -1196,7 +1209,6 @@ def h_run_next_subtask_attempt(state, inp, ctx):
         st.status='failed'
     else:
         st.status='pending'
-    obs=_observe_completed_attempt(state,a,ctx)
     dead=_update_decomposed_execution_state(state, ctx)
     if not dead and all(s.status in {'accepted','skipped'} for s in state.subtasks):
         state.phase='integrating'
@@ -1270,8 +1282,8 @@ def h_launch_subtasks(state, inp, ctx):
                 for aid in [a for a in ids if a in results]:
                     sid=ids[aid]; st=by[sid]
                     a,_=_find_attempt(state, aid)
-                    if a and not isinstance(a,dict) and a.status=='completed' and ctx.reviewer is not None and not a.review:
-                        h_review_attempt(state, OpsReviewAttemptInput(attempt_id=aid,scope='subtask'), ctx)
+                    if a and not isinstance(a,dict) and a.status=='completed':
+                        _validate_review_observe_attempt(state,a,ctx,target_id=aid,review_scope='subtask',st=st,commands=_focused_subtask_validation_commands(state, st))
                     if st.accepted_attempt_id:
                         st.status='accepted'; ctx.recorder.record('subtask_accepted', payload={'subtask_id':sid,'attempt_id':st.accepted_attempt_id,'wave_index':wave_index})
                 state.save(Path(state.run_dir)/'state.json')
@@ -1743,7 +1755,9 @@ def h_select_winner(state, inp, ctx):
     strength=validation_evidence_strength(val)
     review=(_attempt_to_dict(a).get('review') or {})
     reliable_failed=((val.get('decision') or {}).get('status')=='failed') or ('validation_failed' in blockers)
-    unverified_selectable=(not eligible and not reliable_failed and review.get('decision')=='pass' and review.get('recommended_action')=='accept' and set(blockers).issubset({'validation_missing','validation_unverified'}))
+    review_accepts=review.get('decision')=='pass' and review.get('recommended_action')=='accept'
+    deadline_or_exhausted=any(str(x).lower() in {'candidate_attempt_budget_exhausted','attempts_exhausted','orchestration_deadline','backend_timeout','max_orchestration_turns_reached'} for x in (inp.reasons or [])) or state.phase=='selecting'
+    unverified_selectable=(not eligible and not reliable_failed and ((review_accepts and set(blockers).issubset({'validation_missing','validation_unverified'})) or (deadline_or_exhausted and _is_unverified_candidate_usable(state,a))))
     if unverified_selectable:
         verified_alternatives=[]
         for other in getattr(state,'candidates',[]) or []:
@@ -1894,11 +1908,7 @@ def h_run_next_integration_repair_attempt(state, inp, ctx):
     a=_run_attempt(state,ctx,rid,'integration',prompt,state.success_criteria,None,inp.backend_name,True)
     state.candidates.append(a)
     cmds=_validation_plan_commands(state)
-    if a.status=='completed' and cmds:
-        h_validation(state, OpsRunValidationInput(target='candidate', target_id=rid, commands=cmds), ctx)
-    if ctx.reviewer is not None and a.status in {'completed','reviewed'} and not a.review:
-        h_review_attempt(state, OpsReviewAttemptInput(attempt_id=rid, scope='integration'), ctx)
-    obs=_observe_completed_attempt(state,a,ctx)
+    _eligible, _blockers, obs=_validate_review_observe_attempt(state,a,ctx,target_id=rid,review_scope='integration',commands=cmds)
     state.integration.setdefault('repair_attempts',[]).append(a.model_dump())
     state.integration['repair_used']=True
     state.integration['latest_repair_attempt_id']=rid

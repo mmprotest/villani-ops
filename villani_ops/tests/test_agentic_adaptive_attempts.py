@@ -206,3 +206,46 @@ def test_validation_added_after_prior_review_invalidates_stale_review(tmp_path):
     assert a.review is None
     assert a.review_status == 'not_run'
     assert 'review_missing' in a.acceptance_blockers
+
+
+def test_next_candidate_attempt_attaches_skipped_validation_before_review_when_no_commands(tmp_path, monkeypatch):
+    import villani_ops.agentic.tools as tools
+    monkeypatch.setattr(tools, '_default_validation_commands', lambda state: [])
+    class CapturingReviewer:
+        name='capturing-reviewer'
+        def __init__(self): self.calls=[]
+        def review(self, *, state, attempt, scope):
+            self.calls.append(attempt)
+            assert attempt['current_validation']['validation_status'] == 'skipped_no_reliable_command'
+            return {'decision':'pass','recommended_action':'accept','score':0.7,'summary':'plausible unverified','evidence':['patch present'],'issues':[],'blockers':[]}
+    s=make_state(tmp_path); s.investigation={'summary':'checkout failure'}; s.candidate_attempts=1
+    runner=TelemetryRunner(); c=make_ctx(tmp_path, runner); c.reviewer=CapturingReviewer()
+    res=execute_tool_with_policy(s,'ops_run_next_candidate_attempt',{'reason':'first try'},'a1',c)
+    assert not res.is_error, res.content
+    a=s.candidates[0]
+    assert a.validation is not None
+    assert a.validation_status == 'skipped_no_reliable_command'
+    assert c.reviewer.calls
+    assert 'validation_missing' not in (a.review or {}).get('blockers', [])
+    assert len(c.reviewer.calls) == 1
+
+
+def test_run_single_task_attempts_attaches_skipped_validation_before_review_when_no_commands(tmp_path, monkeypatch):
+    import villani_ops.agentic.tools as tools
+    monkeypatch.setattr(tools, '_default_validation_commands', lambda state: [])
+    class CapturingReviewer:
+        name='capturing-reviewer'
+        def __init__(self): self.calls=[]
+        def review(self, *, state, attempt, scope):
+            self.calls.append(attempt)
+            assert attempt['current_validation']['validation_status'] == 'skipped_no_reliable_command'
+            return {'decision':'pass','recommended_action':'accept','score':0.7,'summary':'plausible unverified','evidence':['patch present'],'issues':[],'blockers':[]}
+    s=make_state(tmp_path); s.investigation={'summary':'checkout failure'}; s.execution_path='single_task'
+    runner=TelemetryRunner(); c=make_ctx(tmp_path, runner); c.reviewer=CapturingReviewer()
+    out=tools.h_run_single_task_attempts(s, tools.OpsRunSingleTaskAttemptsInput(attempts=1, reason='bulk'), c)
+    assert out['attempts_started'] == 1
+    a=s.candidates[0]
+    assert a.validation is not None
+    assert a.validation_status == 'skipped_no_reliable_command'
+    assert len(c.reviewer.calls) == 1
+    assert 'validation_missing' not in (a.review or {}).get('blockers', [])
