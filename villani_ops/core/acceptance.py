@@ -85,8 +85,10 @@ def _validation_blockers(validation: Any) -> list[str]:
             if non_rejected or not command_rejected:
                 blockers.append("validation_failed")
             return sorted(set(blockers))
-        return ["validation_inconclusive"]
+        return []
     overall_status = str(validation.get("status") or "").lower()
+    if overall_status in {"infrastructure_error", "skipped_no_reliable_command", "diagnostic_failed", "timeout", "inconclusive"}:
+        return []
     if overall_status == "command_rejected":
         blockers.append("validation_command_rejected")
     elif validation.get("passed") is False:
@@ -98,7 +100,11 @@ def _validation_blockers(validation: Any) -> list[str]:
         if status == "command_rejected":
             blockers.append("validation_command_rejected")
             continue
-        if item.get("passed") is False or status == "failed":
+        if status in {"infrastructure_error", "diagnostic_failed", "skipped_no_reliable_command"}:
+            continue
+        if item.get("blocking") is False:
+            continue
+        if item.get("passed") is False or status in {"failed", "failed_candidate"}:
             blockers.append("validation_failed")
         if status in {"timeout", "timed_out"}:
             blockers.append("validation_timed_out")

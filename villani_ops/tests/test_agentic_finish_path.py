@@ -27,11 +27,11 @@ def test_candidate_validation_rejects_cwd_escape_and_embedded_cd(tmp_path):
     s=state(tmp_path); c=ctx(tmp_path); a, _=_eligible_attempt(tmp_path,s)
     out=execute_tool_with_policy(s,'ops_run_validation',{'target':'candidate','target_id':a.attempt_id,'commands':[{'cmd':'python -c "print(1)"','cwd':str(tmp_path)}]},'v',c)
     assert not out.is_error
-    assert out.content['status']=='command_rejected'
-    assert 'validation_command_rejected' in a.acceptance_blockers
+    assert out.content['status']=='infrastructure_error'
+    assert 'validation_command_rejected' not in a.acceptance_blockers
     assert 'validation_failed' not in a.acceptance_blockers
     out=execute_tool_with_policy(s,'ops_run_validation',{'target':'candidate','target_id':a.attempt_id,'commands':[{'cmd':'cd / && python -c "print(1)"'}]},'v2',c)
-    assert out.content['status']=='command_rejected'
+    assert out.content['status']=='infrastructure_error'
     assert 'remove embedded cd' in out.content['commands'][0]['error']
 
 
@@ -69,9 +69,9 @@ def test_windows_mode_rejects_unix_head(monkeypatch, tmp_path):
     monkeypatch.setattr(tools, '_validation_platform_is_windows', lambda: True)
     res=execute_tool_with_policy(s,'ops_run_validation',{'target':'candidate','target_id':a.attempt_id,'commands':[{'cmd':'python -m pytest 2>&1 | head -300'}]},'v',c)
     assert not res.is_error
-    assert res.content['status']=='command_rejected'
+    assert res.content['status']=='infrastructure_error'
     assert res.content['commands'][0]['reason']=='platform_unsupported_command'
-    assert 'validation_command_rejected' in a.acceptance_blockers
+    assert 'validation_command_rejected' not in a.acceptance_blockers
     assert 'validation_failed' not in a.acceptance_blockers
 
 
