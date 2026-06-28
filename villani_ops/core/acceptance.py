@@ -75,6 +75,8 @@ def _validation_blockers(validation: Any) -> list[str]:
     if decision:
         status = str(decision.get("status") or "").lower()
         if status == "passed":
+            if not validation_is_reliable(validation):
+                return ["validation_unverified"]
             return []
         if status == "failed":
             failures = decision.get("blocking_failures") or []
@@ -111,6 +113,83 @@ def _validation_blockers(validation: Any) -> list[str]:
         if status in {"error", "infrastructure_error"}:
             blockers.append("validation_infrastructure_error")
     return sorted(set(blockers))
+
+RELIABLE_VALIDATION_STRENGTHS = {
+    "authoritative",
+    "project_test",
+    "explicit_user_command",
+    "high_confidence_project_detected",
+}
+WEAK_VALIDATION_STRENGTHS = {
+    "generated_behavioral",
+    "generated_smoke",
+    "diagnostic_only",
+    "skipped",
+    "infrastructure_error",
+}
+
+
+def validation_evidence_strength(validation: Any) -> str:
+    """Classify validation evidence without assuming a language, OS, or benchmark."""
+    if not validation:
+        return "skipped"
+    if not isinstance(validation, dict):
+        validation = getattr(validation, "model_dump", lambda **_: {})()
+    explicit = str(validation.get("evidence_strength") or validation.get("validation_strength") or "").lower()
+    if explicit:
+        return explicit
+    status = str(validation.get("status") or "").lower()
+    if status in {"infrastructure_error", "command_rejected", "timeout", "timed_out", "error"}:
+        return "infrastructure_error"
+    if status in {"skipped_no_reliable_command", "not_run"}:
+        return "skipped"
+    commands = validation.get("commands") or []
+    strengths: list[str] = []
+    for item in commands:
+        if not isinstance(item, dict):
+            item = getattr(item, "model_dump", lambda **_: {})()
+        strength = str(item.get("evidence_strength") or item.get("validation_strength") or "").lower()
+        source = str(item.get("source") or "").lower()
+        authority = str(item.get("authority") or "").lower()
+        confidence = str(item.get("confidence") or "").lower()
+        blocking = item.get("blocking") is True or authority == "acceptance_blocking"
+        item_status = str(item.get("status") or "").lower()
+        if not strength:
+            if item_status in {"infrastructure_error", "command_rejected", "timeout", "timed_out", "error"}:
+                strength = "infrastructure_error"
+            elif source in {"user_provided", "user_success_criteria", "final", "integration"}:
+                strength = "explicit_user_command"
+            elif source == "project_detected" and confidence == "high" and blocking:
+                strength = "high_confidence_project_detected"
+            elif source == "project_detected" and blocking:
+                strength = "project_test"
+            elif source == "generated" and confidence == "high" and blocking:
+                strength = "generated_behavioral"
+            elif source == "generated":
+                strength = "generated_smoke"
+            elif source in {"diagnostic", "exploratory", "runner_trace", "villani_code_debug_trace"} or authority == "diagnostic_only":
+                strength = "diagnostic_only"
+            elif blocking:
+                strength = "project_test"
+            else:
+                strength = "diagnostic_only"
+        strengths.append(strength)
+    if any(s in RELIABLE_VALIDATION_STRENGTHS for s in strengths):
+        order = ["authoritative", "explicit_user_command", "high_confidence_project_detected", "project_test"]
+        return next(s for s in order if s in strengths)
+    if any(s == "generated_behavioral" for s in strengths):
+        return "generated_behavioral"
+    if any(s == "generated_smoke" for s in strengths):
+        return "generated_smoke"
+    if any(s == "diagnostic_only" for s in strengths):
+        return "diagnostic_only"
+    if any(s == "infrastructure_error" for s in strengths):
+        return "infrastructure_error"
+    return "skipped"
+
+
+def validation_is_reliable(validation: Any) -> bool:
+    return validation_evidence_strength(validation) in RELIABLE_VALIDATION_STRENGTHS
 
 
 def is_attempt_acceptance_eligible(attempt: Any, human_approval: Any | None = None, *, state: Any | None = None) -> tuple[bool, list[str]]:
