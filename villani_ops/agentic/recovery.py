@@ -145,7 +145,7 @@ def recommend_next_agentic_action(state):
         # validation/review and a fresh idempotent observation when those are possible.
         for a in state.candidates:
             if _validation_missing(a):
-                return RecoveryRecommendation(action='run_validation',tool_name='ops_run_validation',tool_input={'target':'candidate','target_id':_aid(a),'commands':[{'cmd':'python -m pytest --tb=short -v','purpose':'Validate completed candidate before observation/retry','timeout_seconds':900}]},reason='completed candidate needs validation before observation or retry',can_execute_deterministically=False)
+                return RecoveryRecommendation(action='run_validation',tool_name='ops_run_validation',tool_input={'target':'candidate','target_id':_aid(a),'commands':[]},reason='completed candidate needs validation before observation or retry',can_execute_deterministically=False)
         for a in state.candidates:
             if _review_missing(a):
                 return RecoveryRecommendation(action='review_candidate',tool_name='ops_review_attempt',tool_input={'attempt_id':_aid(a),'scope':'candidate'},reason='completed candidate needs review before observation or retry',can_execute_deterministically=True)
@@ -164,7 +164,7 @@ def recommend_next_agentic_action(state):
         budget=max(1,int(state.candidate_attempts or 1))
         for a in state.candidates:
             if _validation_missing(a):
-                return RecoveryRecommendation(action='run_fallback_validation',tool_name='ops_run_validation',tool_input={'target':'candidate','target_id':_aid(a),'commands':[{'cmd':'python -m pytest --tb=short -v','purpose':'Validate fallback candidate before observation/retry','timeout_seconds':900}]},reason='completed fallback candidate needs validation before observation or retry',can_execute_deterministically=False)
+                return RecoveryRecommendation(action='run_fallback_validation',tool_name='ops_run_validation',tool_input={'target':'candidate','target_id':_aid(a),'commands':[]},reason='completed fallback candidate needs validation before observation or retry',can_execute_deterministically=False)
         for a in state.candidates:
             if _review_missing(a):
                 return RecoveryRecommendation(action='review_fallback_candidate',tool_name='ops_review_attempt',tool_input={'attempt_id':_aid(a),'scope':'candidate'},reason='completed fallback candidate needs review before observation or retry',can_execute_deterministically=True)
@@ -219,10 +219,10 @@ def recommend_next_agentic_action(state):
             return RecoveryRecommendation(action='review_candidate',tool_name='ops_review_attempt',tool_input={'attempt_id':a.attempt_id,'scope':'candidate'},reason='completed candidate has patch evidence but no review',can_execute_deterministically=True)
     for a in state.candidates:
         if _review_passed(a) and not _validation(a):
-            return RecoveryRecommendation(action='run_validation',tool_name='ops_run_validation',tool_input={'target':'candidate','target_id':a.attempt_id,'commands':[{'cmd':'python -m pytest --tb=short -v','purpose':'Validate reviewed candidate in its worktree','timeout_seconds':900}]},reason='reviewed candidate is missing validation',can_execute_deterministically=False)
+            return RecoveryRecommendation(action='run_validation',tool_name='ops_run_validation',tool_input={'target':'candidate','target_id':a.attempt_id,'commands':[]},reason='reviewed candidate is missing validation',can_execute_deterministically=False)
         val=_validation(a) or {}
         if val.get('status')=='command_rejected':
-            return RecoveryRecommendation(action='retry_validation',tool_name='ops_run_validation',tool_input={'target':'candidate','target_id':a.attempt_id,'commands':[{'cmd':'python -m pytest --tb=short -v','purpose':'cross-platform validation retry'}]},reason='validation command was rejected and should be retried safely',can_execute_deterministically=False)
+            return RecoveryRecommendation(action='retry_validation',tool_name='ops_run_validation',tool_input={'target':'candidate','target_id':a.attempt_id,'commands':[]},reason='validation command was rejected and should be retried safely',can_execute_deterministically=False)
     blockers=[]
     for a in _attempts(state):
         _, bs=is_attempt_acceptance_eligible(a,state=state); blockers.extend(bs)
@@ -248,7 +248,7 @@ def handle_no_tool_call(state, reason='no_tool_call', max_recovery_attempts:int=
         if rec.tool_name=='ops_select_winner' and rec.tool_input and rec.tool_input.get('selected_attempt_id'):
             content=f"There is a reviewed and validated eligible candidate: {rec.tool_input['selected_attempt_id']}. Call ops_select_winner."
         if rec.tool_name=='ops_run_validation' and rec.tool_input:
-            content=f"Validation is needed or was rejected. Call ops_run_validation with target=\"candidate\", target_id=\"{rec.tool_input.get('target_id')}\", command \"python -m pytest --tb=short -v\"."
+            content=f"Validation is needed or was rejected. Call ops_run_validation with target=\"candidate\", target_id=\"{rec.tool_input.get('target_id')}\" and commands=[] unless an explicit or high-confidence project validation command is available."
         return RecoveryResult(message=_recovery_prompt(content), recommendation=rec)
     state.recovery_count += 1
     if state.recovery_count>max_recovery_attempts:

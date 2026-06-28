@@ -7,6 +7,7 @@ from .state import CandidateAttemptState, SubtaskState, AttemptObservation, dete
 from .git_artifacts import capture_git_patch, ensure_git_baseline, clean_runner_artifacts_from_worktree, DEFAULT_PATCH_EXCLUDES, is_git_compatible_patch, patch_contains_internal_artifacts, clean_untracked_scratch_artifacts, is_scratch_artifact_path
 from villani_ops.core.acceptance import is_attempt_acceptance_eligible, attempt_requires_patch
 import subprocess, json, time, shutil, os, re
+from villani_ops.agentic.validation import classify_validation_command, run_classified_validation, skipped_validation_result
 from datetime import datetime, timezone
 from .artifacts import read_text_utf8, write_text_utf8, write_json_utf8
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -196,10 +197,10 @@ def _validation_plan_commands(state, subtask=None):
     cmds=[]
     if state.investigation and (state.investigation.get('validation_plan') or {}).get('commands'):
         cmds=[c.get('cmd') for c in state.investigation['validation_plan']['commands'] if c.get('cmd')]
-    return cmds or ['python -m pytest --tb=short -v']
+    return cmds
 
 def build_subtask_runner_prompt(*, parent_task:str, parent_success_criteria:str|None, subtask:SubtaskState, allowed_files:list[str], forbidden_files:list[str]|None, validation_commands:list[ValidationCommand]|list[str], dependency_context:str|None, merge_contract:str|None)->str:
-    cmds=[c.cmd if hasattr(c,'cmd') else str(c) for c in (validation_commands or [])] or ['python -m pytest --tb=short -v']
+    cmds=[c.cmd if hasattr(c,'cmd') else str(c) for c in (validation_commands or [])]
     allowed='\n'.join(f'- {f}' for f in allowed_files) if allowed_files else 'Allowed files were not confidently identified. Make the smallest possible change and explain changed files.'
     forbidden='\n'.join(f'- {f}' for f in (forbidden_files or ['.villani','.villani_code']))
     return ("You are executing ONE Villani Ops subtask, not the whole parent task.\n\n"
@@ -209,7 +210,7 @@ def build_subtask_runner_prompt(*, parent_task:str, parent_success_criteria:str|
         f"{parent_success_criteria or ''}\n\nSUBTASK OBJECTIVE\n{subtask.title}\n{subtask.objective}\n\nSUBTASK SUCCESS CRITERIA\n{subtask.success_criteria or subtask.objective}\n\n"
         f"ALLOWED FILES\n{allowed}\n\nFORBIDDEN FILES / ARTIFACTS\n{forbidden}\nDo not create helper scripts, scratch files, logs, checkpoints, or temporary fix files in the repo.\nDo not modify or create Villani internal directories such as .villani or .villani_code.\nOnly product code and necessary tests should change.\n\n"
         f"DEPENDENCY CONTEXT\n{dependency_context or 'No accepted dependency context was provided.'}\n\nMERGE CONTRACT\n{merge_contract or 'Keep changes minimal and merge-friendly.'}\n\n"
-        "EXPECTED VALIDATION\nRun the narrowest relevant tests for this subtask first. Then, if cheap enough, run broader parent validation.\nValidation commands have authority levels: only acceptance-blocking validation should block acceptance; diagnostic and exploratory failures are evidence, not blockers. Component subtasks are accepted on subtask-scoped evidence. Global validation is reserved for integration/final acceptance.\nSuggested commands:\n" + '\n'.join(f'- {c}' for c in cmds) +
+        "EXPECTED VALIDATION\nRun the narrowest relevant tests for this subtask first. Then, if cheap enough, run broader parent validation.\nValidation commands have authority levels: only acceptance-blocking validation should block acceptance; diagnostic and exploratory failures are evidence, not blockers. Component subtasks are accepted on subtask-scoped evidence. Global validation is reserved for integration/final acceptance.\nSuggested commands (empty means no reliable command was detected; do not invent a generic language-specific fallback):\n" + ('\n'.join(f'- {c}' for c in cmds) if cmds else '- none') +
         "\n\nSCOPE RULES\nDo not modify files outside the allowed list unless absolutely required.\n\nSCOPE EXCEPTION\nIf the subtask cannot be completed without modifying a file outside the allowed list, you may make the smallest necessary cross-file change.\nIf you do this, your final response must include a section:\nSCOPE_EXCEPTION:\n- Extra files modified:\n- Why each extra file was necessary:\n- Why the change is minimal:\n- Why this does not solve unrelated subtasks:\n\nAt the end of your run, report:\nSUBTASK_RESULT:\n- Status: completed / blocked / impossible_in_isolation\n- Files changed:\n- Tests run:\n- Test results:\n- Scope exception used: yes/no\n- If blocked or impossible, explain why:\n")
 
 def build_subtask_attempt_learning_brief(state, subtask:SubtaskState)->str:
@@ -288,7 +289,11 @@ class OpsInspectRepoInput(StrictModel): focus:str; max_files:int=200; include_sn
 class OpsSubmitClassificationInput(StrictModel): category:str; difficulty:Literal['easy','medium','hard','unknown']; reasoning:str; confidence:float; risk_factors:list[str]=Field(default_factory=list); suggested_backend_tier:str|None=None
 class ValidationCommand(StrictModel):
     cmd:str; cwd:str|None=None; purpose:str|None=None; timeout_seconds:int|None=None
-    source:Literal['user_success_criteria','investigation_discovered','subtask_focused','runner_suggested','diagnostic','exploratory','integration','final']|None=None
+    source:Literal['user_provided','project_detected','generated','user_success_criteria','investigation_discovered','subtask_focused','runner_suggested','diagnostic','exploratory','integration','final']|None=None
+    confidence:Literal['high','medium','low']|None=None
+    blocking:bool|None=None
+    shell:bool=False
+    argv:list[str]|None=None
     authority:Literal['acceptance_blocking','supporting_evidence','diagnostic_only']|None=None
     scope:Literal['subtask','integration','candidate','final','repo']|None=None
     subtask_id:str|None=None
@@ -942,7 +947,7 @@ def _plan_commands(plan:ValidationPlan|None):
 def _default_validation_commands(state):
     plan=_coerce_validation_plan((state.investigation or {}).get('validation_plan') if state.investigation else None, default_scope='candidate')
     out=_plan_commands(plan)
-    return out or [ValidationCommand(cmd='python -m pytest --tb=short -v', purpose='Default candidate validation', timeout_seconds=900, source='user_success_criteria', authority='acceptance_blocking', scope='candidate', reason='Default validation for the candidate decision')]
+    return out
 
 def _focused_subtask_validation_commands(state, subtask:SubtaskState):
     plan=_coerce_validation_plan((state.investigation or {}).get('validation_plan') if state.investigation else None, default_scope='subtask', subtask_id=subtask.subtask_id)
@@ -1504,11 +1509,11 @@ def _default_validation_metadata(command, *, target, target_obj, subtask):
         subtask_id=subtask.subtask_id
     if source is None:
         if scope=='subtask':
-            source='subtask_focused'
+            source='project_detected'
         elif scope=='integration':
-            source='integration'
+            source='user_provided'
         else:
-            source='user_success_criteria'
+            source='user_provided'
     if authority is None:
         # Authority must come from an explicit validation plan/command contract.
         # Discovered or merely related commands are non-blocking by default.
@@ -1524,13 +1529,13 @@ def make_validation_decision(result:dict)->dict:
     blocking=[c for c in commands if c.get('authority')=='acceptance_blocking']
     supporting=[c for c in commands if c.get('authority')=='supporting_evidence']
     diagnostic=[c for c in commands if c.get('authority')=='diagnostic_only']
-    blocking_fail=[c for c in blocking if c.get('passed') is not True]
+    blocking_fail=[c for c in blocking if c.get('passed') is not True and c.get('status') not in {'infrastructure_error','timeout'}]
     passed_block=[c for c in blocking if c.get('passed') is True]
     supporting_fail=[c for c in supporting if c.get('passed') is not True]
     diagnostic_fail=[c for c in diagnostic if c.get('passed') is not True]
     passed_support=[c for c in supporting if c.get('passed') is True]
     if blocking:
-        status='failed' if blocking_fail else 'passed'
+        status='failed' if blocking_fail else ('passed' if passed_block else 'inconclusive')
         rationale='acceptance-blocking validation failed' if blocking_fail else 'all acceptance-blocking validation passed'
     elif passed_support and not supporting_fail:
         status='inconclusive'
@@ -1542,11 +1547,21 @@ def make_validation_decision(result:dict)->dict:
 
 def h_validation(state, inp, ctx):
     target_obj, base_cwd, _st = _resolve_validation_target(state, inp)
-    results=[]; all_pass=True; overall_status='passed'; first_cwd=None
     outdir=Path(state.run_dir)/'validation'; outdir.mkdir(exist_ok=True)
     label=_target_label(inp.target, inp.target_id)
+    if not inp.commands:
+        res=skipped_validation_result(target=inp.target, target_id=inp.target_id, cwd=base_cwd.resolve())
+        decision=make_validation_decision(res); res['decision']=decision; res['decision_status']=decision['status']; res['scope']=decision['scope']; res['subtask_id']=decision.get('subtask_id')
+        _attach_validation(state,target_obj,inp.target,res)
+        ctx.recorder.record('validation_attached', payload={'target':inp.target,'target_id':inp.target_id,'passed':False,'status':res['status'],'command_count':0,'cwd':res['cwd'],'artifact_paths':[]})
+        return res
+    results=[]; first_cwd=None
     for i,c in enumerate(inp.commands,1):
         source, authority, scope, subtask_id=_default_validation_metadata(c, target=inp.target, target_obj=target_obj, subtask=_st)
+        blocking = bool(getattr(c,'blocking',None)) if getattr(c,'blocking',None) is not None else authority=='acceptance_blocking'
+        if blocking:
+            authority='acceptance_blocking'
+        confidence=getattr(c,'confidence',None) or ('high' if source in {'user_provided','user_success_criteria','integration','final'} or authority=='acceptance_blocking' else 'low')
         try:
             cmd_cwd=_resolve_command_cwd(c.cwd, base_cwd, target=inp.target, allow_escape=inp.allow_cwd_escape)
             first_cwd=first_cwd or str(cmd_cwd)
@@ -1558,35 +1573,30 @@ def h_validation(state, inp, ctx):
                 util,msg=perr; raise RuntimeError(msg)
         except Exception as e:
             reason='platform_unsupported_command' if isinstance(e,RuntimeError) else 'targeted_cwd_rejected'
-            item={'cmd':c.cmd,'passed':False,'status':'command_rejected','reason':getattr(c,'reason',None) or reason,'error':str(e),'cwd':str(base_cwd.resolve()),'source':source,'authority':authority,'scope':scope,'subtask_id':subtask_id,'purpose':c.purpose or ''}
-            results.append(item); all_pass=False; overall_status='command_rejected'
+            item={'cmd':c.cmd,'command':c.cmd,'passed':False,'status':'infrastructure_error','reason':getattr(c,'reason',None) or reason,'error':str(e),'cwd':str(base_cwd.resolve()),'source':source,'confidence':confidence,'blocking':False if source in {'generated','diagnostic'} else blocking,'authority':'diagnostic_only' if source in {'generated','diagnostic'} else authority,'scope':scope,'subtask_id':subtask_id,'purpose':c.purpose or '','execution_mode':'argv','shell':False,'exit_code':None,'infrastructure_error':str(e)}
+            results.append(item)
             ctx.recorder.record('validation_command_rejected', payload={'target':inp.target,'target_id':inp.target_id,'cmd':c.cmd,'reason':reason,'message':str(e)})
             continue
         ctx.recorder.record('validation_started', payload={'target':inp.target,'target_id':inp.target_id,'target_label':label,'cmd':c.cmd,'cwd':str(cmd_cwd),'worktree_path':str(base_cwd) if inp.target in {'candidate','integration'} else None})
         so=outdir/f'{inp.target}_{inp.target_id or "repo"}_{i}.stdout.log'; se=outdir/f'{inp.target}_{inp.target_id or "repo"}_{i}.stderr.log'
-        try:
-            p=subprocess.run(c.cmd,shell=True,cwd=cmd_cwd,text=True,capture_output=True,timeout=c.timeout_seconds or 300)
-            write_text_utf8(so, p.stdout or ''); write_text_utf8(se, p.stderr or ''); passed=p.returncode==0; status='passed' if passed else 'failed'
-            if not passed: overall_status='failed'
-        except subprocess.TimeoutExpired as e:
-            write_text_utf8(so, e.stdout or ''); write_text_utf8(se, (e.stderr or '')+'\ntimeout'); passed=False; status='timed_out'; overall_status='timed_out'
-        except Exception as e:
-            write_text_utf8(so, ''); write_text_utf8(se, f'{type(e).__name__}: {e}\n'); passed=False; status='infrastructure_error'; overall_status='error'
-        all_pass=all_pass and passed
-        item={'cmd':c.cmd,'passed':passed,'status':status,'cwd':str(cmd_cwd),'stdout_path':str(so),'stderr_path':str(se),'source':source,'authority':authority,'scope':scope,'subtask_id':subtask_id,'purpose':c.purpose or '','reason':getattr(c,'reason',None) or ''}; results.append(item)
-        ctx.recorder.record('validation_completed' if passed else 'validation_failed', payload={'target':inp.target,'target_id':inp.target_id,'passed':passed,'command_count':len(inp.commands),'cwd':str(cmd_cwd),'artifact_paths':{'stdout':str(so),'stderr':str(se)},'validation_result':item})
-    res={'raw_passed':all_pass,'raw_status':overall_status if not all_pass else 'passed','passed':all_pass,'status':overall_status if not all_pass else 'passed','commands':results,'target':inp.target,'target_id':inp.target_id,'cwd':first_cwd or str(base_cwd.resolve())}
+        classified=classify_validation_command(cmd=c.cmd, source=source, confidence=confidence, blocking=blocking, reason=getattr(c,'reason',None) or c.purpose or '', timeout_seconds=c.timeout_seconds or 300)
+        classified=classified.__class__(command=classified.command, source=classified.source, confidence=classified.confidence, blocking=classified.blocking, reason=classified.reason, argv=getattr(c,'argv',None), shell=bool(getattr(c,'shell',False)), timeout_seconds=classified.timeout_seconds)
+        item=run_classified_validation(classified, cwd=cmd_cwd, stdout_path=so, stderr_path=se)
+        item.update({'cwd':str(cmd_cwd),'scope':scope,'subtask_id':subtask_id,'purpose':c.purpose or '','authority':authority,'source':source,'blocking':blocking,'confidence':confidence})
+        results.append(item)
+        ctx.recorder.record('validation_completed' if item.get('passed') else 'validation_failed', payload={'target':inp.target,'target_id':inp.target_id,'passed':item.get('passed'),'command_count':len(inp.commands),'cwd':str(cmd_cwd),'artifact_paths':{'stdout':str(so),'stderr':str(se)},'validation_result':item})
+    statuses={r.get('status') for r in results}
+    if any(r.get('status')=='failed_candidate' and r.get('blocking') for r in results): overall='failed_candidate'; passed=False
+    elif 'timeout' in statuses: overall='timeout'; passed=False
+    elif 'infrastructure_error' in statuses and not any(r.get('status') in {'failed_candidate','diagnostic_failed'} for r in results): overall='infrastructure_error'; passed=False
+    elif 'diagnostic_failed' in statuses: overall='diagnostic_failed'; passed=False
+    elif results and all(r.get('passed') for r in results): overall='passed'; passed=True
+    else: overall='skipped_no_reliable_command'; passed=False
+    res={'raw_passed':passed,'raw_status':overall,'passed':passed,'status':overall,'commands':results,'target':inp.target,'target_id':inp.target_id,'cwd':first_cwd or str(base_cwd.resolve())}
     decision=make_validation_decision(res); res['decision']=decision; res['decision_status']=decision['status']; res['scope']=decision['scope']; res['subtask_id']=decision.get('subtask_id')
-    if decision['status']=='passed':
-        res['passed']=True; res['status']='passed'
-    elif decision['status']=='failed':
-        res['passed']=False
-        if res['status'] not in {'command_rejected','timed_out','error'}:
-            res['status']='failed'
-    else:
-        res['passed']=False; res['status']='inconclusive'
+    if decision['status']=='passed': res['passed']=True; res['status']='passed'
     _attach_validation(state,target_obj,inp.target,res)
-    ctx.recorder.record('validation_attached', payload={'target':inp.target,'target_id':inp.target_id,'passed':all_pass,'status':res['status'],'command_count':len(inp.commands),'cwd':res['cwd'],'artifact_paths':[p for r in results for p in [r.get('stdout_path'),r.get('stderr_path')] if p]})
+    ctx.recorder.record('validation_attached', payload={'target':inp.target,'target_id':inp.target_id,'passed':res['passed'],'status':res['status'],'command_count':len(inp.commands),'cwd':res['cwd'],'artifact_paths':[p for r in results for p in [r.get('stdout_path'),r.get('stderr_path')] if p]})
     if inp.target=='candidate' and target_obj is not None and any(o.attempt_id==inp.target_id for o in state.attempt_observations):
         _observe_completed_attempt(state,target_obj,ctx)
     return res
@@ -1767,7 +1777,7 @@ OPS_TOOLS={
 'ops_launch_subtasks':ToolSpec('ops_launch_subtasks','LEGACY/internal compatibility bulk subtask launcher. Hidden and policy-blocked in normal agentic flow; use ops_run_next_subtask_attempt.',OpsLaunchSubtasksInput,h_launch_subtasks),
 'ops_review_attempt':ToolSpec('ops_review_attempt','Review attempt',OpsReviewAttemptInput,h_review_attempt),
 'ops_integrate_subtasks':ToolSpec('ops_integrate_subtasks','Integrate subtasks',OpsIntegrateSubtasksInput,h_integrate),
-'ops_run_validation':ToolSpec('ops_run_validation','Run validation commands in the selected target workspace automatically. Validation commands carry source, authority, and scope; only acceptance_blocking validation blocks acceptance. Diagnostic/exploratory failures are evidence, not blockers. Component subtasks use subtask-scoped evidence; global validation is reserved for integration/final acceptance. For candidate/integration targets, provide target_id and commands without cd/pushd/Set-Location; cwd defaults to the target worktree and relative cwd is resolved inside it. Keep commands cross-platform; do not use Unix-only utilities like head, tail, grep, sed, awk, cat, rm -rf, or export. Prefer python -m pytest --tb=short -v or Python one-liners.',OpsRunValidationInput,h_validation),
+'ops_run_validation':ToolSpec('ops_run_validation','Run validation commands in the selected target workspace automatically. Validation commands carry source, authority, and scope; only acceptance_blocking validation blocks acceptance. Diagnostic/exploratory failures are evidence, not blockers. Component subtasks use subtask-scoped evidence; global validation is reserved for integration/final acceptance. For candidate/integration targets, provide target_id and commands without cd/pushd/Set-Location; cwd defaults to the target worktree and relative cwd is resolved inside it. Keep commands cross-platform; do not use Unix-only utilities like head, tail, grep, sed, awk, cat, rm -rf, or export. Do not invent language-specific fallback commands unless project evidence supports them.',OpsRunValidationInput,h_validation),
 'ops_select_winner':ToolSpec('ops_select_winner','Select winner',OpsSelectWinnerInput,h_select_winner),
 'ops_finalize_run':ToolSpec('ops_finalize_run','Finalize run',OpsFinalizeRunInput,h_finalize),
 }
