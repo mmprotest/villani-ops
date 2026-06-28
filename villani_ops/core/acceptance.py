@@ -24,6 +24,48 @@ def is_git_compatible_patch(patch_path: Any) -> bool:
     return text.startswith('diff --git ') and 'Added file:' not in text and 'Removed file:' not in text and 'Deleted file:' not in text
 
 
+
+
+def _normalize_unit_interval(value: Any, *, default: float = 0.0) -> float:
+    try:
+        if value is None or isinstance(value, bool):
+            return default
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    if number != number:  # NaN
+        return default
+    if number < 0.0:
+        return 0.0
+    if number <= 1.0:
+        return number
+    if number <= 100.0:
+        return number / 100.0
+    return 1.0
+
+
+def normalize_review_score(value: Any) -> float:
+    """Normalize reviewer scores onto a single 0.0..1.0 comparison scale."""
+    return _normalize_unit_interval(value, default=0.0)
+
+
+def normalize_confidence(value: Any) -> float:
+    """Normalize confidence values onto a single 0.0..1.0 comparison scale."""
+    return _normalize_unit_interval(value, default=0.0)
+
+
+def normalized_review_metrics(review: Any) -> dict[str, Any]:
+    if not isinstance(review, dict):
+        review = getattr(review, "model_dump", lambda **_: {})() if review is not None else {}
+    raw_score = review.get("score") if isinstance(review, dict) else None
+    raw_confidence = review.get("confidence") if isinstance(review, dict) else None
+    return {
+        "raw_review_score": raw_score,
+        "normalized_review_score": normalize_review_score(raw_score),
+        "raw_confidence": raw_confidence,
+        "normalized_confidence": normalize_confidence(raw_confidence),
+    }
+
 def _get(attempt: Any, key: str, default=None):
     if isinstance(attempt, dict):
         return attempt.get(key, default)
@@ -340,3 +382,119 @@ def human_override_blockers(attempt: Any, human_approval: Any | None = None) -> 
     if "acceptance_blockers" not in shown or shown.get("acceptance_blockers") is None:
         blockers.append("shown evidence is missing acceptance blockers")
     return not blockers, blockers
+
+_SERIOUS_UNVERIFIED_BLOCKERS = {
+    "missing_patch",
+    "empty_changed_files",
+    "runner_failed",
+    "runner_exception",
+    "patch_unreadable",
+    "internal_artifacts_only",
+    "scratch_artifact_in_patch",
+    "patch_hygiene_failed",
+    "patch_contains_internal_artifacts",
+    "invalid_patch_format",
+    "patch_apply_check_failed",
+    "scope_failed",
+    "validation_failed",
+    "review_failed",
+    "review_blocking_issues",
+}
+
+_EVIDENCE_RANK = {
+    "authoritative": 5,
+    "explicit_user_command": 5,
+    "high_confidence_project_detected": 4,
+    "project_test": 4,
+    "generated_behavioral": 2,
+    "generated_smoke": 1,
+    "diagnostic_only": 0,
+    "skipped": -1,
+    "infrastructure_error": -2,
+}
+
+
+def serious_unverified_blockers(blockers: list[str] | tuple[str, ...] | None, attempt: Any = None) -> list[str]:
+    serious: list[str] = []
+    for blocker in blockers or []:
+        b = str(blocker)
+        if b in _SERIOUS_UNVERIFIED_BLOCKERS or b.startswith(("attempt_status_invalid", "runner exit code is")):
+            serious.append(b)
+    if attempt is not None:
+        if not has_non_empty_patch(_get(attempt, "patch_path")):
+            serious.append("missing_patch")
+        if not (_get(attempt, "changed_files") or []):
+            serious.append("empty_changed_files")
+        exit_code = _get(attempt, "exit_code")
+        if exit_code is not None and exit_code != 0:
+            serious.append(f"runner exit code is {exit_code}")
+    return sorted(set(serious))
+
+
+def candidate_ranking_evidence(attempt: Any, *, state: Any | None = None) -> dict[str, Any]:
+    review = _get(attempt, "review") or {}
+    validation = _get(attempt, "validation") or {}
+    metrics = normalized_review_metrics(review)
+    try:
+        eligible, blockers = is_attempt_acceptance_eligible(attempt, state=state)
+    except Exception as exc:
+        eligible, blockers = False, [f"acceptance_check_error:{type(exc).__name__}"]
+    strength = validation_evidence_strength(validation)
+    reliable = validation_is_reliable(validation)
+    validation_status = str((_get(attempt, "validation_status") or (validation or {}).get("status") or "not_run")).lower()
+    review_decision = review.get("decision") if isinstance(review, dict) else None
+    serious = serious_unverified_blockers(blockers, attempt)
+    if isinstance(review, dict):
+        review_text = " ".join(str(x).lower() for x in (review.get("blockers") or []) + (review.get("issues") or []))
+        serious_markers = ("core requirement", "unimplemented", "runtime failure", "unsafe", "incomplete", "failed approach", "does not address", "missing required")
+        if any(marker in review_text for marker in serious_markers):
+            serious.append("review_identified_serious_requirement_or_runtime_risk")
+            serious = sorted(set(serious))
+    changed = _get(attempt, "changed_files") or []
+    patch_ok = has_non_empty_patch(_get(attempt, "patch_path"))
+    exit_code = _get(attempt, "exit_code")
+    observations = [o for o in (getattr(state, "attempt_observations", []) or []) if getattr(o, "attempt_id", None) == _get(attempt, "attempt_id")] if state is not None else []
+    latest_obs = observations[-1] if observations else None
+    addressed_feedback = bool(latest_obs and (getattr(latest_obs, "should_repair", False) or getattr(latest_obs, "next_attempt_directives", None)))
+    repeated_weak = bool(latest_obs and getattr(latest_obs, "should_retry_same_plan", False) and not addressed_feedback)
+    reliable_failed = reliable and (((validation or {}).get("decision") or {}).get("status") == "failed" or validation_status in {"failed", "failed_candidate"})
+    composite = (
+        metrics["normalized_review_score"] * 100.0
+        + metrics["normalized_confidence"] * 20.0
+        + _EVIDENCE_RANK.get(strength, 0) * 8.0
+        + (25.0 if eligible and reliable else 0.0)
+        + (8.0 if validation_status == "passed" and reliable else 0.0)
+        + (2.0 if validation_status == "passed" and not reliable else 0.0)
+        + (3.0 if patch_ok else -40.0)
+        + (2.0 if changed else -40.0)
+        + (4.0 if exit_code in {None, 0} else -35.0)
+        + (4.0 if review_decision == "pass" else -8.0)
+        + (5.0 if addressed_feedback else 0.0)
+        - (18.0 * len(serious))
+        - (35.0 if reliable_failed else 0.0)
+        - (8.0 if repeated_weak else 0.0)
+    )
+    return {**metrics, "attempt_id": _get(attempt, "attempt_id"), "composite_score": composite, "acceptance_eligible": eligible, "acceptance_blockers": blockers, "serious_blockers": serious, "validation_strength": strength, "validation_authoritative": reliable, "validation_status": validation_status, "patch_non_empty": patch_ok, "changed_files_present": bool(changed), "runner_exit_code": exit_code, "review_decision": review_decision, "addressed_prior_feedback": addressed_feedback, "repeated_weak_attempt": repeated_weak}
+
+
+def candidate_ranking_key(attempt: Any, *, state: Any | None = None) -> tuple:
+    ev = candidate_ranking_evidence(attempt, state=state)
+    aid = str(ev.get("attempt_id") or "")
+    try:
+        idx = int(aid.rsplit("_", 1)[-1])
+    except Exception:
+        idx = 0
+    return (ev["acceptance_eligible"] and ev["validation_authoritative"], ev["composite_score"], ev["normalized_review_score"], ev["normalized_confidence"], ev["validation_authoritative"], _EVIDENCE_RANK.get(ev["validation_strength"], 0), -len(ev["serious_blockers"]), ev["addressed_prior_feedback"], not ev["repeated_weak_attempt"], -idx)
+
+
+def explain_candidate_selection(winner: Any, alternatives: list[Any], *, state: Any | None = None, limit: int = 3) -> dict[str, Any]:
+    win = candidate_ranking_evidence(winner, state=state)
+    ranked = sorted((candidate_ranking_evidence(a, state=state) for a in alternatives if _get(a, "attempt_id") != win.get("attempt_id")), key=lambda e: (e["composite_score"], e["normalized_review_score"], e["normalized_confidence"]), reverse=True)[:limit]
+    reasons = [f"{win['attempt_id']} selected with normalized score {win['normalized_review_score']:.3f}, normalized confidence {win['normalized_confidence']:.3f}, validation strength {win['validation_strength']}, serious blockers {len(win['serious_blockers'])}."]
+    for alt in ranked:
+        reasons.append(f"Beat {alt['attempt_id']} because composite {win['composite_score']:.2f} vs {alt['composite_score']:.2f}; score {win['normalized_review_score']:.3f} vs {alt['normalized_review_score']:.3f}; confidence {win['normalized_confidence']:.3f} vs {alt['normalized_confidence']:.3f}; evidence {win['validation_strength']} vs {alt['validation_strength']}; serious blockers {len(win['serious_blockers'])} vs {len(alt['serious_blockers'])}.")
+    if win["serious_blockers"]:
+        reasons.append("Unresolved serious blockers: " + ", ".join(win["serious_blockers"][:6]))
+    if not win["validation_authoritative"]:
+        reasons.append("Selection is unverified; ranking does not upgrade validation to verified acceptance.")
+    return {"winner": win, "nearest_alternatives": ranked, "reasons": reasons, "summary": " ".join(reasons)}

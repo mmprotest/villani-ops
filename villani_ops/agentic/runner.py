@@ -15,7 +15,7 @@ from .artifacts import write_artifacts
 from .client import ToolCallingLLMClient
 from villani_ops.runners import runner_for_name
 from villani_ops.telemetry.usage import UsageRecorder, usage_record_from_response
-from villani_ops.core.acceptance import is_attempt_acceptance_eligible, validation_is_reliable
+from villani_ops.core.acceptance import is_attempt_acceptance_eligible, validation_is_reliable, candidate_ranking_key, explain_candidate_selection, candidate_ranking_evidence
 from villani_ops.execution_policies import policy_for_mode
 from villani_ops.orchestration.nodes import OrchestrationNode
 from villani_ops.orchestration.context import TaskContext
@@ -70,10 +70,13 @@ def _clean_finalize_after_backend_error(state, rec, *, error: Exception):
                     ok=False
                 if ok and validation_is_reliable(c.validation or {}):
                     verified.append(c)
-    chosen=(verified or usable or [None])[0]
+    pool=verified or usable
+    chosen=max(pool, key=lambda c: candidate_ranking_key(c, state=state)) if pool else None
     if chosen is not None:
-        state.selection={'decision':'select','selected_attempt_id':chosen.attempt_id,'summary':'Selected best completed candidate after backend error; evidence may be unverified.','confidence':0.5,'decision_bucket':'accepted_verified' if chosen in verified else 'accepted_unverified','materialization_signal':'verified_accepted' if chosen in verified else 'unverified_best_candidate'}
-        state.final_decision={'decision':'accepted','summary':('verified: ' if chosen in verified else 'selected_unverified: ')+msg,'selected_attempt_id':chosen.attempt_id,'selected_patch_path':chosen.patch_path,'decision_bucket':state.selection['decision_bucket'],'materialization_signal':state.selection['materialization_signal'],'blockers':[etype]}
+        explanation=explain_candidate_selection(chosen, state.candidates, state=state)
+        evidence=candidate_ranking_evidence(chosen, state=state)
+        state.selection={'decision':'select','selected_attempt_id':chosen.attempt_id,'summary':explanation['summary'],'confidence':0.5,'decision_bucket':'accepted_verified' if chosen in verified else 'accepted_unverified','materialization_signal':'verified_accepted' if chosen in verified else 'unverified_best_candidate','selection_evidence':evidence,'selection_explanation':explanation}
+        state.final_decision={'decision':'accepted','summary':('verified: ' if chosen in verified else 'selected_unverified: ')+msg+' '+explanation['summary'],'selected_attempt_id':chosen.attempt_id,'selected_patch_path':chosen.patch_path,'decision_bucket':state.selection['decision_bucket'],'materialization_signal':state.selection['materialization_signal'],'blockers':[etype],'selection_evidence':evidence,'selection_explanation':explanation}
         state.status='completed'; state.phase='completed'
     else:
         state.selection=None
