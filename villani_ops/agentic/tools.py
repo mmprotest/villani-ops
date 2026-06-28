@@ -5,7 +5,7 @@ from typing import Any, Callable, Literal
 from pydantic import BaseModel, Field, ConfigDict, model_validator
 from .state import CandidateAttemptState, SubtaskState, AttemptObservation, detect_decomposition_deadlock
 from .git_artifacts import capture_git_patch, ensure_git_baseline, clean_runner_artifacts_from_worktree, DEFAULT_PATCH_EXCLUDES, is_git_compatible_patch, patch_contains_internal_artifacts, clean_untracked_scratch_artifacts, is_scratch_artifact_path
-from villani_ops.core.acceptance import is_attempt_acceptance_eligible, attempt_requires_patch, validation_evidence_strength, validation_is_reliable, normalized_review_metrics, candidate_ranking_evidence, explain_candidate_selection
+from villani_ops.core.acceptance import is_attempt_acceptance_eligible, attempt_requires_patch, validation_evidence_strength, validation_is_reliable, normalized_review_metrics, candidate_ranking_evidence, explain_candidate_selection, candidate_ranking_key
 import subprocess, json, time, shutil, os, re
 from villani_ops.agentic.validation import classify_validation_command, run_classified_validation, skipped_validation_result
 from datetime import datetime, timezone
@@ -1758,6 +1758,8 @@ def h_select_winner(state, inp, ctx):
     review_accepts=review.get('decision')=='pass' and review.get('recommended_action')=='accept'
     deadline_or_exhausted=any(str(x).lower() in {'candidate_attempt_budget_exhausted','attempts_exhausted','orchestration_deadline','backend_timeout','max_orchestration_turns_reached'} for x in (inp.reasons or [])) or state.phase=='selecting'
     unverified_selectable=(not eligible and not reliable_failed and ((review_accepts and set(blockers).issubset({'validation_missing','validation_unverified'})) or (deadline_or_exhausted and _is_unverified_candidate_usable(state,a))))
+    override_warning=None
+    model_selected_attempt_id=inp.selected_attempt_id
     if unverified_selectable:
         verified_alternatives=[]
         for other in getattr(state,'candidates',[]) or []:
@@ -1771,6 +1773,17 @@ def h_select_winner(state, inp, ctx):
                 verified_alternatives.append(getattr(other,'attempt_id',None))
         if verified_alternatives:
             raise ValueError('selected attempt is unverified while verified alternatives exist: '+', '.join(x for x in verified_alternatives if x))
+        usable=[c for c in (getattr(state,'candidates',[]) or []) if _is_unverified_candidate_usable(state,c)]
+        if usable:
+            best=max(usable, key=lambda c: candidate_ranking_key(c, state=state))
+            if getattr(best,'attempt_id',None) != inp.selected_attempt_id and candidate_ranking_key(best, state=state) > candidate_ranking_key(a, state=state):
+                override_warning={'warning':'model_selected_unverified_candidate_overridden_by_ranking','model_selected_attempt_id':inp.selected_attempt_id,'deterministic_selected_attempt_id':getattr(best,'attempt_id',None),'model_selected_evidence':candidate_ranking_evidence(a,state=state),'deterministic_selected_evidence':candidate_ranking_evidence(best,state=state)}
+                state.warnings.append('model_selected_unverified_candidate_overridden_by_ranking')
+                ctx.recorder.record('selection_override', payload=override_warning)
+                a=best; inp.selected_attempt_id=getattr(best,'attempt_id',None)
+                eligible, blockers=is_attempt_acceptance_eligible(a, state=state)
+                val=_attempt_to_dict(a).get('validation') or {}
+                strength=validation_evidence_strength(val)
     stored=a.get('acceptance_eligible') if isinstance(a,dict) else a.acceptance_eligible
     if isinstance(a,dict):
         a['acceptance_eligible']=eligible; a['acceptance_blockers']=blockers
@@ -1783,8 +1796,10 @@ def h_select_winner(state, inp, ctx):
     decision_bucket='accepted_verified' if eligible and validation_is_reliable(val) else ('accepted_unverified' if unverified_selectable or (eligible and not validation_is_reliable(val)) else 'rejected')
     ranking_evidence=candidate_ranking_evidence(a, state=state)
     selection_explanation=explain_candidate_selection(a, getattr(state,'candidates',[]) or [], state=state) if decision_bucket=='accepted_unverified' else {'winner':ranking_evidence,'nearest_alternatives':[],'reasons':['verified candidate selected through central acceptance gate'],'summary':'verified candidate selected through central acceptance gate'}
-    new_selection={**inp.model_dump(),'decision_bucket':decision_bucket,'materialization_signal':('verified_accepted' if decision_bucket=='accepted_verified' else 'unverified_best_candidate'),'validation_strength':strength,'validation_authoritative':validation_is_reliable(val),'selection_evidence':{'stored_acceptance_eligible':stored,'recomputed_acceptance_eligible':eligible,'acceptance_blockers':blockers,'validation_strength':strength, **ranking_evidence, 'selection_explanation':selection_explanation}}
+    new_selection={**inp.model_dump(),'model_selected_attempt_id':model_selected_attempt_id,'decision_bucket':decision_bucket,'materialization_signal':('verified_accepted' if decision_bucket=='accepted_verified' else 'unverified_best_candidate'),'validation_strength':strength,'validation_authoritative':validation_is_reliable(val),'selection_evidence':{'stored_acceptance_eligible':stored,'recomputed_acceptance_eligible':eligible,'acceptance_blockers':blockers,'validation_strength':strength, **ranking_evidence, 'selection_explanation':selection_explanation, **({'selection_warning':override_warning} if override_warning else {})}}
     if decision_bucket=='accepted_unverified':
+        if override_warning:
+            new_selection['warnings']=(new_selection.get('warnings') or []) + [override_warning['warning']]
         new_selection['summary']=(new_selection.get('summary') or '') + ' ' + selection_explanation['summary']
         new_selection['reasons']=list(dict.fromkeys((new_selection.get('reasons') or []) + selection_explanation['reasons']))
     if state.selection and state.selection.get('decision')=='select' and state.selection.get('selected_attempt_id')==inp.selected_attempt_id:

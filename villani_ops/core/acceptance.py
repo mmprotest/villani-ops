@@ -129,7 +129,11 @@ def _validation_blockers(validation: Any) -> list[str]:
             if non_rejected or not command_rejected:
                 blockers.append("validation_failed")
             return sorted(set(blockers))
-        return []
+        if status in {"inconclusive", "skipped", "skipped_no_reliable_command", "not_run"} and not validation_is_reliable(validation):
+            return ["validation_unverified"]
+        # Older validation payloads may include an auxiliary decision object
+        # without an acceptance status; fall through to the legacy overall
+        # status/command checks below for compatibility.
     overall_status = str(validation.get("status") or "").lower()
     if overall_status in {"infrastructure_error", "skipped_no_reliable_command", "diagnostic_failed", "timeout", "inconclusive"}:
         return []
@@ -334,9 +338,18 @@ def is_attempt_acceptance_eligible(attempt: Any, human_approval: Any | None = No
         if review.get("recommended_action") != "accept":
             blockers.append("review_failed")
         if review.get("blockers"):
-            blockers.append("review_failed")
-        if review.get("issues"):
             blockers.append("review_blocking_issues")
+        for key in ("blocking_issues", "fatal_issues", "severe_issues"):
+            if review.get(key):
+                blockers.append("review_blocking_issues")
+        for issue in review.get("issues") or []:
+            if isinstance(issue, dict) and (
+                issue.get("blocking") is True
+                or str(issue.get("severity") or "").lower() in {"blocking", "severe", "fatal"}
+                or str(issue.get("type") or "").lower() in {"blocking", "blocker", "fatal"}
+            ):
+                blockers.append("review_blocking_issues")
+                break
 
     if state is not None and scope != "subtask":
         blockers.extend(_validation_blockers(_get(attempt, "validation")))
@@ -445,9 +458,11 @@ def candidate_ranking_evidence(attempt: Any, *, state: Any | None = None) -> dic
     review_decision = review.get("decision") if isinstance(review, dict) else None
     serious = serious_unverified_blockers(blockers, attempt)
     if isinstance(review, dict):
-        review_text = " ".join(str(x).lower() for x in (review.get("blockers") or []) + (review.get("issues") or []))
+        blocking_parts = list(review.get("blockers") or []) + list(review.get("blocking_issues") or []) + list(review.get("fatal_issues") or []) + list(review.get("severe_issues") or [])
+        blocking_parts += [i for i in (review.get("issues") or []) if isinstance(i, dict) and (i.get("blocking") is True or str(i.get("severity") or "").lower() in {"blocking", "severe", "fatal"})]
+        review_text = " ".join(str(x).lower() for x in blocking_parts)
         serious_markers = ("core requirement", "unimplemented", "runtime failure", "unsafe", "incomplete", "failed approach", "does not address", "missing required")
-        if any(marker in review_text for marker in serious_markers):
+        if review_text and any(marker in review_text for marker in serious_markers):
             serious.append("review_identified_serious_requirement_or_runtime_risk")
             serious = sorted(set(serious))
     changed = _get(attempt, "changed_files") or []
@@ -492,7 +507,14 @@ def explain_candidate_selection(winner: Any, alternatives: list[Any], *, state: 
     ranked = sorted((candidate_ranking_evidence(a, state=state) for a in alternatives if _get(a, "attempt_id") != win.get("attempt_id")), key=lambda e: (e["composite_score"], e["normalized_review_score"], e["normalized_confidence"]), reverse=True)[:limit]
     reasons = [f"{win['attempt_id']} selected with normalized score {win['normalized_review_score']:.3f}, normalized confidence {win['normalized_confidence']:.3f}, validation strength {win['validation_strength']}, serious blockers {len(win['serious_blockers'])}."]
     for alt in ranked:
-        reasons.append(f"Beat {alt['attempt_id']} because composite {win['composite_score']:.2f} vs {alt['composite_score']:.2f}; score {win['normalized_review_score']:.3f} vs {alt['normalized_review_score']:.3f}; confidence {win['normalized_confidence']:.3f} vs {alt['normalized_confidence']:.3f}; evidence {win['validation_strength']} vs {alt['validation_strength']}; serious blockers {len(win['serious_blockers'])} vs {len(alt['serious_blockers'])}.")
+        if alt["composite_score"] > win["composite_score"]:
+            excluded = alt.get("serious_blockers") or []
+            if excluded:
+                reasons.append(f"Higher-scored alternative {alt['attempt_id']} was excluded by serious blockers {excluded[:4]}; composite {win['composite_score']:.2f} vs {alt['composite_score']:.2f}.")
+            else:
+                reasons.append(f"Selected candidate did not beat {alt['attempt_id']} by composite score ({win['composite_score']:.2f} vs {alt['composite_score']:.2f}); this indicates a model-selected lower-ranked candidate unless selection was overridden.")
+        else:
+            reasons.append(f"Beat {alt['attempt_id']} because composite {win['composite_score']:.2f} vs {alt['composite_score']:.2f}; score {win['normalized_review_score']:.3f} vs {alt['normalized_review_score']:.3f}; confidence {win['normalized_confidence']:.3f} vs {alt['normalized_confidence']:.3f}; evidence {win['validation_strength']} vs {alt['validation_strength']}; serious blockers {len(win['serious_blockers'])} vs {len(alt['serious_blockers'])}.")
     if win["serious_blockers"]:
         reasons.append("Unresolved serious blockers: " + ", ".join(win["serious_blockers"][:6]))
     if not win["validation_authoritative"]:

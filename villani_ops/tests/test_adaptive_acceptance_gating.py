@@ -117,3 +117,85 @@ def test_selection_prefers_reliable_validation_over_shallow_diagnostics(tmp_path
         assert 'verified alternatives' in str(e)
     sel=h_select_winner(s, OpsSelectWinnerInput(decision='select', selected_attempt_id='candidate_002', summary='strong', confidence=0.9), c)
     assert sel['decision_bucket'] == 'accepted_verified'
+
+
+def _skipped_uncertainty_validation():
+    return {'status':'skipped_no_reliable_command','passed':False,'evidence_strength':'skipped','commands':[], 'decision':{'status':'inconclusive','rationale':'no reliable command'}}
+
+
+def test_pass_accept_review_uncertainty_issues_are_non_blocking_for_review_gate(tmp_path):
+    s=state(tmp_path)
+    review={'decision':'pass','recommended_action':'accept','score':0.9,'confidence':0.9,'summary':'plausible','blockers':[], 'issues':['Validation skipped (no reliable command available) - this is uncertainty, not a failure','Cannot confirm official verifier passes without test execution']}
+    a=_candidate(tmp_path, _skipped_uncertainty_validation(), review=review); s.candidates.append(a)
+    ok, blockers=is_attempt_acceptance_eligible(a,state=s)
+    assert ok is False
+    assert 'validation_unverified' in blockers
+    assert 'review_blocking_issues' not in blockers
+    assert 'review_failed' not in blockers
+
+
+def test_review_blockers_and_explicit_blocking_issue_metadata_still_block(tmp_path):
+    s=state(tmp_path)
+    for review in [
+        {'decision':'fail','recommended_action':'revise','blockers':[],'issues':[]},
+        {'decision':'pass','recommended_action':'revise','blockers':[],'issues':[]},
+        {'decision':'pass','recommended_action':'accept','blockers':['runtime failure'],'issues':[]},
+        {'decision':'pass','recommended_action':'accept','blockers':[],'issues':[{'message':'unsafe','blocking':True}]},
+    ]:
+        a=_candidate(tmp_path, _skipped_uncertainty_validation(), review=review); s.candidates=[a]
+        ok, blockers=is_attempt_acceptance_eligible(a,state=s)
+        assert ok is False
+        assert ('review_failed' in blockers) or ('review_blocking_issues' in blockers)
+
+
+def test_skipped_validation_candidate_is_usable_unverified_without_serious_review_blocker(tmp_path):
+    from villani_ops.core.acceptance import candidate_ranking_evidence
+    from villani_ops.agentic.tools import _is_unverified_candidate_usable
+    s=state(tmp_path)
+    review={'decision':'pass','recommended_action':'accept','score':0.9,'confidence':0.9,'summary':'plausible','blockers':[], 'issues':['validation inconclusive; unverified status']}
+    a=_candidate(tmp_path, _skipped_uncertainty_validation(), review=review); s.candidates.append(a)
+    ok, blockers=is_attempt_acceptance_eligible(a,state=s)
+    evidence=candidate_ranking_evidence(a,state=s)
+    assert ok is False
+    assert _is_unverified_candidate_usable(s,a) is True
+    assert 'review_blocking_issues' not in blockers
+    assert 'review_blocking_issues' not in evidence['serious_blockers']
+
+
+def test_unverified_selection_overrides_model_to_deterministic_best_and_records_warning(tmp_path):
+    from villani_ops.core.acceptance import candidate_ranking_evidence
+    s=state(tmp_path); c=ctx(tmp_path); s.investigation={'summary':'i'}; s.execution_path='single_task'; s.plan={'summary':'p'}; s.phase='selecting'
+    for aid, score in [('candidate_002',0.9),('candidate_003',0.9),('candidate_004',0.8)]:
+        a=_candidate(tmp_path, _skipped_uncertainty_validation(), review={'decision':'pass','recommended_action':'accept','score':score,'confidence':0.9,'summary':'ok','evidence':[],'issues':['no reliable validation command'],'blockers':[]})
+        a.attempt_id=aid
+        s.candidates.append(a)
+    assert candidate_ranking_evidence(s.candidates[0],state=s)['composite_score'] > candidate_ranking_evidence(s.candidates[2],state=s)['composite_score']
+    sel=h_select_winner(s, OpsSelectWinnerInput(decision='select', selected_attempt_id='candidate_004', summary='model pick', confidence=0.6), c)
+    assert sel['selected_attempt_id'] == 'candidate_002'
+    assert sel['model_selected_attempt_id'] == 'candidate_004'
+    assert 'model_selected_unverified_candidate_overridden_by_ranking' in sel.get('warnings', [])
+    assert sel['selection_evidence']['selection_warning']['deterministic_selected_attempt_id'] == 'candidate_002'
+
+
+def test_selection_explanation_does_not_claim_lower_composite_beat_higher(tmp_path):
+    from villani_ops.core.acceptance import explain_candidate_selection
+    s=state(tmp_path)
+    high=_candidate(tmp_path, _skipped_uncertainty_validation(), review={'decision':'pass','recommended_action':'accept','score':0.9,'confidence':0.9,'summary':'ok','evidence':[],'issues':[],'blockers':[]}); high.attempt_id='candidate_002'
+    low=_candidate(tmp_path, _skipped_uncertainty_validation(), review={'decision':'pass','recommended_action':'accept','score':0.8,'confidence':0.9,'summary':'ok','evidence':[],'issues':[],'blockers':[]}); low.attempt_id='candidate_004'
+    s.candidates=[high,low]
+    explanation=explain_candidate_selection(low, s.candidates, state=s)
+    text=' '.join(explanation['reasons'])
+    assert 'Beat candidate_002 because composite' not in text
+    assert 'did not beat candidate_002' in text
+
+
+def test_recovery_selects_after_multiple_unverified_validation_uncertainty_candidates(tmp_path):
+    from villani_ops.agentic.recovery import recommend_next_agentic_action
+    from villani_ops.agentic.tools import h_observe_completed_attempt, OpsObserveCompletedAttemptInput
+    s=state(tmp_path); c=ctx(tmp_path); s.execution_path='single_task'; s.plan={'strategy':'single_task'}; s.candidate_attempts=5
+    for aid in ['candidate_001','candidate_002']:
+        a=_candidate(tmp_path, _skipped_uncertainty_validation(), review={'decision':'pass','recommended_action':'accept','score':0.9,'confidence':0.9,'summary':'ok','evidence':[],'issues':['validation skipped no reliable command'],'blockers':[]})
+        a.attempt_id=aid; s.candidates.append(a)
+        h_observe_completed_attempt(s, OpsObserveCompletedAttemptInput(attempt_id=aid, reason='test'), c)
+    rec=recommend_next_agentic_action(s)
+    assert rec.action == 'select_best_unverified_candidate'
