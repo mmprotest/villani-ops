@@ -15,7 +15,7 @@ def _eligible_attempt(tmp_path, s, aid='candidate_001'):
 
 def test_candidate_validation_defaults_to_worktree_and_attaches(tmp_path):
     s=state(tmp_path); c=ctx(tmp_path); a, wt=_eligible_attempt(tmp_path,s)
-    res=execute_tool_with_policy(s,'ops_run_validation',{'target':'candidate','target_id':a.attempt_id,'commands':[{'cmd':'python -c "import pathlib; pathlib.Path(\'marker.txt\').write_text(\'ok\')"'}]},'v',c)
+    res=execute_tool_with_policy(s,'ops_run_validation',{'target':'candidate','target_id':a.attempt_id,'commands':[{'cmd':'python -c "import pathlib; pathlib.Path(\'marker.txt\').write_text(\'ok\')"','source':'user_provided','confidence':'high','authority':'acceptance_blocking','blocking':True}]},'v',c)
     assert not res.is_error
     assert (wt/'marker.txt').read_text()=='ok'
     assert a.validation_status=='passed'
@@ -84,7 +84,7 @@ def test_no_tool_call_with_eligible_candidate_auto_selects_and_finalizes(tmp_pat
         tc('ops_select_execution_path',{'path':'parallel_candidates','reason':'r'}),
         tc('ops_launch_candidates',{'attempts':1,'reason':'r'}),
         tc('ops_review_attempt',{'attempt_id':'candidate_001','scope':'candidate'}),
-        tc('ops_run_validation',{'target':'candidate','target_id':'candidate_001','commands':[{'cmd':'python -c "print(1)"'}]}),
+        tc('ops_run_validation',{'target':'candidate','target_id':'candidate_001','commands':[{'cmd':'python -c "print(1)"','source':'user_provided','confidence':'high','authority':'acceptance_blocking','blocking':True}]}),
         [],
         [],
     ]
