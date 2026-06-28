@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from villani_ops.core.acceptance import is_attempt_acceptance_eligible, validation_is_reliable, candidate_ranking_key, explain_candidate_selection
+from villani_ops.core.acceptance import is_attempt_acceptance_eligible, validation_is_reliable, candidate_ranking_key, explain_candidate_selection, best_unverified_candidate, has_unverified_selection_opportunity
 from .state import detect_decomposition_deadlock
 
 class RecoveryRecommendation(BaseModel):
@@ -78,37 +78,8 @@ def has_valid_selected_winner(state):
     except Exception:
         return False
 
-def _has_reliable_validation_failure(a, blockers=None):
-    val=_validation(a) or {}
-    return ((val.get('decision') or {}).get('status')=='failed') or 'validation_failed' in (blockers or [])
-
-def _usable_unverified_candidate(state, a):
-    if _status(a) not in {'completed','reviewed','accepted'}: return False
-    if (a.get('exit_code') if isinstance(a,dict) else getattr(a,'exit_code',None)) not in {None,0}: return False
-    if not _patch(a) or not _changed(a): return False
-    try:
-        ok, blockers=is_attempt_acceptance_eligible(a,state=state)
-    except Exception:
-        return False
-    if ok and validation_is_reliable(_validation(a) or {}): return False
-    fatal={'runner_failed','runner_exception','missing_patch','empty_changed_files','internal_artifacts_only','scratch_artifact_in_patch','patch_hygiene_failed','patch_contains_internal_artifacts','invalid_patch_format','patch_apply_check_failed','scope_failed','review_infrastructure_failed'}
-    if _has_reliable_validation_failure(a, blockers): return False
-    if any(b in fatal or str(b).startswith('attempt_status_invalid') for b in blockers): return False
-    return True
-
-def _validation_unavailable_or_inconclusive(a):
-    val=_validation(a) or {}
-    status=str(val.get('status') or '').lower()
-    decision_status=str((val.get('decision') or {}).get('status') or '').lower()
-    strength=str(val.get('evidence_strength') or val.get('validation_strength') or '').lower()
-    return status in {'skipped_no_reliable_command','inconclusive','not_run'} or decision_status=='inconclusive' or strength=='skipped'
-
-def _usable_unverified_due_to_validation_uncertainty(state):
-    return [a for a in getattr(state,'candidates',[]) or [] if _usable_unverified_candidate(state,a) and _validation_unavailable_or_inconclusive(a)]
-
 def _best_unverified_candidate(state):
-    usable=[a for a in getattr(state,'candidates',[]) or [] if _usable_unverified_candidate(state,a)]
-    return max(usable, key=lambda a: candidate_ranking_key(a, state=state)) if usable else None
+    return best_unverified_candidate(state)
 
 def build_evidence_based_acceptance_summary(state):
     aid=(state.selection or {}).get('selected_attempt_id')
@@ -240,11 +211,10 @@ def recommend_next_agentic_action(state):
         last=observations[-1] if observations else None
         if last and last.outcome=='accepted':
             return RecoveryRecommendation(action='select_winner',tool_name='ops_select_winner',tool_input={'decision':'select','selected_attempt_id':last.attempt_id,'summary':'Observed accepted candidate is eligible for selection.','reasons':['attempt observation accepted'],'confidence':0.95},reason='latest observation is accepted',can_execute_deterministically=True)
-        uncertain_usable=_usable_unverified_due_to_validation_uncertainty(state)
-        if len(uncertain_usable) >= 2:
-            best=max(uncertain_usable, key=lambda a: candidate_ranking_key(a, state=state))
+        if has_unverified_selection_opportunity(state):
+            best=best_unverified_candidate(state)
             e=explain_candidate_selection(best, getattr(state,'candidates',[]) or [], state=state)
-            return RecoveryRecommendation(action='select_best_unverified_candidate',tool_name='ops_select_winner',tool_input={'decision':'select','selected_attempt_id':_aid(best),'summary':e['summary'],'reasons':['multiple_pass_accept_unverified_candidates','validation_unavailable_or_inconclusive']+e['reasons'],'confidence':0.6},reason='multiple usable pass/accept candidates are unverified only because reliable validation is unavailable or inconclusive',can_execute_deterministically=True)
+            return RecoveryRecommendation(action='select_best_unverified_candidate',tool_name='ops_select_winner',tool_input={'decision':'select','selected_attempt_id':_aid(best),'summary':e['summary'],'reasons':['unverified_best_candidate','validation_unavailable_or_inconclusive']+e['reasons'],'confidence':0.6},reason='adaptive selection has a usable unverified candidate opportunity; do not burn attempts solely seeking unavailable validation',can_execute_deterministically=True)
         if last and len(state.candidates) < budget:
             reason_map={
                 'validation_failed':'Focused retry: fix failing validation using prior AttemptObservation evidence and rerun known failing commands.',

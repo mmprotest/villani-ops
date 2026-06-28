@@ -162,6 +162,15 @@ class OpsRunState(BaseModel):
             if needs_validation: a.append('ops_run_validation'); return list(dict.fromkeys(a))
             if needs_review: a.append('ops_review_attempt'); return list(dict.fromkeys(a))
             if needs_observation: a.append('ops_observe_completed_attempt'); return list(dict.fromkeys(a))
+            try:
+                from villani_ops.core.acceptance import has_unverified_selection_opportunity
+                if self.orchestrator=='adaptive' and has_unverified_selection_opportunity(self):
+                    a.append('ops_select_winner')
+                    if len(self.candidates) >= budget or (self.adaptive_context or {}).get('deadline_pressure'):
+                        a.append('ops_finalize_run')
+                    return list(dict.fromkeys(a))
+            except Exception:
+                pass
             if len(self.candidates) < budget: a += ['ops_run_next_candidate_attempt']; return list(dict.fromkeys(a))
             a += ['ops_select_winner','ops_finalize_run']; return list(dict.fromkeys(a))
         if self.execution_path=='parallel_candidates' and not self.candidates: a.append('ops_launch_candidates'); return a

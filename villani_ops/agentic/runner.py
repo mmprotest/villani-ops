@@ -167,6 +167,9 @@ class OpsRunner:
             if state.is_terminal(): break
             remaining=_remaining_time()
             if remaining is not None and remaining <= finalization_reserve:
+                state.adaptive_context['deadline_pressure']=True
+                state.adaptive_context['remaining_seconds']=remaining
+                state.adaptive_context['finalization_reserve_seconds']=finalization_reserve
                 state.warnings.append(f'orchestration_deadline_reached_before_model_request: remaining_seconds={remaining:.1f}, reserve_seconds={finalization_reserve:.1f}')
                 rec.record('orchestration_deadline_reached', payload={'remaining_seconds':remaining,'reserve_seconds':finalization_reserve,'phase':state.phase})
                 rec2=recommend_next_agentic_action(state)

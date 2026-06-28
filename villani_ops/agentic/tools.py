@@ -5,7 +5,7 @@ from typing import Any, Callable, Literal
 from pydantic import BaseModel, Field, ConfigDict, model_validator
 from .state import CandidateAttemptState, SubtaskState, AttemptObservation, detect_decomposition_deadlock
 from .git_artifacts import capture_git_patch, ensure_git_baseline, clean_runner_artifacts_from_worktree, DEFAULT_PATCH_EXCLUDES, is_git_compatible_patch, patch_contains_internal_artifacts, clean_untracked_scratch_artifacts, is_scratch_artifact_path
-from villani_ops.core.acceptance import is_attempt_acceptance_eligible, attempt_requires_patch, validation_evidence_strength, validation_is_reliable, normalized_review_metrics, candidate_ranking_evidence, explain_candidate_selection, candidate_ranking_key
+from villani_ops.core.acceptance import is_attempt_acceptance_eligible, attempt_requires_patch, validation_evidence_strength, validation_is_reliable, normalized_review_metrics, candidate_ranking_evidence, explain_candidate_selection, candidate_ranking_key, is_usable_unverified_candidate, usable_unverified_candidates, best_unverified_candidate
 import subprocess, json, time, shutil, os, re
 from villani_ops.agentic.validation import classify_validation_command, run_classified_validation, skipped_validation_result
 from datetime import datetime, timezone
@@ -14,6 +14,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from villani_ops.telemetry.usage import usage_record_from_runner, usage_record_from_response
 
 _UNVERIFIED_FATAL_BLOCKERS={'runner_failed','runner_exception','missing_patch','empty_changed_files','internal_artifacts_only','scratch_artifact_in_patch','patch_hygiene_failed','patch_contains_internal_artifacts','invalid_patch_format','patch_apply_check_failed','scope_failed','review_infrastructure_failed'}
+
+def _is_unverified_candidate_usable(state, attempt):
+    return is_usable_unverified_candidate(state, attempt)
 
 def extract_changed_file_metadata(diff_text:str)->dict[str,list[str]]:
     """Extract stable changed-file metadata from unified/git/binary diffs.
@@ -1070,24 +1073,6 @@ def _validate_review_observe_attempt(state, attempt, ctx, *, target_id=None, rev
     obs=_observe_completed_attempt(state,attempt,ctx)
     return eligible, blockers, obs
 
-def _reliable_validation_failed(attempt, blockers=None):
-    val=_attempt_to_dict(attempt).get('validation') or {}
-    decision=(val.get('decision') or {}).get('status')
-    return decision=='failed' or 'validation_failed' in (blockers or [])
-
-def _is_unverified_candidate_usable(state, attempt):
-    data=_attempt_to_dict(attempt)
-    if data.get('status') not in {'completed','reviewed','accepted'}: return False
-    if data.get('exit_code') not in {None,0}: return False
-    if not data.get('patch_path') or not data.get('changed_files'): return False
-    ok, blockers=is_attempt_acceptance_eligible(attempt,state=state)
-    if ok and validation_is_reliable(data.get('validation') or {}): return False
-    if _reliable_validation_failed(attempt, blockers): return False
-    if any(b in _UNVERIFIED_FATAL_BLOCKERS or b.startswith('attempt_status_invalid') for b in blockers): return False
-    hygiene=data.get('patch_hygiene') or {}
-    if isinstance(hygiene,dict) and (hygiene.get('contains_internal_artifacts') or hygiene.get('format_valid') is False or hygiene.get('apply_check_passed') is False): return False
-    return True
-
 def h_observe_completed_attempt(state, inp, ctx):
     a=next((c for c in state.candidates if c.attempt_id==inp.attempt_id), None)
     if not a:
@@ -1757,7 +1742,9 @@ def h_select_winner(state, inp, ctx):
     reliable_failed=((val.get('decision') or {}).get('status')=='failed') or ('validation_failed' in blockers)
     review_accepts=review.get('decision')=='pass' and review.get('recommended_action')=='accept'
     deadline_or_exhausted=any(str(x).lower() in {'candidate_attempt_budget_exhausted','attempts_exhausted','orchestration_deadline','backend_timeout','max_orchestration_turns_reached'} for x in (inp.reasons or [])) or state.phase=='selecting'
-    unverified_selectable=(not eligible and not reliable_failed and ((review_accepts and set(blockers).issubset({'validation_missing','validation_unverified'})) or (deadline_or_exhausted and _is_unverified_candidate_usable(state,a))))
+    unverified_selectable=(not eligible and not reliable_failed and is_usable_unverified_candidate(state,a) and (review_accepts or deadline_or_exhausted))
+    if not unverified_selectable and not eligible and not reliable_failed and state.execution_path=='decomposed_subtasks' and inp.selected_attempt_id=='integration_001' and review_accepts and set(blockers).issubset({'validation_missing','validation_unverified'}):
+        unverified_selectable=True
     override_warning=None
     model_selected_attempt_id=inp.selected_attempt_id
     if unverified_selectable:
@@ -1773,9 +1760,9 @@ def h_select_winner(state, inp, ctx):
                 verified_alternatives.append(getattr(other,'attempt_id',None))
         if verified_alternatives:
             raise ValueError('selected attempt is unverified while verified alternatives exist: '+', '.join(x for x in verified_alternatives if x))
-        usable=[c for c in (getattr(state,'candidates',[]) or []) if _is_unverified_candidate_usable(state,c)]
+        usable=usable_unverified_candidates(state)
         if usable:
-            best=max(usable, key=lambda c: candidate_ranking_key(c, state=state))
+            best=best_unverified_candidate(state)
             if getattr(best,'attempt_id',None) != inp.selected_attempt_id and candidate_ranking_key(best, state=state) > candidate_ranking_key(a, state=state):
                 override_warning={'warning':'model_selected_unverified_candidate_overridden_by_ranking','model_selected_attempt_id':inp.selected_attempt_id,'deterministic_selected_attempt_id':getattr(best,'attempt_id',None),'model_selected_evidence':candidate_ranking_evidence(a,state=state),'deterministic_selected_evidence':candidate_ranking_evidence(best,state=state)}
                 state.warnings.append('model_selected_unverified_candidate_overridden_by_ranking')

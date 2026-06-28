@@ -4,7 +4,7 @@ from villani_ops.agentic.state import OpsRunState, CandidateAttemptState, Attemp
 
 def state(tmp_path, attempts=3):
     repo=tmp_path/'repo'; run=tmp_path/'run'; repo.mkdir(); run.mkdir()
-    return OpsRunState(run_id='r',run_dir=str(run),repo_path=str(repo),task='fix bug',mode='performance',runner='villani-code',candidate_attempts=attempts,investigation={'summary':'i'},plan={'strategy':'single_task'},execution_path='single_task',phase='running_candidates')
+    return OpsRunState(run_id='r',run_dir=str(run),repo_path=str(repo),task='fix bug',mode='performance',runner='villani-code',candidate_attempts=attempts,investigation={'summary':'i'},plan={'strategy':'single_task'},execution_path='single_task',phase='running_candidates',orchestrator='adaptive')
 
 
 def attempt(aid='candidate_001'):
@@ -113,3 +113,52 @@ def test_budget_exhaustion_structured_failure_includes_observations(tmp_path):
     assert info['latest_outcome'] == 'validation_failed'
     assert info['attempt_observations'][0]['attempt_id'] == 'candidate_001'
     assert info['recommended_next_manual_action']
+
+
+def usable_attempt(tmp_path, aid='candidate_001', score=0.8, confidence=0.6):
+    p=tmp_path/f'{aid}.patch'
+    p.write_text('diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n@@ -1 +1 @@\n-old\n+new\n')
+    a=attempt(aid)
+    a.patch_path=str(p)
+    a.changed_files=['app.py']
+    a.validation={'passed':False,'status':'skipped_no_reliable_command','evidence_strength':'skipped','decision':{'status':'inconclusive','scope':'candidate','rationale':'no reliable command'}}
+    a.validation_status='skipped_no_reliable_command'
+    a.validation_results=[a.validation]
+    a.review={'decision':'pass','recommended_action':'accept','blockers':[],'score':score,'confidence':confidence}
+    a.review_status='passed'
+    return a
+
+
+def test_allowed_actions_allow_unverified_select_after_two_usable_candidates(tmp_path):
+    s=state(tmp_path, attempts=3)
+    s.candidates=[usable_attempt(tmp_path,'candidate_001'), usable_attempt(tmp_path,'candidate_002', score=0.9)]
+    s.attempt_observations=[obs('candidate_001','partial_progress',validation_snapshot_id='skipped_no_reliable_command:1',review_snapshot_id='passed:0:True'), obs('candidate_002','partial_progress',validation_snapshot_id='skipped_no_reliable_command:1',review_snapshot_id='passed:0:True')]
+    assert 'ops_select_winner' in s.allowed_next_actions()
+    assert 'ops_run_next_candidate_attempt' not in s.allowed_next_actions()
+
+
+def test_allowed_actions_continue_after_one_unverified_when_budget_remains(tmp_path):
+    s=state(tmp_path, attempts=3)
+    s.candidates=[usable_attempt(tmp_path,'candidate_001')]
+    s.attempt_observations=[obs('candidate_001','partial_progress',validation_snapshot_id='skipped_no_reliable_command:1',review_snapshot_id='passed:0:True')]
+    assert 'ops_run_next_candidate_attempt' in s.allowed_next_actions()
+    assert 'ops_select_winner' not in s.allowed_next_actions()
+
+
+def test_allowed_actions_allow_one_unverified_under_deadline_pressure(tmp_path):
+    s=state(tmp_path, attempts=3)
+    s.adaptive_context['deadline_pressure']=True
+    s.candidates=[usable_attempt(tmp_path,'candidate_001')]
+    s.attempt_observations=[obs('candidate_001','partial_progress',validation_snapshot_id='skipped_no_reliable_command:1',review_snapshot_id='passed:0:True')]
+    assert 'ops_select_winner' in s.allowed_next_actions()
+    assert 'ops_run_next_candidate_attempt' not in s.allowed_next_actions()
+
+
+def test_recovery_selects_best_unverified_after_two_skipped_validations(tmp_path):
+    s=state(tmp_path, attempts=3)
+    s.candidates=[usable_attempt(tmp_path,'candidate_001', score=0.7), usable_attempt(tmp_path,'candidate_002', score=0.9)]
+    s.attempt_observations=[obs('candidate_001','partial_progress',validation_snapshot_id='skipped_no_reliable_command:1',review_snapshot_id='passed:0:True'), obs('candidate_002','partial_progress',validation_snapshot_id='skipped_no_reliable_command:1',review_snapshot_id='passed:0:True')]
+    rec=recommend_next_agentic_action(s)
+    assert rec.tool_name == 'ops_select_winner'
+    assert rec.action == 'select_best_unverified_candidate'
+    assert rec.tool_input['selected_attempt_id'] == 'candidate_002'
