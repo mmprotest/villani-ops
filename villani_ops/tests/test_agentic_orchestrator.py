@@ -112,3 +112,45 @@ def test_no_tool_call_after_decomposed_path_launches_ready_subtasks(tmp_path):
     events=(Path(r.run_dir)/'runtime_events.jsonl').read_text()
     assert 'ops_run_next_subtask_attempt' in events
     assert 'agentic_orchestrator_no_progress' not in events
+
+class TimeoutClient:
+    def __init__(self, first=None): self.first=first; self.calls=0
+    def create_message(self, **kw):
+        self.calls += 1
+        if self.first and self.calls == 1:
+            return FakeResp(content=self.first, finish_reason='stop')
+        raise TimeoutError('HTTP read timeout')
+
+
+def test_model_call_read_timeout_writes_terminal_failed_state(tmp_path):
+    r=OpsRunner(client=TimeoutClient(), max_turns=3).run(req(tmp_path))
+    state=json.loads((Path(r.run_dir)/'state.json').read_text())
+    assert r.state.status == 'failed'
+    assert state['status'] == 'failed'
+    assert state['phase'] == 'failed'
+    assert state['final_decision']['terminal_state'] == 'timed_out'
+    assert 'backend_timeout' in state['final_decision']['blockers']
+    assert 'model_request_failed' in (Path(r.run_dir)/'runtime_events.jsonl').read_text()
+
+
+def test_backend_timeout_after_completed_candidate_selects_unverified_best(tmp_path):
+    blocks=tc('ops_submit_investigation',{'summary':'s','confidence':1.0})
+    r=OpsRunner(client=TimeoutClient(first=blocks), max_turns=3).run(req(tmp_path))
+    assert r.state.status == 'failed'
+    # Now use a completed candidate path before the timeout.
+    blocks=[
+        tc('ops_submit_investigation',{'summary':'s','confidence':1.0}),
+        tc('ops_submit_plan',{'summary':'p','strategy':'single_task','should_decompose':False,'candidate_attempts':1,'expected_difficulty':'easy','confidence':1.0}),
+        tc('ops_select_execution_path',{'path':'single_task','reason':'r'}),
+        tc('ops_run_next_candidate_attempt',{'reason':'go'}),
+    ]
+    class LaterTimeout(FakeClient):
+        def create_message(self, **kw):
+            if self.blocks:
+                return super().create_message(**kw)
+            raise TimeoutError('backend read timeout')
+    r=OpsRunner(client=LaterTimeout(blocks), max_turns=10).run(req(tmp_path/'x', candidate_attempts=1))
+    assert r.state.status == 'completed'
+    assert r.state.selection['selected_attempt_id'] == 'candidate_001'
+    assert r.state.final_decision['decision_bucket'] == 'accepted_unverified'
+    assert r.state.final_decision['materialization_signal'] == 'unverified_best_candidate'

@@ -1616,9 +1616,9 @@ def _command_evidence_strength(*, source, authority, confidence, blocking, statu
         return 'infrastructure_error'
     if source in {'user_provided','user_success_criteria','integration','final'}:
         return 'explicit_user_command'
-    if source=='project_detected' and confidence=='high' and (blocking or authority=='acceptance_blocking'):
+    if source in {'project_detected','investigation_discovered','subtask_focused'} and confidence=='high' and (blocking or authority=='acceptance_blocking'):
         return 'high_confidence_project_detected'
-    if source=='project_detected' and (blocking or authority=='acceptance_blocking'):
+    if source in {'project_detected','investigation_discovered','subtask_focused'} and (blocking or authority=='acceptance_blocking'):
         return 'project_test'
     if source=='generated' and confidence=='high' and (blocking or authority=='acceptance_blocking'):
         return 'generated_behavioral'
@@ -1667,10 +1667,16 @@ def h_validation(state, inp, ctx):
     results=[]; first_cwd=None
     for i,c in enumerate(inp.commands,1):
         source, authority, scope, subtask_id=_default_validation_metadata(c, target=inp.target, target_obj=target_obj, subtask=_st)
-        blocking = bool(getattr(c,'blocking',None)) if getattr(c,'blocking',None) is not None else authority=='acceptance_blocking'
+        requested_blocking = bool(getattr(c,'blocking',None)) if getattr(c,'blocking',None) is not None else authority=='acceptance_blocking'
+        confidence=getattr(c,'confidence',None) or ('high' if source in {'user_provided','user_success_criteria','integration','final'} or (source in {'project_detected','investigation_discovered','subtask_focused'} and authority=='acceptance_blocking') else 'low')
+        reliable_blocking = (source in {'user_provided','user_success_criteria','integration','final'}) or (source in {'project_detected','investigation_discovered','subtask_focused'} and confidence=='high')
+        blocking = bool(requested_blocking and reliable_blocking)
         if blocking:
             authority='acceptance_blocking'
-        confidence=getattr(c,'confidence',None) or ('high' if source in {'user_provided','user_success_criteria','integration','final'} or authority=='acceptance_blocking' else 'low')
+        elif requested_blocking and source == 'generated':
+            authority='diagnostic_only'
+        elif requested_blocking:
+            authority='supporting_evidence'
         try:
             cmd_cwd=_resolve_command_cwd(c.cwd, base_cwd, target=inp.target, allow_escape=inp.allow_cwd_escape)
             first_cwd=first_cwd or str(cmd_cwd)
@@ -1692,7 +1698,7 @@ def h_validation(state, inp, ctx):
         classified=classify_validation_command(cmd=c.cmd, source=source, confidence=confidence, blocking=blocking, reason=getattr(c,'reason',None) or c.purpose or '', timeout_seconds=c.timeout_seconds or 300)
         classified=classified.__class__(command=classified.command, source=classified.source, confidence=classified.confidence, blocking=classified.blocking, reason=classified.reason, argv=getattr(c,'argv',None), shell=bool(getattr(c,'shell',False)), timeout_seconds=classified.timeout_seconds)
         item=run_classified_validation(classified, cwd=cmd_cwd, stdout_path=so, stderr_path=se)
-        item.update({'cwd':str(cmd_cwd),'scope':scope,'subtask_id':subtask_id,'purpose':c.purpose or '','authority':authority,'source':source,'blocking':blocking,'confidence':confidence})
+        item.update({'cwd':str(cmd_cwd),'scope':scope,'subtask_id':subtask_id,'purpose':c.purpose or '','authority':item.get('authority') if item.get('status')=='infrastructure_error' else authority,'source':source,'blocking':False if item.get('status')=='infrastructure_error' else blocking,'confidence':confidence})
         item['evidence_strength']=_command_evidence_strength(source=source,authority=authority,confidence=confidence,blocking=blocking,status=item.get('status'))
         results.append(item)
         ctx.recorder.record('validation_completed' if item.get('passed') else 'validation_failed', payload={'target':inp.target,'target_id':inp.target_id,'passed':item.get('passed'),'command_count':len(inp.commands),'cwd':str(cmd_cwd),'artifact_paths':{'stdout':str(so),'stderr':str(se)},'validation_result':item})

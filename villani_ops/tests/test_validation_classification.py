@@ -67,3 +67,27 @@ def test_adaptive_mode_still_single_task_and_agentic_decomposition_unaffected(tm
     r2=execute_tool_with_policy(s2,'ops_submit_plan',{'summary':'p','strategy':'decompose_then_execute','should_decompose':True,'candidate_attempts':2,'expected_difficulty':'medium','confidence':1},'p',c2)
     assert not r2.is_error
     assert s2.plan['strategy']=='decompose_then_execute'
+
+def test_generated_validation_malformed_execution_metadata_is_infrastructure_error(tmp_path):
+    s,a,res=_run(tmp_path, {'cmd':'ignored','argv':[],'source':'generated','confidence':'low','blocking':True})
+    assert res['status']=='infrastructure_error'
+    assert res['commands'][0]['preflight_status']=='failed'
+    assert res['commands'][0]['infrastructure_error']=='argv_mode_selected_but_argv_missing_or_unusable'
+    assert res['commands'][0]['authority']!='acceptance_blocking'
+    assert 'validation_failed' not in a.acceptance_blockers
+
+
+def test_generated_validation_needing_shell_without_shell_mode_is_infrastructure_error(tmp_path):
+    s,a,res=_run(tmp_path, {'cmd':f'{sys.executable} -c "print(1)" && {sys.executable} -c "print(2)"','source':'generated','confidence':'low','shell':False})
+    assert res['status']=='infrastructure_error'
+    assert res['commands'][0]['preflight_status']=='failed'
+    assert 'shell_syntax_requires_explicit_shell_mode' in res['commands'][0]['infrastructure_error']
+    assert 'validation_failed' not in a.acceptance_blockers
+
+
+def test_generated_low_confidence_requested_blocking_is_downgraded_to_diagnostic(tmp_path):
+    s,a,res=_run(tmp_path, {'cmd':f'{sys.executable} -c "import sys; sys.exit(6)"','source':'generated','confidence':'low','blocking':True,'authority':'acceptance_blocking'})
+    assert res['status']=='diagnostic_failed'
+    assert res['commands'][0]['blocking'] is False
+    assert res['commands'][0]['authority']=='diagnostic_only'
+    assert 'validation_failed' not in a.acceptance_blockers
