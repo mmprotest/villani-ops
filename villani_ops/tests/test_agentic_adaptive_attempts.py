@@ -161,3 +161,48 @@ def test_accepted_refresh_and_multiple_backends_count_unique_attempts(tmp_path):
     assert s.runner_assessment['attempts'] == 3
     assert s.backend_assessments['b1']['accepted_candidates'] == 1
     assert s.runner_assessment['accepted_candidates'] == 1
+
+class RecordingReviewer:
+    name='recording-reviewer'
+    def __init__(self, blockers=None):
+        self.calls=[]; self.blockers=blockers or []
+    def review(self, *, state, attempt, scope):
+        self.calls.append({'attempt':attempt,'scope':scope})
+        return {'decision':'fail' if self.blockers else 'pass','recommended_action':'retry' if self.blockers else 'accept','score':0.8,'summary':'reviewed','evidence':['validation visible'],'issues':[],'blockers':list(self.blockers)}
+
+def test_adaptive_candidate_validation_runs_before_review_and_payload_has_current_validation(tmp_path):
+    s=make_state(tmp_path); runner=TelemetryRunner(); c=make_ctx(tmp_path, runner); rec=RecordingReviewer(['rollback_not_fixed']); c.reviewer=rec
+    res=execute_tool_with_policy(s,'ops_run_next_candidate_attempt',{'reason':'first try'},'a1',c)
+    assert not res.is_error, res.content
+    assert rec.calls, 'reviewer should be called'
+    payload=rec.calls[0]['attempt']
+    assert s.candidates[0].validation_status in {'failed_candidate','diagnostic_failed','passed','infrastructure_error','timeout'}
+    assert payload['current_validation']['validation_status'] == s.candidates[0].validation_status
+    assert payload['validation']['commands'][0]['execution_mode']
+    assert 'stdout_summary' in payload['validation']['commands'][0]
+    assert payload['validation']['commands'][0]['command_or_argv']
+
+def test_validation_missing_blocker_cannot_survive_after_validation_passed(tmp_path):
+    from villani_ops.agentic.tools import h_review_attempt, OpsReviewAttemptInput, h_validation, OpsRunValidationInput, ValidationCommand
+    s=make_state(tmp_path); runner=TelemetryRunner(); c=make_ctx(tmp_path, runner)
+    c.reviewer=RecordingReviewer(['validation_missing'])
+    execute_tool_with_policy(s,'ops_run_next_candidate_attempt',{'reason':'first try'},'a1',c)
+    a=s.candidates[0]
+    # Override with an explicit passing blocking validation and review again.
+    h_validation(s, OpsRunValidationInput(target='candidate', target_id=a.attempt_id, commands=[ValidationCommand(cmd='python -c "import sys; sys.exit(0)"', source='user_provided', confidence='high', blocking=True)]), c)
+    h_review_attempt(s, OpsReviewAttemptInput(attempt_id=a.attempt_id, scope='candidate'), c)
+    assert a.validation_status == 'passed'
+    assert 'validation_missing' not in (a.review or {}).get('blockers', [])
+    assert 'validation_missing' not in a.acceptance_blockers
+
+def test_validation_added_after_prior_review_invalidates_stale_review(tmp_path):
+    from villani_ops.agentic.tools import h_validation, OpsRunValidationInput, ValidationCommand
+    s=make_state(tmp_path); runner=TelemetryRunner(); c=make_ctx(tmp_path, runner); c.reviewer=RecordingReviewer(['validation_missing'])
+    execute_tool_with_policy(s,'ops_run_next_candidate_attempt',{'reason':'first try'},'a1',c)
+    a=s.candidates[0]
+    assert a.review is not None
+    h_validation(s, OpsRunValidationInput(target='candidate', target_id=a.attempt_id, commands=[ValidationCommand(cmd='python -c "import sys; sys.exit(0)"', source='user_provided', confidence='high', blocking=True)]), c)
+    assert a.validation_status == 'passed'
+    assert a.review is None
+    assert a.review_status == 'not_run'
+    assert 'review_missing' in a.acceptance_blockers

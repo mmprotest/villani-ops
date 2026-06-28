@@ -100,6 +100,54 @@ def _read_patch_excerpt(path, max_chars=24000):
 def _attempt_to_dict(a):
     return a.model_dump(mode='json') if hasattr(a,'model_dump') else dict(a)
 
+
+
+def _validation_snapshot(attempt) -> str:
+    data=_attempt_to_dict(attempt)
+    validation=data.get('validation') or {}
+    status=data.get('validation_status') or validation.get('status') or 'not_run'
+    source=data.get('validation_source') or validation.get('validation_source') or validation.get('source')
+    commands=validation.get('commands') or []
+    command_sig=[]
+    for c in commands:
+        if isinstance(c, dict):
+            command_sig.append({
+                'cmd': c.get('cmd') or c.get('command'),
+                'status': c.get('status'),
+                'exit_code': c.get('exit_code'),
+                'blocking': c.get('blocking'),
+                'authority': c.get('authority'),
+                'source': c.get('source'),
+            })
+    return json.dumps({'status':status,'source':source,'decision_status':validation.get('decision_status') or (validation.get('decision') or {}).get('status'),'commands':command_sig}, sort_keys=True, default=str)
+
+def _invalidate_stale_review_after_validation(state, attempt, ctx=None, *, reason='validation_changed_after_review'):
+    if isinstance(attempt, dict):
+        if not attempt.get('review'):
+            return False
+        current=_validation_snapshot(attempt)
+        prior=attempt.get('review_validation_snapshot') or (attempt.get('review') or {}).get('validation_snapshot')
+        blockers=(attempt.get('review') or {}).get('blockers') or []
+        stale = (prior is not None and prior != current) or ('validation_missing' in blockers)
+        if stale:
+            attempt['stale_review']=attempt.get('review')
+            attempt['review']=None; attempt['review_status']='not_run'; attempt['review_validation_snapshot']=None
+            attempt['acceptance_eligible']=False
+            attempt['acceptance_blockers']=sorted(set((attempt.get('acceptance_blockers') or [])+['review_invalidated_after_validation']))
+        return stale
+    if not getattr(attempt,'review',None):
+        return False
+    current=_validation_snapshot(attempt)
+    prior=getattr(attempt,'review_validation_snapshot',None) or (attempt.review or {}).get('validation_snapshot')
+    blockers=(attempt.review or {}).get('blockers') or []
+    stale = (prior is not None and prior != current) or ('validation_missing' in blockers)
+    if stale:
+        attempt.review=None; attempt.review_status='not_run'; attempt.review_validation_snapshot=None; attempt.acceptance_eligible=False
+        attempt.acceptance_blockers=sorted(set((attempt.acceptance_blockers or [])+['review_invalidated_after_validation']))
+        if ctx is not None:
+            ctx.recorder.record('review_invalidated_after_validation', payload={'attempt_id':attempt.attempt_id,'reason':reason,'validation_snapshot':current})
+    return stale
+
 def build_agentic_review_payload(state, attempt, scope, subtask=None):
     data=_attempt_to_dict(attempt)
     validation=data.get('validation') or {}
@@ -112,7 +160,29 @@ def build_agentic_review_payload(state, attempt, scope, subtask=None):
         debug_summary.update({'first_relevant_validation':{'status':first.get('status'),'passed':first.get('passed'),'cmd':first.get('cmd')},'final_relevant_validation':{'status':final.get('status'),'passed':final.get('passed'),'cmd':final.get('cmd')},'final_command':final.get('cmd')})
     validation_tails=[]
     for item in validation.get('commands') or []:
-        validation_tails.append({**item, 'stdout_tail':_read_text_tail(item.get('stdout_path'), max_chars=4000), 'stderr_tail':_read_text_tail(item.get('stderr_path'), max_chars=4000)})
+        stdout_tail=_read_text_tail(item.get('stdout_path'), max_chars=4000)
+        stderr_tail=_read_text_tail(item.get('stderr_path'), max_chars=4000)
+        validation_tails.append({
+            **item,
+            'command_source': item.get('source'),
+            'command_or_argv': item.get('argv') or item.get('cmd') or item.get('command'),
+            'stdout_summary': stdout_tail,
+            'stderr_summary': stderr_tail,
+            'stdout_tail': stdout_tail,
+            'stderr_tail': stderr_tail,
+            'blocking_or_diagnostic': 'blocking' if item.get('blocking') or item.get('authority')=='acceptance_blocking' else 'diagnostic',
+        })
+    validation_metadata={
+        'validation_status':data.get('validation_status') or validation.get('status') or 'not_run',
+        'validation_source':data.get('validation_source') or validation.get('validation_source'),
+        'validation_confidence':validation.get('confidence') or next((c.get('confidence') for c in validation_tails if c.get('confidence')), None),
+        'validation_blocking':any(c.get('blocking') or c.get('authority')=='acceptance_blocking' for c in validation_tails),
+        'validation_blocking_or_diagnostic':'blocking' if any(c.get('blocking') or c.get('authority')=='acceptance_blocking' for c in validation_tails) else 'diagnostic',
+        'commands':validation_tails,
+        'decision':validation.get('decision') or {},
+        'decision_status':validation.get('decision_status') or (validation.get('decision') or {}).get('status'),
+        'infrastructure_error_reason':validation.get('infrastructure_error') or next((c.get('infrastructure_error') for c in validation_tails if c.get('infrastructure_error')), None),
+    }
     payload={
         'parent_task':state.task,
         'success_criteria':state.success_criteria,
@@ -124,9 +194,9 @@ def build_agentic_review_payload(state, attempt, scope, subtask=None):
         'stdout_tail':_read_text_tail(data.get('stdout_path')),
         'stderr_tail':_read_text_tail(data.get('stderr_path')),
         'transcript_tail':_read_text_tail(data.get('transcript_path')),
-        'validation':{**current_validation, 'commands':validation_tails, 'authoritative': bool(current_validation)},
+        'validation':{**current_validation, **validation_metadata, 'authoritative': bool(current_validation)},
         'validation_decision':(current_validation or {}).get('decision') or {},
-        'current_validation':{**current_validation, 'source':'ops_run_validation'} if current_validation else {},
+        'current_validation':{**current_validation, **validation_metadata, 'source':'ops_run_validation'} if current_validation else validation_metadata,
         'debug_validation_history':debug_summary,
         'non_blocking_runner_trace_history': debug_summary if debug_cmds else {},
         'imported_debug_validation': debug_hist[:1],
@@ -1249,6 +1319,7 @@ def h_review_attempt(state, inp, ctx):
             base.update({'patch_excerpt':_read_patch_excerpt(data.get('patch_path'), max_chars=8000),'validation_output_summary':payload.get('validation',{}),'scope_assessment':data.get('scope_assessment')})
         return base
     payload=build_agentic_review_payload(state, a, inp.scope, st)
+    review_validation_snapshot=_validation_snapshot(a)
     raw=None; res=None; last_error=None; failure_kind=None
     payloads=[('full',payload),('compact',_compact_payload(payload)),('minimal',_compact_payload(payload, True))]
     for idx,(kind,attempt_payload) in enumerate(payloads,1):
@@ -1277,6 +1348,12 @@ def h_review_attempt(state, inp, ctx):
             if idx < len(payloads):
                 ctx.recorder.record('review_retrying', payload={'attempt_id':inp.attempt_id,'failed_payload':kind,'next_payload':payloads[idx][0],'review_error_type':failure_kind,'message':str(e)[:500]})
                 continue
+    if res is not None and (getattr(a,'validation_status',None) or (_attempt_to_dict(a).get('validation') or {}).get('status')) not in {None,'not_run'}:
+        if 'validation_missing' in (res.blockers or []):
+            res.blockers=[b for b in res.blockers if b!='validation_missing']
+            if res.decision=='fail' and not res.blockers and res.recommended_action in {'accept','retry'}:
+                # The reviewer saw current validation in this invocation; never persist stale validation_missing.
+                res.summary=(res.summary or '') + ' (Removed stale validation_missing blocker because validation was attached before review.)'
     if res is None:
         e=last_error or Exception('unknown structured review failure')
         res=OpsReviewResult(decision='fail',recommended_action='retry',score=0.0,summary='structured review unavailable after retries',evidence=[],issues=[f'{type(e).__name__}: {e}'],blockers=['review_infrastructure_failed','review_malformed'],confidence=0.0)
@@ -1288,12 +1365,12 @@ def h_review_attempt(state, inp, ctx):
             a.acceptance_blockers=sorted(set(a.acceptance_blockers+['review_infrastructure_failed','review_malformed']))
             a.review_status=failure_kind or 'unavailable'; a.review_error_type=type(e).__name__; a.review_error_message=str(e); a.review_retry_count=len(payloads)
     if isinstance(a, dict):
-        a['review']=res.model_dump(); a['status']='reviewed' if a.get('status') not in {'failed','completed'} else a.get('status')
+        a['review']={**res.model_dump(), 'validation_snapshot': review_validation_snapshot}; a['review_validation_snapshot']=review_validation_snapshot; a['status']='reviewed' if a.get('status') not in {'failed','completed'} else a.get('status')
         eligible, blockers=_set_acceptance_from_gate(state, a)
         if res.blockers:
             blockers=sorted(set(blockers+res.blockers)); a['acceptance_blockers']=blockers; eligible=False; a['acceptance_eligible']=False
     else:
-        a.review=res.model_dump(); a.status='reviewed' if a.status!='failed' else 'rejected'
+        a.review={**res.model_dump(), 'validation_snapshot': review_validation_snapshot}; a.review_validation_snapshot=review_validation_snapshot; a.status='reviewed' if a.status!='failed' else 'rejected'
         if res.decision=='pass' and res.recommended_action=='accept' and not res.blockers:
             a.review_status='passed'
         elif 'review_infrastructure_failed' in res.blockers:
@@ -1484,14 +1561,16 @@ def _platform_command_error(cmd: str) -> tuple[str,str] | None:
             return name, f"validation command uses Unix-only utility '{name}' on Windows; use a Python one-liner or pytest flags instead"
     return None
 
-def _attach_validation(state, target_obj, target, result):
+def _attach_validation(state, target_obj, target, result, ctx=None):
     status=result.get('status') or ('passed' if result.get('passed') else 'failed')
     result['validation_source']='ops_run_validation'
     if target=='candidate' and target_obj is not None:
         target_obj.validation=result; target_obj.validation_status=status; target_obj.validation_source='ops_run_validation'; target_obj.validation_results=list(getattr(target_obj,'validation_results',[]) or [])+[result]
+        invalidated=_invalidate_stale_review_after_validation(state,target_obj,ctx,reason='candidate_validation_attached_after_review')
         _set_acceptance_from_gate(state,target_obj)
     elif target=='integration' and isinstance(target_obj,dict):
         target_obj['validation']=result; target_obj['validation_status']=status; target_obj['validation_results']=(target_obj.get('validation_results') or [])+[result]
+        invalidated=_invalidate_stale_review_after_validation(state,target_obj,ctx,reason='validation_attached_after_review')
         _set_acceptance_from_gate(state,target_obj)
     elif target=='repo':
         vals=list(getattr(state,'repo_validation_results',[]) or []); vals.append(result); state.repo_validation_results=vals
@@ -1552,7 +1631,7 @@ def h_validation(state, inp, ctx):
     if not inp.commands:
         res=skipped_validation_result(target=inp.target, target_id=inp.target_id, cwd=base_cwd.resolve())
         decision=make_validation_decision(res); res['decision']=decision; res['decision_status']=decision['status']; res['scope']=decision['scope']; res['subtask_id']=decision.get('subtask_id')
-        _attach_validation(state,target_obj,inp.target,res)
+        _attach_validation(state,target_obj,inp.target,res,ctx)
         ctx.recorder.record('validation_attached', payload={'target':inp.target,'target_id':inp.target_id,'passed':False,'status':res['status'],'command_count':0,'cwd':res['cwd'],'artifact_paths':[]})
         return res
     results=[]; first_cwd=None
@@ -1573,7 +1652,7 @@ def h_validation(state, inp, ctx):
                 util,msg=perr; raise RuntimeError(msg)
         except Exception as e:
             reason='platform_unsupported_command' if isinstance(e,RuntimeError) else 'targeted_cwd_rejected'
-            item={'cmd':c.cmd,'command':c.cmd,'passed':False,'status':'infrastructure_error','reason':getattr(c,'reason',None) or reason,'error':str(e),'cwd':str(base_cwd.resolve()),'source':source,'confidence':confidence,'blocking':False if source in {'generated','diagnostic'} else blocking,'authority':'diagnostic_only' if source in {'generated','diagnostic'} else authority,'scope':scope,'subtask_id':subtask_id,'purpose':c.purpose or '','execution_mode':'argv','shell':False,'exit_code':None,'infrastructure_error':str(e)}
+            item={'cmd':c.cmd,'command':c.cmd,'passed':False,'status':'infrastructure_error','reason':getattr(c,'reason',None) or reason,'error':str(e),'cwd':str(base_cwd.resolve()),'source':source,'confidence':confidence,'blocking':False if source in {'generated','diagnostic'} else blocking,'authority':'diagnostic_only' if source in {'generated','diagnostic'} else authority,'scope':scope,'subtask_id':subtask_id,'purpose':c.purpose or '','execution_mode':'argv','shell':False,'argv':[],'exit_code':None,'infrastructure_error':str(e)}
             results.append(item)
             ctx.recorder.record('validation_command_rejected', payload={'target':inp.target,'target_id':inp.target_id,'cmd':c.cmd,'reason':reason,'message':str(e)})
             continue
@@ -1595,7 +1674,9 @@ def h_validation(state, inp, ctx):
     res={'raw_passed':passed,'raw_status':overall,'passed':passed,'status':overall,'commands':results,'target':inp.target,'target_id':inp.target_id,'cwd':first_cwd or str(base_cwd.resolve())}
     decision=make_validation_decision(res); res['decision']=decision; res['decision_status']=decision['status']; res['scope']=decision['scope']; res['subtask_id']=decision.get('subtask_id')
     if decision['status']=='passed': res['passed']=True; res['status']='passed'
-    _attach_validation(state,target_obj,inp.target,res)
+    _attach_validation(state,target_obj,inp.target,res,ctx)
+    if inp.target=='integration' and isinstance(target_obj,dict) and target_obj.get('review') is None and ctx.reviewer is not None:
+        h_review_attempt(state, OpsReviewAttemptInput(attempt_id=target_obj.get('attempt_id') or 'integration_001', scope='integration'), ctx)
     ctx.recorder.record('validation_attached', payload={'target':inp.target,'target_id':inp.target_id,'passed':res['passed'],'status':res['status'],'command_count':len(inp.commands),'cwd':res['cwd'],'artifact_paths':[p for r in results for p in [r.get('stdout_path'),r.get('stderr_path')] if p]})
     if inp.target=='candidate' and target_obj is not None and any(o.attempt_id==inp.target_id for o in state.attempt_observations):
         _observe_completed_attempt(state,target_obj,ctx)
