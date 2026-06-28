@@ -119,6 +119,7 @@ class OpsRunState(BaseModel):
     best_partial_attempt_id:str|None=None; partial_progress:dict|None=None
     candidates:list[CandidateAttemptState]=Field(default_factory=list); subtasks:list[SubtaskState]=Field(default_factory=list)
     attempt_observations:list[AttemptObservation]=Field(default_factory=list); backend_assessments:dict[str,dict]=Field(default_factory=dict); runner_assessment:dict=Field(default_factory=dict); adaptive_context:dict=Field(default_factory=dict)
+    unverified_selection_policy:Literal['budget_exhausted','after_two','deadline_only','always_allow']='budget_exhausted'
     integration:dict|None=None; decomposition_integration_worktree:str|None=None; integration_base_revision:str|None=None
     accepted_patch_application_status:dict[str,dict]=Field(default_factory=dict)
     reviews:list[dict]=Field(default_factory=list); repo_validation_results:list[dict]=Field(default_factory=list); selection:dict|None=None; final_decision:dict|None=None

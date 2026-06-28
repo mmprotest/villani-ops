@@ -547,15 +547,44 @@ def reliable_validation_available_for_candidates(state: Any) -> bool:
     return False
 
 
+UNVERIFIED_SELECTION_POLICIES = {"budget_exhausted", "after_two", "deadline_only", "always_allow"}
+
+
+def unverified_selection_policy(state: Any) -> str:
+    """Return the adaptive unverified-selection policy.
+
+    Default budget_exhausted keeps external-verifier workflows honest: usable
+    unverified candidates may be finalized at budget exhaustion or under
+    deadline pressure, but they do not stop the run early by default.
+    """
+    ctx = getattr(state, "adaptive_context", {}) or {}
+    policy = str(getattr(state, "unverified_selection_policy", None) or ctx.get("unverified_selection_policy") or "budget_exhausted").lower()
+    return policy if policy in UNVERIFIED_SELECTION_POLICIES else "budget_exhausted"
+
+
+def candidate_budget_exhausted(state: Any) -> bool:
+    budget = max(1, int(getattr(state, "candidate_attempts", 1) or 1))
+    return len(getattr(state, "candidates", []) or []) >= budget
+
+
 def has_unverified_selection_opportunity(state: Any) -> bool:
     usable = usable_unverified_candidates(state)
     if not usable:
         return False
-    budget = max(1, int(getattr(state, "candidate_attempts", 1) or 1))
     deadline_pressure = bool((getattr(state, "adaptive_context", {}) or {}).get("deadline_pressure"))
-    budget_exhausted = len(getattr(state, "candidates", []) or []) >= budget or getattr(state, "phase", None) == "selecting"
-    no_reliable_validation = not reliable_validation_available_for_candidates(state)
-    return deadline_pressure or budget_exhausted or (len(usable) >= 2 and no_reliable_validation)
+    budget_exhausted = candidate_budget_exhausted(state)
+    policy = unverified_selection_policy(state)
+    if policy == "always_allow":
+        return True
+    if deadline_pressure:
+        return True
+    if policy == "deadline_only":
+        return False
+    if budget_exhausted:
+        return True
+    if policy == "after_two" and len(usable) >= 2 and not reliable_validation_available_for_candidates(state):
+        return True
+    return False
 
 
 def explain_candidate_selection(winner: Any, alternatives: list[Any], *, state: Any | None = None, limit: int = 3) -> dict[str, Any]:

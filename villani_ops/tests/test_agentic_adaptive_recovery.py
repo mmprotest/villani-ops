@@ -129,12 +129,12 @@ def usable_attempt(tmp_path, aid='candidate_001', score=0.8, confidence=0.6):
     return a
 
 
-def test_allowed_actions_allow_unverified_select_after_two_usable_candidates(tmp_path):
+def test_allowed_actions_do_not_allow_unverified_select_after_two_usable_candidates_by_default(tmp_path):
     s=state(tmp_path, attempts=3)
     s.candidates=[usable_attempt(tmp_path,'candidate_001'), usable_attempt(tmp_path,'candidate_002', score=0.9)]
     s.attempt_observations=[obs('candidate_001','partial_progress',validation_snapshot_id='skipped_no_reliable_command:1',review_snapshot_id='passed:0:True'), obs('candidate_002','partial_progress',validation_snapshot_id='skipped_no_reliable_command:1',review_snapshot_id='passed:0:True')]
-    assert 'ops_select_winner' in s.allowed_next_actions()
-    assert 'ops_run_next_candidate_attempt' not in s.allowed_next_actions()
+    assert 'ops_select_winner' not in s.allowed_next_actions()
+    assert 'ops_run_next_candidate_attempt' in s.allowed_next_actions()
 
 
 def test_allowed_actions_continue_after_one_unverified_when_budget_remains(tmp_path):
@@ -154,8 +154,32 @@ def test_allowed_actions_allow_one_unverified_under_deadline_pressure(tmp_path):
     assert 'ops_run_next_candidate_attempt' not in s.allowed_next_actions()
 
 
-def test_recovery_selects_best_unverified_after_two_skipped_validations(tmp_path):
+def test_recovery_retries_after_two_skipped_validations_when_budget_remains(tmp_path):
     s=state(tmp_path, attempts=3)
+    s.candidates=[usable_attempt(tmp_path,'candidate_001', score=0.7), usable_attempt(tmp_path,'candidate_002', score=0.9)]
+    s.attempt_observations=[obs('candidate_001','partial_progress',validation_snapshot_id='skipped_no_reliable_command:1',review_snapshot_id='passed:0:True'), obs('candidate_002','partial_progress',validation_snapshot_id='skipped_no_reliable_command:1',review_snapshot_id='passed:0:True')]
+    rec=recommend_next_agentic_action(s)
+    assert rec.tool_name == 'ops_run_next_candidate_attempt'
+    assert rec.action.startswith('focused_retry_')
+
+
+def test_allowed_actions_allow_unverified_select_when_budget_exhausted(tmp_path):
+    s=state(tmp_path, attempts=2)
+    s.candidates=[usable_attempt(tmp_path,'candidate_001'), usable_attempt(tmp_path,'candidate_002', score=0.9)]
+    s.attempt_observations=[obs('candidate_001','partial_progress',validation_snapshot_id='skipped_no_reliable_command:1',review_snapshot_id='passed:0:True'), obs('candidate_002','partial_progress',validation_snapshot_id='skipped_no_reliable_command:1',review_snapshot_id='passed:0:True')]
+    assert 'ops_select_winner' in s.allowed_next_actions()
+
+
+def test_explicit_after_two_policy_allows_unverified_early_selection(tmp_path):
+    s=state(tmp_path, attempts=3)
+    s.unverified_selection_policy='after_two'
+    s.candidates=[usable_attempt(tmp_path,'candidate_001'), usable_attempt(tmp_path,'candidate_002', score=0.9)]
+    s.attempt_observations=[obs('candidate_001','partial_progress',validation_snapshot_id='skipped_no_reliable_command:1',review_snapshot_id='passed:0:True'), obs('candidate_002','partial_progress',validation_snapshot_id='skipped_no_reliable_command:1',review_snapshot_id='passed:0:True')]
+    assert 'ops_select_winner' in s.allowed_next_actions()
+
+
+def test_recovery_selects_best_unverified_when_budget_exhausted(tmp_path):
+    s=state(tmp_path, attempts=2)
     s.candidates=[usable_attempt(tmp_path,'candidate_001', score=0.7), usable_attempt(tmp_path,'candidate_002', score=0.9)]
     s.attempt_observations=[obs('candidate_001','partial_progress',validation_snapshot_id='skipped_no_reliable_command:1',review_snapshot_id='passed:0:True'), obs('candidate_002','partial_progress',validation_snapshot_id='skipped_no_reliable_command:1',review_snapshot_id='passed:0:True')]
     rec=recommend_next_agentic_action(s)

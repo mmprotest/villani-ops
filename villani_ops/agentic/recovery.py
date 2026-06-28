@@ -210,7 +210,19 @@ def recommend_next_agentic_action(state):
         observations=[o for o in getattr(state,'attempt_observations',[]) or [] if getattr(o,'scope',None)=='candidate']
         last=observations[-1] if observations else None
         if last and last.outcome=='accepted':
-            return RecoveryRecommendation(action='select_winner',tool_name='ops_select_winner',tool_input={'decision':'select','selected_attempt_id':last.attempt_id,'summary':'Observed accepted candidate is eligible for selection.','reasons':['attempt observation accepted'],'confidence':0.95},reason='latest observation is accepted',can_execute_deterministically=True)
+            last_attempt=_find_attempt_by_id(state, last.attempt_id)
+            last_verified=False
+            if last_attempt is not None:
+                try:
+                    last_verified=is_attempt_acceptance_eligible(last_attempt,state=state)[0] and validation_is_reliable(_validation(last_attempt) or {})
+                except Exception:
+                    last_verified=False
+            if last_verified:
+                return RecoveryRecommendation(action='select_winner',tool_name='ops_select_winner',tool_input={'decision':'select','selected_attempt_id':last.attempt_id,'summary':'Observed accepted candidate is eligible for selection.','reasons':['attempt observation accepted'],'confidence':0.95},reason='latest observation is accepted with reliable validation',can_execute_deterministically=True)
+            if has_unverified_selection_opportunity(state):
+                best=best_unverified_candidate(state)
+                e=explain_candidate_selection(best, getattr(state,'candidates',[]) or [], state=state)
+                return RecoveryRecommendation(action='select_best_unverified_candidate',tool_name='ops_select_winner',tool_input={'decision':'select','selected_attempt_id':_aid(best),'summary':e['summary'],'reasons':['unverified_best_candidate','validation_unavailable_or_inconclusive']+e['reasons'],'confidence':0.6},reason='usable unverified accepted observation is selectable by policy',can_execute_deterministically=True)
         if has_unverified_selection_opportunity(state):
             best=best_unverified_candidate(state)
             e=explain_candidate_selection(best, getattr(state,'candidates',[]) or [], state=state)
@@ -225,7 +237,8 @@ def recommend_next_agentic_action(state):
                 'infra_failed':'Retry infrastructure failure once if safe; otherwise escalate backend or fail clearly.',
                 'patch_failed':'Focused retry: produce a clean git-applicable patch and do not repeat patch hygiene mistakes.',
                 'scope_failed':'Focused retry: stay in scope and avoid unrelated files.',
-                'unknown':'Focused retry using previous attempt evidence.'}
+                'unknown':'Focused retry using previous attempt evidence.',
+                'accepted':'Continue the adaptive candidate budget because current accepted evidence is unverified; seek a stronger candidate without claiming verified success.'}
             backend_names=list((getattr(state,'backend_assessments',{}) or {}).keys())
             other=next((b for b in backend_names if b and b!=(last.backend_name or 'unknown')), None)
             inp={'reason':reason_map.get(last.outcome, reason_map['unknown']), 'base_attempt_id':last.attempt_id, 'repair':bool(last.should_repair or last.outcome in {'validation_failed','review_failed','patch_failed','scope_failed'})}
