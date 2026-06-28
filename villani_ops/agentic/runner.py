@@ -14,6 +14,7 @@ from .artifacts import write_artifacts
 from .client import ToolCallingLLMClient
 from villani_ops.runners import runner_for_name
 from villani_ops.telemetry.usage import UsageRecorder, usage_record_from_response
+from villani_ops.core.acceptance import is_attempt_acceptance_eligible, validation_is_reliable
 from villani_ops.execution_policies import policy_for_mode
 from villani_ops.orchestration.nodes import OrchestrationNode
 from villani_ops.orchestration.context import TaskContext
@@ -27,7 +28,7 @@ class AgenticLLMReviewer:
         payload={'task':state.task,'success_criteria':state.success_criteria,'execution_path':state.execution_path,'scope':scope,'review_payload':attempt}
         tool={'type':'function','function':{'name':'agentic_review_decision','description':'Return a structured Villani Ops review decision. Never pass without evidence.','parameters':OpsReviewResult.model_json_schema(),'strict':True}}
         messages=[{'role':'user','content':'Review this attempt using the forced structured review tool. Fail closed on missing evidence, runner failure, validation failure, or scope mismatch.\n'+__import__('json').dumps(payload,indent=2,default=str)[:120000]}]
-        resp=self.client.create_message(backend=self.review_backend,messages=messages,system='You are a strict production code reviewer for Villani Ops agentic mode.',tools=[tool],tool_choice={'type':'function','function':{'name':'agentic_review_decision'}},strict=True)
+        resp=self.client.create_message(backend=self.review_backend,messages=messages,system='You are a strict production code reviewer for Villani Ops agentic mode. Treat validation infrastructure_error as a command that failed to test the candidate, not proof the candidate is wrong. diagnostic_failed and generated smoke checks are weak evidence only; passing import/signature/file-exists checks is not proof of full success. Verified acceptance requires reliable explicit or high-confidence project validation or similarly strong evidence, and unverified best-candidate selections must be labelled honestly.',tools=[tool],tool_choice={'type':'function','function':{'name':'agentic_review_decision'}},strict=True)
         self.last_response=resp
         raw={'raw_response':getattr(resp,'raw_response',{}),'content':getattr(resp,'content',[])}
         state_reviews=getattr(state,'reviews',None)
@@ -39,6 +40,45 @@ class AgenticLLMReviewer:
         parsed=OpsReviewResult.model_validate(calls[0].get('input') or {})
         if isinstance(state_reviews,list): state_reviews[-1]['structured_review_parsed_result']=parsed.model_dump()
         return parsed.model_dump()
+
+
+
+def _is_backend_timeout_error(exc: Exception) -> bool:
+    text=(type(exc).__name__ + ' ' + str(exc)).lower()
+    return any(x in text for x in ['timeout','timed out','readtimeout','read timeout','deadline'])
+
+def _clean_finalize_after_backend_error(state, rec, *, error: Exception):
+    etype='backend_timeout' if _is_backend_timeout_error(error) else 'backend_error'
+    msg=f'{etype}: {type(error).__name__}: {error}'
+    state.last_error=msg
+    state.warnings.append(msg)
+    rec.record('model_request_failed', payload={'error_type':etype,'exception_type':type(error).__name__,'message':str(error)})
+    usable=[]
+    verified=[]
+    for c in state.candidates:
+        if c.status in {'completed','reviewed','accepted'} and c.patch_path and c.changed_files:
+            reliable_failed=((c.validation or {}).get('decision') or {}).get('status')=='failed'
+            if reliable_failed:
+                continue
+            review_ok=(c.review or {}).get('decision')=='pass' and (c.review or {}).get('recommended_action')=='accept'
+            if review_ok:
+                usable.append(c)
+                try:
+                    ok,_=is_attempt_acceptance_eligible(c,state=state)
+                except Exception:
+                    ok=False
+                if ok and validation_is_reliable(c.validation or {}):
+                    verified.append(c)
+    chosen=(verified or usable or [None])[0]
+    if chosen is not None:
+        state.selection={'decision':'select','selected_attempt_id':chosen.attempt_id,'summary':'Selected best completed candidate after backend error; evidence may be unverified.','confidence':0.5,'decision_bucket':'accepted_verified' if chosen in verified else 'accepted_unverified','materialization_signal':'verified_accepted' if chosen in verified else 'unverified_best_candidate'}
+        state.final_decision={'decision':'accepted','summary':('verified: ' if chosen in verified else 'selected_unverified: ')+msg,'selected_attempt_id':chosen.attempt_id,'selected_patch_path':chosen.patch_path,'decision_bucket':state.selection['decision_bucket'],'materialization_signal':state.selection['materialization_signal'],'blockers':[etype]}
+        state.status='completed'; state.phase='completed'
+    else:
+        state.selection=None
+        state.final_decision={'decision':'failed','summary':msg,'selected_attempt_id':None,'blockers':[etype], 'terminal_state':'timed_out' if etype=='backend_timeout' else 'failed_infrastructure'}
+        state.status='failed'; state.phase='failed'
+    rec.record('run_finalized', payload=state.final_decision)
 
 def _fakeish(obj):
     n=(getattr(obj,'name',None) or obj.__class__.__name__).lower()
@@ -114,7 +154,11 @@ class OpsRunner:
         for _ in range(self.max_turns):
             if state.is_terminal(): break
             rec.record('model_request_started',phase=state.phase)
-            resp=self.client.create_message(backend=backend,messages=messages,system=system_prompt,tools=openai_tool_specs(adaptive=(request.orchestrator=='adaptive')),tool_choice='auto',strict=True)
+            try:
+                resp=self.client.create_message(backend=backend,messages=messages,system=system_prompt,tools=openai_tool_specs(adaptive=(request.orchestrator=='adaptive')),tool_choice='auto',strict=True)
+            except Exception as e:
+                _clean_finalize_after_backend_error(state, rec, error=e)
+                break
             assistant_msg={'role':'assistant','content':resp.content,'raw_response':getattr(resp,'raw_response',{})}; transcript.append(assistant_msg)
             urec=usage_record_from_response(run_id=rid,phase=state.phase,role='orchestration',backend=backend,response=resp); usage_rec.record(urec); _update_usage_state(); usage_payload={k:getattr(urec,k) for k in ['input_tokens','output_tokens','total_tokens','total_cost','usage_source']}
             rec.record('model_response_received',payload={'finish_reason':getattr(resp,'finish_reason',None),'content':resp.content,'raw_response':getattr(resp,'raw_response',{}),**usage_payload})
