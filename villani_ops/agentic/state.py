@@ -16,7 +16,7 @@ class CandidateAttemptState(BaseModel):
     started_at:str|None=None; completed_at:str|None=None
     exit_code:int|None=None; exit_reason:str|None=None; failure_reason:str|None=None; runner_status:str|None=None; runner_error_type:str|None=None; duration_seconds:float|None=None
     added_files:list[str]=Field(default_factory=list); deleted_files:list[str]=Field(default_factory=list); modified_files:list[str]=Field(default_factory=list); renamed_files:list[str]=Field(default_factory=list)
-    validation:dict|None=None; validation_results:list[dict]=Field(default_factory=list); validation_status:Literal['not_run','passed','failed','command_rejected','error','timed_out','inconclusive']='not_run'; validation_source:str|None=None; token_usage:dict|None=None; cost:float|None=None
+    validation:dict|None=None; validation_results:list[dict]=Field(default_factory=list); validation_status:Literal['not_run','passed','failed','failed_candidate','infrastructure_error','skipped_no_reliable_command','diagnostic_failed','timeout','command_rejected','error','timed_out','inconclusive']='not_run'; validation_source:str|None=None; review_validation_snapshot:str|None=None; token_usage:dict|None=None; cost:float|None=None
     patch_hygiene:dict|None=None; scope_assessment:dict|None=None; runner_telemetry:dict=Field(default_factory=dict)
     review_status:Literal['not_run','passed','failed','unavailable','malformed','provider_error']='not_run'; review_error_type:str|None=None; review_error_message:str|None=None; review_retry_count:int=0
 

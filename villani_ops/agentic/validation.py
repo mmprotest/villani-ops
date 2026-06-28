@@ -61,7 +61,7 @@ def run_classified_validation(command: ClassifiedValidationCommand, *, cwd: Path
         argv, infra = command_to_argv(command.command)
     if infra:
         stdout_path.write_text('', encoding='utf-8'); stderr_path.write_text(infra+'\n', encoding='utf-8')
-        return _result(command, 'infrastructure_error', None, mode, argv, str(stdout_path), str(stderr_path), infra)
+        return _result(command, 'infrastructure_error', None, mode, argv or [], str(stdout_path), str(stderr_path), infra)
     try:
         if command.shell:
             # Single centralized shell path. The caller must explicitly request shell mode.
@@ -91,4 +91,4 @@ def skipped_validation_result(*, target: str, target_id: str | None, cwd: Path, 
     return {'passed': False, 'status': 'skipped_no_reliable_command', 'commands': [], 'target': target, 'target_id': target_id, 'cwd': str(cwd), 'infrastructure_error': None, 'reason': reason}
 
 def _result(c: ClassifiedValidationCommand, status: ValidationStatus, exit_code: int | None, mode: str, argv: list[str] | None, so: str, se: str, infra: str | None) -> dict:
-    return {'cmd': c.command, 'command': c.command, 'argv': argv, 'execution_mode': mode, 'shell': mode == 'shell', 'source': c.source, 'confidence': c.confidence, 'blocking': c.blocking, 'authority': 'acceptance_blocking' if c.blocking else 'diagnostic_only', 'reason': c.reason, 'status': status, 'passed': status == 'passed', 'exit_code': exit_code, 'stdout_path': so, 'stderr_path': se, 'infrastructure_error': infra}
+    return {'cmd': c.command, 'command': c.command, 'argv': (argv or []), 'execution_mode': mode, 'shell': mode == 'shell', 'source': c.source, 'confidence': c.confidence, 'blocking': c.blocking, 'authority': 'acceptance_blocking' if c.blocking else 'diagnostic_only', 'reason': c.reason, 'status': status, 'passed': status == 'passed', 'exit_code': exit_code, 'stdout_path': so, 'stderr_path': se, 'infrastructure_error': infra}
