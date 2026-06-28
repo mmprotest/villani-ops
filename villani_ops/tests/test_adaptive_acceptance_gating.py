@@ -32,7 +32,7 @@ def test_generated_smoke_pass_is_unverified_not_acceptance_eligible(tmp_path):
 
 
 def test_generated_smoke_can_select_unverified_and_final_state_exposes_strength(tmp_path):
-    s=state(tmp_path); c=ctx(tmp_path); s.investigation={'summary':'i'}; s.execution_path='single_task'; s.plan={'summary':'p'}; s.phase='selecting'
+    s=state(tmp_path); c=ctx(tmp_path); s.investigation={'summary':'i'}; s.execution_path='single_task'; s.plan={'summary':'p'}; s.phase='selecting'; s.candidate_attempts=1
     val={'status':'passed','passed':True,'evidence_strength':'generated_smoke','commands':[{'cmd':'shape check','passed':True,'status':'passed','source':'generated','confidence':'low','authority':'diagnostic_only','blocking':False,'evidence_strength':'generated_smoke'}], 'decision':{'status':'passed'}}
     s.candidates.append(_candidate(tmp_path, val))
     sel=h_select_winner(s, OpsSelectWinnerInput(decision='select', selected_attempt_id='candidate_001', summary='best plausible', confidence=0.6), c)
@@ -105,7 +105,7 @@ def test_review_runs_after_validation_and_receives_evidence(tmp_path):
 
 
 def test_selection_prefers_reliable_validation_over_shallow_diagnostics(tmp_path):
-    s=state(tmp_path); c=ctx(tmp_path); s.investigation={'summary':'i'}; s.execution_path='single_task'; s.plan={'summary':'p'}; s.phase='selecting'
+    s=state(tmp_path); c=ctx(tmp_path); s.investigation={'summary':'i'}; s.execution_path='single_task'; s.plan={'summary':'p'}; s.phase='selecting'; s.unverified_selection_policy='always_allow'
     weak={'status':'passed','passed':True,'evidence_strength':'generated_smoke','commands':[{'cmd':'shape','passed':True,'status':'passed','source':'generated','authority':'diagnostic_only','blocking':False,'evidence_strength':'generated_smoke'}], 'decision':{'status':'passed'}}
     strong={'status':'passed','passed':True,'evidence_strength':'explicit_user_command','commands':[{'cmd':'user verifier','passed':True,'status':'passed','source':'user_provided','confidence':'high','authority':'acceptance_blocking','blocking':True,'evidence_strength':'explicit_user_command'}], 'decision':{'status':'passed'}}
     s.candidates.append(_candidate(tmp_path, weak))
@@ -192,7 +192,7 @@ def test_selection_explanation_does_not_claim_lower_composite_beat_higher(tmp_pa
 def test_recovery_selects_after_multiple_unverified_validation_uncertainty_candidates(tmp_path):
     from villani_ops.agentic.recovery import recommend_next_agentic_action
     from villani_ops.agentic.tools import h_observe_completed_attempt, OpsObserveCompletedAttemptInput
-    s=state(tmp_path); c=ctx(tmp_path); s.execution_path='single_task'; s.plan={'strategy':'single_task'}; s.candidate_attempts=5
+    s=state(tmp_path); c=ctx(tmp_path); s.execution_path='single_task'; s.plan={'strategy':'single_task'}; s.candidate_attempts=2
     for aid in ['candidate_001','candidate_002']:
         a=_candidate(tmp_path, _skipped_uncertainty_validation(), review={'decision':'pass','recommended_action':'accept','score':0.9,'confidence':0.9,'summary':'ok','evidence':[],'issues':['validation skipped no reliable command'],'blockers':[]})
         a.attempt_id=aid; s.candidates.append(a)

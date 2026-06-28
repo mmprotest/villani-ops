@@ -5,7 +5,7 @@ from typing import Any, Callable, Literal
 from pydantic import BaseModel, Field, ConfigDict, model_validator
 from .state import CandidateAttemptState, SubtaskState, AttemptObservation, detect_decomposition_deadlock
 from .git_artifacts import capture_git_patch, ensure_git_baseline, clean_runner_artifacts_from_worktree, DEFAULT_PATCH_EXCLUDES, is_git_compatible_patch, patch_contains_internal_artifacts, clean_untracked_scratch_artifacts, is_scratch_artifact_path
-from villani_ops.core.acceptance import is_attempt_acceptance_eligible, attempt_requires_patch, validation_evidence_strength, validation_is_reliable, normalized_review_metrics, candidate_ranking_evidence, explain_candidate_selection, candidate_ranking_key, is_usable_unverified_candidate, usable_unverified_candidates, best_unverified_candidate
+from villani_ops.core.acceptance import is_attempt_acceptance_eligible, attempt_requires_patch, validation_evidence_strength, validation_is_reliable, normalized_review_metrics, candidate_ranking_evidence, explain_candidate_selection, candidate_ranking_key, is_usable_unverified_candidate, usable_unverified_candidates, best_unverified_candidate, has_unverified_selection_opportunity
 import subprocess, json, time, shutil, os, re
 from villani_ops.agentic.validation import classify_validation_command, run_classified_validation, skipped_validation_result
 from datetime import datetime, timezone
@@ -1741,8 +1741,12 @@ def h_select_winner(state, inp, ctx):
     review=(_attempt_to_dict(a).get('review') or {})
     reliable_failed=((val.get('decision') or {}).get('status')=='failed') or ('validation_failed' in blockers)
     review_accepts=review.get('decision')=='pass' and review.get('recommended_action')=='accept'
-    deadline_or_exhausted=any(str(x).lower() in {'candidate_attempt_budget_exhausted','attempts_exhausted','orchestration_deadline','backend_timeout','max_orchestration_turns_reached'} for x in (inp.reasons or [])) or state.phase=='selecting'
-    unverified_selectable=(not eligible and not reliable_failed and is_usable_unverified_candidate(state,a) and (review_accepts or deadline_or_exhausted))
+    deadline_or_exhausted=any(str(x).lower() in {'candidate_attempt_budget_exhausted','attempts_exhausted','orchestration_deadline','backend_timeout','max_orchestration_turns_reached'} for x in (inp.reasons or []))
+    try:
+        unverified_policy_allows=has_unverified_selection_opportunity(state)
+    except Exception:
+        unverified_policy_allows=deadline_or_exhausted
+    unverified_selectable=(not eligible and not reliable_failed and is_usable_unverified_candidate(state,a) and (unverified_policy_allows or deadline_or_exhausted))
     if not unverified_selectable and not eligible and not reliable_failed and state.execution_path=='decomposed_subtasks' and inp.selected_attempt_id=='integration_001' and review_accepts and set(blockers).issubset({'validation_missing','validation_unverified'}):
         unverified_selectable=True
     override_warning=None
