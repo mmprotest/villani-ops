@@ -151,7 +151,7 @@ def test_single_task_attempts_retry_sequentially_and_stop_once_accepted(tmp_path
     s=state(tmp_path); c=ctx(tmp_path)
     runner=CountingRunner(); reviewer=FailingThenPassingReviewer()
     c.runner_adapter=runner; c.reviewer=reviewer
-    s.investigation={'summary':'i','validation_plan':{'commands':[{'cmd':'python -c "import sys; sys.exit(0)"','purpose':'ok'}]}}
+    s.investigation={'summary':'i','validation_plan':{'commands':[{'cmd':'python -c "import sys; sys.exit(0)"','purpose':'ok','source':'user_provided','confidence':'high','authority':'acceptance_blocking','blocking':True}]}}
     s.plan={'summary':'p','strategy':'single_task','candidate_attempts':3}
     s.execution_path='single_task'
     blocked=execute_tool_with_policy(s,'ops_run_single_task_attempts',{'attempts':3,'reason':'go'},'seq',c)

@@ -5,7 +5,7 @@ from typing import Any, Callable, Literal
 from pydantic import BaseModel, Field, ConfigDict, model_validator
 from .state import CandidateAttemptState, SubtaskState, AttemptObservation, detect_decomposition_deadlock
 from .git_artifacts import capture_git_patch, ensure_git_baseline, clean_runner_artifacts_from_worktree, DEFAULT_PATCH_EXCLUDES, is_git_compatible_patch, patch_contains_internal_artifacts, clean_untracked_scratch_artifacts, is_scratch_artifact_path
-from villani_ops.core.acceptance import is_attempt_acceptance_eligible, attempt_requires_patch
+from villani_ops.core.acceptance import is_attempt_acceptance_eligible, attempt_requires_patch, validation_evidence_strength, validation_is_reliable
 import subprocess, json, time, shutil, os, re
 from villani_ops.agentic.validation import classify_validation_command, run_classified_validation, skipped_validation_result
 from datetime import datetime, timezone
@@ -118,6 +118,7 @@ def _validation_snapshot(attempt) -> str:
                 'blocking': c.get('blocking'),
                 'authority': c.get('authority'),
                 'source': c.get('source'),
+                'evidence_strength': c.get('evidence_strength'),
             })
     return json.dumps({'status':status,'source':source,'decision_status':validation.get('decision_status') or (validation.get('decision') or {}).get('status'),'commands':command_sig}, sort_keys=True, default=str)
 
@@ -177,6 +178,8 @@ def build_agentic_review_payload(state, attempt, scope, subtask=None):
         'validation_source':data.get('validation_source') or validation.get('validation_source'),
         'validation_confidence':validation.get('confidence') or next((c.get('confidence') for c in validation_tails if c.get('confidence')), None),
         'validation_blocking':any(c.get('blocking') or c.get('authority')=='acceptance_blocking' for c in validation_tails),
+        'validation_evidence_strength':validation_evidence_strength(validation),
+        'validation_authoritative_or_diagnostic':'authoritative' if validation_is_reliable(validation) else 'diagnostic',
         'validation_blocking_or_diagnostic':'blocking' if any(c.get('blocking') or c.get('authority')=='acceptance_blocking' for c in validation_tails) else 'diagnostic',
         'commands':validation_tails,
         'decision':validation.get('decision') or {},
@@ -194,7 +197,7 @@ def build_agentic_review_payload(state, attempt, scope, subtask=None):
         'stdout_tail':_read_text_tail(data.get('stdout_path')),
         'stderr_tail':_read_text_tail(data.get('stderr_path')),
         'transcript_tail':_read_text_tail(data.get('transcript_path')),
-        'validation':{**current_validation, **validation_metadata, 'authoritative': bool(current_validation)},
+        'validation':{**current_validation, **validation_metadata, 'authoritative': validation_is_reliable(validation)},
         'validation_decision':(current_validation or {}).get('decision') or {},
         'current_validation':{**current_validation, **validation_metadata, 'source':'ops_run_validation'} if current_validation else validation_metadata,
         'debug_validation_history':debug_summary,
@@ -1354,6 +1357,13 @@ def h_review_attempt(state, inp, ctx):
             if res.decision=='fail' and not res.blockers and res.recommended_action in {'accept','retry'}:
                 # The reviewer saw current validation in this invocation; never persist stale validation_missing.
                 res.summary=(res.summary or '') + ' (Removed stale validation_missing blocker because validation was attached before review.)'
+    vmeta=(payload.get('current_validation') or payload.get('validation') or {})
+    if res is not None and res.decision=='pass' and res.recommended_action=='accept' and not validation_is_reliable(vmeta):
+        strength=validation_evidence_strength(vmeta)
+        res.confidence=min(float(res.confidence or 0.0), 0.69)
+        if strength in {'generated_smoke','diagnostic_only','generated_behavioral','skipped'}:
+            res.summary=(res.summary or '') + f' Validation evidence is {strength}; candidate may be plausible but is not verified.'
+            res.evidence=list(res.evidence or [])+[f'validation evidence strength: {strength}']
     if res is None:
         e=last_error or Exception('unknown structured review failure')
         res=OpsReviewResult(decision='fail',recommended_action='retry',score=0.0,summary='structured review unavailable after retries',evidence=[],issues=[f'{type(e).__name__}: {e}'],blockers=['review_infrastructure_failed','review_malformed'],confidence=0.0)
@@ -1387,13 +1397,13 @@ def h_review_attempt(state, inp, ctx):
             blockers=sorted(set(blockers+res.blockers)); a.acceptance_blockers=blockers; eligible=False; a.acceptance_eligible=False
         if st and eligible:
             eligible, blockers, _app=_commit_subtask_acceptance(state, st, a, ctx, reason='review_accept_commit')
-    state.reviews.append({'attempt_id':inp.attempt_id,**res.model_dump(),'acceptance_eligible':eligible,'acceptance_blockers':blockers})
+    state.reviews.append({'attempt_id':inp.attempt_id,**res.model_dump(),'acceptance_eligible':eligible,'acceptance_blockers':blockers,'validation_evidence_strength':validation_evidence_strength(_attempt_to_dict(a).get('validation') or {})})
     if not eligible and blockers:
         state.blockers=sorted(set(state.blockers+blockers))
     ctx.recorder.record(f'{inp.scope}_attempt_reviewed', payload={'attempt_id':inp.attempt_id,'review_decision':res.decision,'review_recommended_action':res.recommended_action,'central_acceptance_eligible':eligible,'acceptance_eligible':eligible,'acceptance_blockers':blockers,'execution_path':state.execution_path,'validation_blocked':any(b.startswith('validation_') for b in blockers),'artifact_blocked':any(b in {'missing_patch','empty_changed_files','patch_unreadable'} for b in blockers), **(({k:getattr(usage_record,k) for k in ['input_tokens','output_tokens','total_tokens','total_cost','usage_source']} if 'usage_record' in locals() and usage_record is not None else {}))})
     if inp.scope in {'candidate','subtask'} and any(o.attempt_id==inp.attempt_id for o in state.attempt_observations) and not isinstance(a,dict):
         _observe_completed_attempt(state,a,ctx)
-    return {**res.model_dump(),'acceptance_eligible':eligible,'acceptance_blockers':blockers,'review_payload_included':['patch_excerpt','stdout_tail','stderr_tail','validation']}
+    return {**res.model_dump(),'acceptance_eligible':eligible,'acceptance_blockers':blockers,'validation_evidence_strength':validation_evidence_strength(_attempt_to_dict(a).get('validation') or {}),'review_payload_included':['patch_excerpt','stdout_tail','stderr_tail','validation','validation_evidence_strength']}
 def _accepted_subtask_attempt(state, st):
     for a in st.attempts:
         if a.attempt_id==st.accepted_attempt_id:
@@ -1588,18 +1598,37 @@ def _default_validation_metadata(command, *, target, target_obj, subtask):
         subtask_id=subtask.subtask_id
     if source is None:
         if scope=='subtask':
-            source='project_detected'
+            source='generated'
         elif scope=='integration':
-            source='user_provided'
+            source='generated'
         else:
-            source='user_provided'
+            source='generated'
     if authority is None:
         # Authority must come from an explicit validation plan/command contract.
         # Discovered or merely related commands are non-blocking by default.
         authority='diagnostic_only' if source in {'diagnostic','exploratory','runner_trace','villani_code_debug_trace'} else 'supporting_evidence'
         if not source_was_explicit and target in {'candidate','integration'}:
-            authority='acceptance_blocking'
+            authority='supporting_evidence'
     return source, authority, scope, subtask_id
+
+def _command_evidence_strength(*, source, authority, confidence, blocking, status=None):
+    if status in {'infrastructure_error','command_rejected','timeout','timed_out','error'}:
+        return 'infrastructure_error'
+    if source in {'user_provided','user_success_criteria','integration','final'}:
+        return 'explicit_user_command'
+    if source=='project_detected' and confidence=='high' and (blocking or authority=='acceptance_blocking'):
+        return 'high_confidence_project_detected'
+    if source=='project_detected' and (blocking or authority=='acceptance_blocking'):
+        return 'project_test'
+    if source=='generated' and confidence=='high' and (blocking or authority=='acceptance_blocking'):
+        return 'generated_behavioral'
+    if source=='generated':
+        return 'generated_smoke'
+    if source in {'diagnostic','exploratory','runner_trace','villani_code_debug_trace'} or authority=='diagnostic_only':
+        return 'diagnostic_only'
+    if blocking or authority=='acceptance_blocking':
+        return 'project_test'
+    return 'diagnostic_only'
 
 def make_validation_decision(result:dict)->dict:
     commands=[c for c in (result or {}).get('commands') or [] if isinstance(c,dict)]
@@ -1630,6 +1659,7 @@ def h_validation(state, inp, ctx):
     label=_target_label(inp.target, inp.target_id)
     if not inp.commands:
         res=skipped_validation_result(target=inp.target, target_id=inp.target_id, cwd=base_cwd.resolve())
+        res['evidence_strength']='skipped'; res['authoritative']=False
         decision=make_validation_decision(res); res['decision']=decision; res['decision_status']=decision['status']; res['scope']=decision['scope']; res['subtask_id']=decision.get('subtask_id')
         _attach_validation(state,target_obj,inp.target,res,ctx)
         ctx.recorder.record('validation_attached', payload={'target':inp.target,'target_id':inp.target_id,'passed':False,'status':res['status'],'command_count':0,'cwd':res['cwd'],'artifact_paths':[]})
@@ -1653,6 +1683,7 @@ def h_validation(state, inp, ctx):
         except Exception as e:
             reason='platform_unsupported_command' if isinstance(e,RuntimeError) else 'targeted_cwd_rejected'
             item={'cmd':c.cmd,'command':c.cmd,'passed':False,'status':'infrastructure_error','reason':getattr(c,'reason',None) or reason,'error':str(e),'cwd':str(base_cwd.resolve()),'source':source,'confidence':confidence,'blocking':False if source in {'generated','diagnostic'} else blocking,'authority':'diagnostic_only' if source in {'generated','diagnostic'} else authority,'scope':scope,'subtask_id':subtask_id,'purpose':c.purpose or '','execution_mode':'argv','shell':False,'argv':[],'exit_code':None,'infrastructure_error':str(e)}
+            item['evidence_strength']=_command_evidence_strength(source=item['source'],authority=item['authority'],confidence=item['confidence'],blocking=item['blocking'],status=item['status'])
             results.append(item)
             ctx.recorder.record('validation_command_rejected', payload={'target':inp.target,'target_id':inp.target_id,'cmd':c.cmd,'reason':reason,'message':str(e)})
             continue
@@ -1662,6 +1693,7 @@ def h_validation(state, inp, ctx):
         classified=classified.__class__(command=classified.command, source=classified.source, confidence=classified.confidence, blocking=classified.blocking, reason=classified.reason, argv=getattr(c,'argv',None), shell=bool(getattr(c,'shell',False)), timeout_seconds=classified.timeout_seconds)
         item=run_classified_validation(classified, cwd=cmd_cwd, stdout_path=so, stderr_path=se)
         item.update({'cwd':str(cmd_cwd),'scope':scope,'subtask_id':subtask_id,'purpose':c.purpose or '','authority':authority,'source':source,'blocking':blocking,'confidence':confidence})
+        item['evidence_strength']=_command_evidence_strength(source=source,authority=authority,confidence=confidence,blocking=blocking,status=item.get('status'))
         results.append(item)
         ctx.recorder.record('validation_completed' if item.get('passed') else 'validation_failed', payload={'target':inp.target,'target_id':inp.target_id,'passed':item.get('passed'),'command_count':len(inp.commands),'cwd':str(cmd_cwd),'artifact_paths':{'stdout':str(so),'stderr':str(se)},'validation_result':item})
     statuses={r.get('status') for r in results}
@@ -1671,7 +1703,9 @@ def h_validation(state, inp, ctx):
     elif 'diagnostic_failed' in statuses: overall='diagnostic_failed'; passed=False
     elif results and all(r.get('passed') for r in results): overall='passed'; passed=True
     else: overall='skipped_no_reliable_command'; passed=False
-    res={'raw_passed':passed,'raw_status':overall,'passed':passed,'status':overall,'commands':results,'target':inp.target,'target_id':inp.target_id,'cwd':first_cwd or str(base_cwd.resolve())}
+    temp={'commands':results,'status':overall}
+    strength=validation_evidence_strength(temp)
+    res={'raw_passed':passed,'raw_status':overall,'passed':passed,'status':overall,'commands':results,'target':inp.target,'target_id':inp.target_id,'cwd':first_cwd or str(base_cwd.resolve()),'evidence_strength':strength,'authoritative':strength in {'authoritative','project_test','explicit_user_command','high_confidence_project_detected'}}
     decision=make_validation_decision(res); res['decision']=decision; res['decision_status']=decision['status']; res['scope']=decision['scope']; res['subtask_id']=decision.get('subtask_id')
     if decision['status']=='passed': res['passed']=True; res['status']='passed'
     _attach_validation(state,target_obj,inp.target,res,ctx)
@@ -1699,16 +1733,35 @@ def h_select_winner(state, inp, ctx):
     status=a.get('status') if isinstance(a,dict) else a.status
     if status=='running': raise ValueError('cannot select running attempt')
     eligible, blockers=is_attempt_acceptance_eligible(a, state=state)
+    val=_attempt_to_dict(a).get('validation') or {}
+    strength=validation_evidence_strength(val)
+    review=(_attempt_to_dict(a).get('review') or {})
+    reliable_failed=((val.get('decision') or {}).get('status')=='failed') or ('validation_failed' in blockers)
+    unverified_selectable=(not eligible and not reliable_failed and review.get('decision')=='pass' and review.get('recommended_action')=='accept' and set(blockers).issubset({'validation_missing','validation_unverified'}))
+    if unverified_selectable:
+        verified_alternatives=[]
+        for other in getattr(state,'candidates',[]) or []:
+            if getattr(other,'attempt_id',None)==inp.selected_attempt_id:
+                continue
+            try:
+                other_ok, _other_blockers=is_attempt_acceptance_eligible(other, state=state)
+            except Exception:
+                other_ok=False
+            if other_ok and validation_is_reliable(getattr(other,'validation',None) or {}):
+                verified_alternatives.append(getattr(other,'attempt_id',None))
+        if verified_alternatives:
+            raise ValueError('selected attempt is unverified while verified alternatives exist: '+', '.join(x for x in verified_alternatives if x))
     stored=a.get('acceptance_eligible') if isinstance(a,dict) else a.acceptance_eligible
     if isinstance(a,dict):
         a['acceptance_eligible']=eligible; a['acceptance_blockers']=blockers
     else:
         a.acceptance_eligible=eligible; a.acceptance_blockers=blockers
-    if not eligible:
+    if not eligible and not unverified_selectable:
         state.blockers=sorted(set(state.blockers+blockers))
         ctx.recorder.record('selection_rejected', payload={'selected_attempt_id':inp.selected_attempt_id,'stored_acceptance_eligible':stored,'recomputed_acceptance_eligible':eligible,'acceptance_blockers':blockers})
         raise ValueError('selected attempt is not acceptance eligible: '+', '.join(blockers))
-    new_selection={**inp.model_dump(),'selection_evidence':{'stored_acceptance_eligible':stored,'recomputed_acceptance_eligible':eligible,'acceptance_blockers':blockers}}
+    decision_bucket='accepted_verified' if eligible and validation_is_reliable(val) else ('accepted_unverified' if unverified_selectable or (eligible and not validation_is_reliable(val)) else 'rejected')
+    new_selection={**inp.model_dump(),'decision_bucket':decision_bucket,'materialization_signal':('verified_accepted' if decision_bucket=='accepted_verified' else 'unverified_best_candidate'),'validation_strength':strength,'validation_authoritative':validation_is_reliable(val),'selection_evidence':{'stored_acceptance_eligible':stored,'recomputed_acceptance_eligible':eligible,'acceptance_blockers':blockers,'validation_strength':strength}}
     if state.selection and state.selection.get('decision')=='select' and state.selection.get('selected_attempt_id')==inp.selected_attempt_id:
         state.phase='finalizing'; return {**state.selection, 'already_selected': True}
     state.selection=new_selection
@@ -1773,11 +1826,13 @@ def h_finalize(state, inp, ctx):
         if any(c.status=='running' for c in state.candidates) or any(a2.status=='running' for s in state.subtasks for a2 in s.attempts):
             raise ValueError('accepted finalization requires no running work')
         eligible, blockers=is_attempt_acceptance_eligible(a, state=state)
+        val=a.get('validation') if isinstance(a,dict) else a.validation
+        sel_bucket=(state.selection or {}).get('decision_bucket')
         if isinstance(a,dict):
             a['acceptance_eligible']=eligible; a['acceptance_blockers']=blockers
         else:
             a.acceptance_eligible=eligible; a.acceptance_blockers=blockers
-        if not eligible:
+        if not eligible and sel_bucket!='accepted_unverified':
             state.blockers=sorted(set(state.blockers+blockers))
             ctx.recorder.record('finalization_blocked', payload={'selected_attempt_id':aid,'acceptance_blockers':blockers})
             raise ValueError('selected attempt is not acceptance eligible: '+', '.join(blockers))
@@ -1789,8 +1844,13 @@ def h_finalize(state, inp, ctx):
             final_payload['selected_patch_path']=patch_path
         # Evidence-based summary prefix prevents over-claiming files not in the selected patch.
         changed=a.get('changed_files') if isinstance(a,dict) else a.changed_files
-        val=a.get('validation') if isinstance(a,dict) else a.validation
-        final_payload['summary']=f"Selected {aid} changed {', '.join(changed or []) or 'no files'}; current validation {((val or {}).get('status') or 'not_run')}." + ((' '+final_payload.get('summary','')) if final_payload.get('summary') else '')
+        strength=validation_evidence_strength(val or {})
+        final_payload['decision_bucket']=sel_bucket or ('accepted_verified' if validation_is_reliable(val or {}) else 'accepted_unverified')
+        final_payload['materialization_signal']='verified_accepted' if final_payload['decision_bucket']=='accepted_verified' else 'unverified_best_candidate'
+        final_payload['validation_strength']=strength
+        final_payload['validation_authoritative']=validation_is_reliable(val or {})
+        prefix='verified' if final_payload['decision_bucket']=='accepted_verified' else 'selected_unverified'
+        final_payload['summary']=f"{prefix}: Selected {aid} changed {', '.join(changed or []) or 'no files'}; current validation {((val or {}).get('status') or 'not_run')} with strength {strength}." + ((' '+final_payload.get('summary','')) if final_payload.get('summary') else '')
     state.final_decision=final_payload; state.status='completed' if inp.decision=='accepted' else 'failed'; state.phase='completed' if state.status=='completed' else 'failed';
     consistency_warnings=validate_final_state_consistency(state)
     if consistency_warnings:
