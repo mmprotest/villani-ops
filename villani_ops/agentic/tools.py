@@ -216,6 +216,15 @@ def build_agentic_review_payload(state, attempt, scope, subtask=None):
         'patch_hygiene':data.get('patch_hygiene') or {},
         'investigation_relevant_files':(state.investigation or {}).get('relevant_files') if state.investigation else [],
         'behavioural_oracle': _active_behavioural_oracle(state, 'subtask' if subtask is not None else 'task', subtask.subtask_id if subtask is not None else None),
+        'task_action_contract': _active_task_action_contract(state, 'subtask' if subtask is not None else ('integration' if scope=='integration' else 'task'), subtask.subtask_id if subtask is not None else None),
+        'task_action_contract_audit_checklist': [
+            'Does the produced artifact match the TaskActionContract expected artifacts, path/format/shape, and required properties?',
+            'Are candidate assumptions grounded in source evidence?',
+            'Did the candidate choose the right input scope and output field/path/format?',
+            'Can the result be reproduced or independently audited?',
+            'Were ambiguity risks resolved, and which audit requirements passed/failed/uncertain?',
+            'For compute-answer tasks, do not accept a numeric answer merely because it looks plausible or candidates agree; agreement is supporting evidence only, not proof.',
+        ],
         'mandatory_adversarial_review_format': ['Review item:', '- Requirement:', '- Edge case:', '- Evidence in patch:', '- Evidence from validation/probes:', '- Risk:', '- Pass/fail:'],
 
     }
@@ -468,7 +477,26 @@ class BehaviouralOracle(StrictModel):
     oracle_confidence:Literal['high','medium','low']='medium'; rationale:str
 class BehaviouralCoverageResult(StrictModel):
     requirement_id:str; status:Literal['passed','failed','uncertain','not_applicable']; evidence:str; risk:Literal['high','medium','low']
+class ExpectedArtifact(StrictModel):
+    artifact_type:Literal['source_patch','output_file','config_file','data_file','report','stdout','side_effect','unknown']
+    path:str|None=None; expected_shape:str|None=None; required_properties:list[str]=Field(default_factory=list); validation_method:str|None=None
+class RequiredOperation(StrictModel):
+    description:str; inputs:list[str]=Field(default_factory=list); outputs:list[str]=Field(default_factory=list); assumptions:list[str]=Field(default_factory=list); risks:list[str]=Field(default_factory=list)
+class SourceGroundingRequirement(StrictModel):
+    description:str; source_type:Literal['readme','schema','config','code','data_sample','user_instruction','external_reference','unknown']; required:bool=True; reason:str
+class AuditRequirement(StrictModel):
+    description:str; audit_type:Literal['artifact_shape','recompute','independent_recompute','semantic_assumption_check','row_count_or_scope_audit','field_selection_audit','invariant_check','round_trip_check','diff_review','manual_review']; priority:Literal['critical','high','medium','low']; reason:str
+class TaskActionContract(StrictModel):
+    scope:Literal['task','subtask','integration','candidate','final']; subtask_id:str|None=None
+    action_type:Literal['modify_code','write_file','compute_answer','transform_data','configure_system','fix_tests','implement_feature','repair_behavior','unknown']
+    expected_artifacts:list[ExpectedArtifact]=Field(default_factory=list)
+    required_operations:list[RequiredOperation]=Field(default_factory=list)
+    source_grounding_requirements:list[SourceGroundingRequirement]=Field(default_factory=list)
+    audit_requirements:list[AuditRequirement]=Field(default_factory=list)
+    ambiguity_risks:list[str]=Field(default_factory=list); validation_implications:list[str]=Field(default_factory=list)
+    confidence:Literal['high','medium','low']; rationale:str
 class OpsDeriveBehaviouralOracleInput(StrictModel): scope:Literal['task','subtask','integration','candidate','final']; subtask_id:str|None=None; reason:str
+class OpsDeriveTaskActionContractInput(StrictModel): scope:Literal['task','subtask','integration','candidate','final']; subtask_id:str|None=None; reason:str
 class OpsMaterializeValidationProbesInput(StrictModel): scope:Literal['task','subtask','integration','candidate','final']; subtask_id:str|None=None; reason:str
 class OpsDiscoverOracleInput(StrictModel): scope:Literal['task','subtask','integration','candidate','final']; subtask_id:str|None=None; reason:str
 class OpsSubmitInvestigationInput(StrictModel): summary:str; suspected_root_cause:str|None=None; relevant_files:list[str]=Field(default_factory=list); relevant_tests:list[str]=Field(default_factory=list); implementation_plan:list[str]=Field(default_factory=list); risks:list[str]=Field(default_factory=list); validation_plan:ValidationPlan|None=None; confidence:float
@@ -498,7 +526,7 @@ class OpsRunNextIntegrationRepairAttemptInput(StrictModel): backend_name:str|Non
 class OpsStartCandidateFallbackInput(StrictModel): reason:str; attempts:int|None=None
 class OpsLaunchSubtasksInput(StrictModel): subtask_ids:list[str]; backend_name:str|None=None; attempts_per_subtask:int; reason:str
 class OpsReviewAttemptInput(StrictModel): attempt_id:str; scope:Literal['candidate','subtask','integration']
-class OpsReviewResult(StrictModel): decision:Literal['pass','fail']; recommended_action:Literal['accept','reject','retry','repair']; score:float; summary:str; evidence:list[str]=Field(default_factory=list); issues:list[str]=Field(default_factory=list); blockers:list[str]=Field(default_factory=list); confidence:float=0.0; behavioural_coverage:list[BehaviouralCoverageResult]=Field(default_factory=list); oracle_coverage_score:float=0.0; critical_requirements_failed:list[str]=Field(default_factory=list); critical_requirements_uncertain:list[str]=Field(default_factory=list); probes_passed:list[str]=Field(default_factory=list); probes_failed:list[str]=Field(default_factory=list); subtask_passed:bool|None=None; scope_ok:bool|None=None; integration_risk:Literal['low','medium','high','unknown']|None=None
+class OpsReviewResult(StrictModel): decision:Literal['pass','fail']; recommended_action:Literal['accept','reject','retry','repair']; score:float; summary:str; evidence:list[str]=Field(default_factory=list); issues:list[str]=Field(default_factory=list); blockers:list[str]=Field(default_factory=list); confidence:float=0.0; behavioural_coverage:list[BehaviouralCoverageResult]=Field(default_factory=list); oracle_coverage_score:float=0.0; critical_requirements_failed:list[str]=Field(default_factory=list); critical_requirements_uncertain:list[str]=Field(default_factory=list); probes_passed:list[str]=Field(default_factory=list); probes_failed:list[str]=Field(default_factory=list); task_action_contract_satisfaction:float=0.0; source_grounding_coverage:float=0.0; audit_requirements_passed:list[str]=Field(default_factory=list); audit_requirements_failed:list[str]=Field(default_factory=list); audit_requirements_uncertain:list[str]=Field(default_factory=list); independent_recompute_agreement:bool=False; candidate_assumption_summary:list[str]=Field(default_factory=list); reproducibility_evidence:list[str]=Field(default_factory=list); subtask_passed:bool|None=None; scope_ok:bool|None=None; integration_risk:Literal['low','medium','high','unknown']|None=None
 class OpsIntegrateSubtasksInput(StrictModel): reason:str
 class OpsRunValidationInput(StrictModel): commands:list[ValidationCommand]; target:Literal['candidate','integration','repo']; target_id:str|None=None; allow_cwd_escape:bool=False
 class OpsSelectWinnerInput(StrictModel): selected_attempt_id:str|None=None; decision:Literal['select','reject_all']; summary:str; reasons:list[str]=Field(default_factory=list); rejected_attempts:list[str]=Field(default_factory=list); confidence:float
@@ -751,6 +779,10 @@ def create_attempt_observation(state, attempt):
     prev_same=[o for o in prior_other_observations if o.backend_name==attempt.backend_name and o.outcome in {'no_patch','runner_failed'}]
     should_escalate=len(prev_same)>=1 and outcome in {'no_patch','runner_failed'}
     if should_escalate: directives.append('Consider a different coding backend because this backend shows repeated no-progress or runner failure.')
+    for gap in list((review or {}).get('audit_requirements_failed') or []) + list((review or {}).get('audit_requirements_uncertain') or []):
+        directives.append(f'Previous candidate left audit requirement unresolved: {gap}. Next attempt must ground the relevant sources, reproduce the artifact/result where possible, and document the evidence.')
+    for gap in list((review or {}).get('critical_requirements_uncertain') or []):
+        directives.append(f'Previous candidate left behavioural requirement uncertain: {gap}. Next attempt must provide concrete patch/artifact and validation evidence.')
     val_snap, review_snap=_attempt_observation_snapshots(attempt)
     obs=AttemptObservation(attempt_id=attempt.attempt_id,scope=attempt.scope,subtask_id=attempt.subtask_id,backend_name=attempt.backend_name,model=attempt.model,outcome=outcome,progress_score=(1.0 if eligible else 0.4 if attempt.changed_files else 0.0),failure_class=failure_class,evidence=evidence[:8],blockers=sorted(set(blockers)),changed_files=attempt.changed_files,validation_status=attempt.validation_status,validation_decision_status=vdec.get('status'),validation_decision_rationale=vdec.get('rationale'),blocking_validation_failures=_cmds(vdec.get('blocking_failures')),diagnostic_validation_failures=_cmds(vdec.get('diagnostic_failures')),supporting_validation_failures=_cmds(vdec.get('supporting_failures')),passed_blocking_validations=_cmds(vdec.get('passed_blocking_checks')),review_status=attempt.review_status,runner_signals=telemetry,backend_signals={},next_attempt_directives=list(dict.fromkeys(directives))[:8],should_retry_same_plan=outcome in {'validation_failed','review_failed','partial_progress','no_patch'},should_repair=outcome in {'validation_failed','review_failed','patch_failed'},should_decompose=outcome=='partial_progress' and len(prior_other_observations)>=1,should_escalate_backend=should_escalate,observed_at_stage=_attempt_observed_stage(attempt),validation_snapshot_id=val_snap,review_snapshot_id=review_snap,updated_at=datetime.now(timezone.utc).isoformat())
     state.attempt_observations=[o for o in state.attempt_observations if o.attempt_id!=attempt.attempt_id]+[obs]
@@ -898,6 +930,8 @@ def build_candidate_runner_prompt(state, *, reason, repair=False, base_attempt_i
     sections=[f'TASK\n{state.task}', f'SUCCESS CRITERIA\n{state.success_criteria or "Complete the task with a minimal correct patch."}', f'CURRENT EXECUTION PATH\n{state.execution_path or "single_task"}. Run exactly this one adaptive candidate attempt.']
     boracle=_active_behavioural_oracle(state, 'task')
     if boracle: sections.append('BEHAVIOURAL ORACLE SUMMARY\n'+_compact_text({'critical_requirements':[r for r in boracle.get('requirements',[]) if r.get('priority') in {'critical','high'}], 'edge_cases':boracle.get('edge_cases',[])[:5], 'checklist':boracle.get('adversarial_review_checklist',[])[:5]}, 4000))
+    contract=_active_task_action_contract(state, 'task')
+    if contract: sections.append('TASK ACTION CONTRACT\n'+_compact_text({'action_type':contract.get('action_type'),'expected_artifacts':contract.get('expected_artifacts'),'source_grounding_requirements':contract.get('source_grounding_requirements'),'audit_requirements':contract.get('audit_requirements'),'validation_implications':contract.get('validation_implications')}, 4500))
     if state.investigation: sections.append('INVESTIGATION SUMMARY\n'+str({k:state.investigation.get(k) for k in ['summary','suspected_root_cause','relevant_files','relevant_tests','implementation_plan'] if k in state.investigation}))
     if changed: sections.append('CHANGED FILES FROM PREVIOUS ATTEMPTS\n'+'\n'.join(f'- {f}' for f in changed))
     if brief: sections.append(brief)
@@ -1121,10 +1155,12 @@ def h_discover_oracle(state, inp, ctx):
     llm=ValidationOracle(oracle_type='llm_review', authority='weak_evidence', scope=inp.scope, subtask_id=inp.subtask_id, description='Structured reviewer assessment.', rationale='Review can evaluate plausibility, scope, and risks.', limitations='Not an objective executable oracle.')
     assessment=OracleAssessment(scope=inp.scope, subtask_id=inp.subtask_id, oracle_quality=quality, available_oracles=selected+([] if selected else [static,llm]), missing_oracle_reason=missing, recommended_strategy=stype, confidence=conf, rationale=('Authoritative oracle selected explicitly by validation strategy.' if selected else 'No selected authoritative command/spec/check exists; use evidence portfolio or human review according to oracle policy.'))
     boracle=_active_behavioural_oracle(state, inp.scope, inp.subtask_id) or _derive_behavioural_oracle(state, scope=inp.scope, subtask_id=inp.subtask_id, reason=inp.reason).model_dump(mode='json')
+    contract=_active_task_action_contract(state, inp.scope, inp.subtask_id) or _derive_task_action_contract(state, scope=inp.scope, subtask_id=inp.subtask_id, reason='derive task action contract during oracle discovery').model_dump(mode='json')
     strong_behavioural=[ValidationOracle(oracle_type='generated_test' if p.get('executable') else 'static_review', authority=p.get('authority') or 'strong_evidence', scope=inp.scope, subtask_id=inp.subtask_id, command=p.get('command'), description=p.get('description') or 'Behavioural probe', rationale='Synthesized from BehaviouralOracle; not automatically authoritative.', limitations=p.get('limitations')) for p in (boracle.get('validation_probes') or []) if (p.get('authority') in {'strong_evidence','weak_evidence'} or not selected)]
-    strategy=ValidationStrategy(scope=inp.scope, subtask_id=inp.subtask_id, strategy_type=stype, authoritative_checks=selected, strong_evidence_checks=strong_behavioural if not selected else [], weak_evidence_checks=[] if selected else [static,llm], behavioural_probes=boracle.get('validation_probes') or [], adversarial_review_checklist=boracle.get('adversarial_review_checklist') or [], human_required_evidence_packet={'unresolved_critical_behaviours':[r for r in boracle.get('requirements',[]) if r.get('priority')=='critical']} if quality=='human_required' else None, requires_human_acceptance=(quality=='human_required'), acceptance_rule=rule + ' Behavioural probes provide coverage evidence but are not automatically authoritative.', rationale=assessment.rationale)
+    strategy=ValidationStrategy(scope=inp.scope, subtask_id=inp.subtask_id, strategy_type=stype, authoritative_checks=selected, strong_evidence_checks=strong_behavioural if not selected else [], weak_evidence_checks=[] if selected else [static,llm], behavioural_probes=boracle.get('validation_probes') or [], adversarial_review_checklist=boracle.get('adversarial_review_checklist') or [], human_required_evidence_packet={'task_action_contract':contract,'unresolved_critical_behaviours':[r for r in boracle.get('requirements',[]) if r.get('priority')=='critical'],'audit_requirements':contract.get('audit_requirements') or [],'source_grounding_requirements':contract.get('source_grounding_requirements') or []}, requires_human_acceptance=(quality=='human_required'), acceptance_rule=rule + ' Behavioural probes and action-contract audits provide coverage evidence but are not automatically authoritative.', rationale=assessment.rationale)
     state.oracle_assessments=[x for x in state.oracle_assessments if not (x.get('scope')==inp.scope and x.get('subtask_id')==inp.subtask_id)] + [assessment.model_dump(mode='json')]
     state.validation_strategies=[x for x in state.validation_strategies if not (x.get('scope')==inp.scope and x.get('subtask_id')==inp.subtask_id)] + [strategy.model_dump(mode='json')]
+    state.task_action_contracts=[x for x in getattr(state,'task_action_contracts',[]) if not (x.get('scope')==inp.scope and x.get('subtask_id')==inp.subtask_id)] + [contract]
     if inp.scope=='subtask' and inp.subtask_id:
         for st in state.subtasks:
             if st.subtask_id==inp.subtask_id:
@@ -1175,21 +1211,110 @@ def h_derive_behavioral_oracle(state, inp, ctx):
 def _active_behavioural_oracle(state, scope='task', subtask_id=None):
     return next((o for o in reversed(state.behavioural_oracles) if o.get('scope')==scope and o.get('subtask_id')==subtask_id), None) or next((o for o in reversed(state.behavioural_oracles) if o.get('scope')=='task'), None)
 
+def _active_task_action_contract(state, scope='task', subtask_id=None):
+    return next((o for o in reversed(getattr(state,'task_action_contracts',[]) or []) if o.get('scope')==scope and o.get('subtask_id')==subtask_id), None) or next((o for o in reversed(getattr(state,'task_action_contracts',[]) or []) if o.get('scope')=='task'), None)
+
+def _infer_action_type(text:str)->str:
+    t=(text or '').lower()
+    if any(w in t for w in ['write ', 'save ', 'output file', 'file containing', 'create a file', 'produce a file']):
+        return 'write_file'
+    if any(w in t for w in ['compute', 'calculate', 'answer', 'sum ', 'average', 'aggregate', 'count ', 'number']):
+        return 'compute_answer'
+    if any(w in t for w in ['transform', 'convert', 'normalize data', 'dataset', 'data from', 'data into']):
+        return 'transform_data'
+    if any(w in t for w in ['configure', 'configuration', 'setting', 'config']):
+        return 'configure_system'
+    if any(w in t for w in ['fix test', 'tests fail', 'repair', 'bug', 'regression']):
+        return 'repair_behavior'
+    if any(w in t for w in ['implement', 'feature', 'add support']):
+        return 'implement_feature'
+    if any(w in t for w in ['modify', 'change', 'patch', 'code']):
+        return 'modify_code'
+    return 'unknown'
+
+def _derive_task_action_contract(state, *, scope, subtask_id=None, reason='') -> TaskActionContract:
+    subject=_task_text_for_oracle(state, scope, subtask_id).strip()
+    action=_infer_action_type(subject)
+    artifacts=[]; ops=[]; grounding=[]; audits=[]; implications=[]; risks=[]
+    if action in {'write_file','compute_answer'}:
+        art_type='output_file' if action=='write_file' else 'stdout'
+        if action=='compute_answer' and any(w in subject.lower() for w in ['file','path','write','save']):
+            art_type='output_file'
+        artifacts.append(ExpectedArtifact(artifact_type=art_type, expected_shape='Task-specified value or artifact shape; parse/check content without assuming executability.', required_properties=['exists when task requires persisted output','content matches requested type/format','content is reproducible from grounded inputs'], validation_method='shape/property/recompute audit'))
+        ops.append(RequiredOperation(description='Produce the requested answer or output artifact from task-grounded inputs.', inputs=['task instructions','success criteria','repo/data/config evidence when relevant'], outputs=['declared expected artifact or answer'], assumptions=['selected input scope','selected output field/path/format'], risks=['plausible-looking result without grounded computation','invalid probe executing a data artifact']))
+        grounding += [SourceGroundingRequirement(description='Ground the expected artifact path/format/value type in user instruction or project evidence.', source_type='user_instruction', reason='Output checks must verify the requested artifact, not a guessed executable.'), SourceGroundingRequirement(description='Ground input scope, selected field/key/column, and parameters in README/schema/config/code/data samples when relevant.', source_type='unknown', reason='Calculation/data tasks can be wrong through ambiguous scope or field selection.')]
+        audits += [AuditRequirement(description='Check artifact existence and expected shape/properties without executing non-executable output artifacts.', audit_type='artifact_shape', priority='critical', reason='Artifact shape is directly required by the action contract.'), AuditRequirement(description='Recompute or independently audit the produced result from grounded source inputs when possible.', audit_type='independent_recompute', priority='high', reason='Agreement or plausibility is not proof for computation tasks.'), AuditRequirement(description='Audit semantic assumptions such as scope, field/key/column, model/config/parameter, and ambiguous exclusions.', audit_type='semantic_assumption_check', priority='high', reason='Ambiguity must be resolved with evidence.')]
+        implications.append('Do not execute the expected output artifact unless the contract explicitly declares it executable.')
+    elif action=='transform_data':
+        artifacts.append(ExpectedArtifact(artifact_type='data_file', expected_shape='Transformed data with task-grounded schema and scope.', required_properties=['schema matches requested output','scope/row count is justified','sample transformations preserve invariants'], validation_method='schema/scope/sample/invariant audit'))
+        ops.append(RequiredOperation(description='Transform source data into the requested target representation.', inputs=['source data','schema/config/readme/user instructions'], outputs=['transformed data artifact'], assumptions=['input subset','field mapping','output schema'], risks=['wrong scope','wrong selected field','dropped/extra rows']))
+        grounding.append(SourceGroundingRequirement(description='Ground input/output schema, scope, and field mapping in authoritative available sources.', source_type='unknown', reason='Transform correctness depends on schema and scope.'))
+        audits += [AuditRequirement(description='Check input/output schema and selected fields.', audit_type='field_selection_audit', priority='critical', reason='Wrong field selection invalidates transforms.'), AuditRequirement(description='Audit row count or transformed scope.', audit_type='row_count_or_scope_audit', priority='high', reason='Scope errors are common and not caught by shape alone.'), AuditRequirement(description='Check invariants and sample transformations; use round-trip checks where applicable.', audit_type='invariant_check', priority='medium', reason='Samples and invariants catch semantic transform errors.')]
+    elif action=='configure_system':
+        artifacts.append(ExpectedArtifact(artifact_type='config_file', expected_shape='Parseable configuration with required task-grounded keys/values.', required_properties=['exists','parses','contains required settings'], validation_method='static parse/key audit and safe dry-run when available'))
+        ops.append(RequiredOperation(description='Apply requested system configuration with environment-independent evidence.', inputs=['task instructions','existing config/schema/docs'], outputs=['config artifact or side effect'], assumptions=['required keys/values'], risks=['environment-specific validation']))
+        audits += [AuditRequirement(description='Parse configuration and verify required keys/values.', audit_type='artifact_shape', priority='critical', reason='Configuration must be syntactically and semantically present.'), AuditRequirement(description='Dry-run or static invariant check when available.', audit_type='invariant_check', priority='medium', reason='Avoid relying on host-specific side effects.')]
+    elif action in {'modify_code','repair_behavior','implement_feature','fix_tests'}:
+        artifacts.append(ExpectedArtifact(artifact_type='source_patch', expected_shape='Minimal source patch satisfying behavioural requirements.', required_properties=['non-empty relevant patch','behavioural requirements addressed','no unrelated regressions'], validation_method='behavioural probes, diff review, contract/invariant checks'))
+        ops.append(RequiredOperation(description='Modify code to satisfy requested behaviour while preserving unrelated contracts.', inputs=['task','success criteria','repo investigation','behavioural oracle'], outputs=['source patch'], assumptions=['affected behaviour and invariants'], risks=['generic review missing edge cases','over-broad rewrite']))
+        audits += [AuditRequirement(description='Review diff against behavioural checklist and invariants.', audit_type='diff_review', priority='critical', reason='Patch must map to behavioural contract.'), AuditRequirement(description='Run behavioural edge-case/metamorphic/property/minimal reproduction probes when available.', audit_type='invariant_check', priority='high', reason='Behavioural regressions require task-aware checks.')]
+    else:
+        artifacts.append(ExpectedArtifact(artifact_type='unknown', expected_shape='Unknown; require evidence packet.', validation_method='manual review'))
+        audits.append(AuditRequirement(description='Produce evidence packet and unresolved audit gaps.', audit_type='manual_review', priority='high', reason='No reliable action contract could be inferred.'))
+        risks.append('action type is ambiguous')
+    return TaskActionContract(scope=scope, subtask_id=subtask_id, action_type=action, expected_artifacts=artifacts, required_operations=ops, source_grounding_requirements=grounding, audit_requirements=audits, ambiguity_risks=risks, validation_implications=implications, confidence='medium' if action!='unknown' else 'low', rationale='Inferred from task text, success criteria, investigation, behavioural oracle, and available validation context; no language/file-name-specific heuristics are used.')
+
+def h_derive_task_action_contract(state, inp, ctx):
+    if not _active_behavioural_oracle(state, inp.scope, inp.subtask_id):
+        h_derive_behavioral_oracle(state, OpsDeriveBehaviouralOracleInput(scope=inp.scope, subtask_id=inp.subtask_id, reason='derive behavioural oracle before task action contract'), ctx)
+    contract=_derive_task_action_contract(state, scope=inp.scope, subtask_id=inp.subtask_id, reason=inp.reason)
+    cd=contract.model_dump(mode='json')
+    state.task_action_contracts=[x for x in getattr(state,'task_action_contracts',[]) if not (x.get('scope')==inp.scope and x.get('subtask_id')==inp.subtask_id)] + [cd]
+    path=Path(state.run_dir)/'task_action_contracts'/f"{inp.scope}{('_'+inp.subtask_id) if inp.subtask_id else ''}.json"
+    write_json_utf8(path, cd)
+    ctx.recorder.record('task_action_contract_derived', payload={'task_action_contract':cd,'artifact_path':str(path)})
+    return {'task_action_contract':cd,'artifact_path':str(path)}
+
 def h_materialize_validation_probes(state, inp, ctx):
     oracle=_active_behavioural_oracle(state, inp.scope, inp.subtask_id)
     if not oracle: oracle=h_derive_behavioral_oracle(state, OpsDeriveBehaviouralOracleInput(scope=inp.scope, subtask_id=inp.subtask_id, reason=inp.reason), ctx)['behavioural_oracle']
+    contract=_active_task_action_contract(state, inp.scope, inp.subtask_id)
+    if not contract:
+        contract=h_derive_task_action_contract(state, OpsDeriveTaskActionContractInput(scope=inp.scope, subtask_id=inp.subtask_id, reason='derive action contract before probe materialization'), ctx)['task_action_contract']
     root=Path(state.run_dir)/'validation_probes'/f"{inp.scope}{('_'+inp.subtask_id) if inp.subtask_id else ''}"; root.mkdir(parents=True, exist_ok=True)
     materialized=[]; manual=[]
+    for i,audit in enumerate(contract.get('audit_requirements') or [], 1):
+        manual.append({'id':f'AC{i}','description':audit.get('description'),'probe_type':'manual_review','executable':False,'expected_observation':audit.get('reason'),'authority':'strong_evidence' if audit.get('priority') in {'critical','high'} else 'weak_evidence','task_action_contract_audit':audit})
+    if contract.get('source_grounding_requirements'):
+        manual.append({'id':'AC_source_grounding','description':'Audit source grounding for semantic assumptions before accepting calculation/data artifacts. Candidate agreement is supporting evidence only, not proof.','probe_type':'manual_review','executable':False,'expected_observation':'Reviewer identifies sources for input scope, output field/path/format, parameters, and unresolved ambiguity risks.','authority':'strong_evidence','source_grounding_requirements':contract.get('source_grounding_requirements')})
     for p in oracle.get('validation_probes') or []:
-        if p.get('executable') and p.get('command'):
+        validity=_probe_contract_conflict(p, contract)
+        if validity:
+            row={**p,'artifact_dir':str(root),'stored_outside_solution_patch':True,'villani_validation_artifact':True,'authority':'diagnostic_only','invalid_probe':True,'invalid_reason':validity}
+            manual.append(row)
+        elif p.get('executable') and p.get('command'):
             row={**p,'artifact_dir':str(root),'stored_outside_solution_patch':True,'villani_validation_artifact':True,'authority':p.get('authority') if p.get('authority')!='acceptance_blocking' else 'strong_evidence'}
             materialized.append(row)
         else:
             manual.append(p)
-    packet={'scope':inp.scope,'subtask_id':inp.subtask_id,'materialized_probes':materialized,'manual_review_items':manual,'note':'Generated probes are stored outside the solution patch and are not automatically authoritative.'}
+    packet={'scope':inp.scope,'subtask_id':inp.subtask_id,'task_action_contract':contract,'expected_artifacts':contract.get('expected_artifacts') or [],'source_grounding_requirements':contract.get('source_grounding_requirements') or [],'audit_requirements':contract.get('audit_requirements') or [],'materialized_probes':materialized,'manual_review_items':manual,'audit_results':[],'unresolved_audit_gaps':contract.get('audit_requirements') or [],'note':'Generated probes are stored outside the solution patch and are not automatically authoritative. Invalid probes are downgraded/rejected when they contradict the task action contract.'}
     write_json_utf8(root/'probes.json', packet)
     ctx.recorder.record('validation_probes_materialized', payload=packet)
     return packet
+
+def _probe_contract_conflict(probe:dict, contract:dict|None)->str|None:
+    if not contract: return None
+    action=contract.get('action_type')
+    arts=contract.get('expected_artifacts') or []
+    data_like=any(a.get('artifact_type') in {'output_file','data_file','report','stdout'} for a in arts)
+    desc=' '.join(str(probe.get(k) or '') for k in ['description','expected_observation','command']).lower()
+    if data_like and action in {'write_file','compute_answer','transform_data'} and any(x in desc for x in ['execute the output artifact','run the output artifact','artifact is executable']):
+        return 'probe invalid because it contradicts task action contract: expected artifact is data/output, not executable'
+    if not (probe.get('related_requirement_ids') or probe.get('description')):
+        return 'probe invalid because it cannot explain what requirement it validates'
+    if 'unstated assumption' in desc and not contract.get('source_grounding_requirements'):
+        return 'probe downgraded because assumption check lacks source grounding in the task action contract'
+    return None
 
 def _plan_commands(plan:ValidationPlan|None):
     if not plan: return []
@@ -1870,6 +1995,7 @@ def h_validation(state, inp, ctx):
     results=[]; first_cwd=None
     for i,c in enumerate(inp.commands,1):
         source, authority, scope, subtask_id=_default_validation_metadata(c, target=inp.target, target_obj=target_obj, subtask=_st)
+        contract=_active_task_action_contract(state, 'subtask' if subtask_id else 'task', subtask_id)
         requested_blocking = bool(getattr(c,'blocking',None)) if getattr(c,'blocking',None) is not None else authority=='acceptance_blocking'
         confidence=getattr(c,'confidence',None) or ('high' if source in {'user_provided','user_success_criteria','integration','final'} or (source in {'project_detected','investigation_discovered','subtask_focused'} and authority=='acceptance_blocking') else 'low')
         reliable_blocking = (source in {'user_provided','user_success_criteria','integration','final'}) or (source in {'project_detected','investigation_discovered','subtask_focused'} and confidence=='high')
@@ -1880,6 +2006,13 @@ def h_validation(state, inp, ctx):
             authority='diagnostic_only'
         elif requested_blocking:
             authority='supporting_evidence'
+        conflict=_validation_command_contract_conflict(c, contract)
+        if conflict:
+            item={'cmd':c.cmd,'command':c.cmd,'passed':False,'status':'command_rejected','reason':conflict,'cwd':str(base_cwd.resolve()),'source':source,'confidence':confidence,'blocking':False,'authority':'diagnostic_only','scope':scope,'subtask_id':subtask_id,'purpose':c.purpose or '','execution_mode':'argv','shell':False,'argv':[],'exit_code':None,'infrastructure_error':conflict,'invalid_probe':True,'invalid_reason':conflict}
+            item['evidence_strength']='diagnostic_only'
+            results.append(item)
+            ctx.recorder.record('validation_command_rejected', payload={'target':inp.target,'target_id':inp.target_id,'cmd':c.cmd,'reason':'task_action_contract_conflict','message':conflict})
+            continue
         try:
             cmd_cwd=_resolve_command_cwd(c.cwd, base_cwd, target=inp.target, allow_escape=inp.allow_cwd_escape)
             first_cwd=first_cwd or str(cmd_cwd)
@@ -1924,6 +2057,21 @@ def h_validation(state, inp, ctx):
     if inp.target=='candidate' and target_obj is not None and any(o.attempt_id==inp.target_id for o in state.attempt_observations):
         _observe_completed_attempt(state,target_obj,ctx)
     return res
+
+def _validation_command_contract_conflict(command, contract:dict|None)->str|None:
+    if not contract: return None
+    arts=contract.get('expected_artifacts') or []
+    data_paths=[a.get('path') for a in arts if a.get('path') and a.get('artifact_type') in {'output_file','data_file','report','stdout'}]
+    text=' '.join(str(x or '') for x in [getattr(command,'purpose',None), getattr(command,'reason',None), getattr(command,'cmd',None)]).lower()
+    if contract.get('action_type') in {'write_file','compute_answer','transform_data'}:
+        if 'execute the output artifact' in text or 'run the output artifact' in text:
+            return 'probe invalid because it contradicts task action contract: expected artifact is data/output, not executable'
+        if data_paths:
+            argv=getattr(command,'argv',None) or []
+            tokens=[str(x) for x in argv] if argv else []
+            if tokens and any(p in tokens[:2] for p in data_paths):
+                return 'probe invalid because command attempts to execute the expected output/data artifact'
+    return None
 
 def h_select_winner(state, inp, ctx):
     if inp.decision=='reject_all':
@@ -2148,6 +2296,7 @@ OPS_TOOLS={
 'ops_submit_classification':ToolSpec('ops_submit_classification','Submit classification',OpsSubmitClassificationInput,h_classification),
 'ops_discover_oracle':ToolSpec('ops_discover_oracle','Discover oracle quality and create a ValidationStrategy before relying on validation. Authority comes from this strategy, not command discovery.',OpsDiscoverOracleInput,h_discover_oracle),
 'ops_derive_behavioral_oracle':ToolSpec('ops_derive_behavioral_oracle','Derive a BehaviouralOracle with requirements, edge cases, probes, and adversarial checklist before candidate evaluation.',OpsDeriveBehaviouralOracleInput,h_derive_behavioral_oracle),
+'ops_derive_task_action_contract':ToolSpec('ops_derive_task_action_contract','Derive the TaskActionContract before probe generation: expected artifacts, operations, source-grounding, audit requirements, ambiguity risks, and validation implications.',OpsDeriveTaskActionContractInput,h_derive_task_action_contract),
 'ops_materialize_validation_probes':ToolSpec('ops_materialize_validation_probes','Materialize high-value behavioural probes as validation artifacts outside the solution patch when executable.',OpsMaterializeValidationProbesInput,h_materialize_validation_probes),
 'ops_submit_investigation':ToolSpec('ops_submit_investigation','Submit investigation',OpsSubmitInvestigationInput,h_investigation),
 'ops_submit_plan':ToolSpec('ops_submit_plan','Submit orchestration plan',OpsSubmitPlanInput,h_plan),
