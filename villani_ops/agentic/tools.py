@@ -352,18 +352,60 @@ def _attach_imported_validation(state, attempt:CandidateAttemptState):
         attempt.validation=result; attempt.validation_status='inconclusive'; attempt.validation_source='villani_code_debug_trace'
     return ev
 
+def _acceptance_basis_for(state, attempt, eligible, blockers):
+    val=_attempt_to_dict(attempt).get('validation') or {}
+    decision=val.get('decision') or {}
+    if eligible and decision.get('acceptance_basis')=='validated_acceptance': return 'validated_acceptance'
+    if eligible and decision.get('acceptance_basis')=='evidence_based_acceptance': return 'evidence_based_acceptance'
+    if any(b in {'validation_failed','review_failed','runner_failed'} or str(b).startswith('runner exit code') for b in blockers): return 'rejected'
+    if 'human_acceptance_required' in blockers: return 'human_required'
+    return decision.get('acceptance_basis') or ('validated_acceptance' if eligible else 'inconclusive')
+
 def _set_acceptance_from_gate(state, attempt):
     eligible, blockers=is_attempt_acceptance_eligible(attempt, state=state)
+    basis=_acceptance_basis_for(state, attempt, eligible, blockers)
     if isinstance(attempt, dict):
-        attempt['acceptance_eligible']=eligible; attempt['acceptance_blockers']=blockers
+        attempt['acceptance_eligible']=eligible; attempt['acceptance_basis']=basis; attempt['acceptance_blockers']=blockers
     else:
-        attempt.acceptance_eligible=eligible; attempt.acceptance_blockers=blockers
+        attempt.acceptance_eligible=eligible; attempt.acceptance_basis=basis; attempt.acceptance_blockers=blockers
     return eligible, blockers
 
 class StrictModel(BaseModel): model_config=ConfigDict(extra='forbid')
 class OpsGetStateInput(StrictModel): include_artifacts:bool=False; include_recent_events:bool=True
 class OpsInspectRepoInput(StrictModel): focus:str; max_files:int=200; include_snippets:bool=True
 class OpsSubmitClassificationInput(StrictModel): category:str; difficulty:Literal['easy','medium','hard','unknown']; reasoning:str; confidence:float; risk_factors:list[str]=Field(default_factory=list); suggested_backend_tier:str|None=None
+class ValidationOracle(StrictModel):
+    oracle_type:Literal['existing_test','user_command','build_or_typecheck','contract_check','metamorphic_check','property_check','differential_check','generated_test','static_review','llm_review','human_review']
+    authority:Literal['acceptance_blocking','strong_evidence','weak_evidence','diagnostic_only','human_required']
+    scope:Literal['task','subtask','integration','candidate','final']
+    subtask_id:str|None=None
+    command:str|None=None
+    description:str
+    rationale:str
+    limitations:str|None=None
+
+class OracleAssessment(StrictModel):
+    scope:Literal['task','subtask','integration','candidate','final']
+    subtask_id:str|None=None
+    oracle_quality:Literal['authoritative','strong_derived','weak_derived','evidence_only','human_required','unknown']
+    available_oracles:list[ValidationOracle]=Field(default_factory=list)
+    missing_oracle_reason:str|None=None
+    recommended_strategy:Literal['authoritative_validation','validation_portfolio','evidence_based_acceptance','human_acceptance_required']
+    confidence:Literal['high','medium','low']
+    rationale:str
+
+class ValidationStrategy(StrictModel):
+    scope:Literal['task','subtask','integration','candidate','final']
+    subtask_id:str|None=None
+    strategy_type:Literal['authoritative_validation','validation_portfolio','evidence_based_acceptance','human_acceptance_required']
+    authoritative_checks:list[ValidationOracle]=Field(default_factory=list)
+    strong_evidence_checks:list[ValidationOracle]=Field(default_factory=list)
+    weak_evidence_checks:list[ValidationOracle]=Field(default_factory=list)
+    diagnostic_checks:list[ValidationOracle]=Field(default_factory=list)
+    requires_human_acceptance:bool=False
+    acceptance_rule:str
+    rationale:str
+
 class ValidationCommand(StrictModel):
     cmd:str; cwd:str|None=None; purpose:str|None=None; timeout_seconds:int|None=None
     source:Literal['user_provided','project_detected','generated','user_success_criteria','investigation_discovered','subtask_focused','runner_suggested','diagnostic','exploratory','integration','final']|None=None
@@ -371,12 +413,13 @@ class ValidationCommand(StrictModel):
     blocking:bool|None=None
     shell:bool=False
     argv:list[str]|None=None
-    authority:Literal['acceptance_blocking','supporting_evidence','diagnostic_only']|None=None
+    authority:Literal['acceptance_blocking','strong_evidence','weak_evidence','supporting_evidence','diagnostic_only','human_required']|None=None
     scope:Literal['subtask','integration','candidate','final','repo']|None=None
     subtask_id:str|None=None
     reason:str|None=None
 class ValidationDecision(StrictModel):
     status:Literal['passed','failed','inconclusive']
+    acceptance_basis:Literal['validated_acceptance','evidence_based_acceptance','human_required','rejected','inconclusive']='inconclusive'
     scope:Literal['subtask','integration','candidate','final','repo']
     subtask_id:str|None=None
     blocking_failures:list[dict]=Field(default_factory=list)
@@ -395,10 +438,12 @@ class ValidationPlan(StrictModel):
     rationale:str='Explicit validation contract for this decision.'
     confidence:Literal['high','medium','low']='medium'
     notes:list[str]=Field(default_factory=list)
+    strategy:ValidationStrategy|None=None
 
     def all_commands(self)->list[ValidationCommand]:
         return [*self.authoritative_commands,*self.supporting_commands,*self.diagnostic_commands,*self.commands]
 
+class OpsDiscoverOracleInput(StrictModel): scope:Literal['task','subtask','integration','candidate','final']; subtask_id:str|None=None; reason:str
 class OpsSubmitInvestigationInput(StrictModel): summary:str; suspected_root_cause:str|None=None; relevant_files:list[str]=Field(default_factory=list); relevant_tests:list[str]=Field(default_factory=list); implementation_plan:list[str]=Field(default_factory=list); risks:list[str]=Field(default_factory=list); validation_plan:ValidationPlan|None=None; confidence:float
 class OpsSubmitPlanInput(StrictModel): summary:str; strategy:Literal['single_task','parallel_candidates','decompose_then_execute']; should_decompose:bool; decomposition_reason:str|None=None; candidate_attempts:int; risks:list[str]=Field(default_factory=list); expected_difficulty:Literal['easy','medium','hard','unknown']; confidence:float
 class SubtaskInput(StrictModel): id:str; title:str; objective:str; success_criteria:str|None=None; relevant_files:list[str]=Field(default_factory=list); dependencies:list[str]=Field(default_factory=list); expected_difficulty:Literal['easy','medium','hard','unknown']='unknown'; risk:Literal['low','medium','high','unknown']='unknown'; confidence:float; can_run_parallel:bool; parallel_group:str|None=None; merge_contract:str|None=None
@@ -434,7 +479,7 @@ class OpsFinalizeRunInput(StrictModel): decision:Literal['accepted','rejected','
 @dataclass
 class ToolSpec: name:str; description:str; input_model:type[BaseModel]; handler:Callable; read_only:bool=False
 
-def h_get_state(state, inp, ctx): return {'status':state.status,'phase':state.phase,'execution_path':state.execution_path,'fallback_execution_path':state.fallback_execution_path,'fallback_used':state.fallback_used,'decomposed_execution_status':state.decomposed_execution_status,'decomposed_execution_blockers':state.decomposed_execution_blockers,'allowed_next_actions':state.allowed_next_actions(),'decomposition_accepted':state.decomposition_accepted,'subtasks':[s.model_dump() for s in state.subtasks],'candidates':[c.model_dump() for c in state.candidates],'warnings':state.warnings,'recovery_count':state.recovery_count}
+def h_get_state(state, inp, ctx): return {'status':state.status,'phase':state.phase,'oracle_policy':state.oracle_policy,'oracle_assessments':state.oracle_assessments,'validation_strategies':state.validation_strategies,'execution_path':state.execution_path,'fallback_execution_path':state.fallback_execution_path,'fallback_used':state.fallback_used,'decomposed_execution_status':state.decomposed_execution_status,'decomposed_execution_blockers':state.decomposed_execution_blockers,'allowed_next_actions':state.allowed_next_actions(),'decomposition_accepted':state.decomposition_accepted,'subtasks':[s.model_dump() for s in state.subtasks],'candidates':[c.model_dump() for c in state.candidates],'warnings':state.warnings,'recovery_count':state.recovery_count}
 def h_inspect_repo(state, inp, ctx):
     root=Path(state.repo_path); files=[str(p.relative_to(root)) for p in root.rglob('*') if p.is_file() and '.git' not in p.parts][:inp.max_files]
     cfg=[f for f in files if Path(f).name in {'pyproject.toml','package.json','Cargo.toml','go.mod','Makefile'}]
@@ -493,7 +538,9 @@ def h_validate_decomposition(state, inp, ctx):
     if state.decomposition and state.decomposition.get('should_use_decomposition') and not any(not s.dependencies for s in state.subtasks): failures.append('no executable root subtask')
     if state.decomposition and state.decomposition.get('should_use_decomposition') is False: failures.append('decomposition not requested for execution')
     deterministic=not failures; warnings=[]; semantic=None
-    if inp.semantic: warnings.append('semantic_decomposition_validation_unavailable'); state.warnings.append('semantic_decomposition_validation_unavailable')
+    if inp.semantic:
+        msg='Semantic decomposition validator unavailable: no authoritative semantic oracle is configured for decomposition; deterministic dependency and contract checks decide decomposition acceptance.'
+        warnings.append(msg); state.warnings.append(msg)
     accepted=deterministic
     reason='deterministic validation passed; semantic validation unavailable' if accepted and semantic is None else 'deterministic validation failed'
     res=DecompositionValidationResult(accepted=accepted,deterministic_accepted=deterministic,semantic_accepted=semantic,failures=failures,required_revisions=failures,warnings=warnings,computed_acceptance_reason=reason)
@@ -1002,13 +1049,51 @@ def _coerce_validation_plan(raw, *, default_scope='candidate', subtask_id=None):
             for c in data.get(old) or []:
                 vc=ValidationCommand.model_validate(c) if isinstance(c,dict) else c
                 effective_auth=auth
-                if effective_auth is None and old=='commands' and default_scope in {'candidate','integration','final','repo'}:
-                    effective_auth='acceptance_blocking'
+                if effective_auth is None and old=='commands':
+                    effective_auth='supporting_evidence'
                 if effective_auth and vc.authority is None: vc=vc.model_copy(update={'authority':effective_auth})
                 vals.append(vc)
             data[new]=vals
         return ValidationPlan.model_validate(data)
     return None
+
+
+
+def _strategy_to_validation_plan(strategy:ValidationStrategy)->ValidationPlan:
+    def cv(o:ValidationOracle, authority:str)->ValidationCommand|None:
+        if not o.command: return None
+        return ValidationCommand(cmd=o.command, purpose=o.description, authority=authority, scope=('candidate' if o.scope=='task' else o.scope), subtask_id=o.subtask_id, reason=o.rationale, confidence='high' if authority=='acceptance_blocking' else ('medium' if authority=='strong_evidence' else 'low'))
+    auth=[c for o in strategy.authoritative_checks if (c:=cv(o,'acceptance_blocking'))]
+    strong=[c for o in strategy.strong_evidence_checks if (c:=cv(o,'strong_evidence'))]
+    weak=[c for o in strategy.weak_evidence_checks if (c:=cv(o,'weak_evidence'))]
+    diag=[c for o in strategy.diagnostic_checks if (c:=cv(o,'diagnostic_only'))]
+    return ValidationPlan(scope=('candidate' if strategy.scope=='task' else strategy.scope), subtask_id=strategy.subtask_id, authoritative_commands=auth, supporting_commands=[*strong,*weak], diagnostic_commands=diag, rationale=strategy.rationale, confidence='high' if auth else ('medium' if strong else 'low'), notes=[strategy.acceptance_rule], strategy=strategy)
+
+def _oracle_scope_to_plan_scope(scope:str)->str:
+    return 'candidate' if scope=='task' else scope
+
+def h_discover_oracle(state, inp, ctx):
+    plan=_coerce_validation_plan((state.investigation or {}).get('validation_plan') if state.investigation else None, default_scope=_oracle_scope_to_plan_scope(inp.scope), subtask_id=inp.subtask_id)
+    selected=[]
+    for c in _plan_commands(plan):
+        if c.authority=='acceptance_blocking':
+            selected.append(ValidationOracle(oracle_type='user_command' if c.source in {'user_provided','user_success_criteria'} else 'existing_test', authority='acceptance_blocking', scope=inp.scope, subtask_id=inp.subtask_id, command=c.cmd, description=c.purpose or 'Explicit validation command selected by validation plan.', rationale=c.reason or 'Selected by ValidationStrategy; command discovery alone is not authority.'))
+    if selected:
+        quality='authoritative'; stype='authoritative_validation'; conf='high'; missing=None; rule='Accept only when authoritative post-attempt validation passes and review accepts.'
+    else:
+        quality='evidence_only'; stype='evidence_based_acceptance'; conf='low'; missing='No authoritative validation oracle was selected by a ValidationStrategy.'; rule='Collect review, diff/scope, and diagnostic evidence; do not label result validated.'
+    static=ValidationOracle(oracle_type='static_review', authority='weak_evidence', scope=inp.scope, subtask_id=inp.subtask_id, description='Static diff/scope review and changed-file reasoning.', rationale='Non-executable evidence used when direct validation is absent.', limitations='Cannot prove runtime behaviour.')
+    llm=ValidationOracle(oracle_type='llm_review', authority='weak_evidence', scope=inp.scope, subtask_id=inp.subtask_id, description='Structured reviewer assessment.', rationale='Review can evaluate plausibility, scope, and risks.', limitations='Not an objective executable oracle.')
+    assessment=OracleAssessment(scope=inp.scope, subtask_id=inp.subtask_id, oracle_quality=quality, available_oracles=selected+([] if selected else [static,llm]), missing_oracle_reason=missing, recommended_strategy=stype, confidence=conf, rationale=('Authoritative oracle selected explicitly by validation strategy.' if selected else 'No selected authoritative command/spec/check exists; use evidence portfolio or human review according to oracle policy.'))
+    strategy=ValidationStrategy(scope=inp.scope, subtask_id=inp.subtask_id, strategy_type=stype, authoritative_checks=selected, weak_evidence_checks=[] if selected else [static,llm], requires_human_acceptance=(quality=='human_required'), acceptance_rule=rule, rationale=assessment.rationale)
+    state.oracle_assessments=[x for x in state.oracle_assessments if not (x.get('scope')==inp.scope and x.get('subtask_id')==inp.subtask_id)] + [assessment.model_dump(mode='json')]
+    state.validation_strategies=[x for x in state.validation_strategies if not (x.get('scope')==inp.scope and x.get('subtask_id')==inp.subtask_id)] + [strategy.model_dump(mode='json')]
+    if inp.scope=='subtask' and inp.subtask_id:
+        for st in state.subtasks:
+            if st.subtask_id==inp.subtask_id:
+                st.oracle_assessment=assessment.model_dump(mode='json'); st.validation_strategy=strategy.model_dump(mode='json')
+    ctx.recorder.record('oracle_discovered', payload={'assessment':assessment.model_dump(mode='json'),'strategy':strategy.model_dump(mode='json')})
+    return {'oracle_assessment':assessment.model_dump(mode='json'),'validation_strategy':strategy.model_dump(mode='json'),'validation_plan':_strategy_to_validation_plan(strategy).model_dump(mode='json')}
 
 def _plan_commands(plan:ValidationPlan|None):
     if not plan: return []
@@ -1632,7 +1717,7 @@ def make_validation_decision(result:dict)->dict:
     scope=(result or {}).get('scope') or ((commands[0] or {}).get('scope') if commands else None) or ('integration' if (result or {}).get('target')=='integration' else ('repo' if (result or {}).get('target')=='repo' else 'candidate'))
     subtask_id=(result or {}).get('subtask_id') or next((c.get('subtask_id') for c in commands if c.get('subtask_id')), None)
     blocking=[c for c in commands if c.get('authority')=='acceptance_blocking']
-    supporting=[c for c in commands if c.get('authority')=='supporting_evidence']
+    supporting=[c for c in commands if c.get('authority') in {'supporting_evidence','strong_evidence','weak_evidence'}]
     diagnostic=[c for c in commands if c.get('authority')=='diagnostic_only']
     blocking_fail=[c for c in blocking if c.get('passed') is not True and c.get('status') not in {'infrastructure_error','timeout'}]
     passed_block=[c for c in blocking if c.get('passed') is True]
@@ -1641,14 +1726,17 @@ def make_validation_decision(result:dict)->dict:
     passed_support=[c for c in supporting if c.get('passed') is True]
     if blocking:
         status='failed' if blocking_fail else ('passed' if passed_block else 'inconclusive')
+        basis='rejected' if blocking_fail else ('validated_acceptance' if passed_block else 'inconclusive')
         rationale='acceptance-blocking validation failed' if blocking_fail else 'all acceptance-blocking validation passed'
     elif passed_support and not supporting_fail:
         status='inconclusive'
+        basis='evidence_based_acceptance' if any(c.get('authority')=='strong_evidence' for c in passed_support) else 'inconclusive'
         rationale='supporting validation passed but no acceptance-blocking validation was available'
     else:
         status='inconclusive'
+        basis='inconclusive'
         rationale='no acceptance-blocking validation was available; diagnostic/supporting failures are non-blocking evidence'
-    return ValidationDecision(status=status,scope=scope,subtask_id=subtask_id,blocking_failures=blocking_fail,supporting_failures=supporting_fail,diagnostic_failures=diagnostic_fail,passed_blocking_checks=passed_block,passed_supporting_checks=passed_support,rationale=rationale).model_dump(mode='json')
+    return ValidationDecision(status=status,acceptance_basis=basis,scope=scope,subtask_id=subtask_id,blocking_failures=blocking_fail,supporting_failures=supporting_fail,diagnostic_failures=diagnostic_fail,passed_blocking_checks=passed_block,passed_supporting_checks=passed_support,rationale=rationale).model_dump(mode='json')
 
 def h_validation(state, inp, ctx):
     target_obj, base_cwd, _st = _resolve_validation_target(state, inp)
@@ -1881,12 +1969,19 @@ def h_finalize(state, inp, ctx):
         final_payload['validation_strength']=strength
         final_payload['validation_authoritative']=validation_is_reliable(val or {})
         ranking_evidence=candidate_ranking_evidence(a, state=state)
+        final_payload['acceptance_basis']='validated_acceptance' if final_payload['validation_authoritative'] else 'evidence_based_acceptance'
+        if getattr(state,'oracle_policy','balanced')=='strict' and not final_payload['validation_authoritative']:
+            final_payload['acceptance_basis']='human_required'
+            final_payload['human_review_packet']={'oracle_quality':'evidence_only','what_changed':changed or [],'evidence_collected':ranking_evidence,'could_not_validate':'No authoritative final validation oracle passed.','risks':['Autonomous acceptance is disabled by strict oracle policy.'],'suggested_manual_checks':['Review the selected patch against the task success criteria.']}
+            state.status='failed'
+            final_payload['decision']='rejected'
+            final_payload['blockers']=sorted(set((final_payload.get('blockers') or [])+['human acceptance required: no authoritative validation oracle found']))
         final_payload['selection_evidence']={**((state.selection or {}).get('selection_evidence') or {}), **ranking_evidence}
         if final_payload['decision_bucket']=='accepted_unverified':
             final_payload['selection_explanation']=explain_candidate_selection(a, getattr(state,'candidates',[]) or [], state=state)
         prefix='verified' if final_payload['decision_bucket']=='accepted_verified' else 'selected_unverified'
         final_payload['summary']=f"{prefix}: Selected {aid} changed {', '.join(changed or []) or 'no files'}; normalized score {ranking_evidence['normalized_review_score']:.3f}, normalized confidence {ranking_evidence['normalized_confidence']:.3f}; current validation {((val or {}).get('status') or 'not_run')} with strength {strength}." + ((' '+final_payload.get('summary','')) if final_payload.get('summary') else '')
-    state.final_decision=final_payload; state.status='completed' if inp.decision=='accepted' else 'failed'; state.phase='completed' if state.status=='completed' else 'failed';
+    state.final_decision=final_payload; state.status='completed' if final_payload.get('decision')=='accepted' else 'failed'; state.phase='completed' if state.status=='completed' else 'failed';
     consistency_warnings=validate_final_state_consistency(state)
     if consistency_warnings:
         state.warnings=sorted(set(state.warnings+consistency_warnings)); state.final_decision['consistency_warnings']=consistency_warnings
@@ -1933,6 +2028,7 @@ OPS_TOOLS={
 'ops_get_state':ToolSpec('ops_get_state','Inspect canonical run state',OpsGetStateInput,h_get_state,True),
 'ops_inspect_repo':ToolSpec('ops_inspect_repo','Inspect repository',OpsInspectRepoInput,h_inspect_repo,True),
 'ops_submit_classification':ToolSpec('ops_submit_classification','Submit classification',OpsSubmitClassificationInput,h_classification),
+'ops_discover_oracle':ToolSpec('ops_discover_oracle','Discover oracle quality and create a ValidationStrategy before relying on validation. Authority comes from this strategy, not command discovery.',OpsDiscoverOracleInput,h_discover_oracle),
 'ops_submit_investigation':ToolSpec('ops_submit_investigation','Submit investigation',OpsSubmitInvestigationInput,h_investigation),
 'ops_submit_plan':ToolSpec('ops_submit_plan','Submit orchestration plan',OpsSubmitPlanInput,h_plan),
 'ops_submit_decomposition':ToolSpec('ops_submit_decomposition','Submit decomposition',OpsSubmitDecompositionInput,h_decomposition),

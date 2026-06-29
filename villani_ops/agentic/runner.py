@@ -3,6 +3,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 import secrets
 import time
+from typing import Literal
 from pydantic import BaseModel, ConfigDict
 from villani_ops.core.decision import Decision
 from .state import OpsRunState
@@ -111,7 +112,7 @@ def _state_aware_no_progress_summary(state):
 
 class OpsRunRequest(BaseModel):
     model_config=ConfigDict(extra='forbid', arbitrary_types_allowed=True)
-    repo_path:str; task:str; success_criteria:str|None=None; mode:str='performance'; runner:str='villani-code'; candidate_attempts:int=3; timeout_seconds:int|None=None; workspace:str='.villani-ops'; orchestrator:str='agentic'; backend:object|None=None; backends:object|None=None; runner_adapter:object|None=None; reviewer:object|None=None; production:bool=True; allow_fake_dependencies:bool=False
+    repo_path:str; task:str; success_criteria:str|None=None; mode:str='performance'; runner:str='villani-code'; candidate_attempts:int=3; timeout_seconds:int|None=None; workspace:str='.villani-ops'; orchestrator:str='agentic'; backend:object|None=None; backends:object|None=None; runner_adapter:object|None=None; reviewer:object|None=None; production:bool=True; allow_fake_dependencies:bool=False; oracle_policy:Literal['strict','balanced','permissive']='balanced'
 class OpsRunResult(BaseModel):
     model_config=ConfigDict(arbitrary_types_allowed=True)
     run_id:str; run_dir:str; state:OpsRunState; decision:Decision
@@ -120,7 +121,7 @@ class OpsRunner:
     def run(self, request:OpsRunRequest)->OpsRunResult:
         rid=datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')+'-'+secrets.token_hex(3)
         run_dir=(self.storage.create_run_dir(rid) if self.storage else Path(request.workspace)/'runs'/rid); run_dir.mkdir(parents=True,exist_ok=True)
-        state=OpsRunState(run_id=rid,run_dir=str(run_dir),repo_path=request.repo_path,task=request.task,success_criteria=request.success_criteria,mode=request.mode,runner=request.runner,candidate_attempts=request.candidate_attempts,orchestrator=request.orchestrator)
+        state=OpsRunState(run_id=rid,run_dir=str(run_dir),repo_path=request.repo_path,task=request.task,success_criteria=request.success_criteria,mode=request.mode,runner=request.runner,candidate_attempts=request.candidate_attempts,orchestrator=request.orchestrator, oracle_policy=request.oracle_policy)
         rec=OpsEventRecorder(run_dir,rid,on_event=(self.progress_reporter.on_event if self.progress_reporter else None)); usage_rec=UsageRecorder(run_dir,rid); transcript=[]; state.save(run_dir/'state.json'); rec.record('run_started',payload={'run_dir':str(run_dir)},phase=state.phase); usage_rec.write_artifacts()
         def _update_usage_state():
             summary=usage_rec.summarize(); state.usage_summary=summary.model_dump(mode='json'); state.usage_records_count=summary.calls_count; state.total_input_tokens=summary.input_tokens; state.total_output_tokens=summary.output_tokens; state.total_tokens=summary.total_tokens; state.total_cost=summary.total_cost; state.usage_unavailable_count=summary.unavailable_calls_count; state.input_tokens=summary.input_tokens; state.output_tokens=summary.output_tokens; state.costs={'total':summary.total_cost,'input':summary.input_cost,'output':summary.output_cost}
@@ -153,7 +154,7 @@ class OpsRunner:
             res=execute_tool_with_policy(state,recobj.tool_name,recobj.tool_input or {},tool_use_id,_ctx())
             block={'type':'tool_result','tool_use_id':res.tool_use_id,'content':res.content,'is_error':res.is_error}; transcript.append(block); messages.append({'role':'tool','tool_call_id':res.tool_use_id,'content':str(res.content)}); rec.record('tool_result_appended',tool_name=res.tool_name,payload=block)
             return res
-        messages=[initial_user_message(task=request.task,success_criteria=request.success_criteria,mode=request.mode,runner=request.runner,candidate_attempts=request.candidate_attempts,repo_path=request.repo_path,orchestrator=request.orchestrator)]
+        messages=[initial_user_message(task=request.task,success_criteria=request.success_criteria,mode=request.mode,runner=request.runner,candidate_attempts=request.candidate_attempts,repo_path=request.repo_path,orchestrator=request.orchestrator, oracle_policy=request.oracle_policy)]
         system_prompt=SYSTEM_PROMPT + (ADAPTIVE_SYSTEM_APPENDIX if request.orchestrator=='adaptive' else '')
         started_monotonic=time.monotonic()
         finalization_reserve=60.0
@@ -250,5 +251,7 @@ class OpsRunner:
             state.warnings.append(f'artifact_finalization_error: {e}')
             rec.record('artifact_write_failed', payload={'path':str(run_dir),'artifact_type':'final_artifacts','error':str(e),'attempts':8})
             print(f'[agentic] Warning: final artifact write failed: {e}')
-        d=Decision(run_id=rid,accepted=state.status=='completed',mode=state.mode,runner=state.runner,orchestration_graph_path=str(run_dir/'orchestration_graph.json'),candidate_attempts_requested=state.candidate_attempts,candidate_attempts_completed=len(state.candidates),winning_attempt_id=(state.selection or {}).get('selected_attempt_id'),reason=(state.final_decision or {}).get('summary',''),decomposition_executed=state.decomposition_executed,subtask_count=len(state.subtasks),subtasks_executed=[s.subtask_id for s in state.subtasks if s.attempts],subtasks_accepted=[s.subtask_id for s in state.subtasks if s.status=='accepted'],attempts_per_subtask=state.candidate_attempts,subtask_attempts_completed=sum(len(s.attempts) for s in state.subtasks),failure_reason='' if state.status=='completed' else (state.final_decision or {}).get('summary','failed'))
+        latest_oracle=state.oracle_assessments[-1] if state.oracle_assessments else {}
+        latest_strategy=state.validation_strategies[-1] if state.validation_strategies else {}
+        d=Decision(run_id=rid,accepted=state.status=='completed',mode=state.mode,runner=state.runner,orchestration_graph_path=str(run_dir/'orchestration_graph.json'),candidate_attempts_requested=state.candidate_attempts,candidate_attempts_completed=len(state.candidates),winning_attempt_id=(state.selection or {}).get('selected_attempt_id'),reason=(state.final_decision or {}).get('summary',''),decomposition_executed=state.decomposition_executed,subtask_count=len(state.subtasks),subtasks_executed=[s.subtask_id for s in state.subtasks if s.attempts],subtasks_accepted=[s.subtask_id for s in state.subtasks if s.status=='accepted'],attempts_per_subtask=state.candidate_attempts,subtask_attempts_completed=sum(len(s.attempts) for s in state.subtasks),failure_reason='' if state.status=='completed' else (state.final_decision or {}).get('summary','failed'), acceptance_basis=(state.final_decision or {}).get('acceptance_basis'), oracle_quality=latest_oracle.get('oracle_quality'), validation_strategy=latest_strategy or None, authoritative_checks=latest_strategy.get('authoritative_checks') or [], derived_evidence_checks=(latest_strategy.get('strong_evidence_checks') or []) + (latest_strategy.get('weak_evidence_checks') or []), human_review_required=(state.final_decision or {}).get('acceptance_basis')=='human_required', oracle_limitations=[o.get('limitations') for o in (latest_oracle.get('available_oracles') or []) if o.get('limitations')])
         return OpsRunResult(run_id=rid,run_dir=str(run_dir),state=state,decision=d)

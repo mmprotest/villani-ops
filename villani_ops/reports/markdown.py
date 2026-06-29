@@ -73,6 +73,28 @@ Planned attempts:
 
 Policy warnings: {', '.join(strategy.get('warnings') or []) or 'none'}
 
+## Oracle and Validation Strategy
+
+Oracle quality: {decision.oracle_quality or 'unknown'}
+
+Acceptance basis: {decision.acceptance_basis or 'inconclusive'}
+
+Human review required: {decision.human_review_required}
+
+Authoritative checks:
+{chr(10).join('- '+str(c.get('description') or c.get('command') or c) for c in (decision.authoritative_checks or [])) or '- none'}
+
+Derived/evidence checks:
+{chr(10).join('- '+str(c.get('description') or c.get('command') or c) for c in (decision.derived_evidence_checks or [])) or '- none'}
+
+Limitations:
+{chr(10).join('- '+str(x) for x in (decision.oracle_limitations or [])) or '- none'}
+
+Validation strategy:
+```json
+{json.dumps(decision.validation_strategy or {}, indent=2)}
+```
+
 ## Policy Strategy
 
 Profile: {strategy.get('profile','')}
