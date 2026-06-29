@@ -1,6 +1,7 @@
 from pydantic import BaseModel
 from villani_ops.core.acceptance import is_attempt_acceptance_eligible
 from .state import detect_decomposition_deadlock
+from .tools import commit_tournament_selection
 
 class RecoveryRecommendation(BaseModel):
     action:str
@@ -105,6 +106,20 @@ def _subtask_commit_ready(st):
     return None
 
 def recommend_next_agentic_action(state):
+    if state.execution_path=='candidate_tournament':
+        if not state.selection and ((state.tournament_ranking and state.tournament_ranking.selected_candidate_id) or state.candidates):
+            committed=commit_tournament_selection(state)
+            if committed and state.selection:
+                aid=state.selection.get('selected_attempt_id'); a=_find_attempt_by_id(state, aid)
+                return RecoveryRecommendation(action='finalize_tournament_selection',tool_name='ops_finalize_run',tool_input={'decision':'accepted','summary':build_evidence_based_acceptance_summary(state),'selected_attempt_id':aid,'selected_patch_path':_patch(a),'blockers':[]},reason='Tournament ranking/available evidence was deterministically committed to selection.',can_execute_deterministically=True)
+        if state.selection:
+            aid=state.selection.get('selected_attempt_id'); a=_find_attempt_by_id(state, aid)
+            return RecoveryRecommendation(action='finalize_selected_winner',tool_name='ops_finalize_run',tool_input={'decision':'accepted','summary':build_evidence_based_acceptance_summary(state),'selected_attempt_id':aid,'selected_patch_path':_patch(a),'blockers':[]},reason='Tournament selection exists and should be finalized.',can_execute_deterministically=True)
+        if state.tournament_ranking is None and any(_complete(c) and _patch(c) and _changed(c) for c in state.candidates):
+            committed=commit_tournament_selection(state)
+            if committed and state.selection:
+                aid=state.selection.get('selected_attempt_id'); a=_find_attempt_by_id(state, aid)
+                return RecoveryRecommendation(action='finalize_best_effort_tournament_selection',tool_name='ops_finalize_run',tool_input={'decision':'accepted','summary':build_evidence_based_acceptance_summary(state),'selected_attempt_id':aid,'selected_patch_path':_patch(a),'blockers':[]},reason='Best-effort tournament selection was committed from materializable completed candidates.',can_execute_deterministically=True)
     if has_valid_selected_winner(state):
         aid=(state.selection or {}).get('selected_attempt_id')
         a=_find_attempt_by_id(state, aid)

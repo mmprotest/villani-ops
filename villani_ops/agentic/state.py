@@ -187,7 +187,12 @@ class OpsRunState(BaseModel):
         if self.execution_path=='candidate_tournament':
             if not self.candidates: a.append('ops_launch_tournament_candidates'); return list(dict.fromkeys(a))
             if self.tournament_ranking is None: a.append('ops_select_winner'); return list(dict.fromkeys(a))
-            a += ['ops_finalize_run']; return list(dict.fromkeys(a))
+            sel=self.selection or {}
+            if sel.get('decision')=='select' and sel.get('selected_attempt_id'):
+                a += ['ops_finalize_run']; return list(dict.fromkeys(a))
+            if self.tournament_ranking.selected_candidate_id:
+                a += ['ops_select_winner','ops_finalize_run']; return list(dict.fromkeys(a))
+            a.append('ops_select_winner'); return list(dict.fromkeys(a))
         if self.execution_path=='single_task':
             budget=max(1,int(self.candidate_attempts or 1))
             eligible=[]; needs_validation=[]; needs_review=[]; needs_observation=[]
