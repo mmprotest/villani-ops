@@ -61,8 +61,31 @@ def derive_graph(state, events: list[dict]) -> dict:
     return {'canonical':'state.json','derived_from_events':len(events),'nodes':nodes,'edges':[]}
 
 
+def _write_tournament_report(run_dir: Path, state) -> None:
+    lines=['# Villani Ops Tournament Report','']
+    lines += [f'Candidates launched/completed: {getattr(state,"candidate_attempts_launched",None) or len(state.candidates)}/{len([c for c in state.candidates if c.status in {"completed","failed","reviewed","accepted","rejected"}])}', f'Parallelism used: max_parallel={getattr(state,"max_parallel",None)}, mode={getattr(state,"concurrency_mode",None)}', '']
+    lines.append('## Candidate summaries')
+    for c in state.candidates:
+        lines.append(f'- {c.attempt_id}: status={c.status}; changed_files={", ".join(c.changed_files) or "none"}; validation={c.validation_status}; review={c.review_status}')
+    lines += ['', '## Individual risks']
+    for cid, r in (getattr(state,'risk_reviews',{}) or {}).items():
+        lines.append(f'- {cid}: recommendation={r.get("recommendation")}; hidden_test_risk={r.get("hidden_test_risk_score")}; risks={"; ".join(r.get("risks") or []) or "none recorded"}')
+    lines += ['', '## Pairwise comparison results']
+    for c in (getattr(state,'pairwise_comparisons',[]) or []):
+        lines.append(f'- {c.get("candidate_a")} vs {c.get("candidate_b")}: winner={c.get("winner")}; confidence={c.get("confidence")}')
+    sel=getattr(state,'selection',None) or {}; rank=getattr(state,'tournament_ranking',None) or {}
+    lines += ['', '## Selected candidate', f'- selected={sel.get("selected_attempt_id") or rank.get("selected_candidate_id")}', f'- why={sel.get("summary") or rank.get("rationale") or "not selected"}', f'- unresolved_risks={", ".join(rank.get("unresolved_risks") or []) or "none recorded"}', f'- validation_basis={"authoritative" if sel.get("validation_authoritative") else "evidence-based"}']
+    write_text_utf8(run_dir/'final_report.md', '\n'.join(lines)+'\n', atomic=True)
+
 def write_artifacts(run_dir: Path, state, events: list[dict], transcript: list[dict]):
     run_dir=Path(run_dir)
     state.save(run_dir/'state.json')
     write_transcript(run_dir,transcript)
     write_json_utf8(run_dir/'orchestration_graph.json', derive_graph(state,events), atomic=True)
+    for c in getattr(state,'candidates',[]) or []:
+        cdir=run_dir/'candidates'/c.attempt_id; cdir.mkdir(parents=True,exist_ok=True)
+        if c.patch_path and Path(c.patch_path).exists(): write_text_utf8(cdir/'patch.diff', Path(c.patch_path).read_text(encoding='utf-8', errors='replace'))
+        write_json_utf8(cdir/'runner_summary.json', {'attempt_id':c.attempt_id,'status':c.status,'changed_files':c.changed_files,'runner_telemetry':c.runner_telemetry,'validation_status':c.validation_status,'exit_code':c.exit_code,'duration_seconds':c.duration_seconds})
+    if getattr(state,'selection',None): write_json_utf8(run_dir/'selection.json', state.selection, atomic=True)
+    if getattr(state,'candidate_agreement_summary',None): write_json_utf8(run_dir/'candidate_agreement_summary.json', state.candidate_agreement_summary, atomic=True)
+    _write_tournament_report(run_dir,state)

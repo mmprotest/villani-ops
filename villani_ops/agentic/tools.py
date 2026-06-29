@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from .artifacts import read_text_utf8, write_text_utf8, write_json_utf8
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from villani_ops.telemetry.usage import usage_record_from_runner, usage_record_from_response
+from villani_ops.agentic.tournament import build_tournament_candidate_prompt, CandidateRiskReview, summarize_candidate_agreement, rank_candidates, PairwiseCandidateComparison, decide_launch_count
 
 _UNVERIFIED_FATAL_BLOCKERS={'runner_failed','runner_exception','missing_patch','empty_changed_files','internal_artifacts_only','scratch_artifact_in_patch','patch_hygiene_failed','patch_contains_internal_artifacts','invalid_patch_format','patch_apply_check_failed','scope_failed','review_infrastructure_failed'}
 
@@ -1072,7 +1073,12 @@ def h_launch_candidates(state, inp, ctx):
     if state.execution_path!='parallel_candidates' and not fallback_active: raise ValueError('candidates require parallel_candidates execution path or explicit decomposition-deadlock fallback')
     made=[]; maxp=max(1, int(getattr(ctx.coding_backend or ctx.backend,'max_parallel',None) or ctx.max_parallel or 1))
     state.max_parallel=maxp
-    total=int(inp.attempts); batch_count=0; final_mode='sequential_due_max_parallel_1' if maxp<=1 or total<=1 else 'parallel_candidates'
+    policy=decide_launch_count(int(inp.attempts), maxp, getattr(ctx,'timeout_seconds',None), review_budget=float(getattr(state,'reserve_review_seconds',120) or 120), finalization_budget=float(getattr(state,'reserve_finalization_seconds',60) or 60))
+    total=int(policy['candidate_attempts_launched']); state.candidate_attempts_launched=total; state.candidate_attempt_launch_reason=policy['reason']
+    if total <= 0:
+        state.stopped_early=True; state.stop_reason='insufficient_time_for_candidate_generation'; state.phase='selecting'
+        return {'launched':[], 'attempts_requested':int(inp.attempts), 'attempts_launched':0, 'reason':policy['reason'], 'max_parallel':maxp}
+    batch_count=0; final_mode='sequential_due_max_parallel_1' if maxp<=1 or total<=1 else 'parallel_candidates'
     next_index=len(state.candidates)+1
     for off in range(0,total,maxp):
         batch=list(range(off, min(off+maxp,total))); batch_count+=1
@@ -1086,7 +1092,7 @@ def h_launch_candidates(state, inp, ctx):
                 scheduled.status='running'; scheduled.started_at=str(time.time()); scheduled.worktree_path=str(Path(state.run_dir)/'attempts'/aid/'worktree')
                 state.candidates.append(scheduled)
                 ctx.recorder.record('candidate_attempt_started', payload={'attempt_id':aid,'status':'running','batch_index':batch_count,'fallback':fallback_active,'artifact_paths':{'artifacts_dir':scheduled.artifacts_dir}})
-                task_prompt=build_decomposition_fallback_prompt(state) if fallback_active else state.task
+                task_prompt=build_decomposition_fallback_prompt(state) if fallback_active else build_tournament_candidate_prompt(state.task, state.success_criteria)
                 futs.append(ex.submit(_run_attempt,state,ctx,aid,'candidate',task_prompt,state.success_criteria,None,inp.backend_name or ctx.coding_backend_name or ctx.backend_name,False))
             byid={}
             for fut in as_completed(futs):
@@ -1100,10 +1106,10 @@ def h_launch_candidates(state, inp, ctx):
             ev='candidate_attempt_completed' if res.status=='completed' else 'candidate_attempt_failed'
             ctx.recorder.record(ev, payload={'attempt_id':aid,'status':res.status,'exit_code':res.exit_code,'failure_reason':res.failure_reason,'batch_index':batch_count,'fallback':fallback_active,'artifact_paths':{'stdout':res.stdout_path,'stderr':res.stderr_path,'patch':res.patch_path}, **({k:res.token_usage.get(k) for k in ['input_tokens','output_tokens','total_tokens','total_cost','usage_source'] if res.token_usage} if res.token_usage else {})})
         state.save(Path(state.run_dir)/'state.json')
-    state.concurrency_mode=final_mode; state.batch_count=batch_count
+    state.concurrency_mode=final_mode; state.batch_count=batch_count; state.candidate_attempts_launched=len(made); state.candidate_attempt_launch_reason=policy['reason']
     state.candidate_concurrency={'concurrency_mode':final_mode,'max_parallel':maxp,'batch_count':batch_count,'worker_state_mutation':'disabled'}
     state.execution_concurrency={'candidate_concurrency_mode':final_mode,'max_parallel':maxp,'candidate_batch_count':batch_count}
-    state.phase='validating'; return {'launched':made,'max_parallel':maxp,'batch_count':batch_count,'concurrency_mode':final_mode,'semantics':'attempts execute in isolated worktrees; main thread mutates OpsRunState; batches never exceed max_parallel'}
+    state.phase='validating'; return {'launched':made,'attempts_requested':int(inp.attempts),'attempts_launched':len(made),'launch_reason':state.candidate_attempt_launch_reason,'max_parallel':maxp,'batch_count':batch_count,'concurrency_mode':final_mode,'semantics':'attempts execute in isolated worktrees; main thread mutates OpsRunState; batches never exceed max_parallel'}
 
 
 def _coerce_validation_plan(raw, *, default_scope='candidate', subtask_id=None):
@@ -1723,6 +1729,12 @@ def h_review_attempt(state, inp, ctx):
         if st and eligible:
             eligible, blockers, _app=_commit_subtask_acceptance(state, st, a, ctx, reason='review_accept_commit')
     state.reviews.append({'attempt_id':inp.attempt_id,**res.model_dump(),'acceptance_eligible':eligible,'acceptance_blockers':blockers,'validation_evidence_strength':validation_evidence_strength(_attempt_to_dict(a).get('validation') or {})})
+    if inp.scope=='candidate':
+        data=_attempt_to_dict(a)
+        risk=CandidateRiskReview(candidate_id=inp.attempt_id, summary=res.summary, changed_files=data.get('changed_files') or [], likely_correct=(res.decision=='pass' and res.recommended_action=='accept' and not res.blockers), confidence=float(res.confidence or 0.0), strengths=list(res.evidence or []), risks=list((res.issues or [])+(res.blockers or [])), likely_hidden_failures=list(res.critical_requirements_uncertain or []), edge_cases_considered=list(res.probes_passed or []), edge_cases_missed=list(res.probes_failed or []), minimality_score=float((res.model_dump().get('minimality_score') or min(1.0, max(0.0, 1.0-0.05*len(data.get('changed_files') or []))))), correctness_score=float(res.score or 0.0), hidden_test_risk_score=float(1.0-min(1.0,max(0.0,float(res.score or 0.0)))), recommendation=('accept' if res.decision=='pass' and res.recommended_action=='accept' else ('reject' if res.decision=='fail' else 'uncertain')), rationale='Adversarial risk review derived from structured review; assumes plausible solution may still be wrong and records unproven behaviour as risk.')
+        state.risk_reviews[inp.attempt_id]=risk.model_dump(mode='json')
+        rdir=Path(state.run_dir)/'reviews'; rdir.mkdir(parents=True,exist_ok=True); write_json_utf8(rdir/f'{inp.attempt_id}.json', risk.model_dump(mode='json'))
+        state.candidate_agreement_summary=summarize_candidate_agreement(state.candidates)
     if not eligible and blockers:
         state.blockers=sorted(set(state.blockers+blockers))
     ctx.recorder.record(f'{inp.scope}_attempt_reviewed', payload={'attempt_id':inp.attempt_id,'review_decision':res.decision,'review_recommended_action':res.recommended_action,'central_acceptance_eligible':eligible,'acceptance_eligible':eligible,'acceptance_blockers':blockers,'execution_path':state.execution_path,'validation_blocked':any(b.startswith('validation_') for b in blockers),'artifact_blocked':any(b in {'missing_patch','empty_changed_files','patch_unreadable'} for b in blockers), **(({k:getattr(usage_record,k) for k in ['input_tokens','output_tokens','total_tokens','total_cost','usage_source']} if 'usage_record' in locals() and usage_record is not None else {}))})
@@ -2138,6 +2150,27 @@ def h_select_winner(state, inp, ctx):
         state.blockers=sorted(set(state.blockers+blockers))
         ctx.recorder.record('selection_rejected', payload={'selected_attempt_id':inp.selected_attempt_id,'stored_acceptance_eligible':stored,'recomputed_acceptance_eligible':eligible,'acceptance_blockers':blockers})
         raise ValueError('selected attempt is not acceptance eligible: '+', '.join(blockers))
+    if state.risk_reviews:
+        try:
+            reviews=[CandidateRiskReview.model_validate(v) for v in state.risk_reviews.values()]
+            existing={(c.get('candidate_a'),c.get('candidate_b')) for c in state.pairwise_comparisons}
+            ids=[r.candidate_id for r in reviews]
+            for i in range(len(ids)):
+                for j in range(i+1,len(ids)):
+                    if (ids[i],ids[j]) not in existing:
+                        ra=state.risk_reviews[ids[i]]; rb=state.risk_reviews[ids[j]]
+                        winner='tie'
+                        if (ra.get('correctness_score',0), -ra.get('hidden_test_risk_score',1)) > (rb.get('correctness_score',0), -rb.get('hidden_test_risk_score',1)): winner='candidate_a'
+                        elif (rb.get('correctness_score',0), -rb.get('hidden_test_risk_score',1)) > (ra.get('correctness_score',0), -ra.get('hidden_test_risk_score',1)): winner='candidate_b'
+                        cmp=PairwiseCandidateComparison(candidate_a=ids[i], candidate_b=ids[j], material_differences=['changed files or risk profile differ'], a_likely_failures=ra.get('likely_hidden_failures',[]), b_likely_failures=rb.get('likely_hidden_failures',[]), winner=winner, confidence=min(float(ra.get('confidence',0.0)), float(rb.get('confidence',0.0))), rationale='Deterministic pairwise comparison over actual changed files, hidden-failure risks, correctness, and minimality; not generic score alone.')
+                        state.pairwise_comparisons.append(cmp.model_dump(mode='json'))
+            validation={getattr(c,'attempt_id',None): ((c.validation or {}).get('decision') or {}).get('status') or c.validation_status for c in state.candidates}
+            ranking=rank_candidates(reviews, [PairwiseCandidateComparison.model_validate(c) for c in state.pairwise_comparisons], validation=validation)
+            state.tournament_ranking=ranking.model_dump(mode='json')
+            cdir=Path(state.run_dir)/'comparisons'; cdir.mkdir(parents=True,exist_ok=True)
+            write_json_utf8(cdir/'pairwise.json', state.pairwise_comparisons); write_json_utf8(cdir/'ranking.json', state.tournament_ranking)
+        except Exception as e:
+            state.warnings.append(f'tournament_ranking_unavailable: {type(e).__name__}: {e}')
     decision_bucket='accepted_verified' if eligible and validation_is_reliable(val) else ('accepted_unverified' if unverified_selectable or (eligible and not validation_is_reliable(val)) else 'rejected')
     ranking_evidence=candidate_ranking_evidence(a, state=state)
     selection_explanation=explain_candidate_selection(a, getattr(state,'candidates',[]) or [], state=state) if decision_bucket=='accepted_unverified' else {'winner':ranking_evidence,'nearest_alternatives':[],'reasons':['verified candidate selected through central acceptance gate'],'summary':'verified candidate selected through central acceptance gate'}
