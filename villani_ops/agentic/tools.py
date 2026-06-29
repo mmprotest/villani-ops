@@ -215,6 +215,9 @@ def build_agentic_review_payload(state, attempt, scope, subtask=None):
         'requires_patch':attempt_requires_patch(state, attempt),
         'patch_hygiene':data.get('patch_hygiene') or {},
         'investigation_relevant_files':(state.investigation or {}).get('relevant_files') if state.investigation else [],
+        'behavioural_oracle': _active_behavioural_oracle(state, 'subtask' if subtask is not None else 'task', subtask.subtask_id if subtask is not None else None),
+        'mandatory_adversarial_review_format': ['Review item:', '- Requirement:', '- Edge case:', '- Evidence in patch:', '- Evidence from validation/probes:', '- Risk:', '- Pass/fail:'],
+
     }
     if subtask is not None:
         payload['subtask']={'id':subtask.subtask_id,'title':subtask.title,'objective':subtask.objective,'success_criteria':subtask.success_criteria,'relevant_files':subtask.relevant_files}
@@ -402,6 +405,9 @@ class ValidationStrategy(StrictModel):
     strong_evidence_checks:list[ValidationOracle]=Field(default_factory=list)
     weak_evidence_checks:list[ValidationOracle]=Field(default_factory=list)
     diagnostic_checks:list[ValidationOracle]=Field(default_factory=list)
+    behavioural_probes:list[ValidationProbe]=Field(default_factory=list)
+    adversarial_review_checklist:list[ReviewQuestion]=Field(default_factory=list)
+    human_required_evidence_packet:dict|None=None
     requires_human_acceptance:bool=False
     acceptance_rule:str
     rationale:str
@@ -443,6 +449,27 @@ class ValidationPlan(StrictModel):
     def all_commands(self)->list[ValidationCommand]:
         return [*self.authoritative_commands,*self.supporting_commands,*self.diagnostic_commands,*self.commands]
 
+
+class BehaviouralRequirement(StrictModel):
+    id:str; description:str; source:Literal['task','success_criteria','investigation','code_context','inferred']; priority:Literal['critical','high','medium','low']; rationale:str
+class BehaviouralInvariant(StrictModel):
+    id:str; description:str; related_requirement_ids:list[str]=Field(default_factory=list); priority:Literal['critical','high','medium','low']; rationale:str
+class BehaviouralEdgeCase(StrictModel):
+    id:str; description:str; related_requirement_ids:list[str]=Field(default_factory=list); priority:Literal['critical','high','medium','low']; why_plausible_solutions_miss_it:str
+class BehaviouralFailureMode(StrictModel):
+    id:str; description:str; related_requirement_ids:list[str]=Field(default_factory=list); priority:Literal['critical','high','medium','low']; detection_strategy:str
+class ValidationProbe(StrictModel):
+    id:str; description:str; related_requirement_ids:list[str]=Field(default_factory=list); related_edge_case_ids:list[str]=Field(default_factory=list); probe_type:Literal['existing_command','generated_executable','metamorphic','property','differential','static_check','manual_review']; executable:bool; command:str|None=None; expected_observation:str; authority:Literal['acceptance_blocking','strong_evidence','weak_evidence','diagnostic_only','human_required']; limitations:str|None=None
+class ReviewQuestion(StrictModel):
+    id:str; question:str; related_requirement_ids:list[str]=Field(default_factory=list); related_edge_case_ids:list[str]=Field(default_factory=list); priority:Literal['critical','high','medium','low']; required_answer:Literal['pass_fail','evidence_text','risk_assessment']
+class BehaviouralOracle(StrictModel):
+    scope:Literal['task','subtask','integration','candidate','final']; subtask_id:str|None=None
+    requirements:list[BehaviouralRequirement]=Field(default_factory=list); invariants:list[BehaviouralInvariant]=Field(default_factory=list); edge_cases:list[BehaviouralEdgeCase]=Field(default_factory=list); failure_modes:list[BehaviouralFailureMode]=Field(default_factory=list); validation_probes:list[ValidationProbe]=Field(default_factory=list); adversarial_review_checklist:list[ReviewQuestion]=Field(default_factory=list)
+    oracle_confidence:Literal['high','medium','low']='medium'; rationale:str
+class BehaviouralCoverageResult(StrictModel):
+    requirement_id:str; status:Literal['passed','failed','uncertain','not_applicable']; evidence:str; risk:Literal['high','medium','low']
+class OpsDeriveBehaviouralOracleInput(StrictModel): scope:Literal['task','subtask','integration','candidate','final']; subtask_id:str|None=None; reason:str
+class OpsMaterializeValidationProbesInput(StrictModel): scope:Literal['task','subtask','integration','candidate','final']; subtask_id:str|None=None; reason:str
 class OpsDiscoverOracleInput(StrictModel): scope:Literal['task','subtask','integration','candidate','final']; subtask_id:str|None=None; reason:str
 class OpsSubmitInvestigationInput(StrictModel): summary:str; suspected_root_cause:str|None=None; relevant_files:list[str]=Field(default_factory=list); relevant_tests:list[str]=Field(default_factory=list); implementation_plan:list[str]=Field(default_factory=list); risks:list[str]=Field(default_factory=list); validation_plan:ValidationPlan|None=None; confidence:float
 class OpsSubmitPlanInput(StrictModel): summary:str; strategy:Literal['single_task','parallel_candidates','decompose_then_execute']; should_decompose:bool; decomposition_reason:str|None=None; candidate_attempts:int; risks:list[str]=Field(default_factory=list); expected_difficulty:Literal['easy','medium','hard','unknown']; confidence:float
@@ -471,7 +498,7 @@ class OpsRunNextIntegrationRepairAttemptInput(StrictModel): backend_name:str|Non
 class OpsStartCandidateFallbackInput(StrictModel): reason:str; attempts:int|None=None
 class OpsLaunchSubtasksInput(StrictModel): subtask_ids:list[str]; backend_name:str|None=None; attempts_per_subtask:int; reason:str
 class OpsReviewAttemptInput(StrictModel): attempt_id:str; scope:Literal['candidate','subtask','integration']
-class OpsReviewResult(StrictModel): decision:Literal['pass','fail']; recommended_action:Literal['accept','reject','retry','repair']; score:float; summary:str; evidence:list[str]=Field(default_factory=list); issues:list[str]=Field(default_factory=list); blockers:list[str]=Field(default_factory=list); confidence:float=0.0; subtask_passed:bool|None=None; scope_ok:bool|None=None; integration_risk:Literal['low','medium','high','unknown']|None=None
+class OpsReviewResult(StrictModel): decision:Literal['pass','fail']; recommended_action:Literal['accept','reject','retry','repair']; score:float; summary:str; evidence:list[str]=Field(default_factory=list); issues:list[str]=Field(default_factory=list); blockers:list[str]=Field(default_factory=list); confidence:float=0.0; behavioural_coverage:list[BehaviouralCoverageResult]=Field(default_factory=list); oracle_coverage_score:float=0.0; critical_requirements_failed:list[str]=Field(default_factory=list); critical_requirements_uncertain:list[str]=Field(default_factory=list); probes_passed:list[str]=Field(default_factory=list); probes_failed:list[str]=Field(default_factory=list); subtask_passed:bool|None=None; scope_ok:bool|None=None; integration_risk:Literal['low','medium','high','unknown']|None=None
 class OpsIntegrateSubtasksInput(StrictModel): reason:str
 class OpsRunValidationInput(StrictModel): commands:list[ValidationCommand]; target:Literal['candidate','integration','repo']; target_id:str|None=None; allow_cwd_escape:bool=False
 class OpsSelectWinnerInput(StrictModel): selected_attempt_id:str|None=None; decision:Literal['select','reject_all']; summary:str; reasons:list[str]=Field(default_factory=list); rejected_attempts:list[str]=Field(default_factory=list); confidence:float
@@ -869,6 +896,8 @@ def build_candidate_runner_prompt(state, *, reason, repair=False, base_attempt_i
     changed=sorted({f for o in state.attempt_observations for f in o.changed_files})
     brief=build_attempt_learning_brief(state)
     sections=[f'TASK\n{state.task}', f'SUCCESS CRITERIA\n{state.success_criteria or "Complete the task with a minimal correct patch."}', f'CURRENT EXECUTION PATH\n{state.execution_path or "single_task"}. Run exactly this one adaptive candidate attempt.']
+    boracle=_active_behavioural_oracle(state, 'task')
+    if boracle: sections.append('BEHAVIOURAL ORACLE SUMMARY\n'+_compact_text({'critical_requirements':[r for r in boracle.get('requirements',[]) if r.get('priority') in {'critical','high'}], 'edge_cases':boracle.get('edge_cases',[])[:5], 'checklist':boracle.get('adversarial_review_checklist',[])[:5]}, 4000))
     if state.investigation: sections.append('INVESTIGATION SUMMARY\n'+str({k:state.investigation.get(k) for k in ['summary','suspected_root_cause','relevant_files','relevant_tests','implementation_plan'] if k in state.investigation}))
     if changed: sections.append('CHANGED FILES FROM PREVIOUS ATTEMPTS\n'+'\n'.join(f'- {f}' for f in changed))
     if brief: sections.append(brief)
@@ -977,6 +1006,10 @@ def build_decomposition_fallback_prompt(state, *, reason:str|None=None, repair:b
     failed=[{'subtask_id':st.subtask_id,'status':st.status,'attempts':[a.attempt_id for a in st.attempts],'observations':[o for o in sub_obs if o.get('subtask_id')==st.subtask_id]} for st in state.subtasks if st.status in {'failed','skipped'}]
     dead=detect_decomposition_deadlock(state)
     cmds=_validation_plan_commands(state)
+    boracle=_active_behavioural_oracle(state, 'task')
+    gaps=[]
+    for o in state.attempt_observations:
+        gaps += list(o.next_attempt_directives or [])
     sections=[
         f'TASK\n{state.task}',
         f'SUCCESS CRITERIA\n{state.success_criteria or "Complete the task with a minimal correct patch."}',
@@ -987,6 +1020,8 @@ def build_decomposition_fallback_prompt(state, *, reason:str|None=None, repair:b
         'FOCUSED VALIDATION FAILURES AND REVIEW BLOCKERS\n'+_compact_text(sub_obs, 5000),
         'PRESERVE / DO NOT REGRESS\n- Preserve accepted subtask work and behavior where compatible.\n- Do not regress accepted changed files listed above.\n- Do not repeat failed subtask approaches or broad unrelated rewrites.',
     ]
+    if boracle:
+        sections.append('FULL-TASK BEHAVIOURAL ORACLE GAPS\n'+_compact_text({'critical_requirements':boracle.get('requirements',[]),'edge_cases':boracle.get('edge_cases',[]),'unresolved_or_failed_directives':gaps[-8:]}, 4500))
     if fb_obs:
         sections.append('PREVIOUS FALLBACK ATTEMPT FEEDBACK\n'+build_attempt_learning_brief(state))
     sections.append('WHAT TO FOCUS ON NEXT\n- Produce one integrated product-code patch for the original task.\n- Fix remaining broken areas, validation failures, review blockers, patch/scope/hygiene blockers.\n- Rerun known relevant commands where possible.\n'+'\n'.join(f'- Rerun: {c}' for c in cmds))
@@ -1085,7 +1120,9 @@ def h_discover_oracle(state, inp, ctx):
     static=ValidationOracle(oracle_type='static_review', authority='weak_evidence', scope=inp.scope, subtask_id=inp.subtask_id, description='Static diff/scope review and changed-file reasoning.', rationale='Non-executable evidence used when direct validation is absent.', limitations='Cannot prove runtime behaviour.')
     llm=ValidationOracle(oracle_type='llm_review', authority='weak_evidence', scope=inp.scope, subtask_id=inp.subtask_id, description='Structured reviewer assessment.', rationale='Review can evaluate plausibility, scope, and risks.', limitations='Not an objective executable oracle.')
     assessment=OracleAssessment(scope=inp.scope, subtask_id=inp.subtask_id, oracle_quality=quality, available_oracles=selected+([] if selected else [static,llm]), missing_oracle_reason=missing, recommended_strategy=stype, confidence=conf, rationale=('Authoritative oracle selected explicitly by validation strategy.' if selected else 'No selected authoritative command/spec/check exists; use evidence portfolio or human review according to oracle policy.'))
-    strategy=ValidationStrategy(scope=inp.scope, subtask_id=inp.subtask_id, strategy_type=stype, authoritative_checks=selected, weak_evidence_checks=[] if selected else [static,llm], requires_human_acceptance=(quality=='human_required'), acceptance_rule=rule, rationale=assessment.rationale)
+    boracle=_active_behavioural_oracle(state, inp.scope, inp.subtask_id) or _derive_behavioural_oracle(state, scope=inp.scope, subtask_id=inp.subtask_id, reason=inp.reason).model_dump(mode='json')
+    strong_behavioural=[ValidationOracle(oracle_type='generated_test' if p.get('executable') else 'static_review', authority=p.get('authority') or 'strong_evidence', scope=inp.scope, subtask_id=inp.subtask_id, command=p.get('command'), description=p.get('description') or 'Behavioural probe', rationale='Synthesized from BehaviouralOracle; not automatically authoritative.', limitations=p.get('limitations')) for p in (boracle.get('validation_probes') or []) if (p.get('authority') in {'strong_evidence','weak_evidence'} or not selected)]
+    strategy=ValidationStrategy(scope=inp.scope, subtask_id=inp.subtask_id, strategy_type=stype, authoritative_checks=selected, strong_evidence_checks=strong_behavioural if not selected else [], weak_evidence_checks=[] if selected else [static,llm], behavioural_probes=boracle.get('validation_probes') or [], adversarial_review_checklist=boracle.get('adversarial_review_checklist') or [], human_required_evidence_packet={'unresolved_critical_behaviours':[r for r in boracle.get('requirements',[]) if r.get('priority')=='critical']} if quality=='human_required' else None, requires_human_acceptance=(quality=='human_required'), acceptance_rule=rule + ' Behavioural probes provide coverage evidence but are not automatically authoritative.', rationale=assessment.rationale)
     state.oracle_assessments=[x for x in state.oracle_assessments if not (x.get('scope')==inp.scope and x.get('subtask_id')==inp.subtask_id)] + [assessment.model_dump(mode='json')]
     state.validation_strategies=[x for x in state.validation_strategies if not (x.get('scope')==inp.scope and x.get('subtask_id')==inp.subtask_id)] + [strategy.model_dump(mode='json')]
     if inp.scope=='subtask' and inp.subtask_id:
@@ -1094,6 +1131,65 @@ def h_discover_oracle(state, inp, ctx):
                 st.oracle_assessment=assessment.model_dump(mode='json'); st.validation_strategy=strategy.model_dump(mode='json')
     ctx.recorder.record('oracle_discovered', payload={'assessment':assessment.model_dump(mode='json'),'strategy':strategy.model_dump(mode='json')})
     return {'oracle_assessment':assessment.model_dump(mode='json'),'validation_strategy':strategy.model_dump(mode='json'),'validation_plan':_strategy_to_validation_plan(strategy).model_dump(mode='json')}
+
+def _task_text_for_oracle(state, scope, subtask_id=None):
+    if scope=='subtask' and subtask_id:
+        st=next((x for x in state.subtasks if x.subtask_id==subtask_id), None)
+        if st: return f"{st.title}\n{st.objective}\n{st.success_criteria or ''}"
+    return f"{state.task}\n{state.success_criteria or ''}"
+
+def _derive_behavioural_oracle(state, *, scope, subtask_id=None, reason='') -> BehaviouralOracle:
+    subject=_task_text_for_oracle(state, scope, subtask_id).strip() or 'Complete requested behaviour.'
+    inv=(state.investigation or {}) if state.investigation else {}
+    risks=[str(x) for x in (inv.get('risks') or [])][:3]
+    reqs=[
+        BehaviouralRequirement(id='R1', description=f'Satisfy the requested {scope} behaviour: {subject[:500]}', source='task', priority='critical', rationale='The task text is the primary behavioural contract.'),
+    ]
+    if state.success_criteria or (scope=='subtask' and subtask_id):
+        reqs.append(BehaviouralRequirement(id='R2', description=f'Satisfy explicit success criteria or subtask contract: {(state.success_criteria or subject)[:500]}', source='success_criteria', priority='critical', rationale='Explicit success criteria and subtask contracts must dominate generic review confidence.'))
+    if inv.get('summary'):
+        reqs.append(BehaviouralRequirement(id=f'R{len(reqs)+1}', description=f'Address investigated risk/context without unrelated broad changes: {str(inv.get("summary"))[:400]}', source='investigation', priority='high', rationale='Repository investigation identifies likely behaviour and risk areas.'))
+    invariants=[BehaviouralInvariant(id='I1', description='Preserve existing unrelated behaviours and public contracts while making the minimal necessary change.', related_requirement_ids=[r.id for r in reqs], priority='critical', rationale='Correct fixes should not trade one hidden failure for another.')]
+    edges=[BehaviouralEdgeCase(id='E1', description='A plausible implementation handles the obvious happy path but misses boundary, empty, repeated, cancellation, ordering, or error-path behaviour implied by the task.', related_requirement_ids=[reqs[0].id], priority='critical', why_plausible_solutions_miss_it='Happy-path patches often satisfy superficial review while hidden validators exercise less common states.')]
+    if risks: edges.append(BehaviouralEdgeCase(id='E2', description='Risk areas from investigation must remain correct: '+ '; '.join(risks), related_requirement_ids=[r.id for r in reqs], priority='high', why_plausible_solutions_miss_it='Code-context risks are easy to overlook when editing only the apparent failing area.'))
+    failure_modes=[BehaviouralFailureMode(id='F1', description='Incomplete implementation, over-broad rewrite, or regression of unrelated behaviour.', related_requirement_ids=[r.id for r in reqs], priority='critical', detection_strategy='Compare patch evidence, validation output, and adversarial checklist answers against every critical requirement.')]
+    probes=[]
+    plan=_coerce_validation_plan((state.investigation or {}).get('validation_plan') if state.investigation else None, default_scope=_oracle_scope_to_plan_scope(scope), subtask_id=subtask_id)
+    for i,c in enumerate(_plan_commands(plan),1):
+        if c.cmd:
+            probes.append(ValidationProbe(id=f'P{i}', description=c.purpose or 'Existing discovered validation command grounded in the validation plan.', related_requirement_ids=[reqs[0].id], probe_type='existing_command', executable=True, command=c.cmd, expected_observation='Command exits successfully and reports no behaviour regressions relevant to the task.', authority='acceptance_blocking' if c.authority=='acceptance_blocking' else 'strong_evidence', limitations='Authority follows ValidationStrategy; command text alone is not proof.'))
+    probes += [ValidationProbe(id=f'P{len(probes)+1}', description='Adversarial static behavioural review of the patch against requirements and edge cases.', related_requirement_ids=[r.id for r in reqs], related_edge_case_ids=[e.id for e in edges], probe_type='static_check', executable=False, expected_observation='Reviewer cites concrete patch/validation evidence for each critical behaviour.', authority='strong_evidence', limitations='Review evidence is not an executable oracle.')]
+    checklist=[ReviewQuestion(id=f'Q{i+1}', question=f'Does the candidate satisfy {r.id}: {r.description}', related_requirement_ids=[r.id], priority=r.priority, required_answer='pass_fail') for i,r in enumerate(reqs)]
+    checklist += [ReviewQuestion(id=f'Q{len(checklist)+1}', question=f'Would the candidate pass edge case {edges[0].id}: {edges[0].description}', related_requirement_ids=edges[0].related_requirement_ids, related_edge_case_ids=[edges[0].id], priority='critical', required_answer='risk_assessment')]
+    return BehaviouralOracle(scope=scope, subtask_id=subtask_id, requirements=reqs, invariants=invariants, edge_cases=edges, failure_modes=failure_modes, validation_probes=probes, adversarial_review_checklist=checklist, oracle_confidence='medium' if len(reqs)>1 else 'low', rationale='Synthesized adversarially from task text, success criteria, investigation, and validation plan; asks what plausible wrong solutions would miss.')
+
+def h_derive_behavioral_oracle(state, inp, ctx):
+    oracle=_derive_behavioural_oracle(state, scope=inp.scope, subtask_id=inp.subtask_id, reason=inp.reason)
+    od=oracle.model_dump(mode='json')
+    state.behavioural_oracles=[x for x in state.behavioural_oracles if not (x.get('scope')==inp.scope and x.get('subtask_id')==inp.subtask_id)] + [od]
+    path=Path(state.run_dir)/'behavioural_oracles'/f"{inp.scope}{('_'+inp.subtask_id) if inp.subtask_id else ''}.json"
+    write_json_utf8(path, od)
+    ctx.recorder.record('behavioural_oracle_derived', payload={'oracle':od,'artifact_path':str(path)})
+    return {'behavioural_oracle':od,'artifact_path':str(path)}
+
+def _active_behavioural_oracle(state, scope='task', subtask_id=None):
+    return next((o for o in reversed(state.behavioural_oracles) if o.get('scope')==scope and o.get('subtask_id')==subtask_id), None) or next((o for o in reversed(state.behavioural_oracles) if o.get('scope')=='task'), None)
+
+def h_materialize_validation_probes(state, inp, ctx):
+    oracle=_active_behavioural_oracle(state, inp.scope, inp.subtask_id)
+    if not oracle: oracle=h_derive_behavioral_oracle(state, OpsDeriveBehaviouralOracleInput(scope=inp.scope, subtask_id=inp.subtask_id, reason=inp.reason), ctx)['behavioural_oracle']
+    root=Path(state.run_dir)/'validation_probes'/f"{inp.scope}{('_'+inp.subtask_id) if inp.subtask_id else ''}"; root.mkdir(parents=True, exist_ok=True)
+    materialized=[]; manual=[]
+    for p in oracle.get('validation_probes') or []:
+        if p.get('executable') and p.get('command'):
+            row={**p,'artifact_dir':str(root),'stored_outside_solution_patch':True,'villani_validation_artifact':True,'authority':p.get('authority') if p.get('authority')!='acceptance_blocking' else 'strong_evidence'}
+            materialized.append(row)
+        else:
+            manual.append(p)
+    packet={'scope':inp.scope,'subtask_id':inp.subtask_id,'materialized_probes':materialized,'manual_review_items':manual,'note':'Generated probes are stored outside the solution patch and are not automatically authoritative.'}
+    write_json_utf8(root/'probes.json', packet)
+    ctx.recorder.record('validation_probes_materialized', payload=packet)
+    return packet
 
 def _plan_commands(plan:ValidationPlan|None):
     if not plan: return []
@@ -1433,6 +1529,27 @@ def h_review_attempt(state, inp, ctx):
             if idx < len(payloads):
                 ctx.recorder.record('review_retrying', payload={'attempt_id':inp.attempt_id,'failed_payload':kind,'next_payload':payloads[idx][0],'review_error_type':failure_kind,'message':str(e)[:500]})
                 continue
+    if res is not None:
+        boracle=_active_behavioural_oracle(state, 'subtask' if st is not None else ('integration' if inp.scope=='integration' else 'task'), st.subtask_id if st is not None else None)
+        reqs=(boracle or {}).get('requirements') or []
+        if reqs and not res.behavioural_coverage:
+            cov=[]
+            text=' '.join(str(x) for x in [res.summary,res.evidence,res.issues,res.blockers]).lower()
+            for r in reqs:
+                status='failed' if any(str(b).lower()==str(r.get('id')).lower() or str(r.get('id')).lower() in str(b).lower() for b in (res.blockers or [])) else ('passed' if res.decision=='pass' and res.recommended_action=='accept' else 'uncertain')
+                cov.append(BehaviouralCoverageResult(requirement_id=r.get('id'), status=status, evidence='Reviewer did not provide explicit structured coverage; inferred from review decision and blockers.', risk='high' if status!='passed' and r.get('priority')=='critical' else 'medium').model_dump(mode='json'))
+            res.behavioural_coverage=[BehaviouralCoverageResult.model_validate(c) for c in cov]
+        if res.behavioural_coverage:
+            critical={r.get('id') for r in reqs if r.get('priority') in {'critical','high'}}
+            failed=[c.requirement_id for c in res.behavioural_coverage if c.requirement_id in critical and c.status=='failed']
+            uncertain=[c.requirement_id for c in res.behavioural_coverage if c.requirement_id in critical and c.status=='uncertain']
+            passed=sum(1 for c in res.behavioural_coverage if c.requirement_id in critical and c.status=='passed')
+            total=max(1, len(critical))
+            res.critical_requirements_failed=list(dict.fromkeys(res.critical_requirements_failed+failed))
+            res.critical_requirements_uncertain=list(dict.fromkeys(res.critical_requirements_uncertain+uncertain))
+            res.oracle_coverage_score=res.oracle_coverage_score or max(0.0, min(1.0, passed/total - 0.5*len(failed)/total - 0.2*len(uncertain)/total))
+            if failed:
+                res.decision='fail'; res.recommended_action='repair'; res.blockers=list(dict.fromkeys((res.blockers or [])+['failed_critical_behavioural_requirement']+failed))
     if res is not None and (getattr(a,'validation_status',None) or (_attempt_to_dict(a).get('validation') or {}).get('status')) not in {None,'not_run'}:
         if 'validation_missing' in (res.blockers or []):
             res.blockers=[b for b in res.blockers if b!='validation_missing']
@@ -1463,6 +1580,7 @@ def h_review_attempt(state, inp, ctx):
             blockers=sorted(set(blockers+res.blockers)); a['acceptance_blockers']=blockers; eligible=False; a['acceptance_eligible']=False
     else:
         a.review={**res.model_dump(), **normalized_review_metrics(res.model_dump()), 'validation_snapshot': review_validation_snapshot}; a.review_validation_snapshot=review_validation_snapshot; a.status='reviewed' if a.status!='failed' else 'rejected'
+        a.oracle_coverage_score=res.oracle_coverage_score; a.critical_requirements_failed=res.critical_requirements_failed; a.critical_requirements_uncertain=res.critical_requirements_uncertain; a.probes_passed=res.probes_passed; a.probes_failed=res.probes_failed
         if res.decision=='pass' and res.recommended_action=='accept' and not res.blockers:
             a.review_status='passed'
         elif 'review_infrastructure_failed' in res.blockers:
@@ -2029,6 +2147,8 @@ OPS_TOOLS={
 'ops_inspect_repo':ToolSpec('ops_inspect_repo','Inspect repository',OpsInspectRepoInput,h_inspect_repo,True),
 'ops_submit_classification':ToolSpec('ops_submit_classification','Submit classification',OpsSubmitClassificationInput,h_classification),
 'ops_discover_oracle':ToolSpec('ops_discover_oracle','Discover oracle quality and create a ValidationStrategy before relying on validation. Authority comes from this strategy, not command discovery.',OpsDiscoverOracleInput,h_discover_oracle),
+'ops_derive_behavioral_oracle':ToolSpec('ops_derive_behavioral_oracle','Derive a BehaviouralOracle with requirements, edge cases, probes, and adversarial checklist before candidate evaluation.',OpsDeriveBehaviouralOracleInput,h_derive_behavioral_oracle),
+'ops_materialize_validation_probes':ToolSpec('ops_materialize_validation_probes','Materialize high-value behavioural probes as validation artifacts outside the solution patch when executable.',OpsMaterializeValidationProbesInput,h_materialize_validation_probes),
 'ops_submit_investigation':ToolSpec('ops_submit_investigation','Submit investigation',OpsSubmitInvestigationInput,h_investigation),
 'ops_submit_plan':ToolSpec('ops_submit_plan','Submit orchestration plan',OpsSubmitPlanInput,h_plan),
 'ops_submit_decomposition':ToolSpec('ops_submit_decomposition','Submit decomposition',OpsSubmitDecompositionInput,h_decomposition),

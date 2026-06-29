@@ -20,7 +20,7 @@ def _allowed(state, name, data):
         if name=='ops_select_execution_path' and data.get('path')!='single_task':
             return True, None
 
-    if name in {'ops_get_state','ops_inspect_repo','ops_submit_classification'}: return True, None
+    if name in {'ops_get_state','ops_inspect_repo','ops_submit_classification','ops_derive_behavioral_oracle','ops_materialize_validation_probes'}: return True, None
     if name=='ops_observe_completed_attempt': return True, None
     if name=='ops_run_next_candidate_attempt' and state.execution_path=='single_task': return True, None
     if name=='ops_run_next_fallback_candidate_attempt' and state.fallback_execution_path=='parallel_candidates_after_decomposition_deadlock': return True, None

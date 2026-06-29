@@ -13,6 +13,7 @@ class CandidateAttemptState(BaseModel):
     worktree_path:str|None=None; artifacts_dir:str|None=None; patch_path:str|None=None
     changed_files:list[str]=Field(default_factory=list); stdout_path:str|None=None; stderr_path:str|None=None; transcript_path:str|None=None
     review:dict|None=None; acceptance_eligible:bool=False; acceptance_basis:str='inconclusive'; acceptance_blockers:list[str]=Field(default_factory=list)
+    oracle_coverage_score:float=0.0; critical_requirements_failed:list[str]=Field(default_factory=list); critical_requirements_uncertain:list[str]=Field(default_factory=list); probes_passed:list[str]=Field(default_factory=list); probes_failed:list[str]=Field(default_factory=list)
     started_at:str|None=None; completed_at:str|None=None
     exit_code:int|None=None; exit_reason:str|None=None; failure_reason:str|None=None; runner_status:str|None=None; runner_error_type:str|None=None; duration_seconds:float|None=None
     added_files:list[str]=Field(default_factory=list); deleted_files:list[str]=Field(default_factory=list); modified_files:list[str]=Field(default_factory=list); renamed_files:list[str]=Field(default_factory=list)
@@ -122,7 +123,7 @@ class OpsRunState(BaseModel):
     attempt_observations:list[AttemptObservation]=Field(default_factory=list); backend_assessments:dict[str,dict]=Field(default_factory=dict); runner_assessment:dict=Field(default_factory=dict); adaptive_context:dict=Field(default_factory=dict)
     unverified_selection_policy:Literal['budget_exhausted','after_two','deadline_only','always_allow']='budget_exhausted'
     oracle_policy:Literal['strict','balanced','permissive']='balanced'
-    oracle_assessments:list[dict]=Field(default_factory=list); validation_strategies:list[dict]=Field(default_factory=list)
+    oracle_assessments:list[dict]=Field(default_factory=list); validation_strategies:list[dict]=Field(default_factory=list); behavioural_oracles:list[dict]=Field(default_factory=list); behavioural_probe_results:list[dict]=Field(default_factory=list)
     integration:dict|None=None; decomposition_integration_worktree:str|None=None; integration_base_revision:str|None=None
     accepted_patch_application_status:dict[str,dict]=Field(default_factory=dict)
     reviews:list[dict]=Field(default_factory=list); repo_validation_results:list[dict]=Field(default_factory=list); selection:dict|None=None; final_decision:dict|None=None
@@ -139,6 +140,7 @@ class OpsRunState(BaseModel):
             a += ['ops_inspect_repo','ops_submit_classification','ops_submit_investigation']; return a
         if not self.plan: a.append('ops_submit_plan'); return a
         if not any(x.get('scope')=='task' for x in self.oracle_assessments): a.append('ops_discover_oracle')
+        if not any(x.get('scope')=='task' for x in self.behavioural_oracles): a.append('ops_derive_behavioral_oracle')
         if self.orchestrator=='adaptive' and self.execution_path=='unknown': a.append('ops_select_execution_path'); return a
         if self.decomposition_requested and not self.decomposition: a.append('ops_submit_decomposition'); return a
         if self.decomposition and not self.decomposition_validated: a.append('ops_validate_decomposition'); return a
@@ -205,6 +207,7 @@ class OpsRunState(BaseModel):
             a += ['ops_select_winner','ops_finalize_run']; return list(dict.fromkeys(a))
         if self.execution_path=='decomposed_subtasks':
             if any(s.status=='pending' and not s.oracle_assessment for s in self.subtasks): a.append('ops_discover_oracle')
+            if any(s.status=='pending' and not any(o.get('scope')=='subtask' and o.get('subtask_id')==s.subtask_id for o in self.behavioural_oracles) for s in self.subtasks): a.append('ops_derive_behavioral_oracle')
             if any(s.status=='pending' for s in self.subtasks): a += ['ops_run_next_subtask_attempt']; return list(dict.fromkeys(a))
             if all(s.status in {'accepted','skipped'} for s in self.subtasks) and not self.integration: a.append('ops_integrate_subtasks'); return a
             if self.integration and (self.integration.get('validation') or {}).get('passed') is False: a.append('ops_run_next_integration_repair_attempt'); return list(dict.fromkeys(a))
