@@ -50,6 +50,12 @@ class CandidateSummary(BaseModel):
     review_issues: list[str] = Field(default_factory=list)
     acceptance_eligible: bool = False
     acceptance_blockers: list[str] = Field(default_factory=list)
+    oracle_coverage_score: float = 0.0
+    critical_requirements_failed: list[str] = Field(default_factory=list)
+    critical_requirements_uncertain: list[str] = Field(default_factory=list)
+    probes_passed: list[str] = Field(default_factory=list)
+    probes_failed: list[str] = Field(default_factory=list)
+    acceptance_basis: Literal['validated_acceptance','behavioural_evidence_acceptance','evidence_based_acceptance','human_required','rejected','inconclusive'] = 'inconclusive'
     has_patch: bool = False
     telemetry: dict[str, Any] = Field(default_factory=dict)
 

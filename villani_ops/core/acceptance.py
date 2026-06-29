@@ -473,8 +473,18 @@ def candidate_ranking_evidence(attempt: Any, *, state: Any | None = None) -> dic
     addressed_feedback = bool(latest_obs and (getattr(latest_obs, "should_repair", False) or getattr(latest_obs, "next_attempt_directives", None)))
     repeated_weak = bool(latest_obs and getattr(latest_obs, "should_retry_same_plan", False) and not addressed_feedback)
     reliable_failed = reliable and (((validation or {}).get("decision") or {}).get("status") == "failed" or validation_status in {"failed", "failed_candidate"})
+    oracle_score = float(_get(attempt, "oracle_coverage_score") or (review.get("oracle_coverage_score") if isinstance(review, dict) else 0.0) or 0.0)
+    crit_failed = list(_get(attempt, "critical_requirements_failed") or (review.get("critical_requirements_failed") if isinstance(review, dict) else []) or [])
+    crit_uncertain = list(_get(attempt, "critical_requirements_uncertain") or (review.get("critical_requirements_uncertain") if isinstance(review, dict) else []) or [])
+    probes_passed = list(_get(attempt, "probes_passed") or (review.get("probes_passed") if isinstance(review, dict) else []) or [])
+    probes_failed = list(_get(attempt, "probes_failed") or (review.get("probes_failed") if isinstance(review, dict) else []) or [])
     composite = (
-        metrics["normalized_review_score"] * 100.0
+        oracle_score * 180.0
+        - len(crit_failed) * 120.0
+        - len(crit_uncertain) * 35.0
+        + len(probes_passed) * 10.0
+        - len(probes_failed) * 40.0
+        + metrics["normalized_review_score"] * 45.0
         + metrics["normalized_confidence"] * 20.0
         + _EVIDENCE_RANK.get(strength, 0) * 8.0
         + (25.0 if eligible and reliable else 0.0)
@@ -489,7 +499,7 @@ def candidate_ranking_evidence(attempt: Any, *, state: Any | None = None) -> dic
         - (35.0 if reliable_failed else 0.0)
         - (8.0 if repeated_weak else 0.0)
     )
-    return {**metrics, "attempt_id": _get(attempt, "attempt_id"), "composite_score": composite, "acceptance_eligible": eligible, "acceptance_blockers": blockers, "serious_blockers": serious, "validation_strength": strength, "validation_authoritative": reliable, "validation_status": validation_status, "patch_non_empty": patch_ok, "changed_files_present": bool(changed), "runner_exit_code": exit_code, "review_decision": review_decision, "addressed_prior_feedback": addressed_feedback, "repeated_weak_attempt": repeated_weak}
+    return {**metrics, "attempt_id": _get(attempt, "attempt_id"), "composite_score": composite, "oracle_coverage_score": oracle_score, "critical_requirements_failed": crit_failed, "critical_requirements_uncertain": crit_uncertain, "probes_passed": probes_passed, "probes_failed": probes_failed, "acceptance_eligible": eligible, "acceptance_blockers": blockers, "serious_blockers": serious, "validation_strength": strength, "validation_authoritative": reliable, "validation_status": validation_status, "patch_non_empty": patch_ok, "changed_files_present": bool(changed), "runner_exit_code": exit_code, "review_decision": review_decision, "addressed_prior_feedback": addressed_feedback, "repeated_weak_attempt": repeated_weak}
 
 
 def candidate_ranking_key(attempt: Any, *, state: Any | None = None) -> tuple:
@@ -499,7 +509,7 @@ def candidate_ranking_key(attempt: Any, *, state: Any | None = None) -> tuple:
         idx = int(aid.rsplit("_", 1)[-1])
     except Exception:
         idx = 0
-    return (ev["acceptance_eligible"] and ev["validation_authoritative"], ev["composite_score"], ev["normalized_review_score"], ev["normalized_confidence"], ev["validation_authoritative"], _EVIDENCE_RANK.get(ev["validation_strength"], 0), -len(ev["serious_blockers"]), ev["addressed_prior_feedback"], not ev["repeated_weak_attempt"], -idx)
+    return (ev["acceptance_eligible"] and ev["validation_authoritative"], -len(ev.get("critical_requirements_failed") or []), ev.get("oracle_coverage_score",0), -len(ev.get("critical_requirements_uncertain") or []), ev["composite_score"], ev["normalized_review_score"], ev["normalized_confidence"], ev["validation_authoritative"], _EVIDENCE_RANK.get(ev["validation_strength"], 0), -len(ev["serious_blockers"]), ev["addressed_prior_feedback"], not ev["repeated_weak_attempt"], -idx)
 
 
 def is_usable_unverified_candidate(state: Any, attempt: Any) -> bool:
