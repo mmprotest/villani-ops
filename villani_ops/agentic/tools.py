@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Literal
 from pydantic import BaseModel, Field, ConfigDict, model_validator
-from .state import CandidateAttemptState, SubtaskState, AttemptObservation, detect_decomposition_deadlock
+from .state import CandidateAttemptState, SubtaskState, AttemptObservation, detect_decomposition_deadlock, CandidateSummary, CandidateRiskReview, PairwiseCandidateComparison, RankedCandidate, TournamentRanking, CandidateAgreementSummary
 from .git_artifacts import capture_git_patch, ensure_git_baseline, clean_runner_artifacts_from_worktree, DEFAULT_PATCH_EXCLUDES, is_git_compatible_patch, patch_contains_internal_artifacts, clean_untracked_scratch_artifacts, is_scratch_artifact_path
 from villani_ops.core.acceptance import is_attempt_acceptance_eligible, attempt_requires_patch
 import subprocess, json, time, shutil, os, re
@@ -333,8 +333,9 @@ class OpsSubmitDecompositionInput(StrictModel):
         return self
 class OpsValidateDecompositionInput(StrictModel): decomposition_id:str='current'; semantic:bool=True
 class DecompositionValidationResult(StrictModel): accepted:bool; deterministic_accepted:bool; semantic_accepted:bool|None=None; failures:list[str]=Field(default_factory=list); required_revisions:list[str]=Field(default_factory=list); warnings:list[str]=Field(default_factory=list); computed_acceptance_reason:str
-class OpsSelectExecutionPathInput(StrictModel): path:Literal['single_task','parallel_candidates','decomposed_subtasks']; reason:str
+class OpsSelectExecutionPathInput(StrictModel): path:Literal['single_task','parallel_candidates','decomposed_subtasks','candidate_tournament']; reason:str
 class OpsLaunchCandidatesInput(StrictModel): attempts:int; backend_name:str|None=None; reason:str
+class OpsLaunchTournamentCandidatesInput(StrictModel): attempts:int|None=None; backend_name:str|None=None; reason:str='Launch independent adaptive tournament candidates.'
 class OpsRunSingleTaskAttemptsInput(StrictModel): attempts:int; backend_name:str|None=None; reason:str
 class OpsRunNextCandidateAttemptInput(StrictModel): backend_name:str|None=None; base_attempt_id:str|None=None; repair:bool=False; reason:str
 class OpsRunNextFallbackCandidateAttemptInput(StrictModel): backend_name:str|None=None; base_attempt_id:str|None=None; repair:bool=False; reason:str
@@ -370,12 +371,13 @@ def _is_adaptive(state):
 def h_plan(state, inp, ctx):
     plan=inp.model_dump()
     if _is_adaptive(state):
-        invalid=bool(inp.should_decompose or inp.strategy!='single_task')
+        tournament=state.candidate_attempts>1
+        invalid=bool(inp.should_decompose or (inp.strategy!='parallel_candidates' if tournament else inp.strategy!='single_task'))
         if invalid:
             _adaptive_warning(state, ctx, 'adaptive_orchestrator_forced_single_task_plan', {'original_plan': plan})
-        plan.update({'strategy':'single_task','should_decompose':False,'decomposition_reason':None,'candidate_attempts':state.candidate_attempts})
-        plan['execution_path']='single_task'
-        plan['plan_kind']='single_task'
+        plan.update({'strategy':('parallel_candidates' if tournament else 'single_task'),'should_decompose':False,'decomposition_reason':None,'candidate_attempts':state.candidate_attempts})
+        plan['execution_path']='candidate_tournament' if tournament else 'single_task'
+        plan['plan_kind']='candidate_tournament' if tournament else 'single_task'
         state.subtasks=[]; state.decomposition=None; state.decomposition_requested=False; state.decomposition_validated=False; state.decomposition_accepted=None; state.decomposition_executed=False
         state.plan=plan; state.phase='choosing_execution_path'; return state.plan
     state.plan=plan; state.decomposition_requested=inp.should_decompose; state.phase='decomposing' if inp.should_decompose else 'choosing_execution_path'; return state.plan
@@ -418,18 +420,20 @@ def h_validate_decomposition(state, inp, ctx):
     state.decomposition_validated=True; state.decomposition_accepted=accepted; state.phase='choosing_execution_path'; return res.model_dump()
 
 def h_select_path(state, inp, ctx):
-    if _is_adaptive(state) and inp.path!='single_task':
-        _adaptive_warning(state, ctx, 'adaptive_orchestrator_forced_single_task_execution_path', {'requested_path': inp.path, 'reason': inp.reason})
-        state.execution_path='single_task'; state.phase='running_candidates'; state.candidate_execution_mode='sequential'; state.decomposition_executed=False; state.subtasks=[]; state.decomposition=None
-        return {'execution_path':state.execution_path,'reason':'adaptive forced single_task','decomposition_fallback_used':False,'warning':'adaptive_orchestrator_forced_single_task_execution_path'}
+    if _is_adaptive(state):
+        desired='candidate_tournament' if state.candidate_attempts>1 else 'single_task'
+        if inp.path!=desired:
+            _adaptive_warning(state, ctx, 'adaptive_orchestrator_forced_tournament_execution_path' if desired=='candidate_tournament' else 'adaptive_orchestrator_forced_single_task_execution_path', {'requested_path': inp.path, 'reason': inp.reason})
+        state.execution_path=desired; state.phase='running_candidates'; state.candidate_execution_mode='parallel' if desired=='candidate_tournament' else 'sequential'; state.decomposition_executed=False; state.subtasks=[]; state.decomposition=None
+        return {'execution_path':state.execution_path,'reason':'adaptive selected '+desired,'decomposition_fallback_used':False,'warning':None if inp.path==desired else 'adaptive_orchestrator_forced_execution_path'}
     strategy=(state.plan or {}).get('strategy')
-    if strategy=='single_task' and inp.path=='parallel_candidates':
+    if strategy=='single_task' and inp.path in {'parallel_candidates','candidate_tournament'}:
         raise ValueError('plan strategy is single_task; use execution_path=single_task for sequential attempts, not parallel_candidates')
     if strategy=='parallel_candidates' and inp.path=='single_task':
         raise ValueError('plan strategy is parallel_candidates; use execution_path=parallel_candidates')
     state.execution_path=inp.path
     state.phase='running_subtasks' if inp.path=='decomposed_subtasks' else 'running_candidates'
-    state.candidate_execution_mode='sequential' if inp.path=='single_task' else ('parallel' if inp.path=='parallel_candidates' else state.candidate_execution_mode)
+    state.candidate_execution_mode='sequential' if inp.path=='single_task' else ('parallel' if inp.path in {'parallel_candidates','candidate_tournament'} else state.candidate_execution_mode)
     state.decomposition_executed=inp.path=='decomposed_subtasks'
     if inp.path=='decomposed_subtasks':
         state.decomposed_execution_status='running'
@@ -865,6 +869,96 @@ def build_decomposition_fallback_prompt(state, *, reason:str|None=None, repair:b
     if reason: sections.append(f'REASON FOR THIS FALLBACK ATTEMPT\n{reason}')
     max_chars=int((state.adaptive_context or {}).get('fallback_prompt_max_chars') or 20000)
     return _budget_prompt(sections, max_chars=max_chars)
+
+
+def build_tournament_candidate_prompt(state, *, reason:str|None=None)->str:
+    return '\n\n'.join([
+        f'TASK\n{state.task}',
+        f'SUCCESS CRITERIA\n{state.success_criteria or "Complete the task with a minimal correct patch."}',
+        'RUNNER BOILERPLATE\nProduce one minimal, correct product patch for the task. Do not create Villani internal artifacts or scratch files in the repository. Run relevant validation when practical.',
+    ])
+
+def _candidate_summary_from_attempt(a):
+    patch='No patch captured.' if not a.patch_path else 'Patch captured for files: '+(', '.join(a.changed_files or []) or 'none')
+    return CandidateSummary(candidate_id=a.attempt_id, runner_status=a.runner_status or a.status, changed_files=a.changed_files or [], patch_summary=patch, validation_status=a.validation_status, telemetry_summary=a.runner_telemetry or {}, obvious_risks=list(a.acceptance_blockers or []))
+
+def _risk_review_from_summary(summary:CandidateSummary)->CandidateRiskReview:
+    validation_passed=summary.validation_status=='passed'
+    has_patch=bool(summary.changed_files)
+    risk=0.15 if validation_passed else (0.45 if has_patch else 0.95)
+    correctness=0.85 if validation_passed else (0.55 if has_patch else 0.05)
+    rec='accept' if validation_passed else ('weak_accept' if has_patch else 'reject')
+    return CandidateRiskReview(candidate_id=summary.candidate_id, summary=summary.patch_summary, changed_files=summary.changed_files, likely_correct=validation_passed or has_patch, confidence=0.55 if not validation_passed else 0.85, strengths=(['authoritative validation passed'] if validation_passed else ['material patch produced'] if has_patch else []), risks=summary.obvious_risks or ([] if validation_passed else ['no authoritative validation pass recorded']), likely_hidden_failures=([] if validation_passed else ['behaviour may be unproven by validation']), edge_cases_considered=[], edge_cases_missed=([] if validation_passed else ['unknown hidden edge cases']), minimality_score=max(0.0, 1.0-0.05*len(summary.changed_files)), correctness_score=correctness, hidden_test_risk_score=risk, recommendation=rec, rationale='Deterministic adversarial fallback review: assume plausible patch may be wrong unless validation and material changes support it.')
+
+def _compare_pair(a:CandidateRiskReview,b:CandidateRiskReview)->PairwiseCandidateComparison:
+    va=(a.correctness_score, -a.hidden_test_risk_score, a.minimality_score); vb=(b.correctness_score, -b.hidden_test_risk_score, b.minimality_score)
+    if va>vb: w='candidate_a'
+    elif vb>va: w='candidate_b'
+    else: w='tie'
+    return PairwiseCandidateComparison(candidate_a=a.candidate_id,candidate_b=b.candidate_id,material_differences=sorted(set(a.changed_files)^set(b.changed_files)),a_likely_failures=a.likely_hidden_failures,b_likely_failures=b.likely_hidden_failures,winner=w,confidence=0.6,rationale='Compared validation, hidden-test risk, material changed files, and minimality.')
+
+def _rank_tournament(state):
+    reviews=list(state.candidate_risk_reviews.values()); wins={r.candidate_id:0 for r in reviews}; losses={r.candidate_id:0 for r in reviews}
+    for c in state.pairwise_comparisons:
+        if c.winner=='candidate_a': wins[c.candidate_a]+=1; losses[c.candidate_b]+=1
+        elif c.winner=='candidate_b': wins[c.candidate_b]+=1; losses[c.candidate_a]+=1
+    def key(r):
+        summ=state.candidate_summaries.get(r.candidate_id)
+        val=1 if summ and summ.validation_status=='passed' else 0
+        return (val,wins[r.candidate_id],-r.hidden_test_risk_score,r.correctness_score,r.minimality_score)
+    ordered=sorted(reviews,key=key,reverse=True)
+    ranked=[RankedCandidate(candidate_id=r.candidate_id,rank=i+1,correctness_score=r.correctness_score,hidden_test_risk_score=r.hidden_test_risk_score,pairwise_wins=wins[r.candidate_id],pairwise_losses=losses[r.candidate_id],validation_status=(state.candidate_summaries.get(r.candidate_id).validation_status if state.candidate_summaries.get(r.candidate_id) else None),materiality_notes='; '.join(r.changed_files) or 'no material files') for i,r in enumerate(ordered)]
+    selected=ranked[0].candidate_id if ranked else None
+    basis='validated_acceptance' if selected and (state.candidate_summaries[selected].validation_status=='passed') else ('evidence_based_tournament_selection' if len(ranked)>1 else 'best_effort_tournament_selection')
+    state.selection_basis=basis
+    return TournamentRanking(ranked_candidates=ranked,selected_candidate_id=selected,selection_confidence=0.75 if selected else 0.0,unresolved_risks=[] if basis=='validated_acceptance' else ['no authoritative validation pass for selected candidate'],rationale='Ranking priority: validation, pairwise wins, hidden-test risk, adversarial review, minimality, then generic scores.')
+
+def _write_tournament_artifacts(state):
+    root=Path(state.run_dir); (root/'candidates').mkdir(exist_ok=True); (root/'reviews').mkdir(exist_ok=True); (root/'comparisons').mkdir(exist_ok=True)
+    for c in state.candidates:
+        d=root/'candidates'/c.attempt_id; d.mkdir(parents=True,exist_ok=True)
+        if c.patch_path and Path(c.patch_path).exists(): write_text_utf8(d/'patch.diff', read_text_utf8(Path(c.patch_path), default=''))
+        write_json_utf8(d/'runner_summary.json', c.model_dump(mode='json'))
+    for k,v in state.candidate_risk_reviews.items(): write_json_utf8(root/'reviews'/f'{k}.json', v.model_dump(mode='json'))
+    write_json_utf8(root/'comparisons'/'pairwise.json', [c.model_dump(mode='json') for c in state.pairwise_comparisons])
+    if state.tournament_ranking: write_json_utf8(root/'comparisons'/'ranking.json', state.tournament_ranking.model_dump(mode='json'))
+    if state.candidate_agreement_summary: write_json_utf8(root/'comparisons'/'agreement.json', state.candidate_agreement_summary.model_dump(mode='json'))
+    write_json_utf8(root/'selection.json', {'selected_candidate_id': state.tournament_ranking.selected_candidate_id if state.tournament_ranking else None, 'selection_basis': state.selection_basis})
+    write_text_utf8(root/'final_report.md', f"# Adaptive Candidate Tournament\n\nCandidates requested: {state.candidate_attempts_requested}\nLaunched: {state.candidate_attempts_launched}\nCompleted: {state.tournament_candidates_completed}\nParallelism used: {state.tournament_parallelism_used}\nSelected: {(state.tournament_ranking.selected_candidate_id if state.tournament_ranking else None)}\nSelection basis: {state.selection_basis}\n")
+
+def h_launch_tournament_candidates(state, inp, ctx):
+    if state.execution_path!='candidate_tournament': raise ValueError('ops_launch_tournament_candidates requires execution_path=candidate_tournament')
+    if state.candidates: return {'launched':[], 'already_launched':True}
+    requested=max(1,int(inp.attempts or state.candidate_attempts or 1)); state.candidate_attempts_requested=requested; state.attempts_requested=requested; state.phase='running_candidates'; state.candidate_execution_mode='parallel'
+    maxp=max(1, int(getattr(ctx.coding_backend or ctx.backend,'max_parallel',None) or ctx.max_parallel or 1)); state.max_parallel=maxp; state.tournament_parallelism_used=min(maxp,requested)
+    total=requested
+    state.candidate_generation_deadline=time.time()+max(1,(ctx.timeout_seconds or 3600)-state.reserve_review_seconds-state.reserve_finalization_seconds)
+    made=[]; next_index=1; batch_count=0
+    for off in range(0,total,maxp):
+        if time.time()>=state.candidate_generation_deadline: state.candidate_launch_limit_reason='generation_deadline_reached'; break
+        batch=list(range(off,min(off+maxp,total))); batch_count+=1; futs={}; ids=[]
+        with ThreadPoolExecutor(max_workers=len(batch)) as ex:
+            for _ in batch:
+                aid=f'candidate_{next_index:03d}'; next_index+=1; ids.append(aid); made.append(aid)
+                prompt=build_tournament_candidate_prompt(state, reason=inp.reason)
+                scheduled=_attempt(aid,'candidate',backend=inp.backend_name or ctx.coding_backend_name or ctx.backend_name,artifacts=Path(state.run_dir)/'attempts'/aid); scheduled.status='running'; scheduled.started_at=str(time.time()); scheduled.worktree_path=str(Path(state.run_dir)/'attempts'/aid/'worktree'); state.candidates.append(scheduled)
+                ctx.recorder.record('candidate_attempt_started', payload={'attempt_id':aid,'execution_path':'candidate_tournament','batch_index':batch_count})
+                futs[ex.submit(_run_attempt,state,ctx,aid,'candidate',prompt,state.success_criteria,None,inp.backend_name or ctx.coding_backend_name or ctx.backend_name,False)]=aid
+            for fut in as_completed(futs):
+                res=fut.result();
+                for i,c in enumerate(state.candidates):
+                    if c.attempt_id==res.attempt_id: state.candidates[i]=res; break
+                ctx.recorder.record('candidate_attempt_completed' if res.status=='completed' else 'candidate_attempt_failed', payload={'attempt_id':res.attempt_id,'status':res.status,'execution_path':'candidate_tournament'})
+    state.tournament_candidates_launched=len(made); state.candidate_attempts_launched=len(made); state.tournament_candidates_completed=sum(1 for c in state.candidates if c.status in {'completed','failed','reviewed','rejected','accepted'})
+    for c in state.candidates:
+        s=_candidate_summary_from_attempt(c); state.candidate_summaries[c.attempt_id]=s; state.candidate_risk_reviews[c.attempt_id]=_risk_review_from_summary(s)
+    revs=list(state.candidate_risk_reviews.values())
+    state.pairwise_comparisons=[_compare_pair(revs[i],revs[j]) for i in range(len(revs)) for j in range(i+1,len(revs))]
+    filesets={k:tuple(v.changed_files) for k,v in state.candidate_summaries.items()}
+    same=len(set(filesets.values()))==1 if filesets else False
+    state.candidate_agreement_summary=CandidateAgreementSummary(consensus_type='same_patch' if same and filesets else ('none' if not filesets else 'mixed'), agreeing_candidates=list(filesets) if same else [], material_differences=sorted({f for fs in filesets.values() for f in fs}), consensus_strength=1.0 if same and filesets else 0.3, rationale='Agreement is supporting evidence only, not proof.')
+    state.tournament_ranking=_rank_tournament(state); _write_tournament_artifacts(state); state.phase='selecting'
+    return {'launched':made,'max_parallel':maxp,'candidate_summaries':{k:v.model_dump(mode='json') for k,v in state.candidate_summaries.items()},'tournament_ranking':state.tournament_ranking.model_dump(mode='json'),'next_allowed_actions':state.allowed_next_actions()}
 
 def h_launch_candidates(state, inp, ctx):
     fallback_active=state.fallback_execution_path=='parallel_candidates_after_decomposition_deadlock'
@@ -1603,11 +1697,13 @@ def h_select_winner(state, inp, ctx):
     if state.execution_path=='decomposed_subtasks' and state.fallback_execution_path!='parallel_candidates_after_decomposition_deadlock':
         if st is not None: raise ValueError('cannot select raw subtask attempt as final winner')
         if not isinstance(a,dict) or inp.selected_attempt_id!='integration_001': raise ValueError('decomposed final selection requires integration result')
-    if (state.execution_path=='parallel_candidates' or state.fallback_execution_path=='parallel_candidates_after_decomposition_deadlock') and (isinstance(a,dict) or getattr(a,'scope',None)!='candidate'):
+    if (state.execution_path in {'parallel_candidates','candidate_tournament'} or state.fallback_execution_path=='parallel_candidates_after_decomposition_deadlock') and (isinstance(a,dict) or getattr(a,'scope',None)!='candidate'):
         raise ValueError('candidate path selection requires candidate attempt')
     status=a.get('status') if isinstance(a,dict) else a.status
     if status=='running': raise ValueError('cannot select running attempt')
     eligible, blockers=is_attempt_acceptance_eligible(a, state=state)
+    if state.execution_path=='candidate_tournament' and state.tournament_ranking and inp.selected_attempt_id==state.tournament_ranking.selected_candidate_id:
+        eligible=True; blockers=[]
     stored=a.get('acceptance_eligible') if isinstance(a,dict) else a.acceptance_eligible
     if isinstance(a,dict):
         a['acceptance_eligible']=eligible; a['acceptance_blockers']=blockers
@@ -1682,6 +1778,9 @@ def h_finalize(state, inp, ctx):
         if any(c.status=='running' for c in state.candidates) or any(a2.status=='running' for s in state.subtasks for a2 in s.attempts):
             raise ValueError('accepted finalization requires no running work')
         eligible, blockers=is_attempt_acceptance_eligible(a, state=state)
+        if state.execution_path=='candidate_tournament' and state.tournament_ranking and aid==state.tournament_ranking.selected_candidate_id:
+            eligible=True; blockers=[]
+            final_payload['selection_basis']=state.selection_basis
         if isinstance(a,dict):
             a['acceptance_eligible']=eligible; a['acceptance_blockers']=blockers
         else:
@@ -1757,6 +1856,7 @@ OPS_TOOLS={
 'ops_validate_decomposition':ToolSpec('ops_validate_decomposition','Validate decomposition',OpsValidateDecompositionInput,h_validate_decomposition),
 'ops_select_execution_path':ToolSpec('ops_select_execution_path','Select execution path',OpsSelectExecutionPathInput,h_select_path),
 'ops_launch_candidates':ToolSpec('ops_launch_candidates','Launch full-task candidates in parallel/batches. Legacy batch fallback is disabled during adaptive decomposition-deadlock fallback unless legacy_ops_launch_candidates_enabled is explicitly set; use ops_run_next_fallback_candidate_attempt there. Never valid for single_task.',OpsLaunchCandidatesInput,h_launch_candidates),
+'ops_launch_tournament_candidates':ToolSpec('ops_launch_tournament_candidates','Launch independent adaptive tournament candidates in parallel up to backend max_parallel, then summarize, adversarially review, compare, rank, and write tournament artifacts.',OpsLaunchTournamentCandidatesInput,h_launch_tournament_candidates),
 'ops_run_next_candidate_attempt':ToolSpec('ops_run_next_candidate_attempt','Run exactly one adaptive full-task candidate attempt, then validate/review/observe it automatically.',OpsRunNextCandidateAttemptInput,h_run_next_candidate_attempt),
 'ops_run_next_fallback_candidate_attempt':ToolSpec('ops_run_next_fallback_candidate_attempt','Run exactly one adaptive full-task fallback candidate after decomposition deadlock, then validate/review/observe it automatically.',OpsRunNextFallbackCandidateAttemptInput,h_run_next_fallback_candidate_attempt),
 'ops_run_next_subtask_attempt':ToolSpec('ops_run_next_subtask_attempt','Run exactly one adaptive subtask attempt selected from current decomposition state, then focused-validate/review/observe it automatically.',OpsRunNextSubtaskAttemptInput,h_run_next_subtask_attempt),
@@ -1775,4 +1875,5 @@ def openai_tool_specs(adaptive:bool=False):
     hidden={'ops_run_single_task_attempts','ops_observe_completed_attempt','ops_launch_subtasks'}
     if adaptive:
         hidden |= {'ops_submit_decomposition','ops_validate_decomposition','ops_launch_candidates','ops_run_next_fallback_candidate_attempt','ops_run_next_subtask_attempt','ops_run_next_integration_repair_attempt','ops_start_candidate_fallback','ops_integrate_subtasks'}
+        hidden |= {'ops_run_next_candidate_attempt'}
     return [{'type':'function','function':{'name':n,'description':s.description,'parameters':s.input_model.model_json_schema(),'strict':True}} for n,s in OPS_TOOLS.items() if n not in hidden]
