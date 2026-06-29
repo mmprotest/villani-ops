@@ -51,6 +51,13 @@ class Decision(BaseModel):
     controller_steps_path: str | None = None
     failure_reason: str = ''
     acceptance_blockers: list[str] = Field(default_factory=list)
+    acceptance_basis: str | None = None
+    oracle_quality: str | None = None
+    validation_strategy: dict[str, Any] | None = None
+    authoritative_checks: list[dict[str, Any]] = Field(default_factory=list)
+    derived_evidence_checks: list[dict[str, Any]] = Field(default_factory=list)
+    human_review_required: bool = False
+    oracle_limitations: list[str] = Field(default_factory=list)
     retries_used: int = 0
     escalations_used: int = 0
     attempts_used: int = 0
