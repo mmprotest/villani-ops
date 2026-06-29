@@ -913,6 +913,75 @@ def _rank_tournament(state):
     state.selection_basis=basis
     return TournamentRanking(ranked_candidates=ranked,selected_candidate_id=selected,selection_confidence=0.75 if selected else 0.0,unresolved_risks=[] if basis=='validated_acceptance' else ['no authoritative validation pass for selected candidate'],rationale='Ranking priority: validation, pairwise wins, hidden-test risk, adversarial review, minimality, then generic scores.')
 
+
+
+def _is_tournament_candidate_materializable(a)->tuple[bool,list[str]]:
+    blockers=[]
+    if a.status not in {'completed','reviewed','accepted'}: blockers.append('candidate_not_completed')
+    if not a.patch_path: blockers.append('candidate_patch_missing')
+    elif not Path(a.patch_path).exists(): blockers.append('candidate_patch_path_missing')
+    if not (a.changed_files or []): blockers.append('candidate_changed_files_missing')
+    if not (a.worktree_path or a.artifacts_dir): blockers.append('candidate_materialization_location_missing')
+    elif a.worktree_path and not Path(a.worktree_path).exists() and (not a.artifacts_dir or not Path(a.artifacts_dir).exists()): blockers.append('candidate_worktree_or_artifacts_missing')
+    return not blockers, blockers
+
+def _best_effort_rank_materializable_candidates(state)->TournamentRanking:
+    scored=[]
+    for c in state.candidates:
+        ok, blockers=_is_tournament_candidate_materializable(c)
+        if not ok: continue
+        validation=1 if c.validation_status=='passed' or ((c.validation or {}).get('passed') is True) else 0
+        review=1 if c.review_status=='passed' or ((c.review or {}).get('decision')=='pass') else 0
+        runner=1 if (c.runner_status in {None,'completed','succeeded','success'} and c.status in {'completed','reviewed','accepted'}) else 0
+        nonempty=1 if c.changed_files else 0
+        minimality=-len(c.changed_files or [])
+        telemetry=-(float(c.cost or 0.0))
+        scored.append(((validation,review,runner,nonempty,minimality,telemetry,c.attempt_id), c))
+    ordered=[c for _score,c in sorted(scored, key=lambda x:x[0], reverse=True)]
+    ranked=[RankedCandidate(candidate_id=c.attempt_id,rank=i+1,correctness_score=0.7 if c.validation_status=='passed' else 0.45,hidden_test_risk_score=0.2 if c.validation_status=='passed' else 0.55,pairwise_wins=0,pairwise_losses=0,validation_status=c.validation_status,materiality_notes='; '.join(c.changed_files or []) or 'material patch available') for i,c in enumerate(ordered)]
+    state.selection_basis='best_effort_tournament_selection' if ranked else 'failed'
+    return TournamentRanking(ranked_candidates=ranked,selected_candidate_id=(ranked[0].candidate_id if ranked else None),selection_confidence=0.6 if ranked else 0.0,unresolved_risks=[] if ranked and ranked[0].validation_status=='passed' else ['best-effort selection from available candidate evidence'],rationale='Best-effort tournament ranking from completed materializable candidates using validation, review, runner success, patch presence, minimality, and telemetry as a tiebreaker.')
+
+def commit_tournament_selection(state, ctx=None)->bool:
+    if state.execution_path!='candidate_tournament': return False
+    ranking=state.tournament_ranking
+    if ranking is None or not ranking.selected_candidate_id:
+        if any(_is_tournament_candidate_materializable(c)[0] for c in state.candidates):
+            state.tournament_ranking=_best_effort_rank_materializable_candidates(state); ranking=state.tournament_ranking
+        else:
+            return False
+    sel=state.selection or {}
+    if sel.get('decision')=='select' and sel.get('selected_attempt_id'):
+        if sel.get('selected_attempt_id')==ranking.selected_candidate_id:
+            state.phase='finalizing'; return False
+        return False
+    candidates=[r.candidate_id for r in ranking.ranked_candidates]
+    if ranking.selected_candidate_id and ranking.selected_candidate_id not in candidates: candidates.insert(0, ranking.selected_candidate_id)
+    skipped=[]; selected=None; blockers=[]
+    for aid in candidates:
+        a, st=_find_attempt(state, aid)
+        if st is not None or not isinstance(a, CandidateAttemptState):
+            skipped.append({'attempt_id':aid,'reason':'not_candidate_attempt'}); continue
+        ok, bs=_is_tournament_candidate_materializable(a)
+        if ok:
+            selected=a; break
+        skipped.append({'attempt_id':aid,'reason':','.join(bs)}); blockers.extend(bs)
+    if selected is None:
+        fallback=next((c for c in state.candidates if _is_tournament_candidate_materializable(c)[0]), None)
+        if fallback is not None:
+            selected=fallback; state.selection_basis='best_effort_tournament_selection'
+        else:
+            state.selection_basis='failed'; state.blockers=sorted(set(state.blockers+blockers+['no_materializable_tournament_candidate']))
+            return False
+    basis=state.selection_basis or ('validated_acceptance' if selected.validation_status=='passed' else 'evidence_based_tournament_selection')
+    state.selection_basis=basis
+    state.selection={'decision':'select','selected_attempt_id':selected.attempt_id,'selection_basis':basis,'summary':f'Tournament ranking selected {selected.attempt_id}; committed deterministic tournament selection.','reasons':[ranking.rationale],'confidence':ranking.selection_confidence or 0.6,'unresolved_risks':list(ranking.unresolved_risks or []),'ranking_source':'tournament_ranking','selection_evidence':{'ranking_selected_candidate_id':ranking.selected_candidate_id,'skipped_ranked_candidates':skipped,'changed_files':selected.changed_files,'validation_status':selected.validation_status}}
+    state.phase='finalizing'
+    root=Path(state.run_dir); write_json_utf8(root/'selection.json', state.selection)
+    if ctx is not None and getattr(ctx,'recorder',None) is not None:
+        ctx.recorder.record('selection_completed', payload=state.selection)
+    return True
+
 def _write_tournament_artifacts(state):
     root=Path(state.run_dir); (root/'candidates').mkdir(exist_ok=True); (root/'reviews').mkdir(exist_ok=True); (root/'comparisons').mkdir(exist_ok=True)
     for c in state.candidates:
@@ -923,7 +992,7 @@ def _write_tournament_artifacts(state):
     write_json_utf8(root/'comparisons'/'pairwise.json', [c.model_dump(mode='json') for c in state.pairwise_comparisons])
     if state.tournament_ranking: write_json_utf8(root/'comparisons'/'ranking.json', state.tournament_ranking.model_dump(mode='json'))
     if state.candidate_agreement_summary: write_json_utf8(root/'comparisons'/'agreement.json', state.candidate_agreement_summary.model_dump(mode='json'))
-    write_json_utf8(root/'selection.json', {'selected_candidate_id': state.tournament_ranking.selected_candidate_id if state.tournament_ranking else None, 'selection_basis': state.selection_basis})
+    write_json_utf8(root/'selection.json', state.selection or {'selected_candidate_id': state.tournament_ranking.selected_candidate_id if state.tournament_ranking else None, 'selection_basis': state.selection_basis})
     write_text_utf8(root/'final_report.md', f"# Adaptive Candidate Tournament\n\nCandidates requested: {state.candidate_attempts_requested}\nLaunched: {state.candidate_attempts_launched}\nCompleted: {state.tournament_candidates_completed}\nParallelism used: {state.tournament_parallelism_used}\nSelected: {(state.tournament_ranking.selected_candidate_id if state.tournament_ranking else None)}\nSelection basis: {state.selection_basis}\n")
 
 def h_launch_tournament_candidates(state, inp, ctx):
@@ -957,7 +1026,7 @@ def h_launch_tournament_candidates(state, inp, ctx):
     filesets={k:tuple(v.changed_files) for k,v in state.candidate_summaries.items()}
     same=len(set(filesets.values()))==1 if filesets else False
     state.candidate_agreement_summary=CandidateAgreementSummary(consensus_type='same_patch' if same and filesets else ('none' if not filesets else 'mixed'), agreeing_candidates=list(filesets) if same else [], material_differences=sorted({f for fs in filesets.values() for f in fs}), consensus_strength=1.0 if same and filesets else 0.3, rationale='Agreement is supporting evidence only, not proof.')
-    state.tournament_ranking=_rank_tournament(state); _write_tournament_artifacts(state); state.phase='selecting'
+    state.tournament_ranking=_rank_tournament(state); commit_tournament_selection(state, ctx); _write_tournament_artifacts(state); state.phase='finalizing' if state.selection else 'selecting'
     return {'launched':made,'max_parallel':maxp,'candidate_summaries':{k:v.model_dump(mode='json') for k,v in state.candidate_summaries.items()},'tournament_ranking':state.tournament_ranking.model_dump(mode='json'),'next_allowed_actions':state.allowed_next_actions()}
 
 def h_launch_candidates(state, inp, ctx):
@@ -1732,6 +1801,8 @@ def validate_final_state_consistency(state) -> list[str]:
     return warnings
 
 def h_finalize(state, inp, ctx):
+    if inp.decision=='accepted' and state.execution_path=='candidate_tournament' and not state.selection:
+        commit_tournament_selection(state, ctx)
     if state.is_terminal():
         return {**(state.final_decision or {}), 'already_finalized': True}
     if inp.decision!='accepted':

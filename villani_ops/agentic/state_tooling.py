@@ -2,7 +2,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from pydantic import BaseModel, ConfigDict
-from .tools import OPS_TOOLS
+from .tools import OPS_TOOLS, commit_tournament_selection
 from .state import detect_decomposition_deadlock
 @dataclass
 class OpsToolContext:
@@ -64,7 +64,9 @@ def _allowed(state, name, data):
         running=any(c.status=='running' for c in state.candidates) or any(s.status=='running' for s in state.subtasks) or (state.integration or {}).get('status')=='running'
         if running: return False,'cannot finalize while work is running'
         if data.get('decision')=='accepted' and not state.selection:
-            return False,'accepted finalization requires valid selection'
+            commit_tournament_selection(state)
+            if not state.selection:
+                return False,'accepted finalization requires valid selection'
         if data.get('decision')=='rejected' and not (state.candidates or any(s.attempts for s in state.subtasks) or state.last_error or data.get('blockers')):
             return False,'rejected finalization requires attempted work or hard blocker'
         if data.get('decision')=='failed':
@@ -85,6 +87,8 @@ def execute_tool_with_policy(state, tool_name:str, tool_input:dict, tool_use_id:
         state.recovery_count += 1; rec.record('tool_failed',tool_name=tool_name,payload={'error':'unknown tool'}); return OpsToolResult(tool_use_id=tool_use_id,tool_name=tool_name,content='unknown tool',is_error=True)
     try:
         parsed=spec.input_model.model_validate(tool_input)
+        if tool_name=='ops_finalize_run' and tool_input.get('decision')=='accepted' and not state.selection:
+            commit_tournament_selection(state, context)
         ok,err=_allowed(state,tool_name,tool_input)
         if not ok: raise ValueError(err)
         rec.record('tool_started',tool_name=tool_name)
