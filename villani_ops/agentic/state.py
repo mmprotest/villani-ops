@@ -53,6 +53,46 @@ class AttemptObservation(BaseModel):
     review_snapshot_id:str|None=None
     updated_at:str|None=None
 
+class CandidateSummary(BaseModel):
+    model_config=ConfigDict(extra='forbid')
+    candidate_id:str
+    runner_status:str
+    changed_files:list[str]=Field(default_factory=list)
+    patch_summary:str
+    validation_status:str|None=None
+    telemetry_summary:dict=Field(default_factory=dict)
+    material_behaviour_claims:list[str]=Field(default_factory=list)
+    obvious_risks:list[str]=Field(default_factory=list)
+
+class CandidateRiskReview(BaseModel):
+    model_config=ConfigDict(extra='forbid')
+    candidate_id:str; summary:str; changed_files:list[str]=Field(default_factory=list)
+    likely_correct:bool; confidence:float
+    strengths:list[str]=Field(default_factory=list); risks:list[str]=Field(default_factory=list); likely_hidden_failures:list[str]=Field(default_factory=list); edge_cases_considered:list[str]=Field(default_factory=list); edge_cases_missed:list[str]=Field(default_factory=list)
+    minimality_score:float; correctness_score:float; hidden_test_risk_score:float
+    recommendation:Literal['strong_accept','accept','weak_accept','reject','uncertain']
+    rationale:str
+
+class PairwiseCandidateComparison(BaseModel):
+    model_config=ConfigDict(extra='forbid')
+    candidate_a:str; candidate_b:str
+    material_differences:list[str]=Field(default_factory=list); a_likely_failures:list[str]=Field(default_factory=list); b_likely_failures:list[str]=Field(default_factory=list)
+    winner:Literal['candidate_a','candidate_b','tie','neither']; confidence:float; rationale:str
+
+class RankedCandidate(BaseModel):
+    model_config=ConfigDict(extra='forbid')
+    candidate_id:str; rank:int; correctness_score:float; hidden_test_risk_score:float; pairwise_wins:int; pairwise_losses:int; validation_status:str|None=None; materiality_notes:str
+
+class TournamentRanking(BaseModel):
+    model_config=ConfigDict(extra='forbid')
+    ranked_candidates:list[RankedCandidate]=Field(default_factory=list)
+    selected_candidate_id:str|None=None; selection_confidence:float; unresolved_risks:list[str]=Field(default_factory=list); rationale:str
+
+class CandidateAgreementSummary(BaseModel):
+    model_config=ConfigDict(extra='forbid')
+    consensus_type:Literal['same_patch','same_answer','same_strategy','mixed','none']
+    agreeing_candidates:list[str]=Field(default_factory=list); material_differences:list[str]=Field(default_factory=list); consensus_strength:float; rationale:str
+
 class SubtaskState(BaseModel):
     model_config=ConfigDict(extra='forbid')
     subtask_id:str; title:str; objective:str; success_criteria:str|None=None
@@ -105,8 +145,14 @@ class OpsRunState(BaseModel):
     status:Literal['active','completed','failed','interrupted']='active'
     phase:Literal['started','investigating','planning','decomposing','choosing_execution_path','running_candidates','running_subtasks','integrating','validating','selecting','finalizing','completed','failed']='started'
     classification:dict|None=None; investigation:dict|None=None; plan:dict|None=None; decomposition:dict|None=None
-    execution_path:Literal['unknown','single_task','parallel_candidates','decomposed_subtasks']='unknown'
+    execution_path:Literal['unknown','single_task','parallel_candidates','decomposed_subtasks','candidate_tournament']='unknown'
     candidate_execution_mode:Literal['unknown','sequential','parallel']='unknown'; attempts_requested:int|None=None; attempts_started:int=0; stopped_early:bool=False; stop_reason:str|None=None
+    tournament_candidates_launched:int=0; tournament_candidates_completed:int=0; tournament_parallelism_used:int=0
+    candidate_summaries:dict[str,CandidateSummary]=Field(default_factory=dict); candidate_risk_reviews:dict[str,CandidateRiskReview]=Field(default_factory=dict)
+    pairwise_comparisons:list[PairwiseCandidateComparison]=Field(default_factory=list); tournament_ranking:TournamentRanking|None=None; candidate_agreement_summary:CandidateAgreementSummary|None=None
+    selection_basis:Literal['validated_acceptance','evidence_based_tournament_selection','best_effort_tournament_selection','failed','inconclusive']|None=None
+    candidate_attempts_requested:int|None=None; candidate_attempts_launched:int=0; candidate_launch_limit_reason:str|None=None
+    reserve_finalization_seconds:int=30; reserve_review_seconds:int=60; max_review_retries:int=2; max_malformed_review_retries:int=2; candidate_generation_deadline:float|None=None
     decomposition_requested:bool=False; decomposition_validated:bool=False; decomposition_accepted:bool|None=None; decomposition_executed:bool=False
     decomposition_fallback_used:bool=False; decomposition_fallback_reason:str|None=None
     decomposed_execution_status:Literal['not_started','running','completed','blocked','failed']='not_started'
@@ -138,6 +184,10 @@ class OpsRunState(BaseModel):
         if self.decomposition_requested and not self.decomposition: a.append('ops_submit_decomposition'); return a
         if self.decomposition and not self.decomposition_validated: a.append('ops_validate_decomposition'); return a
         if self.execution_path=='unknown': a.append('ops_select_execution_path'); return a
+        if self.execution_path=='candidate_tournament':
+            if not self.candidates: a.append('ops_launch_tournament_candidates'); return list(dict.fromkeys(a))
+            if self.tournament_ranking is None: a.append('ops_select_winner'); return list(dict.fromkeys(a))
+            a += ['ops_finalize_run']; return list(dict.fromkeys(a))
         if self.execution_path=='single_task':
             budget=max(1,int(self.candidate_attempts or 1))
             eligible=[]; needs_validation=[]; needs_review=[]; needs_observation=[]

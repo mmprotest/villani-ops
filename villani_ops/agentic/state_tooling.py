@@ -16,9 +16,12 @@ def _allowed(state, name, data):
     if getattr(state, 'orchestrator', None) == 'adaptive':
         blocked={'ops_submit_decomposition','ops_validate_decomposition','ops_launch_candidates','ops_run_next_fallback_candidate_attempt','ops_run_next_subtask_attempt','ops_run_next_integration_repair_attempt','ops_start_candidate_fallback','ops_launch_subtasks','ops_integrate_subtasks'}
         if name in blocked:
-            return False, f'{name} is not allowed in adaptive orchestrator; adaptive is constrained to execution_path=single_task'
-        if name=='ops_select_execution_path' and data.get('path')!='single_task':
+            return False, f'{name} is not allowed in adaptive orchestrator; adaptive uses execution_path=candidate_tournament when candidate_attempts > 1 and does not decompose'
+        if name=='ops_select_execution_path' and data.get('path') not in {'single_task','candidate_tournament'}:
             return True, None
+        if name=='ops_launch_tournament_candidates' and state.execution_path=='candidate_tournament': return True, None
+        if name=='ops_run_next_candidate_attempt' and state.candidate_attempts>1:
+            return False, 'ops_run_next_candidate_attempt is legacy single-attempt/adaptive-retry; tournament mode uses ops_launch_tournament_candidates'
 
     if name in {'ops_get_state','ops_inspect_repo','ops_submit_classification'}: return True, None
     if name=='ops_observe_completed_attempt': return True, None
@@ -37,11 +40,12 @@ def _allowed(state, name, data):
     if name=='ops_select_execution_path':
         p=data.get('path')
         if p=='decomposed_subtasks' and not (state.decomposition_validated and state.decomposition_accepted and len(state.subtasks)>=2): return False,'decomposed_subtasks requires accepted validation and at least 2 subtasks'
-        if p=='parallel_candidates' and not state.plan: return False,'parallel_candidates requires plan'
+        if p in {'parallel_candidates','candidate_tournament'} and not state.plan: return False,'candidate path requires plan'
         if p=='parallel_candidates' and (state.plan or {}).get('strategy')=='single_task': return False,'plan strategy is single_task; use execution_path=single_task for sequential attempts, not parallel_candidates'
     if name=='ops_start_candidate_fallback':
         if state.decomposed_execution_status not in {'blocked','failed'} or not detect_decomposition_deadlock(state): return False,'fallback requires decomposition deadlock'
     if name=='ops_launch_candidates' and state.execution_path=='single_task': return False,'single_task execution uses adaptive sequential attempts; call ops_run_next_candidate_attempt'
+    if name=='ops_launch_tournament_candidates' and state.execution_path!='candidate_tournament': return False,'ops_launch_tournament_candidates requires execution_path=candidate_tournament'
     if name=='ops_launch_candidates' and state.execution_path!='parallel_candidates' and state.fallback_execution_path!='parallel_candidates_after_decomposition_deadlock': return False,'candidates require parallel_candidates execution path or fallback'
     if name=='ops_run_next_candidate_attempt' and state.execution_path!='single_task': return False,'ops_run_next_candidate_attempt requires execution_path=single_task'
     if name=='ops_run_next_fallback_candidate_attempt' and state.fallback_execution_path!='parallel_candidates_after_decomposition_deadlock': return False,'ops_run_next_fallback_candidate_attempt requires decomposition-deadlock fallback mode'
