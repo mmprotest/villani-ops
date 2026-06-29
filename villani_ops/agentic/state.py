@@ -123,7 +123,7 @@ class OpsRunState(BaseModel):
     attempt_observations:list[AttemptObservation]=Field(default_factory=list); backend_assessments:dict[str,dict]=Field(default_factory=dict); runner_assessment:dict=Field(default_factory=dict); adaptive_context:dict=Field(default_factory=dict)
     unverified_selection_policy:Literal['budget_exhausted','after_two','deadline_only','always_allow']='budget_exhausted'
     oracle_policy:Literal['strict','balanced','permissive']='balanced'
-    oracle_assessments:list[dict]=Field(default_factory=list); validation_strategies:list[dict]=Field(default_factory=list); behavioural_oracles:list[dict]=Field(default_factory=list); behavioural_probe_results:list[dict]=Field(default_factory=list)
+    oracle_assessments:list[dict]=Field(default_factory=list); validation_strategies:list[dict]=Field(default_factory=list); behavioural_oracles:list[dict]=Field(default_factory=list); task_action_contracts:list[dict]=Field(default_factory=list); behavioural_probe_results:list[dict]=Field(default_factory=list)
     integration:dict|None=None; decomposition_integration_worktree:str|None=None; integration_base_revision:str|None=None
     accepted_patch_application_status:dict[str,dict]=Field(default_factory=dict)
     reviews:list[dict]=Field(default_factory=list); repo_validation_results:list[dict]=Field(default_factory=list); selection:dict|None=None; final_decision:dict|None=None
@@ -141,6 +141,7 @@ class OpsRunState(BaseModel):
         if not self.plan: a.append('ops_submit_plan'); return a
         if not any(x.get('scope')=='task' for x in self.oracle_assessments): a.append('ops_discover_oracle')
         if not any(x.get('scope')=='task' for x in self.behavioural_oracles): a.append('ops_derive_behavioral_oracle')
+        if not any(x.get('scope')=='task' for x in self.task_action_contracts): a.append('ops_derive_task_action_contract')
         if self.orchestrator=='adaptive' and self.execution_path=='unknown': a.append('ops_select_execution_path'); return a
         if self.decomposition_requested and not self.decomposition: a.append('ops_submit_decomposition'); return a
         if self.decomposition and not self.decomposition_validated: a.append('ops_validate_decomposition'); return a
@@ -208,6 +209,7 @@ class OpsRunState(BaseModel):
         if self.execution_path=='decomposed_subtasks':
             if any(s.status=='pending' and not s.oracle_assessment for s in self.subtasks): a.append('ops_discover_oracle')
             if any(s.status=='pending' and not any(o.get('scope')=='subtask' and o.get('subtask_id')==s.subtask_id for o in self.behavioural_oracles) for s in self.subtasks): a.append('ops_derive_behavioral_oracle')
+            if any(s.status=='pending' and not any(o.get('scope')=='subtask' and o.get('subtask_id')==s.subtask_id for o in self.task_action_contracts) for s in self.subtasks): a.append('ops_derive_task_action_contract')
             if any(s.status=='pending' for s in self.subtasks): a += ['ops_run_next_subtask_attempt']; return list(dict.fromkeys(a))
             if all(s.status in {'accepted','skipped'} for s in self.subtasks) and not self.integration: a.append('ops_integrate_subtasks'); return a
             if self.integration and (self.integration.get('validation') or {}).get('passed') is False: a.append('ops_run_next_integration_repair_attempt'); return list(dict.fromkeys(a))

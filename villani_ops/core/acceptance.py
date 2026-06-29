@@ -478,8 +478,20 @@ def candidate_ranking_evidence(attempt: Any, *, state: Any | None = None) -> dic
     crit_uncertain = list(_get(attempt, "critical_requirements_uncertain") or (review.get("critical_requirements_uncertain") if isinstance(review, dict) else []) or [])
     probes_passed = list(_get(attempt, "probes_passed") or (review.get("probes_passed") if isinstance(review, dict) else []) or [])
     probes_failed = list(_get(attempt, "probes_failed") or (review.get("probes_failed") if isinstance(review, dict) else []) or [])
+    audit_passed = list((review.get("audit_requirements_passed") if isinstance(review, dict) else []) or (review.get("audit_passed") if isinstance(review, dict) else []) or [])
+    audit_failed = list((review.get("audit_requirements_failed") if isinstance(review, dict) else []) or (review.get("audit_failed") if isinstance(review, dict) else []) or [])
+    audit_uncertain = list((review.get("audit_requirements_uncertain") if isinstance(review, dict) else []) or (review.get("audit_uncertain") if isinstance(review, dict) else []) or [])
+    grounding_score = float((review.get("source_grounding_coverage") if isinstance(review, dict) else 0.0) or 0.0)
+    recompute_agreement = bool(isinstance(review, dict) and review.get("independent_recompute_agreement"))
+    contract_satisfaction = float((review.get("task_action_contract_satisfaction") if isinstance(review, dict) else 0.0) or 0.0)
     composite = (
         oracle_score * 180.0
+        + contract_satisfaction * 140.0
+        + grounding_score * 90.0
+        + (35.0 if recompute_agreement else 0.0)
+        + len(audit_passed) * 18.0
+        - len(audit_failed) * 95.0
+        - len(audit_uncertain) * 28.0
         - len(crit_failed) * 120.0
         - len(crit_uncertain) * 35.0
         + len(probes_passed) * 10.0
@@ -499,7 +511,7 @@ def candidate_ranking_evidence(attempt: Any, *, state: Any | None = None) -> dic
         - (35.0 if reliable_failed else 0.0)
         - (8.0 if repeated_weak else 0.0)
     )
-    return {**metrics, "attempt_id": _get(attempt, "attempt_id"), "composite_score": composite, "oracle_coverage_score": oracle_score, "critical_requirements_failed": crit_failed, "critical_requirements_uncertain": crit_uncertain, "probes_passed": probes_passed, "probes_failed": probes_failed, "acceptance_eligible": eligible, "acceptance_blockers": blockers, "serious_blockers": serious, "validation_strength": strength, "validation_authoritative": reliable, "validation_status": validation_status, "patch_non_empty": patch_ok, "changed_files_present": bool(changed), "runner_exit_code": exit_code, "review_decision": review_decision, "addressed_prior_feedback": addressed_feedback, "repeated_weak_attempt": repeated_weak}
+    return {**metrics, "attempt_id": _get(attempt, "attempt_id"), "composite_score": composite, "oracle_coverage_score": oracle_score, "task_action_contract_satisfaction": contract_satisfaction, "source_grounding_coverage": grounding_score, "audit_requirements_passed": audit_passed, "audit_requirements_failed": audit_failed, "audit_requirements_uncertain": audit_uncertain, "independent_recompute_agreement": recompute_agreement, "critical_requirements_failed": crit_failed, "critical_requirements_uncertain": crit_uncertain, "probes_passed": probes_passed, "probes_failed": probes_failed, "acceptance_eligible": eligible, "acceptance_blockers": blockers, "serious_blockers": serious, "validation_strength": strength, "validation_authoritative": reliable, "validation_status": validation_status, "patch_non_empty": patch_ok, "changed_files_present": bool(changed), "runner_exit_code": exit_code, "review_decision": review_decision, "addressed_prior_feedback": addressed_feedback, "repeated_weak_attempt": repeated_weak}
 
 
 def candidate_ranking_key(attempt: Any, *, state: Any | None = None) -> tuple:
@@ -509,7 +521,7 @@ def candidate_ranking_key(attempt: Any, *, state: Any | None = None) -> tuple:
         idx = int(aid.rsplit("_", 1)[-1])
     except Exception:
         idx = 0
-    return (ev["acceptance_eligible"] and ev["validation_authoritative"], -len(ev.get("critical_requirements_failed") or []), ev.get("oracle_coverage_score",0), -len(ev.get("critical_requirements_uncertain") or []), ev["composite_score"], ev["normalized_review_score"], ev["normalized_confidence"], ev["validation_authoritative"], _EVIDENCE_RANK.get(ev["validation_strength"], 0), -len(ev["serious_blockers"]), ev["addressed_prior_feedback"], not ev["repeated_weak_attempt"], -idx)
+    return (ev["acceptance_eligible"] and ev["validation_authoritative"], -len(ev.get("audit_requirements_failed") or []), ev.get("task_action_contract_satisfaction",0), ev.get("source_grounding_coverage",0), len(ev.get("audit_requirements_passed") or []), bool(ev.get("independent_recompute_agreement")), -len(ev.get("critical_requirements_failed") or []), ev.get("oracle_coverage_score",0), -len(ev.get("critical_requirements_uncertain") or []), ev["composite_score"], ev["normalized_review_score"], ev["normalized_confidence"], ev["validation_authoritative"], _EVIDENCE_RANK.get(ev["validation_strength"], 0), -len(ev["serious_blockers"]), ev["addressed_prior_feedback"], not ev["repeated_weak_attempt"], -idx)
 
 
 def is_usable_unverified_candidate(state: Any, attempt: Any) -> bool:
