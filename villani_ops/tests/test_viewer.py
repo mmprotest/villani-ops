@@ -138,3 +138,34 @@ def test_offline_viewer_contains_required_ui_without_external_deps(tmp_path):
     assert 'formatInteger' in text and 'formatCost' in text
     assert 'villani-run-snapshot' in text
     assert 'https://' not in text and 'cdn' not in text.lower() and 'npm' not in text.lower()
+
+
+def test_viewer_snapshot_includes_details_and_candidate_debug_data(tmp_path):
+    rd=fake_run(tmp_path)
+    cdir=rd/'candidates'/'candidate_001'; cdir.mkdir(parents=True)
+    (rd/'state.json').write_text(json.dumps({'run_id':rd.name,'task':'Fix tests','status':'running','candidates':[{'attempt_id':'candidate_001','status':'completed','worktree':'/tmp/wt'}], 'selection': {'selected_attempt_id':'candidate_001','confidence':0.7,'basis':'tests passed'}}))
+    (cdir/'evidence.json').write_text(json.dumps({'changed_files':['a.py'],'implementation_signature':{'files_changed':1},'commands_executed':['pytest -q'],'commands_failed':[],'telemetry':{'tokens':42,'tool_calls':2},'review':{'correctness_score':0.8,'hidden_test_risk':'low','evidence_gaps':['none']}}))
+    (cdir/'patch.diff').write_text('diff --git a/a.py b/a.py\n+pass\n')
+    snap=build_viewer_snapshot(rd)
+    assert 'details' in snap
+    assert snap['details']['events']['2']['related_ids']['candidate_id']=='candidate_001'
+    assert snap['details']['nodes']['candidate_001']['related_ids']['candidate_id']=='candidate_001'
+    cand=snap['details']['candidates']['candidate_001']
+    assert cand['changed_files']==['a.py']
+    assert cand['implementation_signature']['files_changed']==1
+    assert cand['commands_executed']==['pytest -q']
+    assert any(a['id']=='patch.diff' and a['available'] for a in snap['details']['nodes']['candidate_001']['artifacts'])
+
+
+def test_candidate_debug_endpoint_and_missing_candidate(tmp_path):
+    rd=fake_run(tmp_path)
+    srv=ViewerServer(tmp_path/'runs', port=18766).start(try_ports=1)
+    try:
+        data=json.loads(urllib.request.urlopen(f'http://127.0.0.1:{srv.port}/api/runs/{rd.name}/candidate/candidate_001/debug').read())
+        assert data['candidate_id']=='candidate_001'
+        assert 'latest_events' in data and len(data['latest_events']) <= 100
+        with pytest.raises(urllib.error.HTTPError) as e:
+            urllib.request.urlopen(f'http://127.0.0.1:{srv.port}/api/runs/{rd.name}/candidate/missing/debug')
+        assert e.value.code == 404
+    finally:
+        srv.stop()

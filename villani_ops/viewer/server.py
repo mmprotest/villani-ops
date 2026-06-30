@@ -3,7 +3,7 @@ from pathlib import Path
 import json, threading, time, webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlparse
-from .adapter import build_viewer_snapshot
+from .adapter import build_viewer_snapshot, build_candidate_debug_summary
 from .builder import render_viewer_html
 
 def safe_join_under(base: Path, requested: str) -> Path:
@@ -36,10 +36,22 @@ class ViewerServer:
         outer=self
         class H(BaseHTTPRequestHandler):
             def log_message(self,*a): pass
+            def _safe_write(self, data):
+                try:
+                    self.wfile.write(data)
+                    return True
+                except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError, OSError):
+                    return False
+            def _safe_flush(self):
+                try:
+                    self.wfile.flush()
+                    return True
+                except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError, OSError):
+                    return False
             def send_json(self, obj, code=200):
-                data=json.dumps(obj, ensure_ascii=False, default=str).encode(); self.send_response(code); self.send_header('Content-Type','application/json'); self.send_header('Cache-Control','no-store'); self.send_header('Content-Length',str(len(data))); self.end_headers(); self.wfile.write(data)
+                data=json.dumps(obj, ensure_ascii=False, default=str).encode(); self.send_response(code); self.send_header('Content-Type','application/json'); self.send_header('Cache-Control','no-store'); self.send_header('Content-Length',str(len(data))); self.end_headers(); self._safe_write(data)
             def send_text(self, text, ctype='text/html', code=200):
-                data=text.encode(); self.send_response(code); self.send_header('Content-Type',ctype); self.send_header('Cache-Control','no-store'); self.send_header('Content-Length',str(len(data))); self.end_headers(); self.wfile.write(data)
+                data=text.encode(); self.send_response(code); self.send_header('Content-Type',ctype); self.send_header('Cache-Control','no-store'); self.send_header('Content-Length',str(len(data))); self.end_headers(); self._safe_write(data)
             def notfound(self): self.send_json({'error':'not found'},404)
             def do_GET(self):
                 path=unquote(urlparse(self.path).path)
@@ -53,6 +65,12 @@ class ViewerServer:
                     if not rd: return self.notfound()
                     name=parts[3]
                     if name=='snapshot': return self.send_json(build_viewer_snapshot(rd))
+                    if name=='candidate' and len(parts)>=6 and parts[5]=='debug':
+                        snap=build_viewer_snapshot(rd)
+                        cid=parts[4]
+                        if cid not in (snap.get('details',{}).get('candidates',{}) or {}):
+                            return self.send_json({'error':'candidate not found','candidate_id':cid},404)
+                        return self.send_json(build_candidate_debug_summary(rd, cid))
                     files={'state':'state.json','events':'runtime_events.jsonl','graph':'orchestration_graph.json','usage':'usage.json'}
                     if name in files:
                         fp=rd/files[name]
