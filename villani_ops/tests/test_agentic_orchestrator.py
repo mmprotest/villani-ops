@@ -112,3 +112,18 @@ def test_no_tool_call_after_decomposed_path_launches_ready_subtasks(tmp_path):
     events=(Path(r.run_dir)/'runtime_events.jsonl').read_text()
     assert 'ops_run_next_subtask_attempt' in events
     assert 'agentic_orchestrator_no_progress' not in events
+
+
+def test_blank_response_after_valid_adaptive_plan_launches_tournament_not_no_progress(tmp_path):
+    blocks=[
+        tc('ops_submit_investigation',{'summary':'s','confidence':1.0}),
+        tc('ops_submit_plan',{'summary':'p','strategy':'parallel_candidates','should_decompose':False,'candidate_attempts':3,'expected_difficulty':'easy','confidence':1.0}),
+        [],
+    ]
+    r=OpsRunner(client=FakeClient(blocks), max_recovery_attempts=1, max_turns=4).run(req(tmp_path,orchestrator='adaptive',candidate_attempts=3))
+    assert r.state.execution_path=='candidate_tournament'
+    assert r.state.tournament_candidates_launched==3
+    assert (r.state.final_decision or {}).get('blockers') != ['agentic_orchestrator_no_progress']
+    events=(Path(r.run_dir)/'runtime_events.jsonl').read_text()
+    assert 'execution_path_auto_committed' in events
+    assert 'tournament_candidates_launch_started' in events

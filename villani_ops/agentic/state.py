@@ -325,7 +325,10 @@ class OpsRunState(BaseModel):
         if not self.investigation:
             a += ['ops_inspect_repo','ops_submit_classification','ops_submit_investigation']; return a
         if not self.plan: a.append('ops_submit_plan'); return a
-        if self.orchestrator=='adaptive' and self.execution_path=='unknown': a.append('ops_select_execution_path'); return a
+        if self.orchestrator=='adaptive' and self.execution_path=='unknown':
+            if (self.plan or {}).get('execution_path')=='candidate_tournament': a.append('ops_launch_tournament_candidates')
+            else: a.append('ops_select_execution_path')
+            return a
         if self.decomposition_requested and not self.decomposition: a.append('ops_submit_decomposition'); return a
         if self.decomposition and not self.decomposition_validated: a.append('ops_validate_decomposition'); return a
         if self.execution_path=='unknown': a.append('ops_select_execution_path'); return a
