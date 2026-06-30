@@ -15,6 +15,7 @@ from .client import ToolCallingLLMClient
 from villani_ops.runners import runner_for_name
 from villani_ops.telemetry.usage import UsageRecorder, usage_record_from_response
 from villani_ops.execution_policies import policy_for_mode
+from villani_ops.core.policy import DEFAULT_TIMEOUT_SECONDS
 from villani_ops.orchestration.nodes import OrchestrationNode
 from villani_ops.orchestration.context import TaskContext
 
@@ -67,7 +68,7 @@ def _state_aware_no_progress_summary(state):
 
 class OpsRunRequest(BaseModel):
     model_config=ConfigDict(extra='forbid', arbitrary_types_allowed=True)
-    repo_path:str; task:str; success_criteria:str|None=None; mode:str='performance'; runner:str='villani-code'; candidate_attempts:int=3; timeout_seconds:int|None=None; workspace:str='.villani-ops'; orchestrator:str='agentic'; backend:object|None=None; backends:object|None=None; runner_adapter:object|None=None; reviewer:object|None=None; production:bool=True; allow_fake_dependencies:bool=False
+    repo_path:str; task:str; success_criteria:str|None=None; mode:str='performance'; runner:str='villani-code'; candidate_attempts:int=3; timeout_seconds:int|None=DEFAULT_TIMEOUT_SECONDS; workspace:str='.villani-ops'; orchestrator:str='agentic'; backend:object|None=None; backends:object|None=None; runner_adapter:object|None=None; reviewer:object|None=None; production:bool=True; allow_fake_dependencies:bool=False
 class OpsRunResult(BaseModel):
     model_config=ConfigDict(arbitrary_types_allowed=True)
     run_id:str; run_dir:str; state:OpsRunState; decision:Decision
@@ -103,7 +104,7 @@ class OpsRunner:
         coding_name,coding_backend=role_backends.get('coding',(getattr(backend,'name',None),backend))
         review_name,review_backend=role_backends.get('review',(None,None))
         def _ctx():
-            return OpsToolContext(run_dir=run_dir,recorder=rec,transcript=transcript,runner_adapter=runner_adapter,reviewer=reviewer,backend=backend,backend_name=getattr(backend,'name',None),coding_backend=coding_backend,coding_backend_name=coding_name,review_backend=review_backend,review_backend_name=review_name,backends=backends,usage_recorder=usage_rec,timeout_seconds=request.timeout_seconds,max_parallel=getattr(coding_backend,'max_parallel',1),production=request.production,allow_fake_dependencies=request.allow_fake_dependencies)
+            return OpsToolContext(run_dir=run_dir,recorder=rec,transcript=transcript,runner_adapter=runner_adapter,reviewer=reviewer,backend=backend,backend_name=getattr(backend,'name',None),coding_backend=coding_backend,coding_backend_name=coding_name,review_backend=review_backend,review_backend_name=review_name,backends=backends,usage_recorder=usage_rec,timeout_seconds=request.timeout_seconds or DEFAULT_TIMEOUT_SECONDS,max_parallel=getattr(coding_backend,'max_parallel',1),production=request.production,allow_fake_dependencies=request.allow_fake_dependencies)
         def _execute_recommendation(recobj, tool_use_id='recovery'):
             rec.record('recovery_deterministic_action_executed', payload=recobj.model_dump())
             res=execute_tool_with_policy(state,recobj.tool_name,recobj.tool_input or {},tool_use_id,_ctx())

@@ -293,3 +293,30 @@ def test_all_fallback_all_tie_best_effort_low_confidence(tmp_path):
     assert s.selection_basis == 'best_effort_tournament_selection'
     assert rank.selection_confidence <= .35
     assert any('review/comparison unavailable' in r for r in rank.unresolved_risks)
+
+def test_default_timeout_constant_is_1500_and_policy_uses_it():
+    from villani_ops.core.policy import AttemptPlan, DEFAULT_TIMEOUT_SECONDS
+    from villani_ops.agentic.runner import OpsRunRequest
+    assert DEFAULT_TIMEOUT_SECONDS == 1500
+    assert AttemptPlan(backend='b').timeout_seconds == 1500
+    assert OpsRunRequest(repo_path='.', task='x').timeout_seconds == 1500
+    assert OpsRunRequest(repo_path='.', task='x', timeout_seconds=42).timeout_seconds == 42
+
+
+def test_tournament_budget_planning_protects_pairwise_before_reviews(tmp_path):
+    from villani_ops.agentic.tools import _can_spend_candidate_review_budget, _tournament_budget_plan
+    import time
+    s=state(tmp_path)
+    s.reserve_finalization_seconds=90; s.reserve_pairwise_seconds=180; s.reserve_ranking_seconds=30; s.max_candidate_review_seconds=240; s.per_candidate_review_timeout_seconds=30
+    deadline=time.time()+329
+    plan=_tournament_budget_plan(s, deadline)
+    assert plan['reserve_finalization_seconds'] == 90
+    assert plan['reserve_pairwise_seconds'] == 180
+    ok, reason=_can_spend_candidate_review_budget(s, deadline, 0)
+    assert not ok
+    assert reason == 'candidate_review_skipped_protected_pairwise_or_finalization_reserve'
+
+
+def test_pairwise_priority_starts_with_top_two_then_top_three():
+    from villani_ops.agentic.tools import _pairwise_pairs_by_priority
+    assert _pairwise_pairs_by_priority(['a','b','c','d'])[:3] == [('a','b'),('a','c'),('b','c')]

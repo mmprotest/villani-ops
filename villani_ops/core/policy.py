@@ -3,6 +3,8 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 import yaml
 
+DEFAULT_TIMEOUT_SECONDS = 1500
+
 class ObjectiveConfig(BaseModel):
     primary: str = "maximize_valid_solutions_per_dollar"
     secondary: list[str] = Field(default_factory=lambda: ["minimize_tokens", "minimize_attempts", "minimize_wall_time"])
@@ -10,7 +12,7 @@ class ObjectiveConfig(BaseModel):
 class AttemptPlan(BaseModel):
     backend: str
     max_attempts: int = 1
-    timeout_seconds: int = 900
+    timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS
     runner: str = "shell"
 
 class ValidationConfig(BaseModel):

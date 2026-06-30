@@ -1149,11 +1149,13 @@ def _structured_tool_call(ctx, backend, schema_model, tool_name:str, prompt:str,
 def _review_backend_from_ctx(ctx):
     return getattr(ctx,'review_backend',None) or getattr(getattr(ctx,'reviewer',None),'review_backend',None) or getattr(ctx,'backend',None)
 
-def _model_candidate_risk_review(state, packet:CandidateEvidencePacket, ctx)->CandidateRiskReview|None:
+def _model_candidate_risk_review(state, packet:CandidateEvidencePacket, ctx, *, allowed_qualities:tuple[str,...]|None=None)->CandidateRiskReview|None:
     backend=_review_backend_from_ctx(ctx)
     if backend is None: return None
     prompts=[('model_full', build_candidate_review_prompt(state, packet)), ('model_compact', _budget_prompt(['TASK\n'+state.task,'CANDIDATE EVIDENCE PACKET\n'+_compact_text(packet.model_dump(mode='json'),7000)],9000)), ('model_minimal', _budget_prompt(['TASK\n'+state.task,'MINIMAL EVIDENCE\n'+_compact_text({'candidate_id':packet.candidate_id,'summary':packet.patch_summary,'signature':packet.implementation_signature.model_dump(mode='json') if packet.implementation_signature else None,'commands':[c.model_dump(mode='json') for c in packet.commands_executed[:5]],'limitations':packet.evidence_limitations},4000)],5500))]
+    allowed=set(allowed_qualities or [q for q,_ in prompts])
     for quality,prompt in prompts:
+        if quality not in allowed: continue
         try:
             rv=_structured_tool_call(ctx, backend, CandidateRiskReview, 'candidate_risk_review', prompt, 'You are an evidence-grounded tournament reviewer. Use specific patch, command, telemetry, and debug evidence; identify hidden-test risks and missing evidence.', quality=quality, candidate_id=packet.candidate_id, changed_files=packet.changed_files)
             rv=rv.model_copy(update={'review_quality':quality,'candidate_id':packet.candidate_id,'changed_files':packet.changed_files})
@@ -1391,7 +1393,7 @@ def commit_tournament_selection(state, ctx=None)->bool:
             return False
     basis=state.selection_basis or ('validated_acceptance' if selected.validation_status=='passed' else 'evidence_based_tournament_selection')
     state.selection_basis=basis
-    state.selection={'decision':'select','selected_attempt_id':selected.attempt_id,'selection_basis':basis,'summary':f'Tournament ranking selected {selected.attempt_id}; committed deterministic tournament selection.','reasons':[ranking.rationale],'confidence':ranking.selection_confidence or 0.6,'unresolved_risks':list(ranking.unresolved_risks or []),'ranking_source':'tournament_ranking','selection_evidence':{'ranking_selected_candidate_id':ranking.selected_candidate_id,'skipped_ranked_candidates':skipped,'changed_files':selected.changed_files,'validation_status':selected.validation_status}}
+    state.selection={'decision':'select','selected_attempt_id':selected.attempt_id,'selection_basis':basis,'summary':f'Tournament ranking selected {selected.attempt_id}; committed deterministic tournament selection.','reasons':[ranking.rationale],'confidence':ranking.selection_confidence or 0.6,'unresolved_risks':list(ranking.unresolved_risks or []),'ranking_source':'tournament_ranking','selection_evidence':{'ranking_selected_candidate_id':ranking.selected_candidate_id,'skipped_ranked_candidates':skipped,'changed_files':selected.changed_files,'validation_status':selected.validation_status,'pairwise_model_ran':bool((state.adaptive_context or {}).get('pairwise_model_ran')),'pairwise_coverage':(state.adaptive_context or {}).get('pairwise_coverage'),'pairwise_skip_reason':(state.adaptive_context or {}).get('pairwise_skip_reason')}}
     state.phase='finalizing'
     root=Path(state.run_dir); write_json_utf8(root/'selection.json', state.selection)
     if ctx is not None and getattr(ctx,'recorder',None) is not None:
@@ -1416,7 +1418,7 @@ def _write_tournament_artifacts(state):
     model_reviews=sum(1 for r in state.candidate_risk_reviews.values() if r.review_quality!='deterministic_fallback'); fallback_reviews=sum(1 for r in state.candidate_risk_reviews.values() if r.review_quality=='deterministic_fallback')
     model_cmps=sum(1 for c in state.pairwise_comparisons if c.comparison_quality!='deterministic_fallback'); fallback_cmps=sum(1 for c in state.pairwise_comparisons if c.comparison_quality=='deterministic_fallback')
     emergency=state.selection_basis=='best_effort_tournament_selection' and (fallback_reviews or fallback_cmps or not state.pairwise_comparisons)
-    lines=["# Adaptive Candidate Tournament","",f"Candidates requested: {state.candidate_attempts_requested}",f"Launched: {state.candidate_attempts_launched}",f"Completed: {state.tournament_candidates_completed}",f"Tournament phase: {state.tournament_phase}",f"Stages completed: candidates={bool(state.candidate_evidence_packets)}, reviews={bool(state.candidate_risk_reviews)}, comparisons={bool(state.pairwise_comparisons)}, ranking={bool(state.tournament_ranking)}, selection={bool(state.selection)}",f"Parallelism used: {state.tournament_parallelism_used}",f"Reviews: model-backed={model_reviews}, fallback={fallback_reviews}",f"Comparisons: model-backed={model_cmps}, fallback={fallback_cmps}",f"Emergency finalization used: {emergency}",f"Selected: {selected}",f"Selection basis: {state.selection_basis}",f"Selection confidence: {normalize_score(state.tournament_ranking.selection_confidence) if state.tournament_ranking else 0.0:.2f}","Score normalization: numeric review/comparison/ranking scores are normalized to 0.0-1.0; values above 1 up to 10 are treated as 0-10 scores.","","## Why the selected candidate won"]
+    lines=["# Adaptive Candidate Tournament","",f"Candidates requested: {state.candidate_attempts_requested}",f"Launched: {state.candidate_attempts_launched}",f"Completed: {state.tournament_candidates_completed}",f"Tournament phase: {state.tournament_phase}",f"Stages completed: candidates={bool(state.candidate_evidence_packets)}, reviews={bool(state.candidate_risk_reviews)}, comparisons={bool(state.pairwise_comparisons)}, ranking={bool(state.tournament_ranking)}, selection={bool(state.selection)}",f"Parallelism used: {state.tournament_parallelism_used}",f"Reviews: model-backed={model_reviews}, fallback={fallback_reviews}",f"Comparisons: model-backed={model_cmps}, fallback={fallback_cmps}",f"Model pairwise ran: {'yes' if (state.adaptive_context or {}).get('pairwise_model_ran') else 'no'}",f"Pairwise coverage: {(state.adaptive_context or {}).get('pairwise_coverage') or ('fallback-only' if fallback_cmps else 'not_run')}",f"Pairwise skip reason: {(state.adaptive_context or {}).get('pairwise_skip_reason') or 'none'}",f"Emergency finalization used: {emergency}",f"Selected: {selected}",f"Selection basis: {state.selection_basis}",f"Selection confidence: {normalize_score(state.tournament_ranking.selection_confidence) if state.tournament_ranking else 0.0:.2f}","Score normalization: numeric review/comparison/ranking scores are normalized to 0.0-1.0; values above 1 up to 10 are treated as 0-10 scores.","","## Why the selected candidate won"]
     if selected:
         ev=state.candidate_evidence_packets.get(selected); rv=state.candidate_risk_reviews.get(selected)
         lines += [f"Ranking rationale: {state.tournament_ranking.rationale if state.tournament_ranking else ''}", f"Evidence quality: {ev.evidence_quality if ev else 'missing'}", f"Changed files: {', '.join((ev.changed_files if ev else []) or [])}", f"Debug artifacts showed: {(ev.runner_summary if ev else 'unavailable')}", f"Commands run: {', '.join(c.command for c in (ev.commands_executed if ev else [])[:8]) or 'none observed'}", f"Review quality: {rv.review_quality if rv else 'missing'}", f"Normalized correctness score: {normalize_score(rv.correctness_score) if rv else 0.0:.2f}", f"Normalized hidden-test risk score: {normalize_score(rv.hidden_test_risk_score) if rv else 0.0:.2f}", f"Comparison quality: {', '.join(sorted({x.comparison_quality for x in state.pairwise_comparisons if x.candidate_a==selected or x.candidate_b==selected})) or 'none'}", f"Critical evidence gaps: {', '.join((rv.critical_evidence_gaps if rv else []) or []) or 'none'}", f"Risk penalty applied: {bool(rv and rv.risk_penalty_applied)}", f"Original scores: {(rv.original_scores if rv else {})}", f"Pairwise fallback reasons: {', '.join(sorted({str(x.fallback_reason) for x in state.pairwise_comparisons if (x.candidate_a==selected or x.candidate_b==selected) and x.fallback_reason})) or 'none'}", f"Selection downgrade reason: {', '.join((state.tournament_ranking.unresolved_risks if state.tournament_ranking else []) or []) or 'none'}", f"Remaining risks: {', '.join((state.tournament_ranking.unresolved_risks if state.tournament_ranking else []) or []) or 'none recorded'}"]
@@ -1470,8 +1472,39 @@ def hydrate_tournament_state_from_artifacts(state, run_dir=None)->bool:
         elif state.candidate_evidence_packets: state.tournament_phase='candidates_complete'
     return changed
 
+def _seconds_remaining(deadline):
+    return max(0.0, float(deadline) - time.time())
+
+def _reserve_value(state, name, default):
+    return max(0, int(getattr(state, name, default) or default))
+
 def _time_low(state, deadline):
-    return time.time() + max(1,int(state.reserve_finalization_seconds or 30)) >= deadline
+    return time.time() + _reserve_value(state, 'reserve_finalization_seconds', 90) >= deadline
+
+def _tournament_budget_plan(state, deadline)->dict:
+    finalization=_reserve_value(state, 'reserve_finalization_seconds', 90)
+    pairwise=_reserve_value(state, 'reserve_pairwise_seconds', 180)
+    ranking=_reserve_value(state, 'reserve_ranking_seconds', 30)
+    review_cap=_reserve_value(state, 'max_candidate_review_seconds', 240)
+    review_call=_reserve_value(state, 'per_candidate_review_timeout_seconds', 30)
+    pairwise_call=_reserve_value(state, 'per_pairwise_comparison_timeout_seconds', 30)
+    return {'deadline':deadline,'time_remaining_seconds':_seconds_remaining(deadline),'reserve_finalization_seconds':finalization,'reserve_pairwise_seconds':pairwise,'reserve_ranking_seconds':ranking,'max_candidate_review_seconds':review_cap,'expected_review_call_budget_seconds':review_call,'expected_pairwise_call_budget_seconds':pairwise_call}
+
+def _can_spend_candidate_review_budget(state, deadline, spent_review):
+    p=_tournament_budget_plan(state, deadline)
+    if spent_review + p['expected_review_call_budget_seconds'] > p['max_candidate_review_seconds']:
+        return False, 'candidate_review_budget_exhausted'
+    need=p['reserve_finalization_seconds']+p['reserve_pairwise_seconds']+p['reserve_ranking_seconds']+p['expected_review_call_budget_seconds']
+    if p['time_remaining_seconds'] <= need:
+        return False, 'candidate_review_skipped_protected_pairwise_or_finalization_reserve'
+    return True, None
+
+def _can_spend_pairwise_budget(state, deadline):
+    p=_tournament_budget_plan(state, deadline)
+    need=p['reserve_finalization_seconds']+p['reserve_ranking_seconds']+p['expected_pairwise_call_budget_seconds']
+    if p['time_remaining_seconds'] <= need:
+        return False, 'pairwise_skipped_pairwise_budget_exhausted'
+    return True, None
 
 def h_launch_tournament_candidates(state, inp, ctx):
     if state.execution_path!='candidate_tournament': raise ValueError('ops_launch_tournament_candidates requires execution_path=candidate_tournament')
@@ -1503,39 +1536,115 @@ def h_launch_tournament_candidates(state, inp, ctx):
     state.tournament_candidates_launched=len(made); state.candidate_attempts_launched=len(made); state.tournament_phase='candidates_complete'; _persist_tournament_state(state, ctx)
     return {'launched':made,'max_parallel':maxp,'candidate_summaries':{k:v.model_dump(mode='json') for k,v in state.candidate_summaries.items()},'next_allowed_actions':state.allowed_next_actions()}
 
+def _rough_candidate_order(state, candidate_ids:list[str])->list[str]:
+    def q(cid):
+        e=state.candidate_evidence_packets.get(cid)
+        r=state.candidate_risk_reviews.get(cid)
+        c=next((x for x in state.candidates if x.attempt_id==cid), None)
+        material=1 if c and _is_tournament_candidate_materializable(c)[0] else 0
+        validation=1 if c and (c.validation_status=='passed' or ((c.validation or {}).get('passed') is True)) else 0
+        evidence={'high':3,'medium':2,'low':1,'missing':0}.get(e.evidence_quality if e else 'missing',0)
+        review_quality={'model_full':3,'model_compact':2,'model_minimal':1,'deterministic_fallback':0}.get(r.review_quality if r else 'deterministic_fallback',0)
+        correctness=normalize_score(r.correctness_score) if r else 0.45
+        risk=normalize_score(r.hidden_test_risk_score) if r else 0.55
+        gap=1 if r and has_unresolved_critical_evidence_gap(r) else 0
+        minimality=-(len(e.changed_files if e else (c.changed_files if c else [])) or 0)
+        runner=1 if c and (c.runner_status in {None,'completed','succeeded','success'} and c.status in {'completed','reviewed','accepted'}) else 0
+        return (material,validation,runner,review_quality,0-gap,evidence,correctness,-risk,minimality,cid)
+    return sorted(candidate_ids, key=q, reverse=True)
+
+def _pairwise_pairs_by_priority(ordered:list[str])->list[tuple[str,str]]:
+    pairs=[]
+    if len(ordered)>=2: pairs.append((ordered[0], ordered[1]))
+    if len(ordered)>=3:
+        for p in [(ordered[0],ordered[2]),(ordered[1],ordered[2])]:
+            if p not in pairs: pairs.append(p)
+    for i in range(len(ordered)):
+        for j in range(i+1,len(ordered)):
+            p=(ordered[i],ordered[j])
+            if p not in pairs: pairs.append(p)
+    return pairs
+
+def _fallback_reason_for_model_pairwise(ctx, cmp):
+    if _review_backend_from_ctx(ctx) is None: return 'pairwise_skipped_no_review_backend'
+    attempts=getattr(cmp, 'model_attempts', []) if cmp else []
+    if not attempts: return 'pairwise_model_failed_malformed'
+    cats=[a.get('error_category') or a.get('status') for a in attempts]
+    if any(c=='timeout' for c in cats): return 'pairwise_model_failed_timeout'
+    if any(c=='malformed' for c in cats): return 'pairwise_model_failed_parse'
+    return 'pairwise_model_failed_malformed'
+
 def h_evaluate_tournament(state, inp, ctx):
     if state.execution_path!='candidate_tournament': raise ValueError('ops_evaluate_tournament requires execution_path=candidate_tournament')
     hydrate_tournament_state_from_artifacts(state); deadline=time.time()+max(1,int(state.tournament_evaluation_deadline_seconds or 120))
+    budget=_tournament_budget_plan(state, deadline)
+    if getattr(ctx,'recorder',None): ctx.recorder.record('tournament_evaluation_budget_planned', payload=budget)
     for c in state.candidates:
         if c.attempt_id not in state.candidate_summaries or c.attempt_id not in state.candidate_evidence_packets: _record_completed_tournament_candidate(state,c,ctx)
+    material_ids=[c.attempt_id for c in state.candidates if _is_tournament_candidate_materializable(c)[0] and c.attempt_id in state.candidate_summaries]
+    if _seconds_remaining(deadline) <= budget['reserve_finalization_seconds'] and material_ids:
+        for cid in material_ids:
+            if cid not in state.candidate_risk_reviews and cid in state.candidate_summaries:
+                state.candidate_risk_reviews[cid]=_risk_review_from_summary(state.candidate_summaries[cid], state.candidate_evidence_packets.get(cid))
+        state.tournament_ranking=_best_effort_rank_materializable_candidates(state); commit_tournament_selection(state, ctx); state.tournament_phase='selection_committed' if state.selection else 'failed'; _persist_tournament_state(state, ctx); return {'reviewed':list(state.candidate_risk_reviews),'pairwise_comparisons':len(state.pairwise_comparisons),'pairwise_model_ran':False,'pairwise_coverage':'not_run','pairwise_skip_reason':'pairwise_skipped_not_enough_time_after_candidate_generation','budget_plan':budget,'tournament_ranking':state.tournament_ranking.model_dump(mode='json') if state.tournament_ranking else None,'selection':state.selection,'next_allowed_actions':state.allowed_next_actions()}
     state.tournament_phase='reviewing_candidates'; _persist_tournament_state(state, ctx)
+    spent_review=0
+    # Build cheap fallback reviews first so every materializable candidate can be roughly ranked.
     for cid,summ in list(state.candidate_summaries.items()):
-        if cid in state.candidate_risk_reviews: continue
+        if cid not in state.candidate_risk_reviews:
+            state.candidate_risk_reviews[cid]=_risk_review_from_summary(summ, state.candidate_evidence_packets.get(cid)); _persist_tournament_state(state, ctx)
+    # Upgrade reviews compact/minimal/full only when protected pairwise/finalization/ranking reserves remain.
+    for cid in _rough_candidate_order(state, list(state.candidate_summaries)):
         packet=state.candidate_evidence_packets.get(cid)
-        review=None if _time_low(state, deadline) else _model_candidate_risk_review(state, packet, ctx) if packet else None
-        state.candidate_risk_reviews[cid]=review or _risk_review_from_summary(summ, packet)
-        _persist_tournament_state(state, ctx)
+        if not packet: continue
+        ok, reason=_can_spend_candidate_review_budget(state, deadline, spent_review)
+        if not ok:
+            if getattr(ctx,'recorder',None): ctx.recorder.record('tournament_candidate_review_model_skipped', payload={**_tournament_budget_plan(state, deadline),'candidate_id':cid,'reason':reason})
+            continue
+        allowed=('model_full','model_compact','model_minimal') if _seconds_remaining(deadline) > (budget['reserve_finalization_seconds']+budget['reserve_pairwise_seconds']+budget['reserve_ranking_seconds']+2*budget['expected_review_call_budget_seconds']*max(1,len(material_ids))) else ('model_compact','model_minimal')
+        review=_model_candidate_risk_review(state, packet, ctx, allowed_qualities=allowed)
+        spent_review += budget['expected_review_call_budget_seconds']
+        if review: state.candidate_risk_reviews[cid]=review; _persist_tournament_state(state, ctx)
     state.tournament_phase='comparing_candidates'; _persist_tournament_state(state, ctx)
     state.candidate_risk_reviews={cid:apply_review_risk_penalties(rv) for cid,rv in state.candidate_risk_reviews.items()}
-    revs=list(state.candidate_risk_reviews.values()); existing={(c.candidate_a,c.candidate_b) for c in state.pairwise_comparisons}
-    for i in range(len(revs)):
-        for j in range(i+1,len(revs)):
-            if (revs[i].candidate_id,revs[j].candidate_id) in existing: continue
-            ae=state.candidate_evidence_packets.get(revs[i].candidate_id); be=state.candidate_evidence_packets.get(revs[j].candidate_id)
-            fallback_reason=None
-            if _time_low(state, deadline):
-                fallback_reason='skipped_due_time_budget'
-                if getattr(ctx,'recorder',None): ctx.recorder.record('tournament_pairwise_model_fallback_used', payload={'candidate_a':revs[i].candidate_id,'candidate_b':revs[j].candidate_id,'attempt_tier':'minimal','fallback_reason':fallback_reason})
-                cmp=None
-            else:
-                cmp=_model_pairwise_comparison(state, ae, be, revs[i], revs[j], ctx) if ae and be else None
-                if cmp is None and fallback_reason is None: fallback_reason='model_pairwise_unavailable'
-            fb=_compare_pair(revs[i],revs[j], ae, be)
-            if fallback_reason: fb.fallback_reason=fallback_reason
-            state.pairwise_comparisons.append(cmp or fb); _persist_tournament_state(state, ctx)
+    ordered=_rough_candidate_order(state, material_ids)
+    existing={tuple(sorted((c.candidate_a,c.candidate_b))) for c in state.pairwise_comparisons}
+    model_pairwise_count=0; pairwise_skip_reason=None
+    for a_id,b_id in _pairwise_pairs_by_priority(ordered):
+        if tuple(sorted((a_id,b_id))) in existing: continue
+        ae=state.candidate_evidence_packets.get(a_id); be=state.candidate_evidence_packets.get(b_id); ar=state.candidate_risk_reviews.get(a_id); br=state.candidate_risk_reviews.get(b_id)
+        if not (ae and be and ar and br): continue
+        ok, reason=_can_spend_pairwise_budget(state, deadline)
+        if not ok and model_pairwise_count>0:
+            pairwise_skip_reason=reason
+            break
+        cmp=None; fallback_reason=None
+        if _review_backend_from_ctx(ctx) is None:
+            fallback_reason='pairwise_skipped_no_review_backend'
+        elif not ok and model_pairwise_count==0:
+            fallback_reason=reason
+            if _seconds_remaining(deadline) > budget['reserve_finalization_seconds']+budget['reserve_ranking_seconds']:
+                cmp=_model_pairwise_comparison(state, ae, be, ar, br, ctx)
+        else:
+            cmp=_model_pairwise_comparison(state, ae, be, ar, br, ctx)
+        if cmp and cmp.comparison_quality!='deterministic_fallback':
+            model_pairwise_count+=1; state.pairwise_comparisons.append(cmp)
+        else:
+            fb=_compare_pair(ar, br, ae, be); fb.fallback_reason=fallback_reason or _fallback_reason_for_model_pairwise(ctx, cmp); state.pairwise_comparisons.append(fb)
+            if model_pairwise_count==0: pairwise_skip_reason=fb.fallback_reason
+        _persist_tournament_state(state, ctx)
+    coverage='not_run'
+    if model_pairwise_count:
+        model_pairs={tuple(sorted((c.candidate_a,c.candidate_b))) for c in state.pairwise_comparisons if c.comparison_quality!='deterministic_fallback'}
+        top2={tuple(sorted((ordered[0],ordered[1])))} if len(ordered)>=2 else set()
+        top3={tuple(sorted(p)) for p in _pairwise_pairs_by_priority(ordered[:3])}
+        allpairs={tuple(sorted(p)) for p in _pairwise_pairs_by_priority(ordered)}
+        coverage='all' if allpairs and allpairs.issubset(model_pairs) else ('top3' if top3 and top3.issubset(model_pairs) else ('top2' if top2 and top2.issubset(model_pairs) else 'partial'))
+    elif state.pairwise_comparisons: coverage='fallback-only'
+    state.adaptive_context=dict(state.adaptive_context or {}, pairwise_model_ran=bool(model_pairwise_count), pairwise_coverage=coverage, pairwise_skip_reason=pairwise_skip_reason, tournament_evaluation_budget_plan=_tournament_budget_plan(state, deadline))
     state.tournament_phase='ranking'; state.candidate_agreement_summary=build_candidate_agreement_summary(state.candidate_evidence_packets); state.tournament_ranking=_rank_tournament(state); _persist_tournament_state(state, ctx)
     commit_tournament_selection(state, ctx); state.tournament_phase='selection_committed' if state.selection else 'failed'; _persist_tournament_state(state, ctx)
-    return {'reviewed':list(state.candidate_risk_reviews),'pairwise_comparisons':len(state.pairwise_comparisons),'tournament_ranking':state.tournament_ranking.model_dump(mode='json') if state.tournament_ranking else None,'selection':state.selection,'next_allowed_actions':state.allowed_next_actions()}
+    return {'reviewed':list(state.candidate_risk_reviews),'pairwise_comparisons':len(state.pairwise_comparisons),'pairwise_model_ran':bool(model_pairwise_count),'pairwise_coverage':coverage,'pairwise_skip_reason':pairwise_skip_reason,'budget_plan':state.adaptive_context.get('tournament_evaluation_budget_plan'),'tournament_ranking':state.tournament_ranking.model_dump(mode='json') if state.tournament_ranking else None,'selection':state.selection,'next_allowed_actions':state.allowed_next_actions()}
 
 def h_launch_candidates(state, inp, ctx):
     fallback_active=state.fallback_execution_path=='parallel_candidates_after_decomposition_deadlock'
