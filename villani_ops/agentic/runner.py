@@ -68,7 +68,7 @@ def _state_aware_no_progress_summary(state):
 
 class OpsRunRequest(BaseModel):
     model_config=ConfigDict(extra='forbid', arbitrary_types_allowed=True)
-    repo_path:str; task:str; success_criteria:str|None=None; mode:str='performance'; runner:str='villani-code'; candidate_attempts:int=3; timeout_seconds:int|None=DEFAULT_TIMEOUT_SECONDS; workspace:str='.villani-ops'; orchestrator:str='agentic'; backend:object|None=None; backends:object|None=None; runner_adapter:object|None=None; reviewer:object|None=None; production:bool=True; allow_fake_dependencies:bool=False
+    repo_path:str; task:str; success_criteria:str|None=None; mode:str='performance'; runner:str='villani-code'; candidate_attempts:int=3; timeout_seconds:int|None=DEFAULT_TIMEOUT_SECONDS; workspace:str='.villani-ops'; orchestrator:str='agentic'; backend:object|None=None; backends:object|None=None; runner_adapter:object|None=None; reviewer:object|None=None; production:bool=True; allow_fake_dependencies:bool=False; tournament_budget_policy:str='off'
 class OpsRunResult(BaseModel):
     model_config=ConfigDict(arbitrary_types_allowed=True)
     run_id:str; run_dir:str; state:OpsRunState; decision:Decision
@@ -77,7 +77,7 @@ class OpsRunner:
     def run(self, request:OpsRunRequest)->OpsRunResult:
         rid=datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')+'-'+secrets.token_hex(3)
         run_dir=(self.storage.create_run_dir(rid) if self.storage else Path(request.workspace)/'runs'/rid); run_dir.mkdir(parents=True,exist_ok=True)
-        state=OpsRunState(run_id=rid,run_dir=str(run_dir),repo_path=request.repo_path,task=request.task,success_criteria=request.success_criteria,mode=request.mode,runner=request.runner,candidate_attempts=request.candidate_attempts,orchestrator=request.orchestrator)
+        state=OpsRunState(run_id=rid,run_dir=str(run_dir),repo_path=request.repo_path,task=request.task,success_criteria=request.success_criteria,mode=request.mode,runner=request.runner,candidate_attempts=request.candidate_attempts,orchestrator=request.orchestrator,tournament_budget_policy=request.tournament_budget_policy)
         rec=OpsEventRecorder(run_dir,rid,on_event=(self.progress_reporter.on_event if self.progress_reporter else None)); usage_rec=UsageRecorder(run_dir,rid); transcript=[]; state.save(run_dir/'state.json'); rec.record('run_started',payload={'run_dir':str(run_dir)},phase=state.phase); usage_rec.write_artifacts()
         def _update_usage_state():
             summary=usage_rec.summarize(); state.usage_summary=summary.model_dump(mode='json'); state.usage_records_count=summary.calls_count; state.total_input_tokens=summary.input_tokens; state.total_output_tokens=summary.output_tokens; state.total_tokens=summary.total_tokens; state.total_cost=summary.total_cost; state.usage_unavailable_count=summary.unavailable_calls_count; state.input_tokens=summary.input_tokens; state.output_tokens=summary.output_tokens; state.costs={'total':summary.total_cost,'input':summary.input_cost,'output':summary.output_cost}

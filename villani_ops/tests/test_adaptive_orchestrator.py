@@ -303,7 +303,12 @@ def test_default_timeout_constant_is_1500_and_policy_uses_it():
     assert OpsRunRequest(repo_path='.', task='x', timeout_seconds=42).timeout_seconds == 42
 
 
-def test_tournament_budget_planning_protects_pairwise_before_reviews(tmp_path):
+def test_default_tournament_budget_policy_is_off(tmp_path):
+    s=state(tmp_path)
+    assert s.tournament_budget_policy == 'off'
+    assert s.finalization_guard_seconds == 60
+
+def test_default_budget_policy_does_not_protect_pairwise_before_reviews(tmp_path):
     from villani_ops.agentic.tools import _can_spend_candidate_review_budget, _tournament_budget_plan
     import time
     s=state(tmp_path)
@@ -313,8 +318,38 @@ def test_tournament_budget_planning_protects_pairwise_before_reviews(tmp_path):
     assert plan['reserve_finalization_seconds'] == 90
     assert plan['reserve_pairwise_seconds'] == 180
     ok, reason=_can_spend_candidate_review_budget(s, deadline, 0)
+    assert ok
+    assert reason is None
+
+def test_default_budget_policy_does_not_exhaust_pairwise_budget(tmp_path):
+    from villani_ops.agentic.tools import _can_spend_pairwise_budget
+    import time
+    s=state(tmp_path)
+    s.reserve_finalization_seconds=90; s.reserve_ranking_seconds=30; s.per_pairwise_comparison_timeout_seconds=30
+    ok, reason=_can_spend_pairwise_budget(s, time.time()+149)
+    assert ok
+    assert reason is None
+
+def test_finalization_guard_is_only_default_time_based_skip(tmp_path):
+    from villani_ops.agentic.tools import _can_spend_candidate_review_budget, _can_spend_pairwise_budget
+    import time
+    s=state(tmp_path); s.finalization_guard_seconds=60
+    review_ok, review_reason=_can_spend_candidate_review_budget(s, time.time()+60, 0)
+    pairwise_ok, pairwise_reason=_can_spend_pairwise_budget(s, time.time()+60)
+    assert not review_ok and review_reason == 'finalization_guard_reached'
+    assert not pairwise_ok and pairwise_reason == 'finalization_guard_reached'
+
+def test_planned_tournament_budget_policy_retains_protected_reserves(tmp_path):
+    from villani_ops.agentic.tools import _can_spend_candidate_review_budget, _can_spend_pairwise_budget
+    import time
+    s=state(tmp_path); s.tournament_budget_policy='planned'
+    s.reserve_finalization_seconds=90; s.reserve_pairwise_seconds=180; s.reserve_ranking_seconds=30; s.max_candidate_review_seconds=240; s.per_candidate_review_timeout_seconds=30
+    ok, reason=_can_spend_candidate_review_budget(s, time.time()+329, 0)
     assert not ok
     assert reason == 'candidate_review_skipped_protected_pairwise_or_finalization_reserve'
+    ok, reason=_can_spend_pairwise_budget(s, time.time()+149)
+    assert not ok
+    assert reason == 'pairwise_skipped_pairwise_budget_exhausted'
 
 
 def test_pairwise_priority_starts_with_top_two_then_top_three():
