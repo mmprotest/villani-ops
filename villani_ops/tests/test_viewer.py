@@ -138,3 +138,75 @@ def test_offline_viewer_contains_required_ui_without_external_deps(tmp_path):
     assert 'formatInteger' in text and 'formatCost' in text
     assert 'villani-run-snapshot' in text
     assert 'https://' not in text and 'cdn' not in text.lower() and 'npm' not in text.lower()
+
+
+def rich_run(tmp_path: Path):
+    rd=tmp_path/'runs'/'rich'; rd.mkdir(parents=True)
+    (rd/'attempts'/'candidate_002').mkdir(parents=True)
+    (rd/'attempts'/'candidate_002'/'debug.json').write_text('{}')
+    state={
+        'run_id':'rich','status':'running','classification':{'summary':'medium async bug','rationale':'race risk'},
+        'investigation':{'summary':'Found async task cleanup issue','response':'investigation response'},
+        'plan':{'summary':'Run candidates in parallel','rationale':'compare patches'},
+        'selection':{'selected_attempt_id':'candidate_002','rationale':'narrow patch'},
+        'candidates':[{'attempt_id':'candidate_002','status':'running','changed_files':['run.py'],'commands':[{'cmd':'pytest','exit_code':1},{'cmd':'ruff','exit_code':0}], 'patch_path':'candidate_002.patch','patch_summary':'Changed async task orchestration logic.','runner_output':'Villani Code edited run.py','latest_activity':['Read run.py','Edited run.py']}]
+    }
+    (rd/'state.json').write_text(json.dumps(state))
+    events=[
+        {'event_id':'classification-1','timestamp':'2026-06-26T00:00:01+00:00','type':'classification_submitted','payload':{'difficulty':'medium','category':'async/concurrency bug','risk':'medium','model_response':'classified medium async bug because task cleanup may race'}},
+        {'event_id':'investigation-1','timestamp':'2026-06-26T00:00:02+00:00','type':'investigation_submitted','payload':{'summary':'Found cleanup race','assistant_content':'investigation response text'}},
+        {'event_id':'plan-1','timestamp':'2026-06-26T00:00:03+00:00','type':'plan_submitted','payload':{'execution_path':'adaptive_tournament','raw_response':'plan response text'}},
+        {'event_id':'cand-start','timestamp':'2026-06-26T00:00:04+00:00','type':'candidate_attempt_started','payload':{'attempt_id':'candidate_002'}},
+        {'event_id':'review-1','timestamp':'2026-06-26T00:00:05+00:00','type':'candidate_attempt_reviewed','payload':{'attempt_id':'candidate_002','recommendation':'accept','confidence':0.7,'rationale':'review response'}},
+        {'event_id':'pair-1','timestamp':'2026-06-26T00:00:06+00:00','type':'candidate_pairwise_comparison_completed','payload':{'winner':'candidate_002','rationale':'comparison response'}},
+        {'event_id':'select-1','timestamp':'2026-06-26T00:00:07+00:00','type':'selection_completed','payload':{'selected_attempt_id':'candidate_002','rationale':'ranking selection response'}},
+    ]
+    (rd/'runtime_events.jsonl').write_text('\n'.join(json.dumps(e) for e in events))
+    return rd
+
+
+def test_viewer_snapshot_details_are_selectable_and_human_readable(tmp_path):
+    snap=build_viewer_snapshot(rich_run(tmp_path))
+    assert snap['details']
+    assert all(e['id'] and e['detail_id'] for e in snap['timeline'])
+    assert all(n['id'] and n['detail_id'] for n in snap['graph']['nodes'])
+    assert 'raw' in snap['details']['classification-1']
+    assert snap['details']['classification-1']['summary'].startswith('The orchestrator classified')
+    assert snap['details']['investigation-1']['summary'] == 'Found cleanup race'
+    assert 'adaptive_tournament' in snap['details']['plan-1']['summary']
+    assert snap['details']['candidate_002']['summary'].startswith('Candidate 002 is running')
+    assert 'run.py' in snap['details']['candidate_002']['evidence_summary']
+    assert '2 recorded; 1 failed' in snap['details']['candidate_002']['evidence_summary']
+    assert 'Changed async task' in snap['details']['candidate_002']['diff_summary']
+    assert any('debug.json' in a['path'] for a in snap['details']['candidate_002']['artifacts'])
+
+
+def test_viewer_ai_response_extraction_for_core_steps(tmp_path):
+    snap=build_viewer_snapshot(rich_run(tmp_path)); d=snap['details']
+    assert 'classified medium async bug' in d['classification-1']['ai_response']
+    assert 'investigation response text' in d['investigation-1']['ai_response']
+    assert 'plan response text' in d['plan-1']['ai_response']
+    assert 'review response' in d['review-1']['ai_response']
+    assert 'comparison response' in d['pair-1']['ai_response']
+    assert 'ranking selection response' in d['select-1']['ai_response']
+
+
+def test_candidate_detail_handles_missing_debug_artifacts_gracefully(tmp_path):
+    rd=tmp_path/'runs'/'missing-debug'; rd.mkdir(parents=True)
+    (rd/'state.json').write_text(json.dumps({'run_id':'missing-debug','candidates':[{'attempt_id':'candidate_001','status':'completed'}]}))
+    (rd/'runtime_events.jsonl').write_text('')
+    detail=build_viewer_snapshot(rd)['details']['candidate_001']
+    assert 'No changed files were recorded' in detail['summary']
+    assert detail['diff_summary'] == 'No patch was produced.'
+
+
+def test_viewer_server_candidate_debug_endpoint(tmp_path):
+    rd=rich_run(tmp_path)
+    srv=ViewerServer(tmp_path/'runs', port=18766).start(try_ports=1)
+    try:
+        data=json.loads(urllib.request.urlopen(f'http://127.0.0.1:{srv.port}/api/runs/{rd.name}/candidate/candidate_002/debug').read())
+        assert data['candidate_id']=='candidate_002'
+        assert 'run.py' in data['summary']
+        assert data['commands']
+    finally:
+        srv.stop()

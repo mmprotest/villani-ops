@@ -3,7 +3,7 @@ from pathlib import Path
 import json, threading, time, webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlparse
-from .adapter import build_viewer_snapshot
+from .adapter import build_viewer_snapshot, build_candidate_debug_summary, _read_json
 from .builder import render_viewer_html
 
 def safe_join_under(base: Path, requested: str) -> Path:
@@ -36,10 +36,13 @@ class ViewerServer:
         outer=self
         class H(BaseHTTPRequestHandler):
             def log_message(self,*a): pass
+            def _safe_write(self, data):
+                try: self.wfile.write(data)
+                except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError, OSError): pass
             def send_json(self, obj, code=200):
-                data=json.dumps(obj, ensure_ascii=False, default=str).encode(); self.send_response(code); self.send_header('Content-Type','application/json'); self.send_header('Cache-Control','no-store'); self.send_header('Content-Length',str(len(data))); self.end_headers(); self.wfile.write(data)
+                data=json.dumps(obj, ensure_ascii=False, default=str).encode(); self.send_response(code); self.send_header('Content-Type','application/json'); self.send_header('Cache-Control','no-store'); self.send_header('Content-Length',str(len(data))); self.end_headers(); self._safe_write(data)
             def send_text(self, text, ctype='text/html', code=200):
-                data=text.encode(); self.send_response(code); self.send_header('Content-Type',ctype); self.send_header('Cache-Control','no-store'); self.send_header('Content-Length',str(len(data))); self.end_headers(); self.wfile.write(data)
+                data=text.encode(); self.send_response(code); self.send_header('Content-Type',ctype); self.send_header('Cache-Control','no-store'); self.send_header('Content-Length',str(len(data))); self.end_headers(); self._safe_write(data)
             def notfound(self): self.send_json({'error':'not found'},404)
             def do_GET(self):
                 path=unquote(urlparse(self.path).path)
@@ -53,6 +56,9 @@ class ViewerServer:
                     if not rd: return self.notfound()
                     name=parts[3]
                     if name=='snapshot': return self.send_json(build_viewer_snapshot(rd))
+                    if name=='candidate' and len(parts)>=6 and parts[5]=='debug':
+                        state=_read_json(rd/'state.json', {}) or {}
+                        return self.send_json(build_candidate_debug_summary(parts[4], state, rd))
                     files={'state':'state.json','events':'runtime_events.jsonl','graph':'orchestration_graph.json','usage':'usage.json'}
                     if name in files:
                         fp=rd/files[name]
@@ -71,8 +77,11 @@ class ViewerServer:
                             if fp.exists():
                                 with fp.open('rb') as f:
                                     f.seek(pos); data=f.read(); pos=f.tell()
-                                for line in data.splitlines(): self.wfile.write(b'data: '+line+b'\n\n')
-                            self.wfile.write(b': keepalive\n\n'); self.wfile.flush(); time.sleep(1)
+                                for line in data.splitlines(): self._safe_write(b'data: '+line+b'\n\n')
+                            try:
+                                self._safe_write(b': keepalive\n\n'); self.wfile.flush()
+                            except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError, OSError): return
+                            time.sleep(1)
                         return
                 self.notfound()
         return H

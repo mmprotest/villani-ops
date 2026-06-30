@@ -6,8 +6,8 @@ import json, re
 
 SECRET_KEY_RE = re.compile(r"(?i)(api[_-]?key|secret|password|authorization)")
 SECRET_VALUE_RE = re.compile(r"(?i)(bearer\s+[A-Za-z0-9._-]+|gh[pousr]_[A-Za-z0-9_]+|sk-[A-Za-z0-9_-]{12,})")
-EVENTS = {'run_started':'Run started','investigation_submitted':'Investigation submitted','classification_submitted':'Classification submitted','plan_submitted':'Plan submitted','decomposition_submitted':'Decomposition submitted','decomposition_validation_completed':'Decomposition validation completed','execution_path_selected':'Execution path selected','candidate_attempt_started':'Candidate attempt started','candidate_attempt_completed':'Candidate attempt completed','candidate_attempt_failed':'Candidate attempt failed','subtask_attempt_started':'Subtask attempt started','subtask_attempt_completed':'Subtask attempt completed','subtask_attempt_failed':'Subtask attempt failed','subtask_attempt_reviewed':'Subtask attempt reviewed','subtask_accepted':'Subtask accepted','subtask_failed':'Subtask failed','validation_started':'Validation started','validation_completed':'Validation completed','validation_failed':'Validation failed','candidate_attempt_reviewed':'Candidate attempt reviewed','selection_completed':'Selection completed','run_finalized':'Final decision','decomposition_deadlock_detected':'Decomposition deadlock detected','candidate_fallback_started':'Candidate fallback started','integration_started':'Integration started','integration_completed':'Integration completed','integration_failed':'Integration failed','recovery_injected':'Recovery injected','recovery_deterministic_action_executed':'Recovery action executed'}
-STATUS_BY_EVENT = {'run_started':'running','candidate_attempt_started':'running','subtask_attempt_started':'running','validation_started':'running','integration_started':'running','candidate_fallback_started':'running','candidate_attempt_completed':'completed','subtask_attempt_completed':'completed','validation_completed':'completed','integration_completed':'completed','candidate_attempt_failed':'failed','subtask_attempt_failed':'failed','subtask_failed':'failed','validation_failed':'failed','integration_failed':'failed','subtask_accepted':'accepted','candidate_attempt_reviewed':'completed','subtask_attempt_reviewed':'completed','selection_completed':'selected','run_finalized':'completed','decomposition_deadlock_detected':'blocked'}
+EVENTS = {'run_started':'Run started','investigation_submitted':'Investigation submitted','classification_submitted':'Classification submitted','plan_submitted':'Plan submitted','decomposition_submitted':'Decomposition submitted','decomposition_validation_completed':'Decomposition validation completed','execution_path_selected':'Execution path selected','candidate_attempt_started':'Candidate attempt started','candidate_attempt_completed':'Candidate attempt completed','candidate_attempt_failed':'Candidate attempt failed','subtask_attempt_started':'Subtask attempt started','subtask_attempt_completed':'Subtask attempt completed','subtask_attempt_failed':'Subtask attempt failed','subtask_attempt_reviewed':'Subtask attempt reviewed','subtask_accepted':'Subtask accepted','subtask_failed':'Subtask failed','validation_started':'Validation started','validation_completed':'Validation completed','validation_failed':'Validation failed','candidate_attempt_reviewed':'Candidate attempt reviewed','candidate_pairwise_comparison_completed':'Pairwise comparison completed','tournament_ranking_completed':'Tournament ranking completed','ranking_completed':'Tournament ranking completed','selection_completed':'Selection completed','run_finalized':'Final decision','decomposition_deadlock_detected':'Decomposition deadlock detected','candidate_fallback_started':'Candidate fallback started','integration_started':'Integration started','integration_completed':'Integration completed','integration_failed':'Integration failed','recovery_injected':'Recovery injected','recovery_deterministic_action_executed':'Recovery action executed'}
+STATUS_BY_EVENT = {'run_started':'running','candidate_attempt_started':'running','subtask_attempt_started':'running','validation_started':'running','integration_started':'running','candidate_fallback_started':'running','candidate_attempt_completed':'completed','subtask_attempt_completed':'completed','validation_completed':'completed','integration_completed':'completed','candidate_attempt_failed':'failed','subtask_attempt_failed':'failed','subtask_failed':'failed','validation_failed':'failed','integration_failed':'failed','subtask_accepted':'accepted','candidate_attempt_reviewed':'completed','subtask_attempt_reviewed':'completed','candidate_pairwise_comparison_completed':'completed','tournament_ranking_completed':'completed','ranking_completed':'completed','selection_completed':'selected','run_finalized':'completed','decomposition_deadlock_detected':'blocked'}
 
 def _read_json(path: Path, default: Any=None) -> Any:
     try:
@@ -68,8 +68,117 @@ def _timeline(events):
         typ=ev.get('type')
         if typ not in EVENTS: continue
         p=_redact(_payload(ev)); dur=p.get('duration_seconds') or p.get('duration')
-        items.append({'id':ev.get('event_id') or f'event_{i}', 'timestamp':ev.get('timestamp'), 'type':typ, 'title':EVENTS[typ], 'subtitle':_subtitle(ev), 'status':STATUS_BY_EVENT.get(typ,'completed'), 'duration_seconds':dur, 'attempt_id':_attempt_id(ev), 'subtask_id':_subtask_id(ev)})
+        items.append({'id':ev.get('event_id') or f'event_{i}', 'detail_id':ev.get('event_id') or f'event_{i}', 'timestamp':ev.get('timestamp'), 'type':typ, 'title':EVENTS[typ], 'subtitle':_subtitle(ev), 'status':STATUS_BY_EVENT.get(typ,'completed'), 'duration_seconds':dur, 'attempt_id':_attempt_id(ev), 'subtask_id':_subtask_id(ev)})
     return items
+
+
+def _as_text(v: Any) -> str:
+    if v is None: return ''
+    if isinstance(v, str): return v.strip()
+    if isinstance(v, (int,float,bool)): return str(v)
+    if isinstance(v, list): return '\n'.join('- '+_as_text(x) for x in v if _as_text(x))
+    if isinstance(v, dict):
+        for k in ('summary','rationale','reason','decision','content','message','raw_text','text','response'):
+            if _as_text(v.get(k)): return _as_text(v.get(k))
+        return json.dumps(v, ensure_ascii=False, indent=2)[:1800]
+    return str(v)
+
+def _pick(d: Any, *keys):
+    if not isinstance(d, dict): return None
+    for k in keys:
+        v=d.get(k)
+        if v not in (None,'',[],{}): return v
+    return None
+
+def _bullet(items):
+    if not items: return ''
+    if isinstance(items, str): return items
+    return '\n'.join(f'- {_as_text(x)}' for x in items if _as_text(x))
+
+def _candidate(state, cid):
+    return next((c for c in state.get('candidates',[]) if isinstance(c,dict) and c.get('attempt_id')==cid), {}) if isinstance(state,dict) else {}
+
+def _artifact_refs(run_dir: Path, paths: list[Any]) -> list[dict[str,Any]]:
+    out=[]
+    for x in paths:
+        if not x: continue
+        sp=str(x); name=Path(sp).name
+        out.append({'label':name or sp,'path':sp,'kind':Path(sp).suffix.lstrip('.') or 'artifact','exists':(run_dir/sp).exists() if not Path(sp).is_absolute() else Path(sp).exists()})
+    return out
+
+def summarize_classification(payload):
+    return f"The orchestrator classified this as a {payload.get('difficulty') or 'unknown'} {payload.get('category') or 'task'} with {payload.get('risk') or payload.get('risk_level') or 'unknown'} risk."
+
+def summarize_investigation(payload): return _as_text(_pick(payload,'summary','finding','findings')) or 'The orchestrator recorded investigation findings for the task.'
+def summarize_plan(payload): return _as_text(_pick(payload,'summary','plan','strategy')) or f"The plan selected {payload.get('execution_path') or payload.get('plan_type') or 'the next orchestration path'}."
+
+def summarize_candidate_attempt(payload):
+    cid=humanize_id(_pick(payload,'attempt_id','candidate_id') or '')
+    status=payload.get('status') or ('failed' if payload.get('exit_code') not in (None,0) else 'completed')
+    files=payload.get('changed_files') or payload.get('files_written') or []
+    return f"{cid} {status}." + (f" It changed {', '.join(map(str,files[:5]))}." if files else '')
+
+def summarize_review(payload):
+    rec=_pick(payload,'recommendation','recommended_action','decision') or 'recorded a recommendation'
+    conf=_pick(payload,'confidence','score','correctness_score')
+    return f"The review {rec}" + (f" with confidence/score {conf}." if conf is not None else '.')
+
+def summarize_pairwise_comparison(payload):
+    return f"The pairwise comparison preferred {humanize_id(_pick(payload,'winner','winner_attempt_id') or 'a candidate')} over {humanize_id(_pick(payload,'loser','loser_attempt_id') or 'the alternative')}."
+
+def summarize_ranking(payload): return f"The ranking selected {humanize_id(_pick(payload,'selected_attempt_id','winner','selected_candidate') or 'a winner')} from the available candidates."
+def summarize_selection(payload): return summarize_ranking(payload)
+def summarize_final_decision(payload): return _as_text(_pick(payload,'summary','reason','failure_reason')) or f"The run final decision was {payload.get('accepted', payload.get('status','recorded'))}."
+
+SUMMARIZERS={'classification_submitted':summarize_classification,'investigation_submitted':summarize_investigation,'plan_submitted':summarize_plan,'candidate_attempt_started':summarize_candidate_attempt,'candidate_attempt_completed':summarize_candidate_attempt,'candidate_attempt_failed':summarize_candidate_attempt,'candidate_attempt_reviewed':summarize_review,'candidate_pairwise_comparison_completed':summarize_pairwise_comparison,'tournament_ranking_completed':summarize_ranking,'ranking_completed':summarize_ranking,'selection_completed':summarize_selection,'run_finalized':summarize_final_decision,'execution_path_selected':summarize_plan}
+
+def extract_orchestrator_ai_response(event, state, run_dir) -> dict[str,str]|None:
+    p=_payload(event) if isinstance(event,dict) else {}
+    pools=[p]
+    typ=(event or {}).get('type') if isinstance(event,dict) else ''
+    cid=_attempt_id(event or {}) if isinstance(event,dict) else None
+    if cid: pools.append(_candidate(state,cid))
+    for key in ('classification','investigation','plan','selection','final_decision'):
+        if isinstance(state.get(key),dict): pools.append(state[key])
+    for src in pools:
+        if not isinstance(src,dict): continue
+        raw=_pick(src,'ai_response','model_response','llm_response','assistant_message','assistant_content','raw_response','raw_text','response','rationale','reason','summary')
+        if raw:
+            text=_as_text(raw)
+            return {'summary': text.split('\n')[0][:240], 'important_decision': _as_text(_pick(src,'decision','recommendation','selected_attempt_id','winner')) or '', 'rationale': _as_text(_pick(src,'rationale','reason','reasons')) or text, 'risks': _bullet(_pick(src,'risks','warnings','evidence_gaps','likely_hidden_failures'))}
+    return None
+
+def build_candidate_activity_detail(candidate_id, state, run_dir) -> dict[str,Any]:
+    c=_candidate(state,candidate_id); debug_dir=run_dir/'attempts'/str(candidate_id); debug_paths=[]
+    if debug_dir.exists(): debug_paths=[str(x.relative_to(run_dir)) for x in debug_dir.rglob('*') if x.is_file()][:20]
+    files=c.get('changed_files') or c.get('files_written') or c.get('modified_files') or []
+    cmds=c.get('commands') or c.get('commands_run') or c.get('command_evidence') or []
+    failed=[x for x in cmds if isinstance(x,dict) and x.get('exit_code') not in (None,0)]
+    summary=f"{humanize_id(candidate_id)} is {c.get('status','unknown')}. "
+    summary+=f"It changed {', '.join(map(str,files[:6]))}. " if files else 'No changed files were recorded. '
+    summary+=f"It ran {len(cmds)} commands, {len(failed)} failed." if cmds else 'No command evidence was recorded.'
+    return {'id':candidate_id,'type':'candidate','title':humanize_id(candidate_id),'status':c.get('status'),'timestamp':c.get('started_at'),'summary':summary,'what_happened':summary,'why_it_matters':_as_text(c.get('review_summary') or (c.get('review') or {}).get('summary')) or 'Candidate activity explains what Villani Code changed and how it was checked.','ai_response':_as_text(_pick(c,'runner_output','model_output','ai_response','debug_summary')) or 'No AI response captured for this step.','evidence_summary':f"Changed files: {', '.join(map(str,files)) or 'none recorded'}\nCommands: {len(cmds)} recorded; {len(failed)} failed.",'artifacts':_artifact_refs(run_dir, [c.get('patch_path'), c.get('evidence_path'), c.get('debug_path')] + debug_paths),'logs':[{'level':'info','message':_as_text(x),'timestamp':None} for x in (c.get('latest_activity') or [])[:20]],'diff_summary':_as_text(c.get('patch_summary')) or ('No patch was produced.' if not c.get('patch_path') else 'Patch artifact is available.'),'raw':c or {}}
+
+def build_candidate_debug_summary(candidate_id: str, state: dict, run_dir: Path) -> dict[str,Any]:
+    d=build_candidate_activity_detail(candidate_id,state,run_dir)
+    c=_candidate(state,candidate_id)
+    return {'candidate_id':candidate_id,'status':d.get('status') or 'unknown','summary':d.get('summary'),'latest_activity':[l['message'] for l in d.get('logs',[])][:10] or (['No debug artifacts found for this candidate yet.'] if not d.get('artifacts') else []),'files_read':c.get('files_read') or [],'files_written':c.get('changed_files') or c.get('files_written') or [],'commands':c.get('commands') or c.get('commands_run') or [],'warnings':c.get('warnings') or []}
+
+def _detail_for_event(ev, state, run_dir):
+    p=_redact(_payload(ev)); typ=ev.get('type') or 'event'; eid=ev.get('event_id') or ''
+    cid=_attempt_id(ev)
+    if cid and typ in {'candidate_attempt_started','candidate_attempt_completed','candidate_attempt_failed'}: return build_candidate_activity_detail(cid,state,run_dir) | {'id':eid or f'event_{typ}_{cid}','type':typ,'title':EVENTS.get(typ,typ)}
+    summ=SUMMARIZERS.get(typ, lambda x: _as_text(_pick(x,'summary','reason')) or f"{EVENTS.get(typ,humanize_id(typ))} was recorded.")(p)
+    ai=extract_orchestrator_ai_response(ev,state,run_dir)
+    return {'id':eid,'type':typ,'title':EVENTS.get(typ,humanize_id(typ)),'status':STATUS_BY_EVENT.get(typ,'completed'),'timestamp':ev.get('timestamp'),'summary':summ,'what_happened':summ,'why_it_matters':'This step records why the orchestrator moved to the next action.','next_action':_as_text(_pick(p,'next_action','action')),'ai_response_summary':(ai or {}).get('summary') if ai else 'No AI response captured for this step.','ai_response':('\n'.join(f"{k.replace('_',' ').title()}: {v}" for k,v in ai.items() if v) if ai else 'No AI response captured for this step.'),'evidence_summary':_as_text(_pick(p,'evidence_summary','evidence','evidence_used')),'artifacts':_artifact_refs(run_dir, p.get('artifacts') or []),'logs':[],'diff_summary':_as_text(_pick(p,'diff_summary','patch_summary')),'raw':p}
+
+def build_viewer_details(state, events, run_dir):
+    details={}
+    for i,ev in enumerate(sorted(events, key=lambda e:e.get('timestamp') or '')):
+        d=_detail_for_event(ev,state,run_dir); eid=ev.get('event_id') or f'event_{i}'; d['id']=eid; details[eid]=d
+    for c in state.get('candidates',[]) if isinstance(state,dict) else []:
+        if isinstance(c,dict) and c.get('attempt_id'): details[c['attempt_id']]=build_candidate_activity_detail(c['attempt_id'],state,run_dir)
+    return details
 
 def _event_types(events): return {e.get('type') for e in events}
 
@@ -170,7 +279,7 @@ def build_viewer_graph_layout(snapshot_or_state: dict[str,Any], events: list[dic
     def counts(prefix):
         return sum(1 for e in events if (e.get('type') or '').startswith(prefix))
     def add(id,label,type,row,col,status='pending',summary='',details=None,children=None):
-        nodes.append({'id':id,'label':label,'type':type,'row':row,'col':col,'status':status,'subtitle':summary,'summary':summary,'details':details or {},'children':children or []})
+        nodes.append({'id':id,'detail_id':id,'label':label,'type':type,'row':row,'col':col,'status':status,'subtitle':summary,'summary':summary,'details':details or {},'children':children or []})
     def edge(a,b,status='active'):
         edges.append({'id':f'edge_{a}_{b}','source':a,'target':b,'status':status})
     add('investigation_group','Investigation','group',1,1,'completed' if 'investigation_submitted' in types else ('running' if 'run_started' in types else 'pending'),'Inspect and classify')
@@ -217,4 +326,8 @@ def build_viewer_snapshot(run_dir: Path) -> dict[str, Any]:
     run_dir=Path(run_dir); state=_read_json(run_dir/'state.json', {}) or {}; digest=_read_json(run_dir/'event_digest.json', {}) or {}; events=_read_jsonl(run_dir/'runtime_events.jsonl'); usage_rows=_read_jsonl(run_dir/'usage.jsonl')
     usage=_usage(run_dir,state,digest); rid=state.get('run_id') or digest.get('run_id') or run_dir.name; started=state.get('started_at') or (events[0].get('timestamp') if events else None); finalized=state.get('completed_at') or (events[-1].get('timestamp') if events and events[-1].get('type')=='run_finalized' else None); pct,label=_progress(state,events)
     status=state.get('status') or digest.get('status') or ('running' if events else 'unknown')
-    return _redact({'run':{'run_id':rid,'run_id_short':rid[:18]+('…' if len(rid)>18 else ''),'task':state.get('task') or state.get('objective') or digest.get('task') or '', 'status':status, 'mode':state.get('mode') or digest.get('mode') or 'performance','runner':state.get('runner') or digest.get('runner') or 'villani-code','model':_model(state, usage_rows, events), 'started_at':started, 'completed_at':finalized, 'duration_seconds':_duration(started, finalized),'progress_percent':pct,'progress_label':label,'result':state.get('final_decision') or digest.get('final_decision'),'run_dir':str(run_dir),'run_dir_short':'…/'+run_dir.name}, 'usage':usage, 'timeline':_timeline(events), 'graph':build_viewer_graph_layout(state,events), 'warnings':state.get('warnings') or digest.get('warnings') or [], 'errors':state.get('errors') or digest.get('errors') or [], 'artifacts':{'state':'state.json','events':'runtime_events.jsonl','graph':'orchestration_graph.json','usage':'usage.json'}})
+    graph=build_viewer_graph_layout(state,events)
+    details=build_viewer_details(state,events,run_dir)
+    for n in graph.get('nodes',[]):
+        details.setdefault(n.get('detail_id') or n.get('id'), {'id':n.get('id'),'type':n.get('type'),'title':n.get('label') or n.get('id'),'status':n.get('status'),'summary':n.get('summary') or n.get('subtitle') or 'No human-readable detail was captured for this graph node.','what_happened':n.get('summary') or n.get('subtitle') or 'This graph node represents an orchestration stage.','raw':n})
+    return _redact({'run':{'run_id':rid,'run_id_short':rid[:18]+('…' if len(rid)>18 else ''),'task':state.get('task') or state.get('objective') or digest.get('task') or '', 'status':status, 'mode':state.get('mode') or digest.get('mode') or 'performance','runner':state.get('runner') or digest.get('runner') or 'villani-code','model':_model(state, usage_rows, events), 'started_at':started, 'completed_at':finalized, 'duration_seconds':_duration(started, finalized),'progress_percent':pct,'progress_label':label,'result':state.get('final_decision') or digest.get('final_decision'),'run_dir':str(run_dir),'run_dir_short':'…/'+run_dir.name}, 'usage':usage, 'timeline':_timeline(events), 'graph':graph, 'warnings':state.get('warnings') or digest.get('warnings') or [], 'errors':state.get('errors') or digest.get('errors') or [], 'artifacts':{'state':'state.json','events':'runtime_events.jsonl','graph':'orchestration_graph.json','usage':'usage.json'}, 'details':details})
