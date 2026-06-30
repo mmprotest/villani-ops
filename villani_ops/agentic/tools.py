@@ -369,6 +369,23 @@ def _adaptive_warning(state, ctx, message, payload=None):
 def _is_adaptive(state):
     return getattr(state, 'orchestrator', None) == 'adaptive'
 
+def commit_planned_execution_path(state, ctx=None, *, recovered=False):
+    plan=getattr(state, 'plan', None) or {}
+    path=plan.get('execution_path')
+    if path not in {'candidate_tournament','single_task'} or state.execution_path not in {None, 'unknown'}:
+        return False
+    state.execution_path=path
+    state.phase='running_candidates'
+    state.candidate_execution_mode='parallel' if path=='candidate_tournament' else 'sequential'
+    if path=='candidate_tournament' and getattr(state, 'tournament_phase', None) in {None, 'not_started'}:
+        state.tournament_phase='not_started'
+    if ctx is not None and getattr(ctx, 'recorder', None) is not None:
+        ctx.recorder.record('execution_path_recovered_from_plan' if recovered else 'execution_path_auto_committed', payload={'execution_path':path,'plan_strategy':plan.get('strategy')})
+        ctx.recorder.record('execution_path_selected', payload={'execution_path':path,'source':'plan_recovery' if recovered else 'plan_auto_commit'})
+        if path=='candidate_tournament' and not getattr(state, 'candidates', None):
+            ctx.recorder.record('tournament_launch_ready', payload={'execution_path':path,'candidate_attempts':getattr(state, 'candidate_attempts', None)})
+    return True
+
 def h_plan(state, inp, ctx):
     plan=inp.model_dump()
     if _is_adaptive(state):
@@ -380,7 +397,7 @@ def h_plan(state, inp, ctx):
         plan['execution_path']='candidate_tournament' if tournament else 'single_task'
         plan['plan_kind']='candidate_tournament' if tournament else 'single_task'
         state.subtasks=[]; state.decomposition=None; state.decomposition_requested=False; state.decomposition_validated=False; state.decomposition_accepted=None; state.decomposition_executed=False
-        state.plan=plan; state.phase='choosing_execution_path'; return state.plan
+        state.plan=plan; state.phase='choosing_execution_path'; commit_planned_execution_path(state, ctx); return state.plan
     state.plan=plan; state.decomposition_requested=inp.should_decompose; state.phase='decomposing' if inp.should_decompose else 'choosing_execution_path'; return state.plan
 def h_decomposition(state, inp, ctx):
     if _is_adaptive(state):

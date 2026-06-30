@@ -320,3 +320,47 @@ def test_tournament_budget_planning_protects_pairwise_before_reviews(tmp_path):
 def test_pairwise_priority_starts_with_top_two_then_top_three():
     from villani_ops.agentic.tools import _pairwise_pairs_by_priority
     assert _pairwise_pairs_by_priority(['a','b','c','d'])[:3] == [('a','b'),('a','c'),('b','c')]
+
+
+def test_valid_tournament_plan_auto_commits_and_launch_is_next(tmp_path):
+    s=state(tmp_path); c=ctx(tmp_path); s.orchestrator='adaptive'; s.investigation={'summary':'i'}
+    res=execute_tool_with_policy(s,'ops_submit_plan',{'summary':'p','strategy':'parallel_candidates','should_decompose':False,'candidate_attempts':4,'expected_difficulty':'easy','confidence':1},'p',c)
+    assert not res.is_error
+    assert s.plan['execution_path']=='candidate_tournament'
+    assert s.execution_path=='candidate_tournament'
+    assert s.phase=='running_candidates'
+    assert s.tournament_phase=='not_started'
+    assert 'ops_launch_tournament_candidates' in s.allowed_next_actions()
+    assert 'ops_select_execution_path' not in s.allowed_next_actions()
+    events=(tmp_path/'run'/'runtime_events.jsonl').read_text()
+    assert 'execution_path_auto_committed' in events
+    assert 'tournament_launch_ready' in events
+
+
+def test_select_execution_path_rejected_during_planning(tmp_path):
+    s=state(tmp_path); c=ctx(tmp_path); s.orchestrator='adaptive'; s.investigation={'summary':'i'}
+    res=execute_tool_with_policy(s,'ops_select_execution_path',{'path':'candidate_tournament','reason':'too early'},'sel',c)
+    assert res.is_error
+    assert s.execution_path=='unknown'
+    assert 'ops_submit_plan' in s.allowed_next_actions()
+
+
+def test_recovery_commits_stale_plan_path_and_launch_emits_recovered_event(tmp_path):
+    s=state(tmp_path); c=ctx(tmp_path); s.orchestrator='adaptive'; s.investigation={'summary':'i'}
+    s.plan={'summary':'p','strategy':'parallel_candidates','execution_path':'candidate_tournament','candidate_attempts':3}
+    s.execution_path='unknown'; s.phase='failed'; s.tournament_phase='not_started'
+    res=execute_tool_with_policy(s,'ops_launch_tournament_candidates',{'attempts':3,'reason':'recover stale planned path'},'launch',c)
+    assert not res.is_error, res.content
+    assert s.execution_path=='candidate_tournament'
+    assert s.tournament_candidates_launched==3
+    events=(tmp_path/'run'/'runtime_events.jsonl').read_text()
+    assert 'execution_path_recovered_from_plan' in events
+    assert 'tournament_candidates_launch_started' in events
+
+
+def test_prompt_guidance_does_not_select_path_during_planning():
+    from villani_ops.agentic.prompts import SYSTEM_PROMPT, ADAPTIVE_SYSTEM_APPENDIX
+    guidance=SYSTEM_PROMPT + ADAPTIVE_SYSTEM_APPENDIX
+    assert 'select execution_path=candidate_tournament when candidate_attempts > 1' not in guidance
+    assert 'submit the plan only' in guidance
+    assert 'system commits it automatically' in guidance

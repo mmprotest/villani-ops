@@ -2,7 +2,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from pydantic import BaseModel, ConfigDict
-from .tools import OPS_TOOLS, commit_tournament_selection
+from .tools import OPS_TOOLS, commit_tournament_selection, commit_planned_execution_path
 from .state import detect_decomposition_deadlock
 @dataclass
 class OpsToolContext:
@@ -19,7 +19,8 @@ def _allowed(state, name, data):
             return False, f'{name} is not allowed in adaptive orchestrator; adaptive uses execution_path=candidate_tournament when candidate_attempts > 1 and does not decompose'
         if name=='ops_select_execution_path' and data.get('path') not in {'single_task','candidate_tournament'}:
             return True, None
-        if name in {'ops_launch_tournament_candidates','ops_evaluate_tournament'} and state.execution_path=='candidate_tournament': return True, None
+        if name=='ops_launch_tournament_candidates' and state.execution_path in {'candidate_tournament','unknown'} and (state.plan or {}).get('execution_path')=='candidate_tournament': return True, None
+        if name=='ops_evaluate_tournament' and state.execution_path=='candidate_tournament': return True, None
         if name=='ops_run_next_candidate_attempt' and state.candidate_attempts>1:
             return False, 'ops_run_next_candidate_attempt is legacy single-attempt/adaptive-retry; tournament mode uses ops_launch_tournament_candidates'
 
@@ -93,12 +94,15 @@ def execute_tool_with_policy(state, tool_name:str, tool_input:dict, tool_use_id:
         ok,err=_allowed(state,tool_name,tool_input)
         if not ok: raise ValueError(err)
         rec.record('tool_started',tool_name=tool_name)
+        if tool_name=='ops_launch_tournament_candidates' and state.execution_path=='unknown' and (state.plan or {}).get('execution_path')=='candidate_tournament':
+            commit_planned_execution_path(state, context, recovered=True)
         out=spec.handler(state,parsed,context)
         state.last_tool_name=tool_name; state.last_tool_input=tool_input; state.last_error=None
         state.save(Path(state.run_dir)/'state.json')
         rec.record('state_saved',tool_name=tool_name); rec.record('state_updated',tool_name=tool_name)
         event_map={'ops_submit_classification':'classification_submitted','ops_submit_investigation':'investigation_submitted','ops_submit_plan':'plan_submitted','ops_submit_decomposition':'decomposition_submitted','ops_validate_decomposition':'decomposition_validation_completed','ops_select_execution_path':'execution_path_selected'}
         if tool_name in event_map: rec.record(event_map[tool_name],tool_name=tool_name,payload=out if isinstance(out,dict) else {'result':out})
+        if tool_name=='ops_launch_tournament_candidates': rec.record('tournament_candidates_launch_started', tool_name=tool_name, payload=out if isinstance(out,dict) else {'result':out})
         if tool_name=='ops_integrate_subtasks': rec.record('integration_completed' if isinstance(out,dict) and out.get('status')=='completed' else 'integration_failed', tool_name=tool_name, payload=out if isinstance(out,dict) else {'result':out})
         rec.record('tool_finished',tool_name=tool_name,payload={'result':out})
         return OpsToolResult(tool_use_id=tool_use_id,tool_name=tool_name,content=out)

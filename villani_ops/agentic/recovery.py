@@ -1,7 +1,7 @@
 from pydantic import BaseModel
 from villani_ops.core.acceptance import is_attempt_acceptance_eligible
 from .state import detect_decomposition_deadlock
-from .tools import commit_tournament_selection, hydrate_tournament_state_from_artifacts
+from .tools import commit_tournament_selection, hydrate_tournament_state_from_artifacts, commit_planned_execution_path
 
 class RecoveryRecommendation(BaseModel):
     action:str
@@ -106,8 +106,17 @@ def _subtask_commit_ready(st):
     return None
 
 def recommend_next_agentic_action(state):
+    if (state.plan or {}).get('execution_path') and state.execution_path in {None, 'unknown'}:
+        path=(state.plan or {}).get('execution_path')
+        if path=='candidate_tournament':
+            return RecoveryRecommendation(action='launch_recovered_tournament_candidates',tool_name='ops_launch_tournament_candidates',tool_input={'reason':'Execution path was recovered from the accepted plan; launch tournament candidates.'},reason='Accepted plan declared candidate_tournament but execution_path was not committed.',can_execute_deterministically=True)
+        if path=='single_task':
+            commit_planned_execution_path(state, None, recovered=True)
+            return RecoveryRecommendation(action='run_recovered_single_task_candidate',tool_name='ops_run_next_candidate_attempt',tool_input={'reason':'Execution path was recovered from the accepted plan; run first single-task candidate.'},reason='Accepted plan declared single_task but execution_path was not committed.',can_execute_deterministically=True)
     if state.execution_path=='candidate_tournament':
         hydrate_tournament_state_from_artifacts(state)
+        if not state.candidates:
+            return RecoveryRecommendation(action='launch_tournament_candidates',tool_name='ops_launch_tournament_candidates',tool_input={'reason':'Tournament execution path is committed and no candidates have launched.'},reason='candidate_tournament execution path selected but no tournament candidates launched',can_execute_deterministically=True)
         if not state.selection and ((state.tournament_ranking and state.tournament_ranking.selected_candidate_id) or state.candidates):
             committed=commit_tournament_selection(state)
             if committed and state.selection:
