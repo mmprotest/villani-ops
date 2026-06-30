@@ -68,8 +68,123 @@ def _timeline(events):
         typ=ev.get('type')
         if typ not in EVENTS: continue
         p=_redact(_payload(ev)); dur=p.get('duration_seconds') or p.get('duration')
-        items.append({'id':ev.get('event_id') or f'event_{i}', 'timestamp':ev.get('timestamp'), 'type':typ, 'title':EVENTS[typ], 'subtitle':_subtitle(ev), 'status':STATUS_BY_EVENT.get(typ,'completed'), 'duration_seconds':dur, 'attempt_id':_attempt_id(ev), 'subtask_id':_subtask_id(ev)})
+        items.append({'id':_stable_event_id(ev, i), 'timestamp':ev.get('timestamp'), 'type':typ, 'title':EVENTS[typ], 'subtitle':_subtitle(ev), 'status':STATUS_BY_EVENT.get(typ,'completed'), 'duration_seconds':dur, 'attempt_id':_attempt_id(ev), 'subtask_id':_subtask_id(ev)})
     return items
+
+
+def _stable_event_id(ev: dict[str,Any], index: int) -> str:
+    return str(ev.get('event_id') or ev.get('id') or f"event_{ev.get('timestamp') or 'unknown'}_{ev.get('type') or 'event'}_{index}").replace(' ','_')
+
+def _rel_path(run_dir: Path, path: Any) -> str|None:
+    if not path: return None
+    try:
+        pp=Path(str(path))
+        if not pp.is_absolute(): return str(pp)
+        return str(pp.relative_to(run_dir))
+    except Exception: return str(path)
+
+def _artifact(run_dir: Path, path: Any, kind: str='artifact') -> dict[str,Any]|None:
+    rp=_rel_path(run_dir,path)
+    if not rp: return None
+    return {'path':rp,'kind':kind,'exists':(run_dir/rp).exists()}
+
+def _list_json_files(root: Path) -> list[Path]:
+    try: return sorted([p for p in root.glob('*.json') if p.is_file()]) if root.exists() else []
+    except Exception: return []
+
+def _candidate_id_from_obj(obj: dict[str,Any]) -> str|None:
+    for k in ('candidate_id','attempt_id','id','selected_attempt_id'):
+        if obj.get(k): return str(obj[k])
+    return None
+
+def _candidate_artifact_paths(run_dir: Path, cid: str, cand: dict[str,Any]|None=None) -> dict[str,list[str]|str|None]:
+    cand=cand or {}; roots=[run_dir, run_dir/'candidates'/cid, run_dir/cid, run_dir/'attempts'/cid]
+    out={'patch_path':None,'evidence_path':None,'debug_artifact_paths':[],'trace_artifact_paths':[]}
+    for key in ('patch_path','patch_file'):
+        if cand.get(key): out['patch_path']=_rel_path(run_dir,cand.get(key))
+    for key in ('evidence_path','evidence_file'):
+        if cand.get(key): out['evidence_path']=_rel_path(run_dir,cand.get(key))
+    for r in roots:
+        if not out['patch_path'] and (r/'patch.diff').exists(): out['patch_path']=_rel_path(run_dir,r/'patch.diff')
+        if not out['evidence_path'] and (r/'evidence.json').exists(): out['evidence_path']=_rel_path(run_dir,r/'evidence.json')
+        for pat in ('*debug*.json','debug*.jsonl','debug/*.json','debug/*.jsonl'):
+            for f in r.glob(pat):
+                if f.is_file(): out['debug_artifact_paths'].append(_rel_path(run_dir,f))
+        for pat in ('*trace*.json','trace*.jsonl','trace/*.json','trace/*.jsonl'):
+            for f in r.glob(pat):
+                if f.is_file(): out['trace_artifact_paths'].append(_rel_path(run_dir,f))
+    for key in ('debug_artifact_paths','trace_artifact_paths'):
+        vals=cand.get(key) or []
+        if isinstance(vals,(str,Path)): vals=[vals]
+        out[key]=list(dict.fromkeys([x for x in out[key]+[_rel_path(run_dir,v) for v in vals] if x]))[:20]
+    return out
+
+def build_candidate_debug(run_dir: Path, candidate_id: str, limit: int=25) -> dict[str,Any]:
+    run_dir=Path(run_dir); snap_state=_read_json(run_dir/'state.json', {}) or {}; events=_read_jsonl(run_dir/'runtime_events.jsonl')
+    cand=next((c for c in snap_state.get('candidates',[]) if isinstance(c,dict) and _candidate_id_from_obj(c)==candidate_id), {})
+    paths=_candidate_artifact_paths(run_dir,candidate_id,cand); artifact_paths=(paths['debug_artifact_paths']+paths['trace_artifact_paths'])[:20]
+    latest=[]; commands=[]; files_read=[]; files_written=[]; tool_calls=[]; limitations=[]
+    def addrow(x):
+        nonlocal latest,commands,files_read,files_written,tool_calls
+        if not isinstance(x,dict): return
+        typ=str(x.get('type') or x.get('event') or x.get('name') or '')
+        msg=x.get('message') or x.get('summary') or x.get('text') or typ
+        latest.append({'timestamp':x.get('timestamp'),'type':typ,'message':str(msg)[:500]})
+        cmd=x.get('command') or (x.get('cmd') if isinstance(x.get('cmd'),str) else None)
+        if cmd: commands.append({'command':str(cmd)[:500],'exit_code':x.get('exit_code'),'status':x.get('status')})
+        for k,dst in (('files_read',files_read),('file_reads',files_read),('files_written',files_written),('file_writes',files_written),('tool_calls',tool_calls)):
+            vals=x.get(k) or []
+            if isinstance(vals,(str,dict)): vals=[vals]
+            for v in vals[:limit]: dst.append(v if isinstance(v,dict) else str(v)[:500])
+        if x.get('tool') or x.get('tool_name'): tool_calls.append({'tool':x.get('tool') or x.get('tool_name'),'status':x.get('status')})
+    for ev in events:
+        if _attempt_id(ev)==candidate_id: addrow(ev)
+    for rp in artifact_paths:
+        fp=run_dir/rp
+        try:
+            if fp.suffix=='.jsonl':
+                for row in _read_jsonl(fp)[-limit:]: addrow(row)
+            else:
+                data=_read_json(fp, None)
+                rows=data if isinstance(data,list) else (data.get('events') or data.get('latest_events') or data.get('commands') or [] if isinstance(data,dict) else [])
+                if isinstance(data,dict): addrow(data)
+                for row in rows[-limit:] if isinstance(rows,list) else []: addrow(row)
+        except Exception: limitations.append(f'could not read {rp}')
+    if not artifact_paths: limitations.append('debug artifacts not available yet')
+    status=cand.get('status') or next((STATUS_BY_EVENT.get(e.get('type')) for e in reversed(events) if _attempt_id(e)==candidate_id), None) or 'unknown'
+    cap=lambda xs: xs[-limit:]
+    return _redact({'candidate_id':candidate_id,'status':status,'latest_events':cap(latest),'commands':cap(commands),'files_read':cap(files_read),'files_written':cap(files_written),'tool_calls':cap(tool_calls),'artifact_paths':artifact_paths,'limitations':limitations})
+
+def _build_details(run_dir: Path, state: dict[str,Any], events: list[dict[str,Any]], timeline: list[dict[str,Any]], graph: dict[str,Any]) -> dict[str,Any]:
+    details={'events':{},'nodes':{},'candidates':{},'reviews':{},'comparisons':{},'artifacts':{},'selection':None}
+    by_id={t['id']:t for t in timeline}
+    sorted_events=sorted([e for e in events if e.get('type') in EVENTS], key=lambda e:e.get('timestamp') or '')
+    for i,ev in enumerate(sorted_events):
+        eid=_stable_event_id(ev,i); tl=by_id.get(eid,{}) ; typ=ev.get('type') or 'event'; cid=_attempt_id(ev)
+        details['events'][eid]={'id':eid,'kind':'event','type':typ,'title':tl.get('title') or EVENTS.get(typ,typ),'status':tl.get('status') or STATUS_BY_EVENT.get(typ),'timestamp':ev.get('timestamp'),'summary':(tl.get('subtitle') or f"{EVENTS.get(typ,typ)}."),'human':{'what_happened':f"{EVENTS.get(typ,typ)} during orchestration.",'why_it_matters':'This step records progress in the run timeline.','next_action':None},'related':{'candidate_id':cid,'attempt_id':cid,'subtask_id':_subtask_id(ev),'review_id':None,'comparison_id':None},'artifacts':[],'raw':_redact(ev)}
+    for n in graph.get('nodes',[]):
+        cid=n.get('id') if n.get('type')=='candidate' else (n.get('details') or {}).get('selected_attempt_id')
+        details['nodes'][n['id']]={'id':n['id'],'kind':'node','type':n.get('type'),'title':n.get('label') or n['id'],'status':n.get('status'),'summary':n.get('summary') or n.get('subtitle') or 'Orchestration graph step.','related':{'candidate_id':cid},'artifacts':[],'raw':_redact(n)}
+    cands=[c for c in state.get('candidates',[]) if isinstance(c,dict)]
+    ids=set([_candidate_id_from_obj(c) for c in cands if _candidate_id_from_obj(c)])|{_attempt_id(e) for e in events if _attempt_id(e) and 'candidate' in (e.get('type') or '')}
+    try:
+        ids |= {p.name for p in (run_dir/'candidates').iterdir() if p.is_dir()}
+    except Exception: pass
+    for cid in sorted(x for x in ids if x):
+        c=next((x for x in cands if _candidate_id_from_obj(x)==cid), {}) ; paths=_candidate_artifact_paths(run_dir,cid,c)
+        dbg=build_candidate_debug(run_dir,cid,limit=10)
+        arts=[_artifact(run_dir,paths.get('patch_path'),'patch'),_artifact(run_dir,paths.get('evidence_path'),'evidence')]+[_artifact(run_dir,p,'debug') for p in paths['debug_artifact_paths']]+[_artifact(run_dir,p,'trace') for p in paths['trace_artifact_paths']]
+        details['candidates'][cid]={'id':cid,'kind':'candidate','status':c.get('status') or dbg.get('status'),'title':humanize_id(cid),'summary':'Independent tournament candidate in isolated worktree.','worktree':c.get('worktree') or c.get('worktree_path'),'changed_files':c.get('changed_files') or [],'patch_path':paths.get('patch_path'),'evidence_path':paths.get('evidence_path'),'debug_artifact_paths':paths['debug_artifact_paths'],'trace_artifact_paths':paths['trace_artifact_paths'],'commands_executed':dbg['commands'],'commands_failed':[x for x in dbg['commands'] if x.get('exit_code') not in (None,0)],'latest_debug_events':dbg['latest_events'],'telemetry':{'tokens':None,'cost':None,'tool_calls':len(dbg['tool_calls']),'file_reads':len(dbg['files_read']),'file_writes':len(dbg['files_written'])},'review':None,'selection':None,'artifacts':[a for a in arts if a],'raw':_redact(c)}
+    for fp in _list_json_files(run_dir/'reviews'):
+        data=_read_json(fp,{}) or {}; rid=fp.stem; cid=_candidate_id_from_obj(data)
+        details['reviews'][rid]={'id':rid,'kind':'review','type':'candidate_review','title':f"Review {humanize_id(cid or rid)}",'status':data.get('recommendation') or data.get('decision'),'summary':data.get('summary') or data.get('rationale') or 'Candidate review artifact.','related':{'candidate_id':cid},'artifacts':[_artifact(run_dir,fp,'review')],'raw':_redact(data)}
+    comp_root=run_dir/'comparisons'
+    for fp in _list_json_files(comp_root):
+        data=_read_json(fp,{}) or {}; cid=fp.stem
+        details['comparisons'][cid]={'id':cid,'kind':'comparison','type':'pairwise_comparison','title':'Pairwise comparison','status':data.get('winner') or data.get('status'),'summary':data.get('rationale') or data.get('summary') or 'Pairwise comparison artifact.','related':{'candidate_a':data.get('candidate_a'),'candidate_b':data.get('candidate_b'),'winner':data.get('winner')},'artifacts':[_artifact(run_dir,fp,'comparison')],'raw':_redact(data)}
+    sel=_read_json(run_dir/'selection.json', None) or state.get('selection')
+    if isinstance(sel,dict): details['selection']={'id':'selection','kind':'selection','title':'Selection','status':sel.get('selected_attempt_id') or sel.get('winner'),'summary':sel.get('rationale') or sel.get('summary') or 'Selection decision.','related':{'candidate_id':sel.get('selected_attempt_id') or sel.get('winner')},'artifacts':[_artifact(run_dir,'selection.json','selection')],'raw':_redact(sel)}
+    return details
 
 def _event_types(events): return {e.get('type') for e in events}
 
@@ -217,4 +332,5 @@ def build_viewer_snapshot(run_dir: Path) -> dict[str, Any]:
     run_dir=Path(run_dir); state=_read_json(run_dir/'state.json', {}) or {}; digest=_read_json(run_dir/'event_digest.json', {}) or {}; events=_read_jsonl(run_dir/'runtime_events.jsonl'); usage_rows=_read_jsonl(run_dir/'usage.jsonl')
     usage=_usage(run_dir,state,digest); rid=state.get('run_id') or digest.get('run_id') or run_dir.name; started=state.get('started_at') or (events[0].get('timestamp') if events else None); finalized=state.get('completed_at') or (events[-1].get('timestamp') if events and events[-1].get('type')=='run_finalized' else None); pct,label=_progress(state,events)
     status=state.get('status') or digest.get('status') or ('running' if events else 'unknown')
-    return _redact({'run':{'run_id':rid,'run_id_short':rid[:18]+('…' if len(rid)>18 else ''),'task':state.get('task') or state.get('objective') or digest.get('task') or '', 'status':status, 'mode':state.get('mode') or digest.get('mode') or 'performance','runner':state.get('runner') or digest.get('runner') or 'villani-code','model':_model(state, usage_rows, events), 'started_at':started, 'completed_at':finalized, 'duration_seconds':_duration(started, finalized),'progress_percent':pct,'progress_label':label,'result':state.get('final_decision') or digest.get('final_decision'),'run_dir':str(run_dir),'run_dir_short':'…/'+run_dir.name}, 'usage':usage, 'timeline':_timeline(events), 'graph':build_viewer_graph_layout(state,events), 'warnings':state.get('warnings') or digest.get('warnings') or [], 'errors':state.get('errors') or digest.get('errors') or [], 'artifacts':{'state':'state.json','events':'runtime_events.jsonl','graph':'orchestration_graph.json','usage':'usage.json'}})
+    timeline=_timeline(events); graph=build_viewer_graph_layout(state,events); details=_build_details(run_dir,state,events,timeline,graph)
+    return _redact({'run':{'run_id':rid,'run_id_short':rid[:18]+('…' if len(rid)>18 else ''),'task':state.get('task') or state.get('objective') or digest.get('task') or '', 'status':status, 'mode':state.get('mode') or digest.get('mode') or 'performance','runner':state.get('runner') or digest.get('runner') or 'villani-code','model':_model(state, usage_rows, events), 'started_at':started, 'completed_at':finalized, 'duration_seconds':_duration(started, finalized),'progress_percent':pct,'progress_label':label,'result':state.get('final_decision') or digest.get('final_decision'),'run_dir':str(run_dir),'run_dir_short':'…/'+run_dir.name}, 'usage':usage, 'timeline':timeline, 'graph':graph, 'details':details, 'warnings':state.get('warnings') or digest.get('warnings') or [], 'errors':state.get('errors') or digest.get('errors') or [], 'artifacts':{'state':'state.json','events':'runtime_events.jsonl','graph':'orchestration_graph.json','usage':'usage.json'}})

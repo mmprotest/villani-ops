@@ -138,3 +138,63 @@ def test_offline_viewer_contains_required_ui_without_external_deps(tmp_path):
     assert 'formatInteger' in text and 'formatCost' in text
     assert 'villani-run-snapshot' in text
     assert 'https://' not in text and 'cdn' not in text.lower() and 'npm' not in text.lower()
+
+
+def test_viewer_snapshot_details_and_candidate_artifacts(tmp_path):
+    rd=tmp_path/'runs'/'details'; cdir=rd/'candidates'/'candidate_002'; cdir.mkdir(parents=True)
+    (rd/'state.json').write_text(json.dumps({'run_id':'details','status':'running','candidates':[{'attempt_id':'candidate_002','status':'running','worktree':'/tmp/wt'}]}))
+    (rd/'runtime_events.jsonl').write_text('\n'.join([
+        json.dumps({'timestamp':'2026-06-26T00:00:00+00:00','type':'run_started','payload':{}}),
+        json.dumps({'timestamp':'2026-06-26T00:00:01+00:00','type':'candidate_attempt_started','payload':{'attempt_id':'candidate_002'}}),
+    ]))
+    (cdir/'patch.diff').write_text('diff --git a/x b/x')
+    (cdir/'evidence.json').write_text(json.dumps({'changed_files':['x']}))
+    (cdir/'debug.jsonl').write_text(json.dumps({'type':'command','command':'pytest','files_read':['x.py'],'tool_calls':[{'tool':'shell'}]})+'\n')
+    snap=build_viewer_snapshot(rd)
+    assert snap['details']['events']
+    assert snap['details']['nodes']
+    assert all(e['id'] for e in snap['timeline'])
+    ev=next(v for v in snap['details']['events'].values() if v['type']=='candidate_attempt_started')
+    assert ev['summary'] and ev['human']['what_happened']
+    node=snap['details']['nodes']['candidate_002']
+    assert node['summary']
+    cand=snap['details']['candidates']['candidate_002']
+    assert cand['patch_path'].endswith('patch.diff')
+    assert cand['evidence_path'].endswith('evidence.json')
+    assert cand['debug_artifact_paths']
+
+
+def test_viewer_details_reviews_comparisons_selection_and_malformed(tmp_path):
+    rd=tmp_path/'runs'/'structured'; (rd/'reviews').mkdir(parents=True); (rd/'comparisons').mkdir()
+    (rd/'state.json').write_text(json.dumps({'run_id':'structured'}))
+    (rd/'runtime_events.jsonl').write_text('{bad}\n')
+    (rd/'reviews'/'candidate_001.json').write_text(json.dumps({'candidate_id':'candidate_001','recommendation':'accept','summary':'looks good'}))
+    (rd/'reviews'/'bad.json').write_text('{bad')
+    (rd/'comparisons'/'pairwise.json').write_text(json.dumps({'candidate_a':'candidate_001','candidate_b':'candidate_002','winner':'candidate_001','rationale':'better'}))
+    (rd/'selection.json').write_text(json.dumps({'selected_attempt_id':'candidate_001','confidence':0.5,'rationale':'best'}))
+    snap=build_viewer_snapshot(rd)
+    assert snap['details']['reviews']['candidate_001']['summary']=='looks good'
+    assert 'bad' in snap['details']['reviews']
+    assert snap['details']['comparisons']['pairwise']['related']['winner']=='candidate_001'
+    assert snap['details']['selection']['related']['candidate_id']=='candidate_001'
+
+
+def test_candidate_debug_endpoint_summary_and_missing_artifacts(tmp_path):
+    rd=fake_run(tmp_path)
+    cdir=rd/'candidates'/'candidate_001'; cdir.mkdir(parents=True)
+    long='x'*1000
+    (cdir/'trace.jsonl').write_text(json.dumps({'type':'tool','command':long,'files_read':['a.py'],'files_written':['b.py'],'tool':'shell'})+'\n')
+    from villani_ops.viewer.adapter import build_candidate_debug
+    debug=build_candidate_debug(rd,'candidate_001',limit=5)
+    assert debug['commands'] and len(debug['commands'][0]['command']) == 500
+    assert debug['files_read'] == ['a.py']
+    assert debug['files_written'] == ['b.py']
+    assert debug['tool_calls']
+    missing=build_candidate_debug(rd,'candidate_999')
+    assert 'debug artifacts not available yet' in missing['limitations']
+    srv=ViewerServer(tmp_path/'runs', port=18766).start(try_ports=1)
+    try:
+        data=json.loads(urllib.request.urlopen(f'http://127.0.0.1:{srv.port}/api/runs/{rd.name}/candidate/candidate_001/debug').read())
+        assert data['candidate_id']=='candidate_001'
+    finally:
+        srv.stop()
