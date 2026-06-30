@@ -3,10 +3,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Literal
 from pydantic import BaseModel, Field, ConfigDict, model_validator
-from .state import CandidateAttemptState, SubtaskState, AttemptObservation, detect_decomposition_deadlock, CandidateSummary, CandidateEvidencePacket, CommandEvidence, ChangedFileEvidence, CandidateRiskReview, PairwiseCandidateComparison, RankedCandidate, TournamentRanking, CandidateAgreementSummary
+from .state import CandidateAttemptState, SubtaskState, AttemptObservation, detect_decomposition_deadlock, CandidateSummary, CandidateEvidencePacket, CandidateImplementationSignature, CommandEvidence, ChangedFileEvidence, CandidateRiskReview, PairwiseCandidateComparison, RankedCandidate, TournamentRanking, CandidateAgreementSummary
 from .git_artifacts import capture_git_patch, ensure_git_baseline, clean_runner_artifacts_from_worktree, DEFAULT_PATCH_EXCLUDES, is_git_compatible_patch, patch_contains_internal_artifacts, clean_untracked_scratch_artifacts, is_scratch_artifact_path
 from villani_ops.core.acceptance import is_attempt_acceptance_eligible, attempt_requires_patch
-import subprocess, json, time, shutil, os, re
+import subprocess, json, time, shutil, os, re, hashlib
 from datetime import datetime, timezone
 from .artifacts import read_text_utf8, write_text_utf8, write_json_utf8
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -897,10 +897,43 @@ def _extract_command_evidence_from_artifacts(attempt:CandidateAttemptState, *, l
             cmd=c.get('cmd') or c.get('command')
             if cmd:
                 out='\n'.join(str(c.get(k) or '') for k in ('stdout','stderr','stdout_tail','stderr_tail') if c.get(k))
-                rows.append(CommandEvidence(command=str(cmd), exit_code=c.get('exit_code'), purpose=c.get('purpose') or r.get('validation_source'), output_excerpt=_compact_text(out, 1000) if out else None, artifact_path=r.get('artifact_path')))
+                rows.append(CommandEvidence(command=str(cmd), exit_code=c.get('exit_code') if c.get('exit_code') is not None else c.get('returncode'), purpose=c.get('purpose') or r.get('validation_source'), output_excerpt=_compact_text(out, 1000) if out else None, artifact_path=r.get('artifact_path')))
+    roots=[Path(p) for p in [attempt.artifacts_dir, (attempt.runner_telemetry or {}).get('debug_artifact_dir'), (attempt.runner_telemetry or {}).get('resolved_trace_dir')] if p]
+    files=[]
+    for root in roots:
+        if root.exists():
+            for pat in ('*.jsonl','*.json','*.trace'):
+                files += [x for x in root.rglob(pat) if x.is_file()]
+    def dig(obj, path):
+        if isinstance(obj, dict):
+            cmd=obj.get('command') or obj.get('cmd')
+            args=obj.get('arguments') or obj.get('input') or {}
+            if not cmd and isinstance(args, dict): cmd=args.get('command') or args.get('cmd')
+            tc=obj.get('tool_call') or {}
+            if not cmd and isinstance(tc, dict):
+                a=tc.get('arguments') or {}
+                cmd=(a.get('command') or a.get('cmd')) if isinstance(a, dict) else None
+            tool=str(obj.get('tool') or obj.get('name') or (tc.get('name') if isinstance(tc,dict) else '')).lower()
+            if cmd:
+                out='\n'.join(str(obj.get(k) or '') for k in ('stdout','stderr','output','stdout_tail','stderr_tail') if obj.get(k))
+                rows.append(CommandEvidence(command=str(cmd), exit_code=obj.get('exit_code') if obj.get('exit_code') is not None else obj.get('returncode'), purpose=tool or None, output_excerpt=_compact_text(out, 1000) if out else None, artifact_path=str(path)))
+            for v in obj.values(): dig(v, path)
+        elif isinstance(obj, list):
+            for v in obj: dig(v, path)
+    for f in sorted(dict.fromkeys(files))[:100]:
+        txt=read_text_utf8(f, default='')
+        if not txt: continue
+        try:
+            if f.suffix=='.jsonl':
+                for line in txt.splitlines()[:1000]:
+                    if line.strip(): dig(json.loads(line), f)
+            else: dig(json.loads(txt), f)
+        except Exception:
+            continue
     seen=set(); uniq=[]
     for row in rows:
-        key=(row.command,row.exit_code,row.output_excerpt)
+        if not row.command: continue
+        key=(row.command,row.exit_code,row.output_excerpt,row.artifact_path)
         if key not in seen:
             seen.add(key); uniq.append(row)
     return uniq[:limit]
@@ -926,6 +959,48 @@ def summarize_candidate_debug_artifacts(attempt:CandidateAttemptState, *, max_ch
     text=_compact_text('\n'.join(facts), max_chars)
     return {'summary':text,'debug_artifact_paths':sorted(dict.fromkeys(artifact_paths))[:50],'trace_artifact_paths':sorted(dict.fromkeys(trace_paths))[:50],'commands':cmds,'failed_commands':failed}
 
+
+def _normalize_patch_for_signature(patch_diff:str)->str:
+    lines=[]
+    for line in (patch_diff or '').splitlines():
+        if line.startswith(('index ','+++ ','--- ')) or re.match(r'@@ .* @@', line):
+            continue
+        if line.startswith(('diff --git','new file mode','deleted file mode','similarity index')):
+            continue
+        lines.append(line.rstrip())
+    return '\n'.join(lines).strip()
+
+def _diff_side_lines(patch_diff:str, prefix:str)->list[str]:
+    return [l[1:] for l in (patch_diff or '').splitlines() if l.startswith(prefix) and not l.startswith(prefix*3)]
+
+def build_candidate_implementation_signature(candidate_id:str, changed_files:list[str], patch_diff:str, final_file_summaries:list[ChangedFileEvidence]|None=None)->CandidateImplementationSignature:
+    normalized=_normalize_patch_for_signature(patch_diff)
+    h=hashlib.sha256(normalized.encode('utf-8')).hexdigest() if normalized else None
+    added=_diff_side_lines(patch_diff,'+'); removed=_diff_side_lines(patch_diff,'-')
+    import_re=re.compile(r'^\s*(import|from|include|use|require|using)\b', re.I)
+    sym_re=re.compile(r'^\s*(def|class|function|func|fn|method|struct|interface|enum|type|const|let|var)\s+([A-Za-z_][\w:.$-]*)', re.I)
+    control_terms=['if','else','for','while','switch','case','try','catch','finally','return','raise','throw','break','continue','await','async','lock','timeout','cancel','cleanup','close','dispose','retry','error','exception','concurrent','thread','process','resource','validate','fallback']
+    def terms(lines):
+        found=[]
+        low='\n'.join(lines).lower()
+        for t in control_terms:
+            if re.search(r'\b'+re.escape(t)+r'\b', low): found.append(t)
+        return found
+    tokens=[]
+    risk=[]
+    text='\n'.join(added).lower()
+    for t in ['resource','cancellation','cancel','timeout','error','exception','concurrency','thread','async','cleanup','fallback','validation','retry','cache','state','mutation','global','security']:
+        if re.search(r'\b'+t+r'\b', text): tokens.append(t)
+    for t in ['todo','fixme','hack','placeholder','broad','global','sleep','unsafe','ignore','swallow']:
+        if t in text: risk.append(t)
+    changed_symbols=[]
+    for line in added+removed:
+        m=sym_re.match(line)
+        if m: changed_symbols.append(m.group(2))
+    fp=f"files={len(changed_files)} added={len(added)} removed={len(removed)} hash={(h or '')[:12]}"
+    summary=f"Patch changes {len(changed_files)} file(s), adds {len(added)} line(s), removes {len(removed)} line(s); normalized_patch_hash={(h or 'missing')[:16]}."
+    return CandidateImplementationSignature(candidate_id=candidate_id, changed_files=list(changed_files or []), normalized_patch_hash=h, patch_fingerprint=fp, added_imports=sorted({l.strip()[:200] for l in added if import_re.match(l)})[:20], removed_imports=sorted({l.strip()[:200] for l in removed if import_re.match(l)})[:20], changed_symbols=sorted(dict.fromkeys(changed_symbols))[:40], added_control_flow_terms=terms(added), removed_control_flow_terms=terms(removed), strategy_summary=summary, strategy_tokens=sorted(dict.fromkeys(tokens))[:30], risk_markers=sorted(dict.fromkeys(risk))[:20])
+
 def _summarize_changed_file(path:str, worktree:str|None)->ChangedFileEvidence:
     full=Path(worktree or '')/path
     text=read_text_utf8(full, default='') if full.exists() and full.is_file() else ''
@@ -947,15 +1022,58 @@ def build_candidate_evidence_packet(state, attempt:CandidateAttemptState)->Candi
     if dbg['commands']: claims.append(f"observed {len(dbg['commands'])} command(s) in runner/debug artifacts")
     risks=list(attempt.acceptance_blockers or [])
     if dbg['failed_commands']: risks.append('runner/debug artifacts include failed commands')
-    packet=CandidateEvidencePacket(candidate_id=attempt.attempt_id, attempt_id=attempt.attempt_id, patch_summary=(f"Changed {len(changed)} file(s): "+(', '.join(changed[:12]) if changed else 'none')), changed_files=changed, patch_diff_excerpt=_compact_text(diff, 6000) if diff else None, full_patch_path=attempt.patch_path, runner_status=attempt.runner_status or attempt.status, exit_code=attempt.exit_code, runner_summary=dbg['summary'], telemetry_summary=attempt.runner_telemetry or {}, debug_artifact_paths=dbg['debug_artifact_paths'], trace_artifact_paths=dbg['trace_artifact_paths'], commands_executed=dbg['commands'], commands_failed=dbg['failed_commands'], final_changed_file_summaries=[_summarize_changed_file(f, attempt.worktree_path) for f in changed[:8]], observed_behaviour_claims=claims, implementation_strategy=(f"Patch modifies {', '.join(changed[:8])}" if changed else None), potential_risks=sorted(dict.fromkeys(risks)), evidence_quality=q, evidence_limitations=limitations)
+    final_summaries=[_summarize_changed_file(f, attempt.worktree_path) for f in changed[:8]]
+    sig=build_candidate_implementation_signature(attempt.attempt_id, changed, diff, final_summaries)
+    packet=CandidateEvidencePacket(candidate_id=attempt.attempt_id, attempt_id=attempt.attempt_id, patch_summary=(f"Changed {len(changed)} file(s): "+(', '.join(changed[:12]) if changed else 'none')), changed_files=changed, patch_diff_excerpt=_compact_text(diff, 6000) if diff else None, full_patch_path=attempt.patch_path, implementation_signature=sig, runner_status=attempt.runner_status or attempt.status, exit_code=attempt.exit_code, runner_summary=dbg['summary'], telemetry_summary=attempt.runner_telemetry or {}, debug_artifact_paths=dbg['debug_artifact_paths'], trace_artifact_paths=dbg['trace_artifact_paths'], commands_executed=dbg['commands'], commands_failed=dbg['failed_commands'], final_changed_file_summaries=final_summaries, observed_behaviour_claims=claims, implementation_strategy=sig.strategy_summary, potential_risks=sorted(dict.fromkeys(risks+sig.risk_markers)), evidence_quality=q, evidence_limitations=limitations)
     d=Path(state.run_dir)/'candidates'/attempt.attempt_id; d.mkdir(parents=True, exist_ok=True); write_json_utf8(d/'evidence.json', packet.model_dump(mode='json'))
     return packet
 
 def build_candidate_review_prompt(state, packet:CandidateEvidencePacket)->str:
-    return _budget_prompt(['TASK\n'+state.task, 'SUCCESS CRITERIA\n'+(state.success_criteria or 'Complete the task with a minimal correct patch.'), 'INSTRUCTIONS\nDo not give a generic review. Use the candidate evidence packet. Cite specific evidence from the patch, commands, or debug artifacts. If evidence is missing, say what cannot be determined.', 'CANDIDATE EVIDENCE PACKET\n'+_compact_text(packet.model_dump(mode='json'), 14000)], max_chars=18000)
+    return _budget_prompt(['TASK\n'+state.task, 'SUCCESS CRITERIA\n'+(state.success_criteria or 'Complete the task with a minimal correct patch.'), 'INSTRUCTIONS\nDo not give a generic review. Use the candidate evidence packet. Cite specific evidence from patch, commands, telemetry, or debug artifacts. If evidence is missing, say what cannot be determined. Assume plausible code may still be wrong. Identify hidden-test risks and material behavioural risks.', 'CANDIDATE EVIDENCE PACKET\n'+_compact_text(packet.model_dump(mode='json'), 14000)], max_chars=18000)
 
 def build_pairwise_comparison_prompt(state, a:CandidateEvidencePacket, b:CandidateEvidencePacket, ra:CandidateRiskReview|None=None, rb:CandidateRiskReview|None=None)->str:
-    return _budget_prompt(['TASK\n'+state.task, 'SUCCESS CRITERIA\n'+(state.success_criteria or 'Complete the task with a minimal correct patch.'), 'COMPARE\nWhere do these candidates differ in actual implementation? Which better satisfies the success criteria? Which has stronger debug artifact evidence, more relevant checks, riskier untested edge cases, or broader unjustified changes?', 'CANDIDATE A EVIDENCE\n'+_compact_text(a.model_dump(mode='json'), 8000), 'CANDIDATE A REVIEW\n'+_compact_text(ra.model_dump(mode='json') if ra else {}, 3000), 'CANDIDATE B EVIDENCE\n'+_compact_text(b.model_dump(mode='json'), 8000), 'CANDIDATE B REVIEW\n'+_compact_text(rb.model_dump(mode='json') if rb else {}, 3000)], max_chars=22000)
+    return _budget_prompt(['TASK\n'+state.task, 'SUCCESS CRITERIA\n'+(state.success_criteria or 'Complete the task with a minimal correct patch.'), 'COMPARE\nDo not compare only changed file names. If both candidates changed the same file, inspect how their diffs differ. Compare actual implementation strategy and likely behaviour using evidence packets, implementation signatures, reviews, debug artifacts, commands, hidden-test risk, and scope/minimality.', 'CANDIDATE A EVIDENCE\n'+_compact_text(a.model_dump(mode='json'), 8000), 'CANDIDATE A REVIEW\n'+_compact_text(ra.model_dump(mode='json') if ra else {}, 3000), 'CANDIDATE B EVIDENCE\n'+_compact_text(b.model_dump(mode='json'), 8000), 'CANDIDATE B REVIEW\n'+_compact_text(rb.model_dump(mode='json') if rb else {}, 3000)], max_chars=22000)
+
+
+def _structured_tool_call(ctx, backend, schema_model, tool_name:str, prompt:str, system:str):
+    from .client import ToolCallingLLMClient
+    tool={'type':'function','function':{'name':tool_name,'description':'Return structured tournament evidence evaluation only.','parameters':schema_model.model_json_schema(),'strict':True}}
+    resp=ToolCallingLLMClient().create_message(backend=backend,messages=[{'role':'user','content':prompt}],system=system,tools=[tool],tool_choice={'type':'function','function':{'name':tool_name}},strict=True)
+    calls=[b for b in getattr(resp,'content',[]) if b.get('type')=='tool_use' and b.get('name')==tool_name]
+    if not calls: raise ValueError(f'{tool_name}_missing_tool_call')
+    return schema_model.model_validate(calls[0].get('input') or {})
+
+def _review_backend_from_ctx(ctx):
+    return getattr(ctx,'review_backend',None) or getattr(getattr(ctx,'reviewer',None),'review_backend',None) or getattr(ctx,'backend',None)
+
+def _model_candidate_risk_review(state, packet:CandidateEvidencePacket, ctx)->CandidateRiskReview|None:
+    backend=_review_backend_from_ctx(ctx)
+    if backend is None: return None
+    prompts=[('model_full', build_candidate_review_prompt(state, packet)), ('model_compact', _budget_prompt(['TASK\n'+state.task,'CANDIDATE EVIDENCE PACKET\n'+_compact_text(packet.model_dump(mode='json'),7000)],9000)), ('model_minimal', _budget_prompt(['TASK\n'+state.task,'MINIMAL EVIDENCE\n'+_compact_text({'candidate_id':packet.candidate_id,'summary':packet.patch_summary,'signature':packet.implementation_signature.model_dump(mode='json') if packet.implementation_signature else None,'commands':[c.model_dump(mode='json') for c in packet.commands_executed[:5]],'limitations':packet.evidence_limitations},4000)],5500))]
+    for quality,prompt in prompts:
+        try:
+            rv=_structured_tool_call(ctx, backend, CandidateRiskReview, 'candidate_risk_review', prompt, 'You are an evidence-grounded tournament reviewer. Use specific patch, command, telemetry, and debug evidence; identify hidden-test risks and missing evidence.')
+            rv.review_quality=quality; rv.candidate_id=packet.candidate_id; rv.changed_files=packet.changed_files
+            return rv
+        except Exception as e:
+            if getattr(ctx,'recorder',None): ctx.recorder.record('tournament_review_retry_or_fallback', payload={'candidate_id':packet.candidate_id,'error':str(e)[:500],'quality':quality})
+            continue
+    return None
+
+def _model_pairwise_comparison(state, a_packet:CandidateEvidencePacket, b_packet:CandidateEvidencePacket, a_review:CandidateRiskReview, b_review:CandidateRiskReview, ctx)->PairwiseCandidateComparison|None:
+    backend=_review_backend_from_ctx(ctx)
+    if backend is None: return None
+    base=build_pairwise_comparison_prompt(state,a_packet,b_packet,a_review,b_review)
+    prompts=[('model_full',base),('model_compact',_budget_prompt(['TASK\n'+state.task,'COMPARE actual diffs/signatures; do not compare only file names.','A\n'+_compact_text(a_packet.model_dump(mode='json'),5000),'A_REVIEW\n'+_compact_text(a_review.model_dump(mode='json'),2000),'B\n'+_compact_text(b_packet.model_dump(mode='json'),5000),'B_REVIEW\n'+_compact_text(b_review.model_dump(mode='json'),2000)],15000)),('model_minimal',_budget_prompt(['TASK\n'+state.task,'Compare implementation signatures and reviews.','A\n'+_compact_text({'evidence':a_packet.implementation_signature,'review':a_review},3000),'B\n'+_compact_text({'evidence':b_packet.implementation_signature,'review':b_review},3000)],8000))]
+    for quality,prompt in prompts:
+        try:
+            cmp=_structured_tool_call(ctx, backend, PairwiseCandidateComparison, 'pairwise_candidate_comparison', prompt, 'You compare tournament candidates using actual implementation differences, patch signatures, command evidence, and risk reviews. Never decide from changed file names alone.')
+            cmp.comparison_quality=quality; cmp.candidate_a=a_packet.candidate_id; cmp.candidate_b=b_packet.candidate_id
+            return cmp
+        except Exception as e:
+            if getattr(ctx,'recorder',None): ctx.recorder.record('tournament_pairwise_retry_or_fallback', payload={'candidate_a':a_packet.candidate_id,'candidate_b':b_packet.candidate_id,'error':str(e)[:500],'quality':quality})
+            continue
+    return None
 
 def _candidate_summary_from_attempt(a):
     patch='No patch captured.' if not a.patch_path else 'Patch captured for files: '+(', '.join(a.changed_files or []) or 'none')
@@ -978,13 +1096,49 @@ def _risk_review_from_summary(summary:CandidateSummary, evidence:CandidateEviden
 
 def _compare_pair(a:CandidateRiskReview,b:CandidateRiskReview, ae:CandidateEvidencePacket|None=None, be:CandidateEvidencePacket|None=None)->PairwiseCandidateComparison:
     qa=0 if not ae else {'high':3,'medium':2,'low':1,'missing':0}.get(ae.evidence_quality,0); qb=0 if not be else {'high':3,'medium':2,'low':1,'missing':0}.get(be.evidence_quality,0)
-    va=(a.correctness_score, qa, -a.hidden_test_risk_score, a.minimality_score); vb=(b.correctness_score, qb, -b.hidden_test_risk_score, b.minimality_score)
-    if a.review_quality=='deterministic_fallback' and b.review_quality=='deterministic_fallback' and qa==qb and a.correctness_score==b.correctness_score: w='tie'
+    sa=ae.implementation_signature if ae else None; sb=be.implementation_signature if be else None
+    material=[]
+    if sa and sb:
+        if sa.normalized_patch_hash!=sb.normalized_patch_hash:
+            material.append(f"same changed files but different normalized patch hash: {str(sa.normalized_patch_hash)[:12]} vs {str(sb.normalized_patch_hash)[:12]}" if set(sa.changed_files)==set(sb.changed_files) else f"different normalized patch hash: {str(sa.normalized_patch_hash)[:12]} vs {str(sb.normalized_patch_hash)[:12]}")
+        else: material.append(f"same normalized patch hash: {str(sa.normalized_patch_hash)[:12]}")
+        if set(sa.strategy_tokens)!=set(sb.strategy_tokens): material.append(f"candidate_a strategy tokens: {sa.strategy_tokens}; candidate_b strategy tokens: {sb.strategy_tokens}")
+        if set(sa.added_control_flow_terms)!=set(sb.added_control_flow_terms): material.append(f"control-flow/resource terms differ: A={sa.added_control_flow_terms}; B={sb.added_control_flow_terms}")
+        if sa.patch_fingerprint!=sb.patch_fingerprint: material.append(f"patch size/fingerprint differs: A={sa.patch_fingerprint}; B={sb.patch_fingerprint}")
+        if set(sa.risk_markers)!=set(sb.risk_markers): material.append(f"risk markers differ: A={sa.risk_markers}; B={sb.risk_markers}")
+    if not material:
+        material=sorted(set(a.changed_files)^set(b.changed_files)) or ['no signature-level difference available; fallback evidence is non-discriminative']
+    rq={'model_full':3,'model_compact':2,'model_minimal':1,'deterministic_fallback':0}
+    va=(a.correctness_score, -a.hidden_test_risk_score, rq.get(a.review_quality,0), qa, a.minimality_score)
+    vb=(b.correctness_score, -b.hidden_test_risk_score, rq.get(b.review_quality,0), qb, b.minimality_score)
+    # if both deterministic and signatures are identical, tie; otherwise let signature-aware scores discriminate.
+    if sa and sb and sa.normalized_patch_hash==sb.normalized_patch_hash and a.review_quality=='deterministic_fallback' and b.review_quality=='deterministic_fallback' and va==vb: w='tie'
     elif va>vb: w='candidate_a'
     elif vb>va: w='candidate_b'
     else: w='tie'
-    material=sorted(set(a.changed_files)^set(b.changed_files)) or ['no changed-file difference recorded']
-    return PairwiseCandidateComparison(candidate_a=a.candidate_id,candidate_b=b.candidate_id,material_differences=material,a_evidence_advantages=([f'evidence quality {ae.evidence_quality}'] if ae and qa>qb else []),b_evidence_advantages=([f'evidence quality {be.evidence_quality}'] if be and qb>qa else []),a_likely_failures=a.likely_hidden_failures,b_likely_failures=b.likely_hidden_failures,winner=w,confidence=0.5 if a.review_quality=='deterministic_fallback' or b.review_quality=='deterministic_fallback' else 0.7,comparison_quality='deterministic_fallback',rationale='Deterministic fallback comparison inspected changed files, evidence quality, command/debug evidence summaries, hidden-test risks, and minimality; confidence is capped at 0.5.')
+    return PairwiseCandidateComparison(candidate_a=a.candidate_id,candidate_b=b.candidate_id,material_differences=material,a_evidence_advantages=([f'evidence quality {ae.evidence_quality}'] if ae and qa>qb else []),b_evidence_advantages=([f'evidence quality {be.evidence_quality}'] if be and qb>qa else []),a_likely_failures=a.likely_hidden_failures,b_likely_failures=b.likely_hidden_failures,winner=w,confidence=0.5,comparison_quality='deterministic_fallback',rationale='Deterministic fallback comparison inspected normalized patch hashes, implementation strategy tokens, control-flow/resource terms, risk markers, command/debug evidence, hidden-test risks, evidence quality, and minimality. Confidence is capped at 0.5.')
+
+
+def build_candidate_agreement_summary(packets:dict[str,CandidateEvidencePacket])->CandidateAgreementSummary:
+    material={k:v for k,v in packets.items() if v and v.implementation_signature and v.implementation_signature.normalized_patch_hash}
+    if not material:
+        return CandidateAgreementSummary(consensus_type='none', agreeing_candidates=[], material_differences=[], consensus_strength=0.0, rationale='No normalized patch hash/signature evidence available; changed files alone are not agreement proof.')
+    hashes={k:v.implementation_signature.normalized_patch_hash for k,v in material.items()}
+    groups={}
+    for cid,h in hashes.items(): groups.setdefault(h,[]).append(cid)
+    if len(groups)==1 and len(material)==len(packets):
+        return CandidateAgreementSummary(consensus_type='same_patch', agreeing_candidates=sorted(material), material_differences=[], consensus_strength=1.0, rationale='All materializable candidates share the same normalized_patch_hash; agreement is based on patch signature, not only changed files.')
+    token_sets=[set(v.implementation_signature.strategy_tokens) for v in material.values()]
+    inter=set.intersection(*token_sets) if token_sets else set(); union=set.union(*token_sets) if token_sets else set()
+    sim=(len(inter)/len(union)) if union else 0.0
+    diffs=[f"{cid}: hash={str(sig)[:12]} tokens={packets[cid].implementation_signature.strategy_tokens}" for cid,sig in hashes.items()]
+    if sim>=0.7 and len(groups)>1:
+        ctype='same_strategy'; strength=0.65
+    elif len(groups)>1:
+        ctype='mixed'; strength=0.35
+    else:
+        ctype='none'; strength=0.0
+    return CandidateAgreementSummary(consensus_type=ctype, agreeing_candidates=[], material_differences=diffs, consensus_strength=strength, rationale='Agreement evaluated from normalized_patch_hash and implementation signature strategy tokens; same changed files are not treated as same patch.')
 
 def _rank_tournament(state):
     reviews=list(state.candidate_risk_reviews.values()); wins={r.candidate_id:0 for r in reviews}; losses={r.candidate_id:0 for r in reviews}
@@ -999,8 +1153,8 @@ def _rank_tournament(state):
     def key(r):
         summ=state.candidate_summaries.get(r.candidate_id)
         val=1 if summ and summ.validation_status=='passed' else 0
-        review_quality=0 if r.review_quality=='deterministic_fallback' else 1
-        return (val,eq(r.candidate_id),wins[r.candidate_id],-r.hidden_test_risk_score,review_quality,r.correctness_score,r.minimality_score)
+        review_quality={'model_full':3,'model_compact':2,'model_minimal':1,'deterministic_fallback':0}.get(r.review_quality,0)
+        return (val,wins[r.candidate_id],-losses[r.candidate_id],review_quality,-r.hidden_test_risk_score,r.correctness_score,eq(r.candidate_id),r.minimality_score,-(state.candidates[[c.attempt_id for c in state.candidates].index(r.candidate_id)].cost if r.candidate_id in [c.attempt_id for c in state.candidates] and state.candidates[[c.attempt_id for c in state.candidates].index(r.candidate_id)].cost else 0.0))
     ordered=sorted(reviews,key=key,reverse=True)
     ranked=[]
     for i,r in enumerate(ordered):
@@ -1016,7 +1170,7 @@ def _rank_tournament(state):
     if all_fallback: risks.append('review/comparison unavailable or deterministic fallback only')
     if all_ties: risks.append('all pairwise comparisons tied; ranking confidence is low')
     if selected and eq(selected)<=1: risks.append('selected candidate evidence quality is low or missing')
-    return TournamentRanking(ranked_candidates=ranked,selected_candidate_id=selected,selection_confidence=conf if selected else 0.0,unresolved_risks=sorted(dict.fromkeys(risks)),rationale='Ranking priority: validation, candidate evidence quality, pairwise wins, hidden-test risk, adversarial review quality, minimality/scope, then generic scores; deterministic fallback and low evidence quality reduce confidence.')
+    return TournamentRanking(ranked_candidates=ranked,selected_candidate_id=selected,selection_confidence=conf if selected else 0.0,unresolved_risks=sorted(dict.fromkeys(risks)),rationale='Ranking priority: authoritative validation, model-based pairwise wins, lower pairwise losses, review quality, hidden-test risk, correctness, evidence quality, minimality/scope, candidate agreement, then cost/tokens only as tiebreaker; deterministic fallback and low evidence quality reduce confidence.')
 
 
 
@@ -1140,12 +1294,19 @@ def h_launch_tournament_candidates(state, inp, ctx):
     state.tournament_candidates_launched=len(made); state.candidate_attempts_launched=len(made); state.tournament_candidates_completed=sum(1 for c in state.candidates if c.status in {'completed','failed','reviewed','rejected','accepted'})
     for c in state.candidates:
         packet=build_candidate_evidence_packet(state,c); state.candidate_evidence_packets[c.attempt_id]=packet
-        s=_candidate_summary_from_attempt(c); state.candidate_summaries[c.attempt_id]=s; state.candidate_risk_reviews[c.attempt_id]=_risk_review_from_summary(s, packet)
+        s=_candidate_summary_from_attempt(c); state.candidate_summaries[c.attempt_id]=s
+        review=_model_candidate_risk_review(state, packet, ctx)
+        if review is None: review=_risk_review_from_summary(s, packet)
+        state.candidate_risk_reviews[c.attempt_id]=review
     revs=list(state.candidate_risk_reviews.values())
-    state.pairwise_comparisons=[_compare_pair(revs[i],revs[j], state.candidate_evidence_packets.get(revs[i].candidate_id), state.candidate_evidence_packets.get(revs[j].candidate_id)) for i in range(len(revs)) for j in range(i+1,len(revs))]
-    filesets={k:tuple(v.changed_files) for k,v in state.candidate_summaries.items()}
-    same=len(set(filesets.values()))==1 if filesets else False
-    state.candidate_agreement_summary=CandidateAgreementSummary(consensus_type='same_patch' if same and filesets else ('none' if not filesets else 'mixed'), agreeing_candidates=list(filesets) if same else [], material_differences=sorted({f for fs in filesets.values() for f in fs}), consensus_strength=1.0 if same and filesets else 0.3, rationale='Agreement is supporting evidence only, not proof.')
+    comparisons=[]
+    for i in range(len(revs)):
+        for j in range(i+1,len(revs)):
+            ae=state.candidate_evidence_packets.get(revs[i].candidate_id); be=state.candidate_evidence_packets.get(revs[j].candidate_id)
+            cmp=_model_pairwise_comparison(state, ae, be, revs[i], revs[j], ctx) if ae and be else None
+            comparisons.append(cmp or _compare_pair(revs[i],revs[j], ae, be))
+    state.pairwise_comparisons=comparisons
+    state.candidate_agreement_summary=build_candidate_agreement_summary(state.candidate_evidence_packets)
     state.tournament_ranking=_rank_tournament(state); commit_tournament_selection(state, ctx); _write_tournament_artifacts(state); state.phase='finalizing' if state.selection else 'selecting'
     return {'launched':made,'max_parallel':maxp,'candidate_summaries':{k:v.model_dump(mode='json') for k,v in state.candidate_summaries.items()},'tournament_ranking':state.tournament_ranking.model_dump(mode='json'),'next_allowed_actions':state.allowed_next_actions()}
 

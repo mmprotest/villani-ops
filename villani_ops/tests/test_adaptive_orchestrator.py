@@ -174,3 +174,77 @@ def test_no_materializable_tournament_candidates_fails_clearly(tmp_path):
     s.tournament_ranking=_ranking('candidate_001')
     assert commit_tournament_selection(s, ctx(tmp_path)) is False
     assert 'no_materializable_tournament_candidate' in s.blockers
+
+
+def test_signature_distinguishes_same_file_different_diff(tmp_path):
+    from villani_ops.agentic.tools import build_candidate_implementation_signature
+    d1='diff --git a/run.py b/run.py\n@@\n+if ready:\n+    return cleanup()\n'
+    d2='diff --git a/run.py b/run.py\n@@\n+while ready:\n+    retry()\n'
+    s1=build_candidate_implementation_signature('candidate_001',['run.py'],d1)
+    s2=build_candidate_implementation_signature('candidate_002',['run.py'],d2)
+    assert s1.normalized_patch_hash != s2.normalized_patch_hash
+    assert s1.changed_files == s2.changed_files == ['run.py']
+
+
+def test_agreement_same_file_different_diff_not_same_patch(tmp_path):
+    from villani_ops.agentic.tools import build_candidate_evidence_packet, build_candidate_agreement_summary
+    s=state(tmp_path); s.execution_path='candidate_tournament'
+    a1=_material_candidate(tmp_path,s,'candidate_001','run.py')
+    a2=_material_candidate(tmp_path,s,'candidate_002','run.py')
+    import pathlib
+    pathlib.Path(a2.patch_path).write_text('diff --git a/run.py b/run.py\n--- a/run.py\n+++ b/run.py\n@@\n+while ready:\n+    retry()\n')
+    p1=build_candidate_evidence_packet(s,a1); p2=build_candidate_evidence_packet(s,a2)
+    ag=build_candidate_agreement_summary({'candidate_001':p1,'candidate_002':p2})
+    assert ag.consensus_type != 'same_patch'
+    assert 'normalized_patch_hash' in ag.rationale
+
+
+def test_agreement_same_normalized_diff_is_same_patch(tmp_path):
+    from villani_ops.agentic.tools import build_candidate_evidence_packet, build_candidate_agreement_summary
+    s=state(tmp_path); s.execution_path='candidate_tournament'
+    a1=_material_candidate(tmp_path,s,'candidate_001','run.py')
+    a2=_material_candidate(tmp_path,s,'candidate_002','run.py')
+    p1=build_candidate_evidence_packet(s,a1); p2=build_candidate_evidence_packet(s,a2)
+    ag=build_candidate_agreement_summary({'candidate_001':p1,'candidate_002':p2})
+    assert ag.consensus_type == 'same_patch'
+
+
+def test_command_evidence_from_nested_debug_jsonl(tmp_path):
+    from villani_ops.agentic.tools import _extract_command_evidence_from_artifacts
+    from villani_ops.agentic.state import CandidateAttemptState
+    adir=tmp_path/'artifacts'; adir.mkdir()
+    (adir/'events.jsonl').write_text('{"tool":"shell","input":{"command":"make test"},"exit_code":0,"stdout":"ok"}\n{"tool_call":{"name":"run_command","arguments":{"cmd":"lint"}},"returncode":1,"stderr":"bad"}\n')
+    a=CandidateAttemptState(attempt_id='c',status='completed',scope='candidate',artifacts_dir=str(adir))
+    cmds=_extract_command_evidence_from_artifacts(a)
+    assert {c.command for c in cmds} >= {'make test','lint'}
+    assert all(c.artifact_path for c in cmds)
+
+
+def test_fallback_pairwise_uses_signature_not_only_changed_files(tmp_path):
+    from villani_ops.agentic.tools import build_candidate_evidence_packet, _risk_review_from_summary, _candidate_summary_from_attempt, _compare_pair
+    s=state(tmp_path)
+    a1=_material_candidate(tmp_path,s,'candidate_001','run.py')
+    a2=_material_candidate(tmp_path,s,'candidate_002','run.py')
+    import pathlib
+    pathlib.Path(a2.patch_path).write_text('diff --git a/run.py b/run.py\n--- a/run.py\n+++ b/run.py\n@@\n+while ready:\n+    retry()\n')
+    p1=build_candidate_evidence_packet(s,a1); p2=build_candidate_evidence_packet(s,a2)
+    r1=_risk_review_from_summary(_candidate_summary_from_attempt(a1),p1); r2=_risk_review_from_summary(_candidate_summary_from_attempt(a2),p2)
+    cmp=_compare_pair(r1,r2,p1,p2)
+    assert cmp.comparison_quality == 'deterministic_fallback'
+    assert cmp.confidence <= 0.5
+    assert any('normalized patch hash' in x for x in cmp.material_differences)
+    assert 'no changed-file difference recorded' not in cmp.material_differences
+
+
+def test_all_fallback_all_tie_best_effort_low_confidence(tmp_path):
+    from villani_ops.agentic.tools import _rank_tournament
+    from villani_ops.agentic.state import CandidateRiskReview, PairwiseCandidateComparison
+    s=state(tmp_path); s.execution_path='candidate_tournament'
+    def rv(cid):
+        return CandidateRiskReview(candidate_id=cid,summary='s',changed_files=['a.py'],likely_correct=True,confidence=.4,implementation_strategy='x',minimality_score=.5,correctness_score=.5,hidden_test_risk_score=.5,recommendation='uncertain',rationale='fallback')
+    s.candidate_risk_reviews={'candidate_001':rv('candidate_001'),'candidate_002':rv('candidate_002')}
+    s.pairwise_comparisons=[PairwiseCandidateComparison(candidate_a='candidate_001',candidate_b='candidate_002',winner='tie',confidence=.5,rationale='tie')]
+    rank=_rank_tournament(s)
+    assert s.selection_basis == 'best_effort_tournament_selection'
+    assert rank.selection_confidence <= .35
+    assert any('review/comparison unavailable' in r for r in rank.unresolved_risks)
