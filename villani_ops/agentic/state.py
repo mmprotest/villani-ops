@@ -79,6 +79,21 @@ class ChangedFileEvidence(BaseModel):
     key_symbols_or_functions:list[str]=Field(default_factory=list)
     risky_sections:list[str]=Field(default_factory=list)
 
+class CandidateImplementationSignature(BaseModel):
+    model_config=ConfigDict(extra='forbid')
+    candidate_id:str
+    changed_files:list[str]=Field(default_factory=list)
+    normalized_patch_hash:str|None=None
+    patch_fingerprint:str|None=None
+    added_imports:list[str]=Field(default_factory=list)
+    removed_imports:list[str]=Field(default_factory=list)
+    changed_symbols:list[str]=Field(default_factory=list)
+    added_control_flow_terms:list[str]=Field(default_factory=list)
+    removed_control_flow_terms:list[str]=Field(default_factory=list)
+    strategy_summary:str
+    strategy_tokens:list[str]=Field(default_factory=list)
+    risk_markers:list[str]=Field(default_factory=list)
+
 class CandidateEvidencePacket(BaseModel):
     model_config=ConfigDict(extra='forbid')
     candidate_id:str
@@ -87,6 +102,7 @@ class CandidateEvidencePacket(BaseModel):
     changed_files:list[str]=Field(default_factory=list)
     patch_diff_excerpt:str|None=None
     full_patch_path:str|None=None
+    implementation_signature:CandidateImplementationSignature|None=None
     runner_status:str
     exit_code:int|None=None
     runner_summary:str|None=None
