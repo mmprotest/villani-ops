@@ -64,20 +64,69 @@ class CandidateSummary(BaseModel):
     material_behaviour_claims:list[str]=Field(default_factory=list)
     obvious_risks:list[str]=Field(default_factory=list)
 
+class CommandEvidence(BaseModel):
+    model_config=ConfigDict(extra='forbid')
+    command:str
+    exit_code:int|None=None
+    purpose:str|None=None
+    output_excerpt:str|None=None
+    artifact_path:str|None=None
+
+class ChangedFileEvidence(BaseModel):
+    model_config=ConfigDict(extra='forbid')
+    path:str
+    summary:str
+    key_symbols_or_functions:list[str]=Field(default_factory=list)
+    risky_sections:list[str]=Field(default_factory=list)
+
+class CandidateEvidencePacket(BaseModel):
+    model_config=ConfigDict(extra='forbid')
+    candidate_id:str
+    attempt_id:str|None=None
+    patch_summary:str
+    changed_files:list[str]=Field(default_factory=list)
+    patch_diff_excerpt:str|None=None
+    full_patch_path:str|None=None
+    runner_status:str
+    exit_code:int|None=None
+    runner_summary:str|None=None
+    telemetry_summary:dict=Field(default_factory=dict)
+    debug_artifact_paths:list[str]=Field(default_factory=list)
+    trace_artifact_paths:list[str]=Field(default_factory=list)
+    commands_executed:list[CommandEvidence]=Field(default_factory=list)
+    commands_failed:list[CommandEvidence]=Field(default_factory=list)
+    final_changed_file_summaries:list[ChangedFileEvidence]=Field(default_factory=list)
+    observed_behaviour_claims:list[str]=Field(default_factory=list)
+    implementation_strategy:str|None=None
+    potential_risks:list[str]=Field(default_factory=list)
+    evidence_quality:Literal['high','medium','low','missing']
+    evidence_limitations:list[str]=Field(default_factory=list)
+
 class CandidateRiskReview(BaseModel):
     model_config=ConfigDict(extra='forbid')
     candidate_id:str; summary:str; changed_files:list[str]=Field(default_factory=list)
     likely_correct:bool; confidence:float
+    implementation_strategy:str=''
+    evidence_used:list[str]=Field(default_factory=list)
+    evidence_gaps:list[str]=Field(default_factory=list)
     strengths:list[str]=Field(default_factory=list); risks:list[str]=Field(default_factory=list); likely_hidden_failures:list[str]=Field(default_factory=list); edge_cases_considered:list[str]=Field(default_factory=list); edge_cases_missed:list[str]=Field(default_factory=list)
+    debug_artifact_findings:list[str]=Field(default_factory=list)
+    command_findings:list[str]=Field(default_factory=list)
+    patch_findings:list[str]=Field(default_factory=list)
     minimality_score:float; correctness_score:float; hidden_test_risk_score:float
+    review_quality:Literal['model_full','model_compact','model_minimal','deterministic_fallback']='deterministic_fallback'
     recommendation:Literal['strong_accept','accept','weak_accept','reject','uncertain']
     rationale:str
 
 class PairwiseCandidateComparison(BaseModel):
     model_config=ConfigDict(extra='forbid')
     candidate_a:str; candidate_b:str
-    material_differences:list[str]=Field(default_factory=list); a_likely_failures:list[str]=Field(default_factory=list); b_likely_failures:list[str]=Field(default_factory=list)
-    winner:Literal['candidate_a','candidate_b','tie','neither']; confidence:float; rationale:str
+    material_differences:list[str]=Field(default_factory=list)
+    a_evidence_advantages:list[str]=Field(default_factory=list); b_evidence_advantages:list[str]=Field(default_factory=list)
+    a_likely_failures:list[str]=Field(default_factory=list); b_likely_failures:list[str]=Field(default_factory=list)
+    winner:Literal['candidate_a','candidate_b','tie','neither']; confidence:float
+    comparison_quality:Literal['model_full','model_compact','model_minimal','deterministic_fallback']='deterministic_fallback'
+    rationale:str
 
 class RankedCandidate(BaseModel):
     model_config=ConfigDict(extra='forbid')
@@ -148,7 +197,7 @@ class OpsRunState(BaseModel):
     execution_path:Literal['unknown','single_task','parallel_candidates','decomposed_subtasks','candidate_tournament']='unknown'
     candidate_execution_mode:Literal['unknown','sequential','parallel']='unknown'; attempts_requested:int|None=None; attempts_started:int=0; stopped_early:bool=False; stop_reason:str|None=None
     tournament_candidates_launched:int=0; tournament_candidates_completed:int=0; tournament_parallelism_used:int=0
-    candidate_summaries:dict[str,CandidateSummary]=Field(default_factory=dict); candidate_risk_reviews:dict[str,CandidateRiskReview]=Field(default_factory=dict)
+    candidate_summaries:dict[str,CandidateSummary]=Field(default_factory=dict); candidate_evidence_packets:dict[str,CandidateEvidencePacket]=Field(default_factory=dict); candidate_risk_reviews:dict[str,CandidateRiskReview]=Field(default_factory=dict)
     pairwise_comparisons:list[PairwiseCandidateComparison]=Field(default_factory=list); tournament_ranking:TournamentRanking|None=None; candidate_agreement_summary:CandidateAgreementSummary|None=None
     selection_basis:Literal['validated_acceptance','evidence_based_tournament_selection','best_effort_tournament_selection','failed','inconclusive']|None=None
     candidate_attempts_requested:int|None=None; candidate_attempts_launched:int=0; candidate_launch_limit_reason:str|None=None
