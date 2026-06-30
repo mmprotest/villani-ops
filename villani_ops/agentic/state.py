@@ -297,7 +297,7 @@ class OpsRunState(BaseModel):
     pairwise_comparisons:list[PairwiseCandidateComparison]=Field(default_factory=list); tournament_ranking:TournamentRanking|None=None; candidate_agreement_summary:CandidateAgreementSummary|None=None
     selection_basis:Literal['validated_acceptance','evidence_based_tournament_selection','best_effort_tournament_selection','failed','inconclusive']|None=None
     candidate_attempts_requested:int|None=None; candidate_attempts_launched:int=0; candidate_launch_limit_reason:str|None=None
-    reserve_finalization_seconds:int=30; reserve_review_seconds:int=60; per_candidate_review_timeout_seconds:int=30; per_pairwise_comparison_timeout_seconds:int=30; tournament_evaluation_deadline_seconds:int=120; max_review_retries:int=2; max_malformed_review_retries:int=2; max_pairwise_retries:int=2; candidate_generation_deadline:float|None=None
+    reserve_finalization_seconds:int=90; reserve_pairwise_seconds:int=180; reserve_ranking_seconds:int=30; reserve_review_seconds:int=60; max_candidate_review_seconds:int=240; per_candidate_review_timeout_seconds:int=30; per_pairwise_comparison_timeout_seconds:int=30; tournament_evaluation_deadline_seconds:int=120; max_review_retries:int=2; max_malformed_review_retries:int=2; max_pairwise_retries:int=2; candidate_generation_deadline:float|None=None
     decomposition_requested:bool=False; decomposition_validated:bool=False; decomposition_accepted:bool|None=None; decomposition_executed:bool=False
     decomposition_fallback_used:bool=False; decomposition_fallback_reason:str|None=None
     decomposed_execution_status:Literal['not_started','running','completed','blocked','failed']='not_started'
