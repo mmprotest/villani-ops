@@ -22,11 +22,16 @@ def normalize_score(value: object, *, default: float = 0.5) -> float:
         return score / 10.0
     return 1.0
 
+UNVERIFIED_EVIDENCE_TERMS = ("no test", "not tested", "untested", "not exercised", "not verified", "not validated", "no evidence", "cannot determine", "unclear whether", "not proven", "assumes", "relies on", "may not", "could fail", "uncovered", "missing evidence", "not demonstrated", "not confirmed")
+CRITICAL_BEHAVIOUR_TERMS = ("cleanup", "recovery", "rollback", "failure path", "error path", "exception path", "cancellation", "interruption", "resource lifecycle", "resource release", "finalization", "commit", "atomicity", "ordering", "concurrency", "race", "idempotency", "deduplication", "retry", "timeout", "partial failure", "consistency", "state transition", "invariant", "edge case", "boundary", "overflow", "underflow", "parsing ambiguity", "data loss", "security", "authorization", "authentication", "validation", "serialization", "deserialization", "transaction", "side effect")
+
+def _has_authoritative_validation_text(items: list[str]) -> bool:
+    text = " ".join(str(x).lower() for x in items)
+    return "authoritative validation passed" in text or "validation status: passed" in text
+
 def _mentions_unproven_critical_behaviour(items: list[str]) -> bool:
     text = " ".join(str(x).lower() for x in items)
-    critical = any(t in text for t in ("critical", "required", "must", "essential"))
-    unproven = any(t in text for t in ("unproven", "not proven", "not demonstrated", "uncertain", "missing evidence", "assumed", "not guaranteed"))
-    return critical and unproven
+    return any(t in text for t in UNVERIFIED_EVIDENCE_TERMS) and any(t in text for t in CRITICAL_BEHAVIOUR_TERMS)
 
 class CandidateAttemptState(BaseModel):
     model_config=ConfigDict(extra='forbid')
@@ -155,6 +160,9 @@ class CandidateRiskReview(BaseModel):
     patch_findings:list[str]=Field(default_factory=list)
     minimality_score:float; correctness_score:float; hidden_test_risk_score:float
     review_quality:Literal['model_full','model_compact','model_minimal','deterministic_fallback']='deterministic_fallback'
+    critical_evidence_gaps:list[str]=Field(default_factory=list)
+    risk_penalty_applied:bool=False
+    original_scores:dict=Field(default_factory=dict)
     recommendation:Literal['strong_accept','accept','weak_accept','reject','uncertain']
     rationale:str
 
@@ -164,13 +172,28 @@ class CandidateRiskReview(BaseModel):
         return normalize_score(value)
 
     @model_validator(mode='after')
-    def _cap_unproven_critical_behaviour(self):
-        if _mentions_unproven_critical_behaviour(list(self.evidence_gaps or []) + list(self.risks or []) + list(self.likely_hidden_failures or [])):
-            self.correctness_score = min(normalize_score(self.correctness_score), 0.65)
-            self.hidden_test_risk_score = max(normalize_score(self.hidden_test_risk_score), 0.65)
-            if self.recommendation in {'strong_accept','accept','weak_accept'}:
-                self.recommendation = 'uncertain'
+    def _normalize_after_validation(self):
+        self.confidence = normalize_score(self.confidence)
+        self.minimality_score = normalize_score(self.minimality_score)
+        self.correctness_score = normalize_score(self.correctness_score)
+        self.hidden_test_risk_score = normalize_score(self.hidden_test_risk_score)
         return self
+
+class PairwiseComparisonDraft(BaseModel):
+    model_config=ConfigDict(extra='ignore')
+    candidate_a:str='candidate_a'
+    candidate_b:str='candidate_b'
+    material_differences:list[str]=Field(default_factory=list)
+    a_likely_failures:list[str]=Field(default_factory=list)
+    b_likely_failures:list[str]=Field(default_factory=list)
+    winner:Literal['candidate_a','candidate_b','tie','neither']='tie'
+    confidence:float=0.5
+    rationale:str='Compact pairwise comparison draft.'
+
+    @field_validator('confidence', mode='before')
+    @classmethod
+    def _normalize_confidence(cls, value):
+        return normalize_score(value)
 
 class PairwiseCandidateComparison(BaseModel):
     model_config=ConfigDict(extra='forbid')
@@ -180,6 +203,9 @@ class PairwiseCandidateComparison(BaseModel):
     a_likely_failures:list[str]=Field(default_factory=list); b_likely_failures:list[str]=Field(default_factory=list)
     winner:Literal['candidate_a','candidate_b','tie','neither']; confidence:float
     comparison_quality:Literal['model_full','model_compact','model_minimal','deterministic_fallback']='deterministic_fallback'
+    model_attempts:list[dict]=Field(default_factory=list)
+    fallback_reason:str|None=None
+    parse_repair_applied:bool=False
     rationale:str
 
     @field_validator('confidence', mode='before')
