@@ -72,6 +72,12 @@ def test_adaptive_tournament_launches_parallel_and_writes_ranking(tmp_path):
     assert s.tournament_parallelism_used == 2
     assert len({a.worktree_path for a in s.candidates}) == 3
     assert s.candidate_summaries
+    assert s.candidate_evidence_packets
+    assert not s.candidate_risk_reviews
+    assert s.tournament_phase == 'candidates_complete'
+    assert (tmp_path/'run'/'candidates'/'candidate_001'/'evidence.json').exists()
+    ev=execute_tool_with_policy(s,'ops_evaluate_tournament',{'reason':'evaluate saved candidates'},'eval',c)
+    assert not ev.is_error, ev.content
     assert s.candidate_risk_reviews
     assert s.pairwise_comparisons
     assert s.tournament_ranking and s.tournament_ranking.selected_candidate_id
@@ -96,6 +102,45 @@ def _ranking(selected, ranked=None):
         ranked_candidates=[RankedCandidate(candidate_id=aid,rank=i+1,correctness_score=0.7,hidden_test_risk_score=0.2,pairwise_wins=0,pairwise_losses=0,validation_status='not_run',materiality_notes='patch') for i, aid in enumerate(ranked)],
         selected_candidate_id=selected,selection_confidence=0.8,unresolved_risks=['risk'],rationale='ranked evidence')
 
+
+
+def test_hydrate_tournament_state_from_artifacts_restores_evidence_ranking_selection(tmp_path):
+    from villani_ops.agentic.tools import build_candidate_evidence_packet, hydrate_tournament_state_from_artifacts, commit_tournament_selection, _write_tournament_artifacts
+    s=state(tmp_path); s.execution_path='candidate_tournament'; s.phase='running_candidates'
+    a=_material_candidate(tmp_path, s, 'candidate_001')
+    s.candidate_evidence_packets[a.attempt_id]=build_candidate_evidence_packet(s,a)
+    s.tournament_ranking=_ranking('candidate_001')
+    assert commit_tournament_selection(s, ctx(tmp_path)) is True
+    _write_tournament_artifacts(s)
+    fresh=state(tmp_path); fresh.execution_path='candidate_tournament'; fresh.phase='running_candidates'
+    assert hydrate_tournament_state_from_artifacts(fresh) is True
+    assert fresh.candidate_evidence_packets['candidate_001']
+    assert fresh.tournament_ranking.selected_candidate_id=='candidate_001'
+    assert fresh.selection['selected_attempt_id']=='candidate_001'
+
+
+def test_low_time_evaluation_uses_fallback_reviews_and_best_effort_selection(tmp_path):
+    s=state(tmp_path); c=ctx(tmp_path); s.investigation={'summary':'i'}; s.plan={'strategy':'parallel_candidates'}; s.execution_path='candidate_tournament'; s.tournament_evaluation_deadline_seconds=1; s.reserve_finalization_seconds=60
+    a=_material_candidate(tmp_path, s, 'candidate_001')
+    from villani_ops.agentic.tools import _record_completed_tournament_candidate
+    _record_completed_tournament_candidate(s,a,c)
+    res=execute_tool_with_policy(s,'ops_evaluate_tournament',{'reason':'low time'},'eval',c)
+    assert not res.is_error, res.content
+    assert s.candidate_risk_reviews['candidate_001'].review_quality=='deterministic_fallback'
+    assert s.selection['selected_attempt_id']=='candidate_001'
+    assert s.selection['selection_basis']=='best_effort_tournament_selection'
+
+
+def test_tolerant_structured_parsing_repairs_extra_and_missing_fields():
+    from villani_ops.agentic.tools import _coerce_structured_payload
+    from villani_ops.agentic.state import CandidateRiskReview, PairwiseCandidateComparison
+    review=_coerce_structured_payload(CandidateRiskReview, {'candidate_id':'candidate_001','summary':'ok','extra':'ignored'}, quality='model_minimal', changed_files=['a.py'])
+    assert review.candidate_id=='candidate_001'
+    assert review.confidence <= 0.55
+    assert 'model output repaired or missing fields' in review.evidence_gaps
+    cmp=_coerce_structured_payload(PairwiseCandidateComparison, {'winner':'candidate_a','extra':'ignored'}, quality='model_minimal', candidate_id=('a','b'))
+    assert cmp.candidate_a=='a' and cmp.candidate_b=='b'
+    assert cmp.confidence <= 0.55
 
 def test_tournament_ranking_commits_selection_immediately_and_idempotently(tmp_path):
     from villani_ops.agentic.tools import commit_tournament_selection
