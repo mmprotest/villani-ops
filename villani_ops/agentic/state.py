@@ -1,8 +1,32 @@
 from __future__ import annotations
 from pathlib import Path
 from typing import Literal
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, field_validator, model_validator
 from .artifacts import read_text_utf8, write_text_utf8
+
+
+def normalize_score(value: object, *, default: float = 0.5) -> float:
+    try:
+        if value is None:
+            return float(default)
+        score = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    if score != score or score in (float("inf"), float("-inf")):
+        return float(default)
+    if score < 0:
+        return 0.0
+    if score <= 1:
+        return score
+    if score <= 10:
+        return score / 10.0
+    return 1.0
+
+def _mentions_unproven_critical_behaviour(items: list[str]) -> bool:
+    text = " ".join(str(x).lower() for x in items)
+    critical = any(t in text for t in ("critical", "required", "must", "essential"))
+    unproven = any(t in text for t in ("unproven", "not proven", "not demonstrated", "uncertain", "missing evidence", "assumed", "not guaranteed"))
+    return critical and unproven
 
 class CandidateAttemptState(BaseModel):
     model_config=ConfigDict(extra='forbid')
@@ -134,6 +158,20 @@ class CandidateRiskReview(BaseModel):
     recommendation:Literal['strong_accept','accept','weak_accept','reject','uncertain']
     rationale:str
 
+    @field_validator('confidence','minimality_score','correctness_score','hidden_test_risk_score', mode='before')
+    @classmethod
+    def _normalize_model_score(cls, value):
+        return normalize_score(value)
+
+    @model_validator(mode='after')
+    def _cap_unproven_critical_behaviour(self):
+        if _mentions_unproven_critical_behaviour(list(self.evidence_gaps or []) + list(self.risks or []) + list(self.likely_hidden_failures or [])):
+            self.correctness_score = min(normalize_score(self.correctness_score), 0.65)
+            self.hidden_test_risk_score = max(normalize_score(self.hidden_test_risk_score), 0.65)
+            if self.recommendation in {'strong_accept','accept','weak_accept'}:
+                self.recommendation = 'uncertain'
+        return self
+
 class PairwiseCandidateComparison(BaseModel):
     model_config=ConfigDict(extra='forbid')
     candidate_a:str; candidate_b:str
@@ -144,14 +182,29 @@ class PairwiseCandidateComparison(BaseModel):
     comparison_quality:Literal['model_full','model_compact','model_minimal','deterministic_fallback']='deterministic_fallback'
     rationale:str
 
+    @field_validator('confidence', mode='before')
+    @classmethod
+    def _normalize_confidence(cls, value):
+        return normalize_score(value)
+
 class RankedCandidate(BaseModel):
     model_config=ConfigDict(extra='forbid')
     candidate_id:str; rank:int; correctness_score:float; hidden_test_risk_score:float; pairwise_wins:int; pairwise_losses:int; validation_status:str|None=None; materiality_notes:str
+
+    @field_validator('correctness_score','hidden_test_risk_score', mode='before')
+    @classmethod
+    def _normalize_ranked_scores(cls, value):
+        return normalize_score(value)
 
 class TournamentRanking(BaseModel):
     model_config=ConfigDict(extra='forbid')
     ranked_candidates:list[RankedCandidate]=Field(default_factory=list)
     selected_candidate_id:str|None=None; selection_confidence:float; unresolved_risks:list[str]=Field(default_factory=list); rationale:str
+
+    @field_validator('selection_confidence', mode='before')
+    @classmethod
+    def _normalize_selection_confidence(cls, value):
+        return normalize_score(value)
 
 class CandidateAgreementSummary(BaseModel):
     model_config=ConfigDict(extra='forbid')

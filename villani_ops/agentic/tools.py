@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Literal
 from pydantic import BaseModel, Field, ConfigDict, model_validator
-from .state import CandidateAttemptState, SubtaskState, AttemptObservation, detect_decomposition_deadlock, CandidateSummary, CandidateEvidencePacket, CandidateImplementationSignature, CommandEvidence, ChangedFileEvidence, CandidateRiskReview, PairwiseCandidateComparison, RankedCandidate, TournamentRanking, CandidateAgreementSummary
+from .state import CandidateAttemptState, SubtaskState, AttemptObservation, detect_decomposition_deadlock, CandidateSummary, CandidateEvidencePacket, CandidateImplementationSignature, CommandEvidence, ChangedFileEvidence, CandidateRiskReview, PairwiseCandidateComparison, RankedCandidate, TournamentRanking, CandidateAgreementSummary, normalize_score
 from .git_artifacts import capture_git_patch, ensure_git_baseline, clean_runner_artifacts_from_worktree, DEFAULT_PATCH_EXCLUDES, is_git_compatible_patch, patch_contains_internal_artifacts, clean_untracked_scratch_artifacts, is_scratch_artifact_path
 from villani_ops.core.acceptance import is_attempt_acceptance_eligible, attempt_requires_patch
 import subprocess, json, time, shutil, os, re, hashlib
@@ -1030,10 +1030,37 @@ def build_candidate_evidence_packet(state, attempt:CandidateAttemptState)->Candi
     return packet
 
 def build_candidate_review_prompt(state, packet:CandidateEvidencePacket)->str:
-    return _budget_prompt(['TASK\n'+state.task, 'SUCCESS CRITERIA\n'+(state.success_criteria or 'Complete the task with a minimal correct patch.'), 'INSTRUCTIONS\nDo not give a generic review. Use the candidate evidence packet. Cite specific evidence from patch, commands, telemetry, or debug artifacts. If evidence is missing, say what cannot be determined. Assume plausible code may still be wrong. Identify hidden-test risks and material behavioural risks.', 'CANDIDATE EVIDENCE PACKET\n'+_compact_text(packet.model_dump(mode='json'), 14000)], max_chars=18000)
+    instructions = (
+        'All numeric scores must be between 0.0 and 1.0. Do not use 0-10 scoring. '
+        'Do not give a generic review. Use the candidate evidence packet. Cite specific evidence from patch, commands, telemetry, or debug artifacts. '
+        'If evidence is missing, say what cannot be determined. Assume plausible code may still be wrong. Identify hidden-test risks and material behavioural risks. '
+        'Do not reward a candidate merely because it contains words or structures that seem related to the task. Inspect whether the implementation actually guarantees the required behaviour. '
+        'For error handling, cancellation, cleanup, concurrency, resource lifecycle, idempotency, ordering, retries, and rollback tasks, identify what must happen after interruption/failure and whether the patch actually ensures it. '
+        'If the patch catches an exception but does not complete required cleanup/recovery, mark that as high risk. If the patch relies on default runtime behaviour without evidence, mark uncertainty. '
+        'Runner-executed checks are evidence, but they may not cover hidden edge cases. Do not accept solely because a candidate ran its own check. Ask whether the check actually exercises the risky behaviour. '
+        'When unproven critical required behaviour is identified, use hidden_test_risk_score >= 0.65, correctness_score <= 0.65, and recommendation uncertain or reject.'
+    )
+    return _budget_prompt(['TASK\n'+state.task, 'SUCCESS CRITERIA\n'+(state.success_criteria or 'Complete the task with a minimal correct patch.'), 'INSTRUCTIONS\n'+instructions, 'CANDIDATE EVIDENCE PACKET\n'+_compact_text(packet.model_dump(mode='json'), 14000)], max_chars=18000)
+
+
+def _compact_pairwise_candidate(packet:CandidateEvidencePacket, review:CandidateRiskReview|None=None)->dict:
+    return {
+        'candidate_id': packet.candidate_id,
+        'patch_summary': packet.patch_summary,
+        'implementation_signature': packet.implementation_signature.model_dump(mode='json') if packet.implementation_signature else None,
+        'key_diff_excerpt': _compact_text(packet.patch_diff_excerpt or '', 2500),
+        'review_summary': review.summary if review else None,
+        'review_quality': review.review_quality if review else None,
+        'normalized_correctness_score': normalize_score(review.correctness_score) if review else None,
+        'normalized_hidden_test_risk_score': normalize_score(review.hidden_test_risk_score) if review else None,
+        'risks': (review.risks if review else packet.potential_risks)[:8],
+        'evidence_gaps': (review.evidence_gaps if review else packet.evidence_limitations)[:8],
+        'command_evidence': [c.model_dump(mode='json') for c in packet.commands_executed[:5]],
+        'evidence_quality': packet.evidence_quality,
+    }
 
 def build_pairwise_comparison_prompt(state, a:CandidateEvidencePacket, b:CandidateEvidencePacket, ra:CandidateRiskReview|None=None, rb:CandidateRiskReview|None=None)->str:
-    return _budget_prompt(['TASK\n'+state.task, 'SUCCESS CRITERIA\n'+(state.success_criteria or 'Complete the task with a minimal correct patch.'), 'COMPARE\nDo not compare only changed file names. If both candidates changed the same file, inspect how their diffs differ. Compare actual implementation strategy and likely behaviour using evidence packets, implementation signatures, reviews, debug artifacts, commands, hidden-test risk, and scope/minimality.', 'CANDIDATE A EVIDENCE\n'+_compact_text(a.model_dump(mode='json'), 8000), 'CANDIDATE A REVIEW\n'+_compact_text(ra.model_dump(mode='json') if ra else {}, 3000), 'CANDIDATE B EVIDENCE\n'+_compact_text(b.model_dump(mode='json'), 8000), 'CANDIDATE B REVIEW\n'+_compact_text(rb.model_dump(mode='json') if rb else {}, 3000)], max_chars=22000)
+    return _budget_prompt(['TASK SUMMARY\n'+state.task, 'SUCCESS CRITERIA\n'+(state.success_criteria or 'Complete the task with a minimal correct patch.'), 'COMPARE\nAll numeric scores must be between 0.0 and 1.0. Do not use 0-10 scoring. Compare actual implementation strategy and likely behaviour from compact evidence. Exclude full logs, telemetry dumps, full state JSON, unbounded output, and raw debug artifacts.', 'CANDIDATE A COMPACT EVIDENCE\n'+_compact_text(_compact_pairwise_candidate(a, ra), 6500), 'CANDIDATE B COMPACT EVIDENCE\n'+_compact_text(_compact_pairwise_candidate(b, rb), 6500)], max_chars=15000)
 
 
 def _coerce_structured_payload(schema_model, data, *, quality=None, candidate_id=None, changed_files=None):
@@ -1042,13 +1069,13 @@ def _coerce_structured_payload(schema_model, data, *, quality=None, candidate_id
     name=schema_model.__name__
     if name=='CandidateRiskReview':
         obj.setdefault('candidate_id', candidate_id or obj.get('candidate_id') or 'unknown'); obj.setdefault('summary','Repaired malformed model review.'); obj.setdefault('changed_files', changed_files or [])
-        obj.setdefault('likely_correct', False); obj['confidence']=min(float(obj.get('confidence',0.55) or 0.55),0.55); obj.setdefault('implementation_strategy','unknown')
+        obj.setdefault('likely_correct', False); obj['confidence']=min(normalize_score(obj.get('confidence',0.55), default=0.55),0.55); obj.setdefault('implementation_strategy','unknown')
         for k in ['evidence_used','evidence_gaps','strengths','risks','likely_hidden_failures','edge_cases_considered','edge_cases_missed','debug_artifact_findings','command_findings','patch_findings']: obj.setdefault(k, [] if k!='evidence_gaps' else ['model output repaired or missing fields'])
         obj.setdefault('minimality_score',0.5); obj.setdefault('correctness_score',0.45); obj.setdefault('hidden_test_risk_score',0.55); obj.setdefault('review_quality', quality or 'model_minimal'); obj.setdefault('recommendation','uncertain'); obj.setdefault('rationale','Tolerantly parsed/repaired model output; confidence capped.')
     elif name=='PairwiseCandidateComparison':
         obj.setdefault('candidate_a', candidate_id[0] if isinstance(candidate_id,tuple) else obj.get('candidate_a','candidate_a')); obj.setdefault('candidate_b', candidate_id[1] if isinstance(candidate_id,tuple) else obj.get('candidate_b','candidate_b'))
         for k in ['material_differences','a_evidence_advantages','b_evidence_advantages','a_likely_failures','b_likely_failures']: obj.setdefault(k, [])
-        obj.setdefault('winner','tie'); obj['confidence']=min(float(obj.get('confidence',0.5) or 0.5),0.55); obj.setdefault('comparison_quality', quality or 'model_minimal'); obj.setdefault('rationale','Tolerantly parsed/repaired model comparison; confidence capped.')
+        obj.setdefault('winner','tie'); obj['confidence']=min(normalize_score(obj.get('confidence',0.5), default=0.5),0.55); obj.setdefault('comparison_quality', quality or 'model_minimal'); obj.setdefault('rationale','Tolerantly parsed/repaired model comparison; confidence capped.')
     return schema_model.model_validate(obj)
 
 def _extract_json_object(text):
@@ -1082,8 +1109,8 @@ def _model_candidate_risk_review(state, packet:CandidateEvidencePacket, ctx)->Ca
     for quality,prompt in prompts:
         try:
             rv=_structured_tool_call(ctx, backend, CandidateRiskReview, 'candidate_risk_review', prompt, 'You are an evidence-grounded tournament reviewer. Use specific patch, command, telemetry, and debug evidence; identify hidden-test risks and missing evidence.', quality=quality, candidate_id=packet.candidate_id, changed_files=packet.changed_files)
-            rv.review_quality=quality; rv.candidate_id=packet.candidate_id; rv.changed_files=packet.changed_files
-            return rv
+            rv=rv.model_copy(update={'review_quality':quality,'candidate_id':packet.candidate_id,'changed_files':packet.changed_files})
+            return CandidateRiskReview.model_validate(rv.model_dump(mode='json'))
         except Exception as e:
             if getattr(ctx,'recorder',None): ctx.recorder.record('tournament_review_retry_or_fallback', payload={'candidate_id':packet.candidate_id,'error':str(e)[:500],'quality':quality})
             continue
@@ -1097,8 +1124,8 @@ def _model_pairwise_comparison(state, a_packet:CandidateEvidencePacket, b_packet
     for quality,prompt in prompts:
         try:
             cmp=_structured_tool_call(ctx, backend, PairwiseCandidateComparison, 'pairwise_candidate_comparison', prompt, 'You compare tournament candidates using actual implementation differences, patch signatures, command evidence, and risk reviews. Never decide from changed file names alone.', quality=quality, candidate_id=(a_packet.candidate_id,b_packet.candidate_id))
-            cmp.comparison_quality=quality; cmp.candidate_a=a_packet.candidate_id; cmp.candidate_b=b_packet.candidate_id
-            return cmp
+            cmp=cmp.model_copy(update={'comparison_quality':quality,'candidate_a':a_packet.candidate_id,'candidate_b':b_packet.candidate_id})
+            return PairwiseCandidateComparison.model_validate(cmp.model_dump(mode='json'))
         except Exception as e:
             if getattr(ctx,'recorder',None): ctx.recorder.record('tournament_pairwise_retry_or_fallback', payload={'candidate_a':a_packet.candidate_id,'candidate_b':b_packet.candidate_id,'error':str(e)[:500],'quality':quality})
             continue
@@ -1123,6 +1150,14 @@ def _risk_review_from_summary(summary:CandidateSummary, evidence:CandidateEviden
     conf=0.85 if validation_passed else (0.55 if q in {'high','medium'} and has_patch else 0.45)
     return CandidateRiskReview(candidate_id=summary.candidate_id, summary=summary.patch_summary, changed_files=summary.changed_files, likely_correct=validation_passed or (has_patch and q!='missing'), confidence=min(conf,0.55), implementation_strategy=(evidence.implementation_strategy if evidence and evidence.implementation_strategy else 'unknown'), evidence_used=patch_findings+command_findings[:3]+debug_findings[:2], evidence_gaps=gaps, strengths=(['authoritative validation passed'] if validation_passed else ['material patch produced'] if has_patch else []), risks=summary.obvious_risks or list(evidence.potential_risks if evidence else []) or ([] if validation_passed else ['no authoritative validation pass recorded']), likely_hidden_failures=([] if validation_passed else ['behaviour may be unproven by validation']), edge_cases_considered=[], edge_cases_missed=([] if validation_passed else ['unknown hidden edge cases']), debug_artifact_findings=debug_findings, command_findings=command_findings, patch_findings=patch_findings, minimality_score=max(0.0, 1.0-0.05*len(summary.changed_files)), correctness_score=correctness, hidden_test_risk_score=risk, review_quality='deterministic_fallback', recommendation=rec, rationale='Deterministic fallback review based on candidate evidence packet; model review unavailable, so confidence is capped at 0.55.')
 
+def _validation_rank(review:CandidateRiskReview, evidence:CandidateEvidencePacket|None)->int:
+    # Authoritative validation is represented on candidate summaries in ranking; pairwise fallback only
+    # gets packet/review evidence, so keep this neutral unless evidence explicitly records a pass/fail claim.
+    claims=' '.join((evidence.observed_behaviour_claims if evidence else []) or []).lower()
+    if 'validation status: passed' in claims: return 1
+    if 'validation status: failed' in claims or 'validation status: error' in claims: return -1
+    return 0
+
 def _compare_pair(a:CandidateRiskReview,b:CandidateRiskReview, ae:CandidateEvidencePacket|None=None, be:CandidateEvidencePacket|None=None)->PairwiseCandidateComparison:
     qa=0 if not ae else {'high':3,'medium':2,'low':1,'missing':0}.get(ae.evidence_quality,0); qb=0 if not be else {'high':3,'medium':2,'low':1,'missing':0}.get(be.evidence_quality,0)
     sa=ae.implementation_signature if ae else None; sb=be.implementation_signature if be else None
@@ -1131,21 +1166,32 @@ def _compare_pair(a:CandidateRiskReview,b:CandidateRiskReview, ae:CandidateEvide
         if sa.normalized_patch_hash!=sb.normalized_patch_hash:
             material.append(f"same changed files but different normalized patch hash: {str(sa.normalized_patch_hash)[:12]} vs {str(sb.normalized_patch_hash)[:12]}" if set(sa.changed_files)==set(sb.changed_files) else f"different normalized patch hash: {str(sa.normalized_patch_hash)[:12]} vs {str(sb.normalized_patch_hash)[:12]}")
         else: material.append(f"same normalized patch hash: {str(sa.normalized_patch_hash)[:12]}")
-        if set(sa.strategy_tokens)!=set(sb.strategy_tokens): material.append(f"candidate_a strategy tokens: {sa.strategy_tokens}; candidate_b strategy tokens: {sb.strategy_tokens}")
-        if set(sa.added_control_flow_terms)!=set(sb.added_control_flow_terms): material.append(f"control-flow/resource terms differ: A={sa.added_control_flow_terms}; B={sb.added_control_flow_terms}")
-        if sa.patch_fingerprint!=sb.patch_fingerprint: material.append(f"patch size/fingerprint differs: A={sa.patch_fingerprint}; B={sb.patch_fingerprint}")
+        if set(sa.strategy_tokens)!=set(sb.strategy_tokens): material.append(f"different strategy tokens: A={sa.strategy_tokens}; B={sb.strategy_tokens}")
+        if set(sa.added_control_flow_terms)!=set(sb.added_control_flow_terms): material.append(f"different control-flow/resource/error-handling terms: A={sa.added_control_flow_terms}; B={sb.added_control_flow_terms}")
+        if sa.patch_fingerprint!=sb.patch_fingerprint: material.append(f"different patch size/scope: A={sa.patch_fingerprint}; B={sb.patch_fingerprint}")
         if set(sa.risk_markers)!=set(sb.risk_markers): material.append(f"risk markers differ: A={sa.risk_markers}; B={sb.risk_markers}")
+    if ae and be and ([c.command for c in ae.commands_executed[:5]] != [c.command for c in be.commands_executed[:5]] or len(ae.commands_failed)!=len(be.commands_failed)):
+        material.append('different command evidence')
     if not material:
         material=sorted(set(a.changed_files)^set(b.changed_files)) or ['no signature-level difference available; fallback evidence is non-discriminative']
     rq={'model_full':3,'model_compact':2,'model_minimal':1,'deterministic_fallback':0}
-    va=(a.correctness_score, -a.hidden_test_risk_score, rq.get(a.review_quality,0), qa, a.minimality_score)
-    vb=(b.correctness_score, -b.hidden_test_risk_score, rq.get(b.review_quality,0), qb, b.minimality_score)
-    # if both deterministic and signatures are identical, tie; otherwise let signature-aware scores discriminate.
-    if sa and sb and sa.normalized_patch_hash==sb.normalized_patch_hash and a.review_quality=='deterministic_fallback' and b.review_quality=='deterministic_fallback' and va==vb: w='tie'
-    elif va>vb: w='candidate_a'
-    elif vb>va: w='candidate_b'
-    else: w='tie'
-    return PairwiseCandidateComparison(candidate_a=a.candidate_id,candidate_b=b.candidate_id,material_differences=material,a_evidence_advantages=([f'evidence quality {ae.evidence_quality}'] if ae and qa>qb else []),b_evidence_advantages=([f'evidence quality {be.evidence_quality}'] if be and qb>qa else []),a_likely_failures=a.likely_hidden_failures,b_likely_failures=b.likely_hidden_failures,winner=w,confidence=0.5,comparison_quality='deterministic_fallback',rationale='Deterministic fallback comparison inspected normalized patch hashes, implementation strategy tokens, control-flow/resource terms, risk markers, command/debug evidence, hidden-test risks, evidence quality, and minimality. Confidence is capped at 0.5.')
+    ca=normalize_score(a.correctness_score); cb=normalize_score(b.correctness_score)
+    ra=normalize_score(a.hidden_test_risk_score); rb=normalize_score(b.hidden_test_risk_score)
+    ma=normalize_score(a.minimality_score); mb=normalize_score(b.minimality_score)
+    # Ordered fallback signals: validation, signature/evidence, review quality, normalized risk/correctness/minimality.
+    va=_validation_rank(a,ae); vb=_validation_rank(b,be)
+    sig_a=1 if sa and sb and sa.normalized_patch_hash!=sb.normalized_patch_hash and (sa.risk_markers or sa.strategy_tokens) else 0
+    sig_b=1 if sa and sb and sa.normalized_patch_hash!=sb.normalized_patch_hash and (sb.risk_markers or sb.strategy_tokens) else 0
+    aggregate_a=(0.30*va)+(0.14*sig_a)+(0.14*(qa/3))+(0.12*(rq.get(a.review_quality,0)/3))+(0.12*(1-ra))+(0.12*ca)+(0.06*ma)
+    aggregate_b=(0.30*vb)+(0.14*sig_b)+(0.14*(qb/3))+(0.12*(rq.get(b.review_quality,0)/3))+(0.12*(1-rb))+(0.12*cb)+(0.06*mb)
+    diff=aggregate_a-aggregate_b
+    if abs(diff) < 0.05:
+        w='tie'; conf=0.45
+    elif diff > 0:
+        w='candidate_a'; conf=0.5
+    else:
+        w='candidate_b'; conf=0.5
+    return PairwiseCandidateComparison(candidate_a=a.candidate_id,candidate_b=b.candidate_id,material_differences=material,a_evidence_advantages=([f'evidence quality {ae.evidence_quality}'] if ae and qa>qb else []),b_evidence_advantages=([f'evidence quality {be.evidence_quality}'] if be and qb>qa else []),a_likely_failures=a.likely_hidden_failures,b_likely_failures=b.likely_hidden_failures,winner=w,confidence=conf,comparison_quality='deterministic_fallback',rationale='Deterministic fallback comparison prioritized validation claims, implementation signatures, evidence/commands, review quality, normalized risk/correctness/minimality, and used a 0.05 tie margin so normalized numeric scores cannot dominate.')
 
 
 def build_candidate_agreement_summary(packets:dict[str,CandidateEvidencePacket])->CandidateAgreementSummary:
@@ -1170,36 +1216,50 @@ def build_candidate_agreement_summary(packets:dict[str,CandidateEvidencePacket])
     return CandidateAgreementSummary(consensus_type=ctype, agreeing_candidates=[], material_differences=diffs, consensus_strength=strength, rationale='Agreement evaluated from normalized_patch_hash and implementation signature strategy tokens; same changed files are not treated as same patch.')
 
 def _rank_tournament(state):
-    reviews=list(state.candidate_risk_reviews.values()); wins={r.candidate_id:0 for r in reviews}; losses={r.candidate_id:0 for r in reviews}
+    reviews=[CandidateRiskReview.model_validate(r.model_dump(mode='json')) for r in state.candidate_risk_reviews.values()]
+    wins={r.candidate_id:0 for r in reviews}; losses={r.candidate_id:0 for r in reviews}
     for c in state.pairwise_comparisons:
-        if c.winner=='candidate_a': wins[c.candidate_a]+=1; losses[c.candidate_b]+=1
-        elif c.winner=='candidate_b': wins[c.candidate_b]+=1; losses[c.candidate_a]+=1
-    all_fallback=bool(reviews) and all(r.review_quality=='deterministic_fallback' for r in reviews)
-    all_ties=bool(state.pairwise_comparisons) and all(c.winner=='tie' and c.comparison_quality=='deterministic_fallback' for c in state.pairwise_comparisons)
+        if c.winner=='candidate_a' and c.candidate_a in wins and c.candidate_b in losses: wins[c.candidate_a]+=1; losses[c.candidate_b]+=1
+        elif c.winner=='candidate_b' and c.candidate_b in wins and c.candidate_a in losses: wins[c.candidate_b]+=1; losses[c.candidate_a]+=1
+    all_review_fallback=bool(reviews) and all(r.review_quality=='deterministic_fallback' for r in reviews)
+    all_pairwise_fallback=bool(state.pairwise_comparisons) and all(c.comparison_quality=='deterministic_fallback' for c in state.pairwise_comparisons)
+    all_ties=bool(state.pairwise_comparisons) and all(c.winner=='tie' for c in state.pairwise_comparisons)
     def eq(aid):
         e=state.candidate_evidence_packets.get(aid)
         return {'high':3,'medium':2,'low':1,'missing':0}.get(e.evidence_quality if e else 'missing',0)
+    def cost(aid):
+        c=next((x for x in state.candidates if x.attempt_id==aid), None)
+        return float(c.cost or 0.0) if c else 0.0
     def key(r):
         summ=state.candidate_summaries.get(r.candidate_id)
         val=1 if summ and summ.validation_status=='passed' else 0
         review_quality={'model_full':3,'model_compact':2,'model_minimal':1,'deterministic_fallback':0}.get(r.review_quality,0)
-        return (val,wins[r.candidate_id],-losses[r.candidate_id],review_quality,-r.hidden_test_risk_score,r.correctness_score,eq(r.candidate_id),r.minimality_score,-(state.candidates[[c.attempt_id for c in state.candidates].index(r.candidate_id)].cost if r.candidate_id in [c.attempt_id for c in state.candidates] and state.candidates[[c.attempt_id for c in state.candidates].index(r.candidate_id)].cost else 0.0))
+        correctness=normalize_score(r.correctness_score); risk=normalize_score(r.hidden_test_risk_score); minimality=normalize_score(r.minimality_score); confidence=normalize_score(r.confidence)
+        return (val,wins[r.candidate_id],-losses[r.candidate_id],review_quality,confidence,eq(r.candidate_id),-risk,correctness,minimality,-cost(r.candidate_id))
     ordered=sorted(reviews,key=key,reverse=True)
     ranked=[]
     for i,r in enumerate(ordered):
         e=state.candidate_evidence_packets.get(r.candidate_id)
-        ranked.append(RankedCandidate(candidate_id=r.candidate_id,rank=i+1,correctness_score=r.correctness_score,hidden_test_risk_score=r.hidden_test_risk_score,pairwise_wins=wins[r.candidate_id],pairwise_losses=losses[r.candidate_id],validation_status=(state.candidate_summaries.get(r.candidate_id).validation_status if state.candidate_summaries.get(r.candidate_id) else None),materiality_notes=(f"evidence={e.evidence_quality}; " if e else 'evidence=missing; ')+('; '.join(r.changed_files) or 'no material files')))
+        ranked.append(RankedCandidate(candidate_id=r.candidate_id,rank=i+1,correctness_score=normalize_score(r.correctness_score),hidden_test_risk_score=normalize_score(r.hidden_test_risk_score),pairwise_wins=wins[r.candidate_id],pairwise_losses=losses[r.candidate_id],validation_status=(state.candidate_summaries.get(r.candidate_id).validation_status if state.candidate_summaries.get(r.candidate_id) else None),materiality_notes=(f"evidence={e.evidence_quality}; review_quality={r.review_quality}; normalized_scores=correctness:{normalize_score(r.correctness_score):.2f},risk:{normalize_score(r.hidden_test_risk_score):.2f}; " if e else f"evidence=missing; review_quality={r.review_quality}; normalized_scores=correctness:{normalize_score(r.correctness_score):.2f},risk:{normalize_score(r.hidden_test_risk_score):.2f}; ")+('; '.join(r.changed_files) or 'no material files')))
     selected=ranked[0].candidate_id if ranked else None
     selected_validated=bool(selected and state.candidate_summaries.get(selected) and state.candidate_summaries[selected].validation_status=='passed')
+    discriminative_reviews=False
+    if len(ordered)>1:
+        a,b=ordered[0],ordered[1]
+        discriminative_reviews=abs((normalize_score(a.correctness_score)-normalize_score(a.hidden_test_risk_score))-(normalize_score(b.correctness_score)-normalize_score(b.hidden_test_risk_score)))>=0.10 and normalize_score(a.confidence)>=0.55
     if selected_validated: basis='validated_acceptance'; conf=0.85
-    elif all_fallback and (all_ties or len(ranked)<=1): basis='best_effort_tournament_selection'; conf=0.35
-    else: basis='evidence_based_tournament_selection' if len(ranked)>1 else 'best_effort_tournament_selection'; conf=0.65
+    elif all_pairwise_fallback and all_review_fallback: basis='best_effort_tournament_selection'; conf=0.35
+    elif all_pairwise_fallback:
+        basis='evidence_based_tournament_selection' if discriminative_reviews else 'best_effort_tournament_selection'; conf=0.5 if discriminative_reviews else 0.35
+    else:
+        basis='evidence_based_tournament_selection' if len(ranked)>1 else 'best_effort_tournament_selection'; conf=0.65
+    if all_ties and not selected_validated: conf=min(conf,0.5)
     state.selection_basis=basis
     risks=[] if basis=='validated_acceptance' else ['no authoritative validation pass for selected candidate']
-    if all_fallback: risks.append('review/comparison unavailable or deterministic fallback only')
+    if all_review_fallback or all_pairwise_fallback: risks.append('review/comparison unavailable or deterministic fallback only')
     if all_ties: risks.append('all pairwise comparisons tied; ranking confidence is low')
     if selected and eq(selected)<=1: risks.append('selected candidate evidence quality is low or missing')
-    return TournamentRanking(ranked_candidates=ranked,selected_candidate_id=selected,selection_confidence=conf if selected else 0.0,unresolved_risks=sorted(dict.fromkeys(risks)),rationale='Ranking priority: authoritative validation, model-based pairwise wins, lower pairwise losses, review quality, hidden-test risk, correctness, evidence quality, minimality/scope, candidate agreement, then cost/tokens only as tiebreaker; deterministic fallback and low evidence quality reduce confidence.')
+    return TournamentRanking(ranked_candidates=ranked,selected_candidate_id=selected,selection_confidence=normalize_score(conf if selected else 0.0),unresolved_risks=sorted(dict.fromkeys(risks)),rationale='Ranking priority: authoritative validation, pairwise wins/losses, review quality/confidence, evidence quality, normalized hidden-test risk, normalized correctness, normalized minimality/scope, candidate agreement, then cost/tokens only as tiebreaker. Fallback-only pairwise comparisons cap confidence and may force best-effort selection.')
 
 
 
@@ -1288,16 +1348,16 @@ def _write_tournament_artifacts(state):
     model_reviews=sum(1 for r in state.candidate_risk_reviews.values() if r.review_quality!='deterministic_fallback'); fallback_reviews=sum(1 for r in state.candidate_risk_reviews.values() if r.review_quality=='deterministic_fallback')
     model_cmps=sum(1 for c in state.pairwise_comparisons if c.comparison_quality!='deterministic_fallback'); fallback_cmps=sum(1 for c in state.pairwise_comparisons if c.comparison_quality=='deterministic_fallback')
     emergency=state.selection_basis=='best_effort_tournament_selection' and (fallback_reviews or fallback_cmps or not state.pairwise_comparisons)
-    lines=["# Adaptive Candidate Tournament","",f"Candidates requested: {state.candidate_attempts_requested}",f"Launched: {state.candidate_attempts_launched}",f"Completed: {state.tournament_candidates_completed}",f"Tournament phase: {state.tournament_phase}",f"Stages completed: candidates={bool(state.candidate_evidence_packets)}, reviews={bool(state.candidate_risk_reviews)}, comparisons={bool(state.pairwise_comparisons)}, ranking={bool(state.tournament_ranking)}, selection={bool(state.selection)}",f"Parallelism used: {state.tournament_parallelism_used}",f"Reviews: model-backed={model_reviews}, fallback={fallback_reviews}",f"Comparisons: model-backed={model_cmps}, fallback={fallback_cmps}",f"Emergency finalization used: {emergency}",f"Selected: {selected}",f"Selection basis: {state.selection_basis}","","## Why the selected candidate won"]
+    lines=["# Adaptive Candidate Tournament","",f"Candidates requested: {state.candidate_attempts_requested}",f"Launched: {state.candidate_attempts_launched}",f"Completed: {state.tournament_candidates_completed}",f"Tournament phase: {state.tournament_phase}",f"Stages completed: candidates={bool(state.candidate_evidence_packets)}, reviews={bool(state.candidate_risk_reviews)}, comparisons={bool(state.pairwise_comparisons)}, ranking={bool(state.tournament_ranking)}, selection={bool(state.selection)}",f"Parallelism used: {state.tournament_parallelism_used}",f"Reviews: model-backed={model_reviews}, fallback={fallback_reviews}",f"Comparisons: model-backed={model_cmps}, fallback={fallback_cmps}",f"Emergency finalization used: {emergency}",f"Selected: {selected}",f"Selection basis: {state.selection_basis}",f"Selection confidence: {normalize_score(state.tournament_ranking.selection_confidence) if state.tournament_ranking else 0.0:.2f}","Score normalization: numeric review/comparison/ranking scores are normalized to 0.0-1.0; values above 1 up to 10 are treated as 0-10 scores.","","## Why the selected candidate won"]
     if selected:
         ev=state.candidate_evidence_packets.get(selected); rv=state.candidate_risk_reviews.get(selected)
-        lines += [f"Ranking rationale: {state.tournament_ranking.rationale if state.tournament_ranking else ''}", f"Evidence quality: {ev.evidence_quality if ev else 'missing'}", f"Changed files: {', '.join((ev.changed_files if ev else []) or [])}", f"Debug artifacts showed: {(ev.runner_summary if ev else 'unavailable')}", f"Commands run: {', '.join(c.command for c in (ev.commands_executed if ev else [])[:8]) or 'none observed'}", f"Review quality: {rv.review_quality if rv else 'missing'}", f"Remaining risks: {', '.join((state.tournament_ranking.unresolved_risks if state.tournament_ranking else []) or []) or 'none recorded'}"]
+        lines += [f"Ranking rationale: {state.tournament_ranking.rationale if state.tournament_ranking else ''}", f"Evidence quality: {ev.evidence_quality if ev else 'missing'}", f"Changed files: {', '.join((ev.changed_files if ev else []) or [])}", f"Debug artifacts showed: {(ev.runner_summary if ev else 'unavailable')}", f"Commands run: {', '.join(c.command for c in (ev.commands_executed if ev else [])[:8]) or 'none observed'}", f"Review quality: {rv.review_quality if rv else 'missing'}", f"Normalized correctness score: {normalize_score(rv.correctness_score) if rv else 0.0:.2f}", f"Normalized hidden-test risk score: {normalize_score(rv.hidden_test_risk_score) if rv else 0.0:.2f}", f"Comparison quality: {', '.join(sorted({x.comparison_quality for x in state.pairwise_comparisons if x.candidate_a==selected or x.candidate_b==selected})) or 'none'}", f"Remaining risks: {', '.join((state.tournament_ranking.unresolved_risks if state.tournament_ranking else []) or []) or 'none recorded'}"]
     lines += ["","## Rejected candidates"]
     for c in state.candidates:
         if c.attempt_id==selected: continue
         ev=state.candidate_evidence_packets.get(c.attempt_id); rv=state.candidate_risk_reviews.get(c.attempt_id)
         losses=[x for x in state.pairwise_comparisons if (x.candidate_a==c.attempt_id and x.winner=='candidate_b') or (x.candidate_b==c.attempt_id and x.winner=='candidate_a')]
-        lines += [f"### {c.attempt_id}", f"Why lost: {'lost pairwise comparison(s)' if losses else 'ranked lower by evidence/risk/minimality or tied fallback ordering'}", f"Material differences: {', '.join((ev.changed_files if ev else c.changed_files) or [])}", f"Specific risks: {', '.join((rv.risks if rv else []) or (ev.potential_risks if ev else []) or []) or 'none recorded'}", f"Evidence gaps: {', '.join((rv.evidence_gaps if rv else []) or (ev.evidence_limitations if ev else ['evidence packet missing']))}"]
+        lines += [f"### {c.attempt_id}", f"Why lost: {'lost pairwise comparison(s)' if losses else 'ranked lower by evidence/risk/minimality or tied fallback ordering'}", f"Material differences: {', '.join((ev.changed_files if ev else c.changed_files) or [])}", f"Specific risks: {', '.join((rv.risks if rv else []) or (ev.potential_risks if ev else []) or []) or 'none recorded'}", f"Review quality: {rv.review_quality if rv else 'missing'}", f"Normalized correctness score: {normalize_score(rv.correctness_score) if rv else 0.0:.2f}", f"Normalized hidden-test risk score: {normalize_score(rv.hidden_test_risk_score) if rv else 0.0:.2f}", f"Comparison quality: {', '.join(sorted({x.comparison_quality for x in state.pairwise_comparisons if x.candidate_a==c.attempt_id or x.candidate_b==c.attempt_id})) or 'none'}", f"Evidence gaps: {', '.join((rv.evidence_gaps if rv else []) or (ev.evidence_limitations if ev else ['evidence packet missing']))}"]
     write_text_utf8(root/'final_report.md', '\n'.join(lines)+'\n')
 
 def _persist_tournament_state(state, ctx=None):
