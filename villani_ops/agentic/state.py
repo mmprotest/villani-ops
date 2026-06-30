@@ -213,11 +213,12 @@ class OpsRunState(BaseModel):
     execution_path:Literal['unknown','single_task','parallel_candidates','decomposed_subtasks','candidate_tournament']='unknown'
     candidate_execution_mode:Literal['unknown','sequential','parallel']='unknown'; attempts_requested:int|None=None; attempts_started:int=0; stopped_early:bool=False; stop_reason:str|None=None
     tournament_candidates_launched:int=0; tournament_candidates_completed:int=0; tournament_parallelism_used:int=0
+    tournament_phase:Literal['not_started','launching_candidates','candidates_complete','reviewing_candidates','comparing_candidates','ranking','selection_committed','finalizing','complete','failed']='not_started'
     candidate_summaries:dict[str,CandidateSummary]=Field(default_factory=dict); candidate_evidence_packets:dict[str,CandidateEvidencePacket]=Field(default_factory=dict); candidate_risk_reviews:dict[str,CandidateRiskReview]=Field(default_factory=dict)
     pairwise_comparisons:list[PairwiseCandidateComparison]=Field(default_factory=list); tournament_ranking:TournamentRanking|None=None; candidate_agreement_summary:CandidateAgreementSummary|None=None
     selection_basis:Literal['validated_acceptance','evidence_based_tournament_selection','best_effort_tournament_selection','failed','inconclusive']|None=None
     candidate_attempts_requested:int|None=None; candidate_attempts_launched:int=0; candidate_launch_limit_reason:str|None=None
-    reserve_finalization_seconds:int=30; reserve_review_seconds:int=60; max_review_retries:int=2; max_malformed_review_retries:int=2; candidate_generation_deadline:float|None=None
+    reserve_finalization_seconds:int=30; reserve_review_seconds:int=60; per_candidate_review_timeout_seconds:int=30; per_pairwise_comparison_timeout_seconds:int=30; tournament_evaluation_deadline_seconds:int=120; max_review_retries:int=2; max_malformed_review_retries:int=2; max_pairwise_retries:int=2; candidate_generation_deadline:float|None=None
     decomposition_requested:bool=False; decomposition_validated:bool=False; decomposition_accepted:bool|None=None; decomposition_executed:bool=False
     decomposition_fallback_used:bool=False; decomposition_fallback_reason:str|None=None
     decomposed_execution_status:Literal['not_started','running','completed','blocked','failed']='not_started'
@@ -251,7 +252,7 @@ class OpsRunState(BaseModel):
         if self.execution_path=='unknown': a.append('ops_select_execution_path'); return a
         if self.execution_path=='candidate_tournament':
             if not self.candidates: a.append('ops_launch_tournament_candidates'); return list(dict.fromkeys(a))
-            if self.tournament_ranking is None: a.append('ops_select_winner'); return list(dict.fromkeys(a))
+            if self.tournament_ranking is None: a.append('ops_evaluate_tournament'); return list(dict.fromkeys(a))
             sel=self.selection or {}
             if sel.get('decision')=='select' and sel.get('selected_attempt_id'):
                 a += ['ops_finalize_run']; return list(dict.fromkeys(a))

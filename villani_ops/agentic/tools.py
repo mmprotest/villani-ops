@@ -336,6 +336,7 @@ class DecompositionValidationResult(StrictModel): accepted:bool; deterministic_a
 class OpsSelectExecutionPathInput(StrictModel): path:Literal['single_task','parallel_candidates','decomposed_subtasks','candidate_tournament']; reason:str
 class OpsLaunchCandidatesInput(StrictModel): attempts:int; backend_name:str|None=None; reason:str
 class OpsLaunchTournamentCandidatesInput(StrictModel): attempts:int|None=None; backend_name:str|None=None; reason:str='Launch independent adaptive tournament candidates.'
+class OpsEvaluateTournamentInput(StrictModel): reason:str='Evaluate completed tournament candidates.'
 class OpsRunSingleTaskAttemptsInput(StrictModel): attempts:int; backend_name:str|None=None; reason:str
 class OpsRunNextCandidateAttemptInput(StrictModel): backend_name:str|None=None; base_attempt_id:str|None=None; repair:bool=False; reason:str
 class OpsRunNextFallbackCandidateAttemptInput(StrictModel): backend_name:str|None=None; base_attempt_id:str|None=None; repair:bool=False; reason:str
@@ -1035,13 +1036,41 @@ def build_pairwise_comparison_prompt(state, a:CandidateEvidencePacket, b:Candida
     return _budget_prompt(['TASK\n'+state.task, 'SUCCESS CRITERIA\n'+(state.success_criteria or 'Complete the task with a minimal correct patch.'), 'COMPARE\nDo not compare only changed file names. If both candidates changed the same file, inspect how their diffs differ. Compare actual implementation strategy and likely behaviour using evidence packets, implementation signatures, reviews, debug artifacts, commands, hidden-test risk, and scope/minimality.', 'CANDIDATE A EVIDENCE\n'+_compact_text(a.model_dump(mode='json'), 8000), 'CANDIDATE A REVIEW\n'+_compact_text(ra.model_dump(mode='json') if ra else {}, 3000), 'CANDIDATE B EVIDENCE\n'+_compact_text(b.model_dump(mode='json'), 8000), 'CANDIDATE B REVIEW\n'+_compact_text(rb.model_dump(mode='json') if rb else {}, 3000)], max_chars=22000)
 
 
-def _structured_tool_call(ctx, backend, schema_model, tool_name:str, prompt:str, system:str):
+def _coerce_structured_payload(schema_model, data, *, quality=None, candidate_id=None, changed_files=None):
+    if not isinstance(data, dict): raise ValueError('structured_payload_not_object')
+    allowed=set(schema_model.model_fields); obj={k:v for k,v in data.items() if k in allowed}
+    name=schema_model.__name__
+    if name=='CandidateRiskReview':
+        obj.setdefault('candidate_id', candidate_id or obj.get('candidate_id') or 'unknown'); obj.setdefault('summary','Repaired malformed model review.'); obj.setdefault('changed_files', changed_files or [])
+        obj.setdefault('likely_correct', False); obj['confidence']=min(float(obj.get('confidence',0.55) or 0.55),0.55); obj.setdefault('implementation_strategy','unknown')
+        for k in ['evidence_used','evidence_gaps','strengths','risks','likely_hidden_failures','edge_cases_considered','edge_cases_missed','debug_artifact_findings','command_findings','patch_findings']: obj.setdefault(k, [] if k!='evidence_gaps' else ['model output repaired or missing fields'])
+        obj.setdefault('minimality_score',0.5); obj.setdefault('correctness_score',0.45); obj.setdefault('hidden_test_risk_score',0.55); obj.setdefault('review_quality', quality or 'model_minimal'); obj.setdefault('recommendation','uncertain'); obj.setdefault('rationale','Tolerantly parsed/repaired model output; confidence capped.')
+    elif name=='PairwiseCandidateComparison':
+        obj.setdefault('candidate_a', candidate_id[0] if isinstance(candidate_id,tuple) else obj.get('candidate_a','candidate_a')); obj.setdefault('candidate_b', candidate_id[1] if isinstance(candidate_id,tuple) else obj.get('candidate_b','candidate_b'))
+        for k in ['material_differences','a_evidence_advantages','b_evidence_advantages','a_likely_failures','b_likely_failures']: obj.setdefault(k, [])
+        obj.setdefault('winner','tie'); obj['confidence']=min(float(obj.get('confidence',0.5) or 0.5),0.55); obj.setdefault('comparison_quality', quality or 'model_minimal'); obj.setdefault('rationale','Tolerantly parsed/repaired model comparison; confidence capped.')
+    return schema_model.model_validate(obj)
+
+def _extract_json_object(text):
+    if not text: return None
+    if isinstance(text, list): text='\n'.join(str(x.get('text') or x.get('content') or x) for x in text)
+    m=re.search(r'\{.*\}', str(text), re.S)
+    if not m: return None
+    return json.loads(m.group(0))
+
+def _structured_tool_call(ctx, backend, schema_model, tool_name:str, prompt:str, system:str, *, quality=None, candidate_id=None, changed_files=None):
     from .client import ToolCallingLLMClient
     tool={'type':'function','function':{'name':tool_name,'description':'Return structured tournament evidence evaluation only.','parameters':schema_model.model_json_schema(),'strict':True}}
     resp=ToolCallingLLMClient().create_message(backend=backend,messages=[{'role':'user','content':prompt}],system=system,tools=[tool],tool_choice={'type':'function','function':{'name':tool_name}},strict=True)
-    calls=[b for b in getattr(resp,'content',[]) if b.get('type')=='tool_use' and b.get('name')==tool_name]
-    if not calls: raise ValueError(f'{tool_name}_missing_tool_call')
-    return schema_model.model_validate(calls[0].get('input') or {})
+    blocks=getattr(resp,'content',[]) or []
+    calls=[b for b in blocks if isinstance(b,dict) and b.get('type')=='tool_use' and b.get('name')==tool_name]
+    if calls: return _coerce_structured_payload(schema_model, calls[0].get('input') or {}, quality=quality, candidate_id=candidate_id, changed_files=changed_files)
+    for b in blocks:
+        try:
+            obj=_extract_json_object(b.get('text') or b.get('content') if isinstance(b,dict) else b)
+            if obj is not None: return _coerce_structured_payload(schema_model, obj, quality=quality, candidate_id=candidate_id, changed_files=changed_files)
+        except Exception: pass
+    raise ValueError(f'{tool_name}_missing_tool_call')
 
 def _review_backend_from_ctx(ctx):
     return getattr(ctx,'review_backend',None) or getattr(getattr(ctx,'reviewer',None),'review_backend',None) or getattr(ctx,'backend',None)
@@ -1052,7 +1081,7 @@ def _model_candidate_risk_review(state, packet:CandidateEvidencePacket, ctx)->Ca
     prompts=[('model_full', build_candidate_review_prompt(state, packet)), ('model_compact', _budget_prompt(['TASK\n'+state.task,'CANDIDATE EVIDENCE PACKET\n'+_compact_text(packet.model_dump(mode='json'),7000)],9000)), ('model_minimal', _budget_prompt(['TASK\n'+state.task,'MINIMAL EVIDENCE\n'+_compact_text({'candidate_id':packet.candidate_id,'summary':packet.patch_summary,'signature':packet.implementation_signature.model_dump(mode='json') if packet.implementation_signature else None,'commands':[c.model_dump(mode='json') for c in packet.commands_executed[:5]],'limitations':packet.evidence_limitations},4000)],5500))]
     for quality,prompt in prompts:
         try:
-            rv=_structured_tool_call(ctx, backend, CandidateRiskReview, 'candidate_risk_review', prompt, 'You are an evidence-grounded tournament reviewer. Use specific patch, command, telemetry, and debug evidence; identify hidden-test risks and missing evidence.')
+            rv=_structured_tool_call(ctx, backend, CandidateRiskReview, 'candidate_risk_review', prompt, 'You are an evidence-grounded tournament reviewer. Use specific patch, command, telemetry, and debug evidence; identify hidden-test risks and missing evidence.', quality=quality, candidate_id=packet.candidate_id, changed_files=packet.changed_files)
             rv.review_quality=quality; rv.candidate_id=packet.candidate_id; rv.changed_files=packet.changed_files
             return rv
         except Exception as e:
@@ -1067,7 +1096,7 @@ def _model_pairwise_comparison(state, a_packet:CandidateEvidencePacket, b_packet
     prompts=[('model_full',base),('model_compact',_budget_prompt(['TASK\n'+state.task,'COMPARE actual diffs/signatures; do not compare only file names.','A\n'+_compact_text(a_packet.model_dump(mode='json'),5000),'A_REVIEW\n'+_compact_text(a_review.model_dump(mode='json'),2000),'B\n'+_compact_text(b_packet.model_dump(mode='json'),5000),'B_REVIEW\n'+_compact_text(b_review.model_dump(mode='json'),2000)],15000)),('model_minimal',_budget_prompt(['TASK\n'+state.task,'Compare implementation signatures and reviews.','A\n'+_compact_text({'evidence':a_packet.implementation_signature,'review':a_review},3000),'B\n'+_compact_text({'evidence':b_packet.implementation_signature,'review':b_review},3000)],8000))]
     for quality,prompt in prompts:
         try:
-            cmp=_structured_tool_call(ctx, backend, PairwiseCandidateComparison, 'pairwise_candidate_comparison', prompt, 'You compare tournament candidates using actual implementation differences, patch signatures, command evidence, and risk reviews. Never decide from changed file names alone.')
+            cmp=_structured_tool_call(ctx, backend, PairwiseCandidateComparison, 'pairwise_candidate_comparison', prompt, 'You compare tournament candidates using actual implementation differences, patch signatures, command evidence, and risk reviews. Never decide from changed file names alone.', quality=quality, candidate_id=(a_packet.candidate_id,b_packet.candidate_id))
             cmp.comparison_quality=quality; cmp.candidate_a=a_packet.candidate_id; cmp.candidate_b=b_packet.candidate_id
             return cmp
         except Exception as e:
@@ -1256,7 +1285,10 @@ def _write_tournament_artifacts(state):
     write_json_utf8(root/'selection.json', state.selection or {'selected_candidate_id': state.tournament_ranking.selected_candidate_id if state.tournament_ranking else None, 'selection_basis': state.selection_basis})
 
     selected=state.tournament_ranking.selected_candidate_id if state.tournament_ranking else None
-    lines=["# Adaptive Candidate Tournament","",f"Candidates requested: {state.candidate_attempts_requested}",f"Launched: {state.candidate_attempts_launched}",f"Completed: {state.tournament_candidates_completed}",f"Parallelism used: {state.tournament_parallelism_used}",f"Selected: {selected}",f"Selection basis: {state.selection_basis}","","## Why the selected candidate won"]
+    model_reviews=sum(1 for r in state.candidate_risk_reviews.values() if r.review_quality!='deterministic_fallback'); fallback_reviews=sum(1 for r in state.candidate_risk_reviews.values() if r.review_quality=='deterministic_fallback')
+    model_cmps=sum(1 for c in state.pairwise_comparisons if c.comparison_quality!='deterministic_fallback'); fallback_cmps=sum(1 for c in state.pairwise_comparisons if c.comparison_quality=='deterministic_fallback')
+    emergency=state.selection_basis=='best_effort_tournament_selection' and (fallback_reviews or fallback_cmps or not state.pairwise_comparisons)
+    lines=["# Adaptive Candidate Tournament","",f"Candidates requested: {state.candidate_attempts_requested}",f"Launched: {state.candidate_attempts_launched}",f"Completed: {state.tournament_candidates_completed}",f"Tournament phase: {state.tournament_phase}",f"Stages completed: candidates={bool(state.candidate_evidence_packets)}, reviews={bool(state.candidate_risk_reviews)}, comparisons={bool(state.pairwise_comparisons)}, ranking={bool(state.tournament_ranking)}, selection={bool(state.selection)}",f"Parallelism used: {state.tournament_parallelism_used}",f"Reviews: model-backed={model_reviews}, fallback={fallback_reviews}",f"Comparisons: model-backed={model_cmps}, fallback={fallback_cmps}",f"Emergency finalization used: {emergency}",f"Selected: {selected}",f"Selection basis: {state.selection_basis}","","## Why the selected candidate won"]
     if selected:
         ev=state.candidate_evidence_packets.get(selected); rv=state.candidate_risk_reviews.get(selected)
         lines += [f"Ranking rationale: {state.tournament_ranking.rationale if state.tournament_ranking else ''}", f"Evidence quality: {ev.evidence_quality if ev else 'missing'}", f"Changed files: {', '.join((ev.changed_files if ev else []) or [])}", f"Debug artifacts showed: {(ev.runner_summary if ev else 'unavailable')}", f"Commands run: {', '.join(c.command for c in (ev.commands_executed if ev else [])[:8]) or 'none observed'}", f"Review quality: {rv.review_quality if rv else 'missing'}", f"Remaining risks: {', '.join((state.tournament_ranking.unresolved_risks if state.tournament_ranking else []) or []) or 'none recorded'}"]
@@ -1268,47 +1300,104 @@ def _write_tournament_artifacts(state):
         lines += [f"### {c.attempt_id}", f"Why lost: {'lost pairwise comparison(s)' if losses else 'ranked lower by evidence/risk/minimality or tied fallback ordering'}", f"Material differences: {', '.join((ev.changed_files if ev else c.changed_files) or [])}", f"Specific risks: {', '.join((rv.risks if rv else []) or (ev.potential_risks if ev else []) or []) or 'none recorded'}", f"Evidence gaps: {', '.join((rv.evidence_gaps if rv else []) or (ev.evidence_limitations if ev else ['evidence packet missing']))}"]
     write_text_utf8(root/'final_report.md', '\n'.join(lines)+'\n')
 
+def _persist_tournament_state(state, ctx=None):
+    _write_tournament_artifacts(state)
+    state.save(Path(state.run_dir)/'state.json')
+    if ctx is not None and getattr(ctx,'recorder',None): ctx.recorder.record('state_saved', tool_name='tournament_stage')
+
+def _record_completed_tournament_candidate(state, attempt:CandidateAttemptState, ctx=None):
+    state.tournament_candidates_completed=sum(1 for c in state.candidates if c.status in {'completed','failed','reviewed','rejected','accepted'})
+    state.candidate_summaries[attempt.attempt_id]=_candidate_summary_from_attempt(attempt)
+    state.candidate_evidence_packets[attempt.attempt_id]=build_candidate_evidence_packet(state, attempt)
+    ok, blockers=_is_tournament_candidate_materializable(attempt)
+    state.candidate_summaries[attempt.attempt_id].obvious_risks=sorted(set(state.candidate_summaries[attempt.attempt_id].obvious_risks + ([] if ok else blockers)))
+    _persist_tournament_state(state, ctx)
+    if ctx is not None and getattr(ctx,'recorder',None): ctx.recorder.record('tournament_candidate_state_saved', payload={'attempt_id':attempt.attempt_id,'status':attempt.status,'materializable':ok})
+
+def hydrate_tournament_state_from_artifacts(state, run_dir=None)->bool:
+    root=Path(run_dir or state.run_dir); changed=False
+    cand_root=root/'candidates'
+    if cand_root.exists():
+        for evp in cand_root.glob('*/evidence.json'):
+            cid=evp.parent.name
+            if cid not in state.candidate_evidence_packets:
+                state.candidate_evidence_packets[cid]=CandidateEvidencePacket.model_validate(json.loads(read_text_utf8(evp))); changed=True
+        for rsp in cand_root.glob('*/runner_summary.json'):
+            cid=rsp.parent.name
+            if not any(c.attempt_id==cid for c in state.candidates):
+                state.candidates.append(CandidateAttemptState.model_validate(json.loads(read_text_utf8(rsp)))); changed=True
+            if cid not in state.candidate_summaries:
+                a=next((c for c in state.candidates if c.attempt_id==cid), None)
+                if a: state.candidate_summaries[cid]=_candidate_summary_from_attempt(a); changed=True
+    rp=root/'comparisons'/'ranking.json'
+    if rp.exists() and state.tournament_ranking is None:
+        state.tournament_ranking=TournamentRanking.model_validate(json.loads(read_text_utf8(rp))); changed=True
+    sp=root/'selection.json'
+    if sp.exists() and not state.selection:
+        data=json.loads(read_text_utf8(sp))
+        if data.get('decision')=='select': state.selection=data; changed=True
+    if changed:
+        state.tournament_candidates_completed=sum(1 for c in state.candidates if c.status in {'completed','failed','reviewed','rejected','accepted'})
+        if state.tournament_ranking: state.tournament_phase='ranking'
+        elif state.candidate_evidence_packets: state.tournament_phase='candidates_complete'
+    return changed
+
+def _time_low(state, deadline):
+    return time.time() + max(1,int(state.reserve_finalization_seconds or 30)) >= deadline
+
 def h_launch_tournament_candidates(state, inp, ctx):
     if state.execution_path!='candidate_tournament': raise ValueError('ops_launch_tournament_candidates requires execution_path=candidate_tournament')
-    if state.candidates: return {'launched':[], 'already_launched':True}
-    requested=max(1,int(inp.attempts or state.candidate_attempts or 1)); state.candidate_attempts_requested=requested; state.attempts_requested=requested; state.phase='running_candidates'; state.candidate_execution_mode='parallel'
+    if state.candidates:
+        hydrate_tournament_state_from_artifacts(state); return {'launched':[], 'already_launched':True, 'next_allowed_actions':state.allowed_next_actions()}
+    requested=max(1,int(inp.attempts or state.candidate_attempts or 1)); state.candidate_attempts_requested=requested; state.attempts_requested=requested; state.phase='running_candidates'; state.tournament_phase='launching_candidates'; state.candidate_execution_mode='parallel'
     maxp=max(1, int(getattr(ctx.coding_backend or ctx.backend,'max_parallel',None) or ctx.max_parallel or 1)); state.max_parallel=maxp; state.tournament_parallelism_used=min(maxp,requested)
-    total=requested
     state.candidate_generation_deadline=time.time()+max(1,(ctx.timeout_seconds or 3600)-state.reserve_review_seconds-state.reserve_finalization_seconds)
-    made=[]; next_index=1; batch_count=0
-    for off in range(0,total,maxp):
+    made=[]; next_index=1; batch_count=0; _persist_tournament_state(state, ctx)
+    for off in range(0,requested,maxp):
         if time.time()>=state.candidate_generation_deadline: state.candidate_launch_limit_reason='generation_deadline_reached'; break
-        batch=list(range(off,min(off+maxp,total))); batch_count+=1; futs={}; ids=[]
+        batch=list(range(off,min(off+maxp,requested))); batch_count+=1; futs={}
         with ThreadPoolExecutor(max_workers=len(batch)) as ex:
             for _ in batch:
-                aid=f'candidate_{next_index:03d}'; next_index+=1; ids.append(aid); made.append(aid)
+                aid=f'candidate_{next_index:03d}'; next_index+=1; made.append(aid)
                 prompt=build_tournament_candidate_prompt(state, reason=inp.reason)
                 scheduled=_attempt(aid,'candidate',backend=inp.backend_name or ctx.coding_backend_name or ctx.backend_name,artifacts=Path(state.run_dir)/'attempts'/aid); scheduled.status='running'; scheduled.started_at=str(time.time()); scheduled.worktree_path=str(Path(state.run_dir)/'attempts'/aid/'worktree'); state.candidates.append(scheduled)
+                state.tournament_candidates_launched=len(made); state.candidate_attempts_launched=len(made); _persist_tournament_state(state, ctx)
                 ctx.recorder.record('candidate_attempt_started', payload={'attempt_id':aid,'execution_path':'candidate_tournament','batch_index':batch_count})
                 futs[ex.submit(_run_attempt,state,ctx,aid,'candidate',prompt,state.success_criteria,None,inp.backend_name or ctx.coding_backend_name or ctx.backend_name,False)]=aid
             for fut in as_completed(futs):
-                res=fut.result();
+                try: res=fut.result()
+                except Exception as e:
+                    aid=futs[fut]; res=next(c for c in state.candidates if c.attempt_id==aid); res.status='failed'; res.failure_reason=str(e)
                 for i,c in enumerate(state.candidates):
                     if c.attempt_id==res.attempt_id: state.candidates[i]=res; break
+                _record_completed_tournament_candidate(state,res,ctx)
                 ctx.recorder.record('candidate_attempt_completed' if res.status=='completed' else 'candidate_attempt_failed', payload={'attempt_id':res.attempt_id,'status':res.status,'execution_path':'candidate_tournament'})
-    state.tournament_candidates_launched=len(made); state.candidate_attempts_launched=len(made); state.tournament_candidates_completed=sum(1 for c in state.candidates if c.status in {'completed','failed','reviewed','rejected','accepted'})
+    state.tournament_candidates_launched=len(made); state.candidate_attempts_launched=len(made); state.tournament_phase='candidates_complete'; _persist_tournament_state(state, ctx)
+    return {'launched':made,'max_parallel':maxp,'candidate_summaries':{k:v.model_dump(mode='json') for k,v in state.candidate_summaries.items()},'next_allowed_actions':state.allowed_next_actions()}
+
+def h_evaluate_tournament(state, inp, ctx):
+    if state.execution_path!='candidate_tournament': raise ValueError('ops_evaluate_tournament requires execution_path=candidate_tournament')
+    hydrate_tournament_state_from_artifacts(state); deadline=time.time()+max(1,int(state.tournament_evaluation_deadline_seconds or 120))
     for c in state.candidates:
-        packet=build_candidate_evidence_packet(state,c); state.candidate_evidence_packets[c.attempt_id]=packet
-        s=_candidate_summary_from_attempt(c); state.candidate_summaries[c.attempt_id]=s
-        review=_model_candidate_risk_review(state, packet, ctx)
-        if review is None: review=_risk_review_from_summary(s, packet)
-        state.candidate_risk_reviews[c.attempt_id]=review
-    revs=list(state.candidate_risk_reviews.values())
-    comparisons=[]
+        if c.attempt_id not in state.candidate_summaries or c.attempt_id not in state.candidate_evidence_packets: _record_completed_tournament_candidate(state,c,ctx)
+    state.tournament_phase='reviewing_candidates'; _persist_tournament_state(state, ctx)
+    for cid,summ in list(state.candidate_summaries.items()):
+        if cid in state.candidate_risk_reviews: continue
+        packet=state.candidate_evidence_packets.get(cid)
+        review=None if _time_low(state, deadline) else _model_candidate_risk_review(state, packet, ctx) if packet else None
+        state.candidate_risk_reviews[cid]=review or _risk_review_from_summary(summ, packet)
+        _persist_tournament_state(state, ctx)
+    state.tournament_phase='comparing_candidates'; _persist_tournament_state(state, ctx)
+    revs=list(state.candidate_risk_reviews.values()); existing={(c.candidate_a,c.candidate_b) for c in state.pairwise_comparisons}
     for i in range(len(revs)):
         for j in range(i+1,len(revs)):
+            if (revs[i].candidate_id,revs[j].candidate_id) in existing: continue
             ae=state.candidate_evidence_packets.get(revs[i].candidate_id); be=state.candidate_evidence_packets.get(revs[j].candidate_id)
-            cmp=_model_pairwise_comparison(state, ae, be, revs[i], revs[j], ctx) if ae and be else None
-            comparisons.append(cmp or _compare_pair(revs[i],revs[j], ae, be))
-    state.pairwise_comparisons=comparisons
-    state.candidate_agreement_summary=build_candidate_agreement_summary(state.candidate_evidence_packets)
-    state.tournament_ranking=_rank_tournament(state); commit_tournament_selection(state, ctx); _write_tournament_artifacts(state); state.phase='finalizing' if state.selection else 'selecting'
-    return {'launched':made,'max_parallel':maxp,'candidate_summaries':{k:v.model_dump(mode='json') for k,v in state.candidate_summaries.items()},'tournament_ranking':state.tournament_ranking.model_dump(mode='json'),'next_allowed_actions':state.allowed_next_actions()}
+            cmp=None if _time_low(state, deadline) else (_model_pairwise_comparison(state, ae, be, revs[i], revs[j], ctx) if ae and be else None)
+            state.pairwise_comparisons.append(cmp or _compare_pair(revs[i],revs[j], ae, be)); _persist_tournament_state(state, ctx)
+    state.tournament_phase='ranking'; state.candidate_agreement_summary=build_candidate_agreement_summary(state.candidate_evidence_packets); state.tournament_ranking=_rank_tournament(state); _persist_tournament_state(state, ctx)
+    commit_tournament_selection(state, ctx); state.tournament_phase='selection_committed' if state.selection else 'failed'; _persist_tournament_state(state, ctx)
+    return {'reviewed':list(state.candidate_risk_reviews),'pairwise_comparisons':len(state.pairwise_comparisons),'tournament_ranking':state.tournament_ranking.model_dump(mode='json') if state.tournament_ranking else None,'selection':state.selection,'next_allowed_actions':state.allowed_next_actions()}
 
 def h_launch_candidates(state, inp, ctx):
     fallback_active=state.fallback_execution_path=='parallel_candidates_after_decomposition_deadlock'
@@ -2208,7 +2297,8 @@ OPS_TOOLS={
 'ops_validate_decomposition':ToolSpec('ops_validate_decomposition','Validate decomposition',OpsValidateDecompositionInput,h_validate_decomposition),
 'ops_select_execution_path':ToolSpec('ops_select_execution_path','Select execution path',OpsSelectExecutionPathInput,h_select_path),
 'ops_launch_candidates':ToolSpec('ops_launch_candidates','Launch full-task candidates in parallel/batches. Legacy batch fallback is disabled during adaptive decomposition-deadlock fallback unless legacy_ops_launch_candidates_enabled is explicitly set; use ops_run_next_fallback_candidate_attempt there. Never valid for single_task.',OpsLaunchCandidatesInput,h_launch_candidates),
-'ops_launch_tournament_candidates':ToolSpec('ops_launch_tournament_candidates','Launch independent adaptive tournament candidates in parallel up to backend max_parallel, then summarize, adversarially review, compare, rank, and write tournament artifacts.',OpsLaunchTournamentCandidatesInput,h_launch_tournament_candidates),
+'ops_launch_tournament_candidates':ToolSpec('ops_launch_tournament_candidates','Launch independent adaptive tournament candidates in parallel up to backend max_parallel, save candidates/evidence incrementally, then return before tournament evaluation.',OpsLaunchTournamentCandidatesInput,h_launch_tournament_candidates),
+'ops_evaluate_tournament':ToolSpec('ops_evaluate_tournament','Review completed tournament candidates, compare/rank, and commit selection with time-boxed deterministic fallbacks.',OpsEvaluateTournamentInput,h_evaluate_tournament),
 'ops_run_next_candidate_attempt':ToolSpec('ops_run_next_candidate_attempt','Run exactly one adaptive full-task candidate attempt, then validate/review/observe it automatically.',OpsRunNextCandidateAttemptInput,h_run_next_candidate_attempt),
 'ops_run_next_fallback_candidate_attempt':ToolSpec('ops_run_next_fallback_candidate_attempt','Run exactly one adaptive full-task fallback candidate after decomposition deadlock, then validate/review/observe it automatically.',OpsRunNextFallbackCandidateAttemptInput,h_run_next_fallback_candidate_attempt),
 'ops_run_next_subtask_attempt':ToolSpec('ops_run_next_subtask_attempt','Run exactly one adaptive subtask attempt selected from current decomposition state, then focused-validate/review/observe it automatically.',OpsRunNextSubtaskAttemptInput,h_run_next_subtask_attempt),

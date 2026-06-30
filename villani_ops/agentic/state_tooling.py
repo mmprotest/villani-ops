@@ -19,7 +19,7 @@ def _allowed(state, name, data):
             return False, f'{name} is not allowed in adaptive orchestrator; adaptive uses execution_path=candidate_tournament when candidate_attempts > 1 and does not decompose'
         if name=='ops_select_execution_path' and data.get('path') not in {'single_task','candidate_tournament'}:
             return True, None
-        if name=='ops_launch_tournament_candidates' and state.execution_path=='candidate_tournament': return True, None
+        if name in {'ops_launch_tournament_candidates','ops_evaluate_tournament'} and state.execution_path=='candidate_tournament': return True, None
         if name=='ops_run_next_candidate_attempt' and state.candidate_attempts>1:
             return False, 'ops_run_next_candidate_attempt is legacy single-attempt/adaptive-retry; tournament mode uses ops_launch_tournament_candidates'
 
@@ -46,6 +46,7 @@ def _allowed(state, name, data):
         if state.decomposed_execution_status not in {'blocked','failed'} or not detect_decomposition_deadlock(state): return False,'fallback requires decomposition deadlock'
     if name=='ops_launch_candidates' and state.execution_path=='single_task': return False,'single_task execution uses adaptive sequential attempts; call ops_run_next_candidate_attempt'
     if name=='ops_launch_tournament_candidates' and state.execution_path!='candidate_tournament': return False,'ops_launch_tournament_candidates requires execution_path=candidate_tournament'
+    if name=='ops_evaluate_tournament' and state.execution_path!='candidate_tournament': return False,'ops_evaluate_tournament requires execution_path=candidate_tournament'
     if name=='ops_launch_candidates' and state.execution_path!='parallel_candidates' and state.fallback_execution_path!='parallel_candidates_after_decomposition_deadlock': return False,'candidates require parallel_candidates execution path or fallback'
     if name=='ops_run_next_candidate_attempt' and state.execution_path!='single_task': return False,'ops_run_next_candidate_attempt requires execution_path=single_task'
     if name=='ops_run_next_fallback_candidate_attempt' and state.fallback_execution_path!='parallel_candidates_after_decomposition_deadlock': return False,'ops_run_next_fallback_candidate_attempt requires decomposition-deadlock fallback mode'

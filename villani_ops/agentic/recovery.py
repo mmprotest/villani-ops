@@ -1,7 +1,7 @@
 from pydantic import BaseModel
 from villani_ops.core.acceptance import is_attempt_acceptance_eligible
 from .state import detect_decomposition_deadlock
-from .tools import commit_tournament_selection
+from .tools import commit_tournament_selection, hydrate_tournament_state_from_artifacts
 
 class RecoveryRecommendation(BaseModel):
     action:str
@@ -107,6 +107,7 @@ def _subtask_commit_ready(st):
 
 def recommend_next_agentic_action(state):
     if state.execution_path=='candidate_tournament':
+        hydrate_tournament_state_from_artifacts(state)
         if not state.selection and ((state.tournament_ranking and state.tournament_ranking.selected_candidate_id) or state.candidates):
             committed=commit_tournament_selection(state)
             if committed and state.selection:
@@ -116,6 +117,8 @@ def recommend_next_agentic_action(state):
             aid=state.selection.get('selected_attempt_id'); a=_find_attempt_by_id(state, aid)
             return RecoveryRecommendation(action='finalize_selected_winner',tool_name='ops_finalize_run',tool_input={'decision':'accepted','summary':build_evidence_based_acceptance_summary(state),'selected_attempt_id':aid,'selected_patch_path':_patch(a),'blockers':[]},reason='Tournament selection exists and should be finalized.',can_execute_deterministically=True)
         if state.tournament_ranking is None and any(_complete(c) and _patch(c) and _changed(c) for c in state.candidates):
+            if len(state.candidate_risk_reviews) < len([c for c in state.candidates if _complete(c)]):
+                return RecoveryRecommendation(action='evaluate_tournament',tool_name='ops_evaluate_tournament',tool_input={'reason':'Resume tournament evaluation from saved candidate evidence.'},reason='Completed tournament candidates/evidence exist but reviews/ranking are incomplete.',can_execute_deterministically=False)
             committed=commit_tournament_selection(state)
             if committed and state.selection:
                 aid=state.selection.get('selected_attempt_id'); a=_find_attempt_by_id(state, aid)
