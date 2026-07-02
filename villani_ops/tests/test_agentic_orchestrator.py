@@ -1,3 +1,6 @@
+import pytest
+
+pytestmark = pytest.mark.integration
 from types import SimpleNamespace
 import json
 from pathlib import Path

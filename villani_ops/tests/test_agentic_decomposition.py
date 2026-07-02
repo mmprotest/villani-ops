@@ -1,3 +1,6 @@
+import pytest
+
+pytestmark = pytest.mark.integration
 from villani_ops.tests.test_agentic_tools import state, ctx
 from villani_ops.agentic.state_tooling import execute_tool_with_policy
 

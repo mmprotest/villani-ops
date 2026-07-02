@@ -18,6 +18,12 @@ villani-ops = "villani_ops.cli.main:app"
 
 [tool.pytest.ini_options]
 testpaths = ["villani_ops/tests"]
+addopts = "-m 'not slow and not integration and not e2e'"
+markers = [
+  "slow: slow tests excluded from the default suite",
+  "integration: integration tests excluded from the default suite",
+  "e2e: end-to-end tests excluded from the default suite",
+]
 
 [tool.setuptools.package-data]
 villani_ops = ["viewer/static/index.html"]

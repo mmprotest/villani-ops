@@ -1,3 +1,6 @@
+import pytest
+
+pytestmark = pytest.mark.integration
 from pathlib import Path
 
 from villani_ops.agentic.tools import extract_changed_file_metadata, _set_acceptance_from_gate

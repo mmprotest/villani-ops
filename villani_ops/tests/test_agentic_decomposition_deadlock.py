@@ -1,3 +1,6 @@
+import pytest
+
+pytestmark = pytest.mark.integration
 from villani_ops.agentic.state import OpsRunState, SubtaskState, CandidateAttemptState, detect_decomposition_deadlock
 from villani_ops.agentic.state_tooling import execute_tool_with_policy
 from villani_ops.agentic.recovery import recommend_next_agentic_action
