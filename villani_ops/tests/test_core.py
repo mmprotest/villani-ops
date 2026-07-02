@@ -51,3 +51,13 @@ def test_cli_init_backend_runner(tmp_path, monkeypatch):
     res=runner.invoke(app,["backend","list"]); assert res.exit_code==0 and "local" in res.output
     assert runner.invoke(app,["runner","set","shell","--command","python x.py"]).exit_code==0
     res=runner.invoke(app,["runner","list"]); assert res.exit_code==0 and "python x.py" in res.output
+
+
+def test_init_creates_nested_workspace_parents(tmp_path):
+    from villani_ops.storage.files import FileStorage
+    ws=tmp_path/'missing'/'parent'/'.villani-ops'
+    FileStorage(ws).init_workspace()
+    assert ws.exists()
+    assert (ws/'config.yaml').exists()
+    assert (ws/'backends.yaml').exists()
+    assert (ws/'runs').is_dir()

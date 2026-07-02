@@ -138,3 +138,55 @@ def test_offline_viewer_contains_required_ui_without_external_deps(tmp_path):
     assert 'formatInteger' in text and 'formatCost' in text
     assert 'villani-run-snapshot' in text
     assert 'https://' not in text and 'cdn' not in text.lower() and 'npm' not in text.lower()
+
+
+def _decision_run(tmp_path, state):
+    rd=tmp_path/'runs'/state.get('run_id','decision'); rd.mkdir(parents=True, exist_ok=True)
+    (rd/'state.json').write_text(json.dumps(state))
+    (rd/'runtime_events.jsonl').write_text(json.dumps({'timestamp':'2026-06-26T00:00:00+00:00','type':'run_finalized','payload':state.get('final_decision') or {}}))
+    return rd
+
+
+def test_decision_summary_and_warnings_render_in_offline_html(tmp_path):
+    rd=_decision_run(tmp_path, {'run_id':'decision','status':'completed','task':'A very long task objective that should remain fully present in the DOM','runner':'villani-code-long-runner-name','backend_model':'local/backend/model-name-long','selection':{'selected_attempt_id':'candidate_003'},'selection_basis':'best_effort_tournament_selection','candidates':[{'attempt_id':'candidate_003','status':'completed','patch_path':'x.patch','changed_files':['src/calculator.py'],'runner_status':'completed','review_status':'passed','validation_status':'not_run','acceptance_eligible':True}]})
+    snap=build_viewer_snapshot(rd)
+    assert snap['decision']['state'] == 'accepted_with_warnings'
+    html=write_offline_viewer(rd).read_text()
+    assert 'Decision Summary' in html
+    assert 'Raw final state' in html and 'Final result\\n' not in html
+    assert 'Validation did not run. Treat this result as unverified.' in html
+    assert 'A very long task objective that should remain fully present in the DOM' in html
+    assert 'candidate_003' in html and 'Candidate Evidence' in html
+
+
+def test_decision_summary_states(tmp_path):
+    base={'run_id':'r','selection':{'selected_attempt_id':'candidate_001'},'candidates':[{'attempt_id':'candidate_001','validation_status':'passed','review_status':'passed'}]}
+    assert build_viewer_snapshot(_decision_run(tmp_path/'a',{**base,'status':'completed'}))['decision']['state']=='accepted'
+    assert build_viewer_snapshot(_decision_run(tmp_path/'b',{**base,'run_id':'r2','status':'completed','candidates':[{'attempt_id':'candidate_001','review_status':'passed'}]}))['decision']['state']=='accepted_with_warnings'
+    assert build_viewer_snapshot(_decision_run(tmp_path/'c',{'run_id':'r3','status':'failed','failure_message':'Could not connect to backend http://127.0.0.1:9/v1'}))['decision']['state']=='failed'
+    assert build_viewer_snapshot(_decision_run(tmp_path/'d',{'run_id':'r4','status':'completed','candidates':[]}))['decision']['state']=='incomplete'
+
+
+def test_graph_and_candidate_evidence_expose_winner_missing_validation_and_failure(tmp_path):
+    rd=_decision_run(tmp_path, {'run_id':'graph2','status':'failed','selection':{'selected_attempt_id':'candidate_001'},'candidates':[{'attempt_id':'candidate_001','status':'completed','validation_status':'not_run','changed_files':['a.py']},{'attempt_id':'candidate_002','status':'failed'}]})
+    snap=build_viewer_snapshot(rd)
+    assert any(n['subtitle']=='Selected winner' for n in snap['graph']['nodes'])
+    assert any(n['id']=='validation_group' and n['status']=='missing' for n in snap['graph']['nodes'])
+    assert any(n['id']=='finalization_group' and n['status']=='failed' for n in snap['graph']['nodes'])
+    assert {c['candidate_id'] for c in snap['candidate_evidence']} == {'candidate_001','candidate_002'}
+
+
+def test_normalized_usage_statuses(tmp_path):
+    rd=tmp_path/'runs'/'usage-normalized'; rd.mkdir(parents=True)
+    (rd/'state.json').write_text(json.dumps({'run_id':'usage-normalized','status':'completed'}))
+    (rd/'runtime_events.jsonl').write_text('')
+    (rd/'usage.json').write_text(json.dumps({'input_tokens':1200,'output_tokens':5100,'total_tokens':6300,'calls_count':1,'unavailable_calls_count':1}))
+    u=build_viewer_snapshot(rd)['usage']; assert u['tokens']['status']=='available' and u['cost']['status']=='unavailable'
+    (rd/'usage.json').write_text(json.dumps({'calls_count':0,'unavailable_calls_count':0}))
+    u=build_viewer_snapshot(rd)['usage']; assert u['tokens']['status']=='unavailable' and u['cost']['status']=='unavailable'
+    (rd/'usage.json').write_text(json.dumps({'total_tokens':10,'total_cost':0.12,'calls_count':2,'unavailable_calls_count':1}))
+    assert build_viewer_snapshot(rd)['usage']['cost']['status']=='partial'
+    (rd/'usage.json').write_text(json.dumps({'total_tokens':10,'total_cost':0.01,'calls_count':1,'estimated':True}))
+    assert build_viewer_snapshot(rd)['usage']['cost']['status']=='estimated'
+    (rd/'usage.json').write_text(json.dumps({'total_tokens':10,'total_cost':0.0,'calls_count':1,'unavailable_calls_count':0}))
+    assert build_viewer_snapshot(rd)['usage']['cost']['status']=='zero'

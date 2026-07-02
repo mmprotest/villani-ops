@@ -14,19 +14,19 @@ class FileStorage:
     def __init__(self, workspace: str | Path = ".villani-ops"):
         self.workspace = Path(workspace).expanduser().resolve()
     def init_workspace(self):
-        self.workspace.mkdir(exist_ok=True); (self.workspace/"policies").mkdir(exist_ok=True); (self.workspace/"runs").mkdir(exist_ok=True)
+        self.workspace.mkdir(parents=True, exist_ok=True); (self.workspace/"policies").mkdir(exist_ok=True); (self.workspace/"runs").mkdir(exist_ok=True)
         if not (self.workspace/"config.yaml").exists(): self.save_config({"runners":{"shell":{"command":None},"villani_code":{"command":None}}})
         if not (self.workspace/"backends.yaml").exists(): self.save_backends([])
     def load_config(self)->dict[str,Any]:
         p=self.workspace/"config.yaml"; return yaml.safe_load(p.read_text()) if p.exists() else {"runners":{}}
-    def save_config(self,cfg): self.workspace.mkdir(exist_ok=True); (self.workspace/"config.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False))
+    def save_config(self,cfg): self.workspace.mkdir(parents=True, exist_ok=True); (self.workspace/"config.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False))
     def load_backends(self)->dict[str,Backend]:
         p=self.workspace/"backends.yaml"; data=yaml.safe_load(p.read_text()) if p.exists() else []
         items=data.get("backends", data) if isinstance(data,dict) else data or []
         return {b["name"]: Backend.model_validate(b) for b in items}
     def save_backends(self, backends):
         vals=list(backends.values()) if isinstance(backends,dict) else backends
-        self.workspace.mkdir(exist_ok=True); (self.workspace/"backends.yaml").write_text(yaml.safe_dump({"backends":[b.model_dump(mode="json") for b in vals]}, sort_keys=False))
+        self.workspace.mkdir(parents=True, exist_ok=True); (self.workspace/"backends.yaml").write_text(yaml.safe_dump({"backends":[b.model_dump(mode="json") for b in vals]}, sort_keys=False))
     def create_run_dir(self, run_id):
         p=self.workspace/"runs"/run_id; (p/"attempts").mkdir(parents=True, exist_ok=True); return p
     def save_task(self, run_dir, task:Task): (Path(run_dir)/"task.json").write_text(task.model_dump_json(indent=2))

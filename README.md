@@ -46,7 +46,7 @@ villani-ops backend add qwen35b \
   --provider openai-compatible \
   --base-url http://127.0.0.1:1234/v1 \
   --model villanis/models/qwen3.6-35b-a3b-ud-iq4_xs.gguf \
-  --api-key key \
+  --api-key dummy \
   --input-cost 0.14 \
   --output-cost 1.00 \
   --roles coding,classification,review,policy,investigation,selection \
@@ -55,7 +55,7 @@ villani-ops backend add qwen35b \
   --max-parallel 4
 ```
 
-Run a tournament:
+Run a tournament (equivalent one-line form: `villani-ops run --mode performance --repo ./repo --task "Fix the failing tests"`):
 
 ```bash
 villani-ops run \
@@ -95,6 +95,10 @@ Recommended demo defaults:
 | `--candidate-attempts` | `4` | Run multiple independent candidates. |
 | `--timeout-seconds` | `1500` | Default run timeout if not explicitly set. |
 | backend `--max-parallel` | `4` | Allow parallel candidate execution when capacity exists. |
+
+## Legacy compatibility
+
+The previous cost-policy runner remains available as a legacy compatibility command via `villani-ops cost-run` for older YAML policy workflows. New runs should use `villani-ops run --mode performance`.
 
 ## Adaptive tournament mode
 
@@ -212,5 +216,3 @@ Known limitations:
 - If no authoritative validation exists, selection may be best-effort.
 
 The current release is for testing the orchestration loop, candidate tournament, artifact trail, and local-first workflow.
-  --non-interactive
-```

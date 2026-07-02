@@ -1,7 +1,8 @@
 from __future__ import annotations
 from pathlib import Path
 from datetime import datetime, timezone
-import secrets
+import secrets, json
+import httpx
 from pydantic import BaseModel, ConfigDict
 from villani_ops.core.decision import Decision
 from .state import OpsRunState
@@ -18,6 +19,43 @@ from villani_ops.execution_policies import policy_for_mode
 from villani_ops.core.policy import DEFAULT_TIMEOUT_SECONDS
 from villani_ops.orchestration.nodes import OrchestrationNode
 from villani_ops.orchestration.context import TaskContext
+
+
+def _backend_label(backend):
+    return str(getattr(backend, 'base_url', None) or getattr(backend, 'name', None) or getattr(backend, 'model', None) or 'configured backend')
+
+def _provider_failure(exc: Exception, backend) -> tuple[str, str, bool]:
+    label = _backend_label(backend)
+    if isinstance(exc, httpx.ConnectError):
+        return 'backend_connection_error', f'Could not connect to backend: {label}', True
+    if isinstance(exc, (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.TimeoutException)):
+        return 'backend_timeout', f'Backend timed out: {label}', True
+    if isinstance(exc, httpx.HTTPStatusError):
+        code = getattr(getattr(exc, 'response', None), 'status_code', 'unknown')
+        return 'backend_http_error', f'Backend returned HTTP {code}: {label}', True
+    if isinstance(exc, httpx.HTTPError):
+        return 'backend_response_error', f'Backend request failed: {label}', True
+    if isinstance(exc, (json.JSONDecodeError, KeyError, IndexError, TypeError, ValueError)):
+        return 'backend_response_error', f'Backend response could not be parsed: {label}', True
+    return 'runner_error', str(exc) or exc.__class__.__name__, False
+
+def _write_failure_report(run_dir: Path, state: OpsRunState):
+    msg = state.failure_message or (state.final_decision or {}).get('summary') or 'Run failed'
+    lines = ['# Villani Ops Run Failed', '', f'Status: {state.status}', f'Failure kind: {state.failure_kind or "runner_error"}', f'Reason: {msg}', f'Recoverable: {str(bool(state.recoverable)).lower()}', '', 'Next step: Start the backend server or update the backend configuration.']
+    (Path(run_dir) / 'final_report.md').write_text('\n'.join(lines) + '\n', encoding='utf-8')
+
+def _finalize_provider_failure(run_dir: Path, state: OpsRunState, rec: OpsEventRecorder, usage_rec: UsageRecorder, transcript: list[dict], exc: Exception, backend) -> OpsRunResult:
+    kind, msg, recoverable = _provider_failure(exc, backend)
+    state.status='failed'; state.phase='failed'; state.failure_kind=kind; state.failure_message=msg; state.recoverable=recoverable
+    state.final_decision={'decision':'failed','summary':msg,'failure_kind':kind,'failure_message':msg,'recoverable':recoverable,'next_step':'Start the backend server or update the backend configuration.'}
+    state.blockers.append(kind)
+    rec.record('provider_failure', payload={'failure_kind':kind,'failure_message':msg,'recoverable':recoverable,'backend':_backend_label(backend)})
+    rec.record('run_finalized', payload=state.final_decision)
+    try: usage_rec.write_artifacts()
+    except Exception: pass
+    state.save(Path(run_dir)/'state.json'); rec.write_digest(state); write_artifacts(Path(run_dir),state,rec.events(),transcript); _write_failure_report(Path(run_dir), state)
+    d=Decision(run_id=state.run_id,accepted=False,mode=state.mode,runner=state.runner,reason=msg,failure_reason=msg)
+    return OpsRunResult(run_id=state.run_id,run_dir=str(run_dir),state=state,decision=d)
 
 class AgenticLLMReviewer:
     def __init__(self, review_backend):
@@ -115,7 +153,10 @@ class OpsRunner:
         for _ in range(self.max_turns):
             if state.is_terminal(): break
             rec.record('model_request_started',phase=state.phase)
-            resp=self.client.create_message(backend=backend,messages=messages,system=system_prompt,tools=openai_tool_specs(adaptive=(request.orchestrator=='adaptive')),tool_choice='auto',strict=True)
+            try:
+                resp=self.client.create_message(backend=backend,messages=messages,system=system_prompt,tools=openai_tool_specs(adaptive=(request.orchestrator=='adaptive')),tool_choice='auto',strict=True)
+            except Exception as e:
+                return _finalize_provider_failure(run_dir,state,rec,usage_rec,transcript,e,backend)
             assistant_msg={'role':'assistant','content':resp.content,'raw_response':getattr(resp,'raw_response',{})}; transcript.append(assistant_msg)
             urec=usage_record_from_response(run_id=rid,phase=state.phase,role='orchestration',backend=backend,response=resp); usage_rec.record(urec); _update_usage_state(); usage_payload={k:getattr(urec,k) for k in ['input_tokens','output_tokens','total_tokens','total_cost','usage_source']}
             rec.record('model_response_received',payload={'finish_reason':getattr(resp,'finish_reason',None),'content':resp.content,'raw_response':getattr(resp,'raw_response',{}),**usage_payload})
