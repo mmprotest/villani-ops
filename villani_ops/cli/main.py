@@ -183,6 +183,14 @@ def run(ctx: typer.Context, repo: str|None=None, task: str|None=typer.Option(Non
     else:
         result=VillaniOps(s, progress_reporter=RunProgressReporter(not quiet, verbose=verbose)).run(repo=repo, task=t, candidate_attempts=candidate_attempts, timeout_seconds=timeout_seconds, classify=classify, non_interactive=(non_interactive or not sys.stdin.isatty()), mode=mode, runner=runner)
     d=result.decision
+    failure_kind = getattr(getattr(result, 'state', None), 'failure_kind', None)
+    if failure_kind:
+        msg = getattr(result.state, 'failure_message', None) or getattr(d, 'failure_reason', None) or getattr(d, 'reason', 'Run failed')
+        console.print('Villani Ops run failed')
+        console.print(f'Reason: {msg}')
+        console.print(f'Run directory: {result.run_dir}')
+        console.print('Next step: Start the backend server or update the backend configuration.')
+        raise typer.Exit(1)
     console.print(f"Result: {'ACCEPTED' if d.accepted else 'FAILED'}")
     console.print(f'Mode: {d.mode}')
     console.print(f'Task: {t.objective}')

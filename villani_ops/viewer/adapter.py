@@ -141,7 +141,44 @@ def _usage(run_dir, state, digest):
     candidates=[cost, summary, state.get('usage_summary') if isinstance(state,dict) else {}, digest.get('usage') if isinstance(digest,dict) else {}, aggregate_usage_jsonl(run_dir)]
     src=next((c for c in candidates if _meaningful(c)), {})
     inp=_num(src,'input_tokens','prompt_tokens'); out=_num(src,'output_tokens','completion_tokens'); total=_num(src,'total_tokens') or inp+out
-    return {'input_tokens':inp,'output_tokens':out,'total_tokens':total,'input_cost':_num(src,'input_cost'),'output_cost':_num(src,'output_cost'),'total_cost':_num(src,'total_cost','cost','usd'),'calls_count':int(_num(src,'calls_count')),'unavailable_calls_count':int(_num(src,'unavailable_calls_count','unavailable_calls')),'by_role':src.get('by_role',{}) if isinstance(src,dict) else {},'by_backend':src.get('by_backend',{}) if isinstance(src,dict) else {},'by_model':src.get('by_model',{}) if isinstance(src,dict) else {}}
+    return {'input_tokens':inp,'output_tokens':out,'total_tokens':total,'input_cost':_num(src,'input_cost'),'output_cost':_num(src,'output_cost'),'total_cost':_num(src,'total_cost','cost','usd'),'calls_count':int(_num(src,'calls_count')),'unavailable_calls_count':int(_num(src,'unavailable_calls_count','unavailable_calls')),'tokens':{'status':'available' if total else 'unavailable','total':total or None,'input':inp or None,'output':out or None},'cost':{'status':('partial' if int(_num(src,'unavailable_calls_count','unavailable_calls')) and _num(src,'total_cost','cost','usd') else ('estimated' if src.get('estimated') else ('available' if _num(src,'total_cost','cost','usd') else ('zero' if int(_num(src,'calls_count')) and not int(_num(src,'unavailable_calls_count','unavailable_calls')) else 'unavailable')))),'amount':_num(src,'total_cost','cost','usd') if (_num(src,'total_cost','cost','usd') or int(_num(src,'calls_count'))) else None,'currency':'USD','reason':'Backend pricing data is missing' if int(_num(src,'unavailable_calls_count','unavailable_calls')) or not _meaningful(src) else None},'by_role':src.get('by_role',{}) if isinstance(src,dict) else {},'by_backend':src.get('by_backend',{}) if isinstance(src,dict) else {},'by_model':src.get('by_model',{}) if isinstance(src,dict) else {}}
+
+def _validation_status(c):
+    return (c.get('validation_status') or (c.get('validation') or {}).get('status') or ('passed' if (c.get('validation') or {}).get('passed') is True else 'failed' if (c.get('validation') or {}).get('passed') is False else 'not_run'))
+
+def derive_decision_summary(state: dict, digest: dict) -> dict:
+    status=str(state.get('status') or digest.get('status') or 'unknown')
+    sel=(state.get('selection') or {}).get('selected_attempt_id') or (state.get('selection') or {}).get('selected_candidate_id') or digest.get('selected_attempt')
+    cands=[c for c in state.get('candidates',[]) if isinstance(c,dict)]
+    winner=next((c for c in cands if c.get('attempt_id')==sel), {})
+    warnings=[]
+    if status=='failed': kind='failed'
+    elif status=='interrupted': kind='cancelled'
+    elif not sel: kind='incomplete'
+    else:
+        val=_validation_status(winner)
+        rev=winner.get('review_status') or ('passed' if winner.get('review') else 'not_run')
+        if val=='passed' and rev not in {'not_run','missing','unknown','unavailable',None}: kind='accepted'
+        else: kind='accepted_with_warnings'
+        if val not in {'passed'}: warnings.append('Validation did not run. Treat this result as unverified.' if val in {'not_run','missing','skipped','unknown','',None} else f'Validation status is {val}. Treat this result as unverified.')
+        if rev in {'not_run','missing','unknown','unavailable',None}: warnings.append('Review did not run. Treat this result as unreviewed.')
+    if (state.get('usage_summary') or {}).get('cost_unavailable') or _num(state.get('usage_summary') or {}, 'unavailable_calls_count'):
+        warnings.append('Cost is unavailable because pricing data is missing.')
+    label={'accepted':'Accepted','accepted_with_warnings':'Accepted with warnings','failed':'Failed','incomplete':'Incomplete','cancelled':'Cancelled'}.get(kind,'Unknown')
+    failure=state.get('failure_message') or (state.get('final_decision') or {}).get('failure_message') or (state.get('final_decision') or {}).get('summary') if kind=='failed' else None
+    changed=winner.get('changed_files') or (state.get('integration') or {}).get('changed_files') or []
+    return {'state':kind,'label':label,'winner':sel,'selection_basis':state.get('selection_basis') or (state.get('selection') or {}).get('selection_basis') or (state.get('selection') or {}).get('basis') or 'Unavailable','validation_status':_validation_status(winner) if winner else 'Unknown','review_status':winner.get('review_status') or ('passed' if winner.get('review') else 'Unknown'),'runner_status':winner.get('runner_status') or winner.get('status') or status,'changed_files_count':len(changed),'changed_files':changed,'confidence':(state.get('tournament_ranking') or {}).get('selection_confidence') or (state.get('selection') or {}).get('confidence'),'failure_reason':failure,'warnings':warnings,'next_step':'Start the backend server or update backend configuration.' if kind=='failed' else ('Run validation/review before trusting this result.' if kind in {'accepted_with_warnings','incomplete'} else '')}
+
+def candidate_evidence(state: dict) -> list[dict]:
+    sel=(state.get('selection') or {}).get('selected_attempt_id') or (state.get('selection') or {}).get('selected_candidate_id')
+    out=[]
+    for c in [x for x in state.get('candidates',[]) if isinstance(x,dict)]:
+        val=_validation_status(c); rev=c.get('review_status') or ('passed' if c.get('review') else 'Unknown')
+        warns=[]
+        if val!='passed': warns.append('Validation did not run' if val in {'not_run','missing','unknown','',None} else f'Validation {val}')
+        if rev in {'not_run','Unknown','missing','unavailable',None}: warns.append('Review did not run')
+        out.append({'candidate_id':c.get('attempt_id') or 'Unknown','status':c.get('status') or 'Unknown','patch':'yes' if c.get('patch_path') else 'no','changed_files':c.get('changed_files') or [],'runner_status':c.get('runner_status') or (f"exit {c.get('exit_code')}" if c.get('exit_code') is not None else 'Unknown'),'review_status':rev,'validation_status':val or 'Unknown','eligible':bool(c.get('acceptance_eligible')),'blockers':(c.get('acceptance_blockers') or [])+warns,'selected':c.get('attempt_id')==sel})
+    return out
 
 def _model(state, usage, events):
     for k in ('selected_model','orchestrator_model','backend_model','model'):
@@ -202,13 +239,13 @@ def build_viewer_graph_layout(snapshot_or_state: dict[str,Any], events: list[dic
     add(group_id,'Fallback candidates' if fallback else 'Candidates','group',cand_row,cand_col,'completed' if cand_ids else 'pending',f"{len(cand_ids)} candidates",{},[{'id':cid,'status':next((c.get('status') for c in candidates if c.get('attempt_id')==cid),None),'validations':sum(1 for e in events if _attempt_id(e)==cid and (e.get('type') or '').startswith('validation_')),'reviews':sum(1 for e in events if _attempt_id(e)==cid and e.get('type')=='candidate_attempt_reviewed')} for cid in cand_ids])
     edge(prev,group_id)
     for i,cid in enumerate(cand_ids[:3],1):
-        add(cid,humanize_id(cid),'candidate',cand_row,cand_col+i,'selected' if cid==sel else 'completed','summarized in candidates group')
+        add(cid,humanize_id(cid),'candidate',cand_row,cand_col+i,'selected' if cid==sel else 'completed',('Selected winner' if cid==sel else 'candidate lane'))
         edge(group_id,cid)
     final_row = 4 if sub_ids else 3
-    add('validation_group','Validation','group',final_row,5,'completed' if 'validation_completed' in types else ('failed' if 'validation_failed' in types else 'pending'),f"{counts('validation_')} validation events")
+    add('validation_group','Validation','group',final_row,5,'completed' if 'validation_completed' in types else ('failed' if 'validation_failed' in types else 'missing'),('validation missing' if counts('validation_')==0 else f"{counts('validation_')} validation events"))
     add('review_group','Review','group',final_row,6,'completed' if 'candidate_attempt_reviewed' in types or 'subtask_attempt_reviewed' in types else 'pending',f"{counts('review_')} retries")
     add('selection_group','Selection','group',final_row,7,'selected' if sel or 'selection_completed' in types else 'pending',humanize_id(sel or 'winner'),{'selected_attempt_id':sel})
-    final_status='completed' if 'run_finalized' in types or state.get('status') in {'completed','failed'} else 'pending'
+    final_status='failed' if state.get('status')=='failed' else ('completed' if 'run_finalized' in types or state.get('status') in {'completed','failed'} else 'pending')
     add('finalization_group','Finalization','group',final_row,8,final_status,state.get('status') or '',{'final_decision':state.get('final_decision')})
     for a,b in [(group_id,'validation_group'),('validation_group','review_group'),('review_group','selection_group'),('selection_group','finalization_group')]: edge(a,b)
     return {'nodes':nodes,'edges':edges}
@@ -217,4 +254,6 @@ def build_viewer_snapshot(run_dir: Path) -> dict[str, Any]:
     run_dir=Path(run_dir); state=_read_json(run_dir/'state.json', {}) or {}; digest=_read_json(run_dir/'event_digest.json', {}) or {}; events=_read_jsonl(run_dir/'runtime_events.jsonl'); usage_rows=_read_jsonl(run_dir/'usage.jsonl')
     usage=_usage(run_dir,state,digest); rid=state.get('run_id') or digest.get('run_id') or run_dir.name; started=state.get('started_at') or (events[0].get('timestamp') if events else None); finalized=state.get('completed_at') or (events[-1].get('timestamp') if events and events[-1].get('type')=='run_finalized' else None); pct,label=_progress(state,events)
     status=state.get('status') or digest.get('status') or ('running' if events else 'unknown')
-    return _redact({'run':{'run_id':rid,'run_id_short':rid[:18]+('…' if len(rid)>18 else ''),'task':state.get('task') or state.get('objective') or digest.get('task') or '', 'status':status, 'mode':state.get('mode') or digest.get('mode') or 'performance','runner':state.get('runner') or digest.get('runner') or 'villani-code','model':_model(state, usage_rows, events), 'started_at':started, 'completed_at':finalized, 'duration_seconds':_duration(started, finalized),'progress_percent':pct,'progress_label':label,'result':state.get('final_decision') or digest.get('final_decision'),'run_dir':str(run_dir),'run_dir_short':'…/'+run_dir.name}, 'usage':usage, 'timeline':_timeline(events), 'graph':build_viewer_graph_layout(state,events), 'warnings':state.get('warnings') or digest.get('warnings') or [], 'errors':state.get('errors') or digest.get('errors') or [], 'artifacts':{'state':'state.json','events':'runtime_events.jsonl','graph':'orchestration_graph.json','usage':'usage.json'}})
+    decision=derive_decision_summary(state,digest)
+    evidence=candidate_evidence(state)
+    return _redact({'run':{'run_id':rid,'run_id_short':rid[:18]+('…' if len(rid)>18 else ''),'task':state.get('task') or state.get('objective') or digest.get('task') or '', 'status':status, 'mode':state.get('mode') or digest.get('mode') or 'performance','runner':state.get('runner') or digest.get('runner') or 'villani-code','model':_model(state, usage_rows, events), 'started_at':started, 'completed_at':finalized, 'duration_seconds':_duration(started, finalized),'progress_percent':pct,'progress_label':label,'result':state.get('final_decision') or digest.get('final_decision'),'run_dir':str(run_dir),'run_dir_short':'…/'+run_dir.name}, 'usage':usage, 'decision':decision, 'candidate_evidence':evidence, 'timeline':_timeline(events), 'graph':build_viewer_graph_layout(state,events), 'warnings':state.get('warnings') or digest.get('warnings') or [], 'errors':state.get('errors') or digest.get('errors') or [], 'artifacts':{'state':'state.json','events':'runtime_events.jsonl','graph':'orchestration_graph.json','usage':'usage.json'}})

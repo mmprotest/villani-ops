@@ -288,6 +288,7 @@ class OpsRunState(BaseModel):
     run_started_at:float=Field(default_factory=__import__('time').time)
     orchestrator:Literal['adaptive','agentic']='agentic'
     status:Literal['active','completed','failed','interrupted']='active'
+    failure_kind:str|None=None; failure_message:str|None=None; recoverable:bool|None=None
     phase:Literal['started','investigating','planning','decomposing','choosing_execution_path','running_candidates','running_subtasks','integrating','validating','selecting','finalizing','completed','failed']='started'
     classification:dict|None=None; investigation:dict|None=None; plan:dict|None=None; decomposition:dict|None=None
     execution_path:Literal['unknown','single_task','parallel_candidates','decomposed_subtasks','candidate_tournament']='unknown'
