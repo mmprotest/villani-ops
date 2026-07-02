@@ -39,21 +39,41 @@ def _provider_failure(exc: Exception, backend) -> tuple[str, str, bool]:
         return 'backend_response_error', f'Backend response could not be parsed: {label}', True
     return 'runner_error', str(exc) or exc.__class__.__name__, False
 
-def _write_failure_report(run_dir: Path, state: OpsRunState):
-    msg = state.failure_message or (state.final_decision or {}).get('summary') or 'Run failed'
-    lines = ['# Villani Ops Run Failed', '', f'Status: {state.status}', f'Failure kind: {state.failure_kind or "runner_error"}', f'Reason: {msg}', f'Recoverable: {str(bool(state.recoverable)).lower()}', '', 'Next step: Start the backend server or update the backend configuration.']
+def _write_final_report(run_dir: Path, state: OpsRunState):
+    msg = state.failure_message or (state.final_decision or {}).get('summary') or ('Run completed' if state.status=='completed' else 'Run failed')
+    title = '# Villani Ops Run Report' if state.status=='completed' else '# Villani Ops Run Failed'
+    lines = [title, '', f'Run ID: {state.run_id}', f'Run directory: {run_dir}', f'Status: {state.status}']
+    if state.failure_kind or state.status=='failed': lines += [f'Failure kind: {state.failure_kind or "runner_error"}', f'Failure message: {msg}']
+    if state.backend_name or state.backend_model or state.backend_url:
+        lines += ['', '## Backend', f'Name: {state.backend_name or "Unknown backend"}', f'Model: {state.backend_model or "Unknown model"}', f'URL: {state.backend_url or "Unknown URL"}']
+    if state.recoverable is not None: lines.append(f'Recoverable: {str(bool(state.recoverable)).lower()}')
+    if state.status=='completed':
+        lines += ['', f'Winner: {(state.selection or {}).get("selected_attempt_id") or "none"}', f'Validation/review status: {state.final_decision or {}}']
+        if state.warnings: lines += ['', 'Warnings:', *[f'- {w}' for w in state.warnings]]
+    else:
+        lines += ['', 'Next step: Start the backend server or update the backend configuration.']
     (Path(run_dir) / 'final_report.md').write_text('\n'.join(lines) + '\n', encoding='utf-8')
+
+def _write_failure_report(run_dir: Path, state: OpsRunState):
+    _write_final_report(run_dir, state)
+
+def _write_viewer(run_dir: Path):
+    try:
+        from villani_ops.viewer.builder import write_offline_viewer
+        write_offline_viewer(Path(run_dir))
+    except Exception:
+        pass
 
 def _finalize_provider_failure(run_dir: Path, state: OpsRunState, rec: OpsEventRecorder, usage_rec: UsageRecorder, transcript: list[dict], exc: Exception, backend) -> OpsRunResult:
     kind, msg, recoverable = _provider_failure(exc, backend)
-    state.status='failed'; state.phase='failed'; state.failure_kind=kind; state.failure_message=msg; state.recoverable=recoverable
+    state.status='failed'; state.phase='failed'; state.failure_kind=kind; state.failure_message=msg; state.recoverable=recoverable; state.backend_name=getattr(backend,'name',None); state.backend_model=getattr(backend,'model',None); state.backend_url=getattr(backend,'base_url',None)
     state.final_decision={'decision':'failed','summary':msg,'failure_kind':kind,'failure_message':msg,'recoverable':recoverable,'next_step':'Start the backend server or update the backend configuration.'}
     state.blockers.append(kind)
-    rec.record('provider_failure', payload={'failure_kind':kind,'failure_message':msg,'recoverable':recoverable,'backend':_backend_label(backend)})
+    rec.record('provider_failure', payload={'failure_kind':kind,'failure_message':msg,'recoverable':recoverable,'backend_name':getattr(backend,'name',None),'model':getattr(backend,'model',None),'backend_url':getattr(backend,'base_url',None)})
     rec.record('run_finalized', payload=state.final_decision)
     try: usage_rec.write_artifacts()
     except Exception: pass
-    state.save(Path(run_dir)/'state.json'); rec.write_digest(state); write_artifacts(Path(run_dir),state,rec.events(),transcript); _write_failure_report(Path(run_dir), state)
+    state.save(Path(run_dir)/'state.json'); rec.write_digest(state); write_artifacts(Path(run_dir),state,rec.events(),transcript); _write_failure_report(Path(run_dir), state); _write_viewer(Path(run_dir))
     d=Decision(run_id=state.run_id,accepted=False,mode=state.mode,runner=state.runner,reason=msg,failure_reason=msg)
     return OpsRunResult(run_id=state.run_id,run_dir=str(run_dir),state=state,decision=d)
 
@@ -130,13 +150,14 @@ class OpsRunner:
             elif backend is not None:
                 role_backends={r:(getattr(backend,'name','backend'),backend) for r in ['orchestration','coding','review','selection']}
         except Exception as e:
-            state.status='failed'; state.phase='failed'; state.final_decision={'decision':'failed','summary':str(e),'blockers':['agentic_backend_role_unavailable']}; state.save(run_dir/'state.json'); rec.record('run_finalized',payload=state.final_decision); rec.write_digest(state); write_artifacts(run_dir,state,rec.events(),transcript); return OpsRunResult(run_id=rid,run_dir=str(run_dir),state=state,decision=Decision(run_id=rid,accepted=False,mode=state.mode,runner=state.runner,reason=str(e),failure_reason=str(e)))
+            state.status='failed'; state.phase='failed'; state.final_decision={'decision':'failed','summary':str(e),'blockers':['agentic_backend_role_unavailable']}; state.save(run_dir/'state.json'); rec.record('run_finalized',payload=state.final_decision); rec.write_digest(state); write_artifacts(run_dir,state,rec.events(),transcript); _write_final_report(run_dir, state); _write_viewer(run_dir); return OpsRunResult(run_id=rid,run_dir=str(run_dir),state=state,decision=Decision(run_id=rid,accepted=False,mode=state.mode,runner=state.runner,reason=str(e),failure_reason=str(e)))
         if backend is None or not getattr(backend,'model',None) or not (hasattr(backend,'create_message') or getattr(backend,'base_url',None)) or (request.production and not request.allow_fake_dependencies and _fakeish(backend)):
             msg='agentic orchestrator requires a real configured backend with tool-calling support or OpenAI-compatible chat completions'
-            state.status='failed'; state.phase='failed'; state.final_decision={'decision':'failed','summary':msg,'blockers':['backend_config_missing']}; state.save(run_dir/'state.json'); rec.record('run_finalized',payload=state.final_decision); rec.write_digest(state); write_artifacts(run_dir,state,rec.events(),transcript); return OpsRunResult(run_id=rid,run_dir=str(run_dir),state=state,decision=Decision(run_id=rid,accepted=False,mode=state.mode,runner=state.runner,reason=msg,failure_reason=msg))
+            state.status='failed'; state.phase='failed'; state.final_decision={'decision':'failed','summary':msg,'blockers':['backend_config_missing']}; state.save(run_dir/'state.json'); rec.record('run_finalized',payload=state.final_decision); rec.write_digest(state); write_artifacts(run_dir,state,rec.events(),transcript); _write_final_report(run_dir, state); _write_viewer(run_dir); return OpsRunResult(run_id=rid,run_dir=str(run_dir),state=state,decision=Decision(run_id=rid,accepted=False,mode=state.mode,runner=state.runner,reason=msg,failure_reason=msg))
         if request.production and not request.allow_fake_dependencies and _fakeish(self.client):
             msg='fake orchestrator client forbidden in production agentic mode'
-            state.status='failed'; state.phase='failed'; state.final_decision={'decision':'failed','summary':msg,'blockers':['agentic_fake_client_forbidden']}; state.save(run_dir/'state.json'); rec.record('run_finalized',payload=state.final_decision); rec.write_digest(state); write_artifacts(run_dir,state,rec.events(),transcript); return OpsRunResult(run_id=rid,run_dir=str(run_dir),state=state,decision=Decision(run_id=rid,accepted=False,mode=state.mode,runner=state.runner,reason=msg,failure_reason=msg))
+            state.status='failed'; state.phase='failed'; state.final_decision={'decision':'failed','summary':msg,'blockers':['agentic_fake_client_forbidden']}; state.save(run_dir/'state.json'); rec.record('run_finalized',payload=state.final_decision); rec.write_digest(state); write_artifacts(run_dir,state,rec.events(),transcript); _write_final_report(run_dir, state); _write_viewer(run_dir); return OpsRunResult(run_id=rid,run_dir=str(run_dir),state=state,decision=Decision(run_id=rid,accepted=False,mode=state.mode,runner=state.runner,reason=msg,failure_reason=msg))
+        state.backend_name=getattr(backend,'name',None); state.backend_model=getattr(backend,'model',None); state.backend_url=getattr(backend,'base_url',None); state.save(run_dir/'state.json')
         runner_adapter=request.runner_adapter or self.runner_adapter or runner_for_name(request.runner)
         reviewer=request.reviewer or self.reviewer or (AgenticLLMReviewer(role_backends['review'][1]) if role_backends.get('review') else None)
         coding_name,coding_backend=role_backends.get('coding',(getattr(backend,'name',None),backend))
@@ -152,7 +173,7 @@ class OpsRunner:
         system_prompt=SYSTEM_PROMPT + (ADAPTIVE_SYSTEM_APPENDIX if request.orchestrator=='adaptive' else '')
         for _ in range(self.max_turns):
             if state.is_terminal(): break
-            rec.record('model_request_started',phase=state.phase)
+            rec.record('model_request_started',phase=state.phase,payload={'backend_name':state.backend_name,'model':state.backend_model,'backend_url':state.backend_url})
             try:
                 resp=self.client.create_message(backend=backend,messages=messages,system=system_prompt,tools=openai_tool_specs(adaptive=(request.orchestrator=='adaptive')),tool_choice='auto',strict=True)
             except Exception as e:
@@ -202,7 +223,7 @@ class OpsRunner:
             rec.record('artifact_write_failed', payload={'path':str(run_dir/'usage.json'),'artifact_type':'usage_summary','error':str(e),'attempts':8})
             print('[agentic] Warning: usage summary write failed; usage.jsonl remains available')
         try:
-            state.save(run_dir/'state.json'); rec.write_digest(state); write_artifacts(run_dir,state,rec.events(),transcript)
+            state.save(run_dir/'state.json'); rec.write_digest(state); write_artifacts(run_dir,state,rec.events(),transcript); _write_final_report(run_dir, state); _write_viewer(run_dir)
         except Exception as e:
             state.warnings.append(f'artifact_finalization_error: {e}')
             rec.record('artifact_write_failed', payload={'path':str(run_dir),'artifact_type':'final_artifacts','error':str(e),'attempts':8})

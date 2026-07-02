@@ -78,6 +78,19 @@ def _payload(ev): return ev.get('payload') or {}
 def _attempt_id(ev): return ev.get('attempt_id') or _payload(ev).get('attempt_id') or _payload(ev).get('candidate_id') or _payload(ev).get('selected_attempt_id')
 def _subtask_id(ev): return ev.get('subtask_id') or _payload(ev).get('subtask_id')
 
+DISPLAY_LABELS = {
+    'best_effort_tournament_selection': 'Best effort selection',
+    'adaptive_orchestrator_forced_tournament_execution_path': 'Forced tournament path',
+    'validated_winner': 'Validated winner',
+    'manual_acceptance': 'Manual acceptance',
+}
+
+def human_label(value: Any) -> str:
+    s=str(value or '').strip()
+    if not s: return 'Unavailable'
+    if s in DISPLAY_LABELS: return DISPLAY_LABELS[s]
+    return re.sub(r'[_-]+',' ',s).strip().capitalize()
+
 def humanize_id(id: str) -> str:
     s=str(id or '')
     m=re.fullmatch(r'(?:candidate[_-]?)?(\d+)', s, re.I)
@@ -93,10 +106,10 @@ def _subtitle(ev: dict[str,Any]) -> str:
     if t=='classification_submitted': bits=[p.get('difficulty'), p.get('category')]
     elif t in {'plan_submitted','execution_path_selected'}: bits=[p.get('execution_path') or p.get('path') or p.get('plan_type')]
     elif t in {'provider_failure','backend_failure'}:
-        bits=[p.get('failure_kind') or p.get('kind'), p.get('failure_message') or p.get('message'), p.get('backend') or p.get('backend_url') or p.get('backend_name')]
+        bits=[human_label(p.get('failure_kind') or p.get('kind')), p.get('failure_message') or p.get('message'), p.get('backend_url') or p.get('backend_name') or p.get('backend')]
         if p.get('recoverable') is not None: bits.append('recoverable='+str(p.get('recoverable')).lower())
     elif t in {'model_request_started','model_response_received'}:
-        bits=[p.get('backend') or p.get('backend_url') or p.get('backend_name'), p.get('model')]
+        bits=[p.get('backend_name') or p.get('backend') or p.get('backend_url'), p.get('model')]
     elif t.startswith('tool_call_'):
         bits=[p.get('tool') or p.get('name'), p.get('status')]
     elif 'candidate' in t or t.startswith('validation_') or t=='selection_completed': bits=[humanize_id(_attempt_id(ev) or '')]
@@ -267,7 +280,7 @@ def derive_decision_summary(state: dict, digest: dict) -> dict:
         warnings.append('Cost is unavailable because pricing data is missing.')
     label=base['label']; failure=base.get('failure_reason')
     changed=winner.get('changed_files') or (state.get('integration') or {}).get('changed_files') or []
-    return {'state':kind,'label':label,'severity':base.get('severity'),'winner':sel,'selection_basis':state.get('selection_basis') or (state.get('selection') or {}).get('selection_basis') or (state.get('selection') or {}).get('basis') or 'Unavailable','validation_status':_validation_status(winner) if winner else 'Unknown','review_status':winner.get('review_status') or ('passed' if winner.get('review') else 'Unknown'),'runner_status':winner.get('runner_status') or winner.get('status') or status,'changed_files_count':len(changed),'changed_files':changed,'confidence':(state.get('tournament_ranking') or {}).get('selection_confidence') or (state.get('selection') or {}).get('confidence'),'failure_reason':failure,'warnings':warnings,'next_step':'Start the backend server or update backend configuration.' if kind=='failed' else ('Run validation/review before trusting this result.' if kind in {'accepted_with_warnings','incomplete'} else '')}
+    return {'state':kind,'label':label,'severity':base.get('severity'),'winner':sel,'selection_basis':human_label(state.get('selection_basis') or (state.get('selection') or {}).get('selection_basis') or (state.get('selection') or {}).get('basis') or 'Unavailable'),'validation_status':human_label(_validation_status(winner)) if winner else 'Unknown','review_status':human_label(winner.get('review_status') or ('passed' if winner.get('review') else 'Unknown')),'runner_status':human_label(winner.get('runner_status') or winner.get('status') or status),'changed_files_count':len(changed),'changed_files':changed,'confidence':(state.get('tournament_ranking') or {}).get('selection_confidence') or (state.get('selection') or {}).get('confidence'),'failure_reason':human_label(failure) if failure in PROVIDER_FAILURE_KINDS else failure,'warnings':warnings,'next_step':'Start the backend server or update backend configuration.' if kind=='failed' else ('Run validation/review before trusting this result.' if kind in {'accepted_with_warnings','incomplete'} else '')}
 
 def candidate_evidence(state: dict) -> list[dict]:
     sel=(state.get('selection') or {}).get('selected_attempt_id') or (state.get('selection') or {}).get('selected_candidate_id')
@@ -278,16 +291,34 @@ def candidate_evidence(state: dict) -> list[dict]:
         if val!='passed': warns.append('Validation did not run' if val in {'not_run','missing','unknown','',None} else f'Validation {val}')
         if rev in {'not_run','Unknown','missing','unavailable',None}: warns.append('Review did not run')
         norm=normalize_candidate_evidence(c)
-        out.append({'candidate_id':c.get('attempt_id') or 'Unknown','status':c.get('status') or 'Unknown','patch':norm.patch,'changed_files':norm.changed_files,'runner_status':c.get('runner_status') or (f"exit {c.get('exit_code')}" if c.get('exit_code') is not None else 'Unknown'),'review_status':rev,'validation_status':val or 'Unknown','eligible':bool(c.get('acceptance_eligible')),'blockers':(c.get('acceptance_blockers') or [])+warns,'selected':c.get('attempt_id')==sel})
+        out.append({'candidate_id':c.get('attempt_id') or 'Unknown','status':human_label(c.get('status') or 'Unknown'),'patch':norm.patch,'changed_files':norm.changed_files,'runner_status':human_label(c.get('runner_status') or (f"exit {c.get('exit_code')}" if c.get('exit_code') is not None else 'Unknown')),'review_status':human_label(rev),'validation_status':human_label(val or 'Unknown'),'eligible':bool(c.get('acceptance_eligible')),'blockers':(c.get('acceptance_blockers') or [])+warns,'selected':c.get('attempt_id')==sel})
     return out
+
+def _backend_url_from_state_events(state, events):
+    for k in ('backend_url','base_url'):
+        if state.get(k): return str(state[k])
+    b=state.get('backend')
+    if isinstance(b,dict) and b.get('base_url'): return str(b.get('base_url'))
+    for ev in events:
+        p=_payload(ev)
+        if p.get('backend_url') or p.get('base_url'): return str(p.get('backend_url') or p.get('base_url'))
+    return ''
+
+def _backend_name_from_state_events(state, events):
+    if state.get('backend_name'): return str(state.get('backend_name'))
+    b=state.get('backend')
+    if isinstance(b,dict) and b.get('name'): return str(b.get('name'))
+    for ev in events:
+        p=_payload(ev)
+        if p.get('backend_name') or (p.get('backend') and not str(p.get('backend')).startswith(('http://','https://'))): return str(p.get('backend_name') or p.get('backend'))
+    return ''
 
 def _model(state, usage, events):
     for k in ('selected_model','orchestrator_model','backend_model','model'):
         if state.get(k): return str(state[k])
     b=state.get('backend')
     if isinstance(b,dict):
-        for k in ('model','name'):
-            if b.get(k): return str(b[k])
+        if b.get('model'): return str(b['model'])
     us=state.get('usage_summary')
     if isinstance(us,dict) and isinstance(us.get('by_model'),dict) and us['by_model']: return next(iter(us['by_model']))
     for row in usage if isinstance(usage,list) else []:
@@ -296,8 +327,7 @@ def _model(state, usage, events):
         p=_payload(ev)
         if p.get('model'): return str(p['model'])
         if p.get('backend_model'): return str(p['backend_model'])
-        if p.get('backend'): return str(p['backend'])
-    return str(state.get('backend_name') or '')
+    return 'Unknown model'
 
 def _provider_failure_kind(state: dict[str,Any], events: list[dict[str,Any]]) -> str|None:
     kind=state.get('failure_kind') or (state.get('final_decision') or {}).get('failure_kind')
@@ -319,12 +349,12 @@ def build_viewer_graph_layout(snapshot_or_state: dict[str,Any], events: list[dic
         pf_event=next((e for e in events if e.get('type') in {'provider_failure','backend_failure'}), {})
         p=_payload(pf_event)
         msg=state.get('failure_message') or p.get('failure_message') or p.get('message') or ''
-        backend=p.get('backend') or p.get('backend_url') or p.get('backend_name') or state.get('backend_name') or ''
+        backend_name=_backend_name_from_state_events(state, events); backend_url=_backend_url_from_state_events(state, events); backend=backend_name or backend_url
         nodes=[
             {'id':'run_started','label':'Run started','type':'start','row':1,'col':1,'status':'completed' if 'run_started' in types else 'pending','subtitle':'Run initialized','summary':'Run initialized','details':{}},
             {'id':'model_request','label':'Model request','type':'request','row':1,'col':2,'status':'completed' if 'model_request_started' in types else 'pending','subtitle':backend or 'Backend request','summary':backend or 'Backend request','details':{'backend':backend}},
-            {'id':'provider_failure','label':'Provider failure','type':'failure','row':1,'col':3,'status':'failed','subtitle':pf_kind,'summary':pf_kind,'details':{'failure_kind':pf_kind,'failure_message':msg,'backend':backend,'recoverable':state.get('recoverable', p.get('recoverable'))}},
-            {'id':'failed_finalization','label':'Failed finalization','type':'finalization','row':1,'col':4,'status':'failed','subtitle':'Failed','summary':'Failed','details':{'status':state.get('status'),'failure_kind':pf_kind,'failure_message':msg}},
+            {'id':'provider_failure','label':'Provider failure','type':'failure','row':1,'col':3,'status':'failed','subtitle':human_label(pf_kind),'summary':human_label(pf_kind),'details':{'failure_kind':pf_kind,'failure_label':human_label(pf_kind),'failure_message':msg,'backend_name':backend_name,'backend_url':backend_url,'recoverable':state.get('recoverable', p.get('recoverable'))}},
+            {'id':'failed_finalization','label':'Failed finalization','type':'finalization','row':1,'col':4,'status':'failed','subtitle':'Failed','summary':'Failed','details':{'status':state.get('status'),'failure_kind':pf_kind,'failure_label':human_label(pf_kind),'failure_message':msg}},
         ]
         edges=[{'id':'edge_run_started_model_request','source':'run_started','target':'model_request','status':'active'},{'id':'edge_model_request_provider_failure','source':'model_request','target':'provider_failure','status':'failed'},{'id':'edge_provider_failure_failed_finalization','source':'provider_failure','target':'failed_finalization','status':'failed'}]
         return {'kind':'provider_failure','nodes':nodes,'edges':edges}
@@ -367,10 +397,10 @@ def build_viewer_graph_layout(snapshot_or_state: dict[str,Any], events: list[dic
     add(group_id,'Fallback candidates' if fallback else 'Candidates','group',cand_row,cand_col,'completed' if cand_ids else 'pending',f"{len(cand_ids)} candidates",{},[{'id':cid,'status':next((c.get('status') for c in candidates if c.get('attempt_id')==cid),None),'validations':sum(1 for e in events if _attempt_id(e)==cid and (e.get('type') or '').startswith('validation_')),'reviews':sum(1 for e in events if _attempt_id(e)==cid and e.get('type')=='candidate_attempt_reviewed')} for cid in cand_ids])
     edge(prev,group_id)
     for i,cid in enumerate(cand_ids[:3],1):
-        add(cid,humanize_id(cid),'candidate',cand_row,cand_col+i,'selected' if cid==sel else 'completed',('Selected winner' if cid==sel else 'candidate lane'))
+        add(cid,humanize_id(cid),'candidate',cand_row,cand_col+i,'selected' if cid==sel else 'completed',('Selected winner' if cid==sel else 'Candidate lane'))
         edge(group_id,cid)
     final_row = 4 if sub_ids else 3
-    add('validation_group','Validation','group',final_row,5,'completed' if 'validation_completed' in types else ('failed' if 'validation_failed' in types else 'missing'),('validation missing' if counts('validation_')==0 else f"{counts('validation_')} validation events"))
+    add('validation_group','Validation','group',final_row,5,'completed' if 'validation_completed' in types else ('failed' if 'validation_failed' in types else 'missing'),('Warning: validation not run' if counts('validation_')==0 else f"{counts('validation_')} validation events"))
     add('review_group','Review','group',final_row,6,'completed' if 'candidate_attempt_reviewed' in types or 'subtask_attempt_reviewed' in types else 'pending',f"{counts('review_')} retries")
     add('selection_group','Selection','group',final_row,7,'selected' if sel or 'selection_completed' in types else 'pending',humanize_id(sel or 'winner'),{'selected_attempt_id':sel})
     final_status='failed' if state.get('status')=='failed' else ('completed' if 'run_finalized' in types or state.get('status') in {'completed','failed'} else 'pending')
@@ -384,4 +414,4 @@ def build_viewer_snapshot(run_dir: Path) -> dict[str, Any]:
     status=state.get('status') or digest.get('status') or ('running' if events else 'unknown')
     decision=derive_decision_summary(state,digest)
     evidence=candidate_evidence(state)
-    return _redact({'run':{'run_id':rid,'run_id_short':rid[:18]+('…' if len(rid)>18 else ''),'task':state.get('task') or state.get('objective') or digest.get('task') or '', 'status':status, 'mode':state.get('mode') or digest.get('mode') or 'performance','runner':state.get('runner') or digest.get('runner') or 'villani-code','model':_model(state, usage_rows, events), 'started_at':started, 'completed_at':finalized, 'duration_seconds':_duration(started, finalized),'progress_percent':pct,'progress_label':label,'result':state.get('final_decision') or digest.get('final_decision'),'run_dir':str(run_dir),'run_dir_short':'…/'+run_dir.name}, 'usage':usage, 'decision':decision, 'candidate_evidence':evidence, 'timeline':_timeline(events), 'graph':build_viewer_graph_layout(state,events), 'warnings':state.get('warnings') or digest.get('warnings') or [], 'errors':state.get('errors') or digest.get('errors') or [], 'artifacts':{'state':'state.json','events':'runtime_events.jsonl','graph':'orchestration_graph.json','usage':'usage.json'}})
+    return _redact({'run':{'run_id':rid,'run_id_short':rid[:18]+('…' if len(rid)>18 else ''),'task':state.get('task') or state.get('objective') or digest.get('task') or '', 'status':status, 'mode':state.get('mode') or digest.get('mode') or 'performance','runner':state.get('runner') or digest.get('runner') or 'villani-code','model':_model(state, usage_rows, events), 'backend_name': _backend_name_from_state_events(state, events), 'backend_url': _backend_url_from_state_events(state, events), 'started_at':started, 'completed_at':finalized, 'duration_seconds':_duration(started, finalized),'progress_percent':pct,'progress_label':label,'result':state.get('final_decision') or digest.get('final_decision'),'run_dir':str(run_dir),'run_dir_short':'…/'+run_dir.name}, 'usage':usage, 'decision':decision, 'candidate_evidence':evidence, 'timeline':_timeline(events), 'graph':build_viewer_graph_layout(state,events), 'warnings':state.get('warnings') or digest.get('warnings') or [], 'errors':state.get('errors') or digest.get('errors') or [], 'artifacts':{'state':'state.json','events':'runtime_events.jsonl','graph':'orchestration_graph.json','usage':'usage.json'}})
