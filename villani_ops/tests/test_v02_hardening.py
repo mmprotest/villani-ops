@@ -14,8 +14,8 @@ from villani_ops.llm.client import LLMCallResult
 runner=CliRunner()
 
 def init_git(path: Path):
-    path.mkdir(); subprocess.run(['git','init'],cwd=path,check=True,capture_output=True); subprocess.run(['git','config','user.email','a@b.c'],cwd=path,check=True); subprocess.run(['git','config','user.name','A'],cwd=path,check=True)
-    (path/'hello.txt').write_text('hello\n'); subprocess.run(['git','add','.'],cwd=path,check=True); subprocess.run(['git','commit','-m','init'],cwd=path,check=True,capture_output=True)
+    path.mkdir(); subprocess.run(['git','init'],cwd=path,check=True,capture_output=True, timeout=10); subprocess.run(['git','config','user.email','a@b.c'],cwd=path,check=True, timeout=10); subprocess.run(['git','config','user.name','A'],cwd=path,check=True, timeout=10)
+    (path/'hello.txt').write_text('hello\n'); subprocess.run(['git','add','.'],cwd=path,check=True, timeout=10); subprocess.run(['git','commit','-m','init'],cwd=path,check=True,capture_output=True, timeout=10)
 
 def make_run(ws: Path, repo: Path, patch_text: str, accepted=True):
     rd=ws/'runs'/'r1'; rd.mkdir(parents=True, exist_ok=True); (rd/'task.json').write_text(json.dumps({'repo_path':str(repo)})); patch=rd/'diff.patch'; patch.write_text(patch_text)
@@ -82,12 +82,12 @@ def test_apply_guards_check_and_success_and_commit(tmp_path, monkeypatch):
 
 def test_branch_existing_refuses_and_force_branch(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path); repo=tmp_path/'repo'; init_git(repo); ws=tmp_path/'.villani-ops'
-    subprocess.run(['git','checkout','-b','feature'],cwd=repo,check=True,capture_output=True); subprocess.run(['git','checkout','master'],cwd=repo,check=True,capture_output=True)
+    subprocess.run(['git','checkout','-b','feature'],cwd=repo,check=True,capture_output=True, timeout=10); subprocess.run(['git','checkout','master'],cwd=repo,check=True,capture_output=True, timeout=10)
     patch='diff --git a/hello.txt b/hello.txt\nindex ce01362..2e09960 100644\n--- a/hello.txt\n+++ b/hello.txt\n@@ -1 +1 @@\n-hello\n+branch\n'
     make_run(ws,repo,patch)
     assert runner.invoke(app,['branch','r1','--name','feature','--workspace',str(ws)]).exit_code!=0
     res=runner.invoke(app,['branch','r1','--name','feature','--force-branch','--workspace',str(ws)])
-    assert res.exit_code==0 and subprocess.run(['git','branch','--show-current'],cwd=repo,text=True,capture_output=True).stdout.strip()=='feature'
+    assert res.exit_code==0 and subprocess.run(['git','branch','--show-current'],cwd=repo,text=True,capture_output=True, timeout=10).stdout.strip()=='feature'
 
 def test_pr_missing_gh_saves_manual_artifact(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path); repo=tmp_path/'repo'; init_git(repo); ws=tmp_path/'.villani-ops'

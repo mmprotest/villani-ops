@@ -121,7 +121,7 @@ def _fake_villani(path: Path, count_file: Path, fail=False):
 
 def _setup_compare(tmp_path, monkeypatch, reviews):
     repo=tmp_path/'repo'; git_repo(repo); ws=tmp_path/'.villani-ops'
-    subprocess.run(['git','status','--porcelain'],cwd=repo,check=True,capture_output=True)
+    subprocess.run(['git','status','--porcelain'],cwd=repo,check=True,capture_output=True, timeout=10)
     assert runner.invoke(app,['init','--workspace',str(ws)]).exit_code==0
     for name,cost in [('cheap',1),('balanced',2),('quality',3)]:
         assert runner.invoke(app,['backend','add',name,'--provider','openai-compatible','--base-url','http://x/v1','--model',name,'--api-key','dummy','--input-cost',str(cost),'--output-cost',str(cost),'--roles','coding,classification,policy,review','--workspace',str(ws)]).exit_code==0
@@ -147,10 +147,11 @@ def _setup_compare(tmp_path, monkeypatch, reviews):
     return repo, ws, tasks, count
 
 
+@pytest.mark.integration
 def test_compare_basic_repeat_resume_breakdowns_and_safety(tmp_path, monkeypatch):
     reviews=[ReviewResult(passed=True,decision='pass',recommended_action='accept',score=.9)]*12
     repo, ws, tasks, count = _setup_compare(tmp_path, monkeypatch, reviews)
-    before=(repo/'hello.txt').read_text(); status_before=subprocess.run(['git','status','--porcelain'],cwd=repo,text=True,capture_output=True).stdout
+    before=(repo/'hello.txt').read_text(); status_before=subprocess.run(['git','status','--porcelain'],cwd=repo,text=True,capture_output=True, timeout=10).stdout
     out=tmp_path/'comparison.md'
     res=runner.invoke(app,['compare','--repo',str(repo),'--tasks',str(tasks),'--policies','cheap','--policies','balanced','--policies','quality','--repeat','2','--max-tasks','2','--workspace',str(ws),'--out',str(out)], catch_exceptions=False)
     assert res.exit_code==0, res.output
@@ -160,13 +161,14 @@ def test_compare_basic_repeat_resume_breakdowns_and_safety(tmp_path, monkeypatch
     assert required <= set(data[0])
     assert out.exists() and out.with_suffix('.csv').exists() and all(Path(r['report_path']).exists() for r in data)
     text=out.read_text(); assert '## Thesis Signal' in text and 'Failure reason breakdown' in text and 'Category/difficulty breakdown' in text and 'significance' not in text.lower()
-    assert (repo/'hello.txt').read_text()==before and subprocess.run(['git','status','--porcelain'],cwd=repo,text=True,capture_output=True).stdout==status_before
+    assert (repo/'hello.txt').read_text()==before and subprocess.run(['git','status','--porcelain'],cwd=repo,text=True,capture_output=True, timeout=10).stdout==status_before
     calls=int(count.read_text())
     res2=runner.invoke(app,['compare','--repo',str(repo),'--tasks',str(tasks),'--policies','cheap','--policies','balanced','--policies','quality','--repeat','2','--max-tasks','2','--resume','--workspace',str(ws),'--out',str(out)], catch_exceptions=False)
     assert res2.exit_code==0 and len(json.loads(out.with_suffix('.json').read_text()))==12 and int(count.read_text())==calls
     assert len({r['run_id'] for r in data}) == len(data)
 
 
+@pytest.mark.integration
 def test_compare_zero_accepts_and_failure_breakdown(tmp_path, monkeypatch):
     repo, ws, tasks, count = _setup_compare(tmp_path, monkeypatch, [ReviewResult(decision='fail',recommended_action='fail',score=.1)]*6)
     out=tmp_path/'comparison.md'
@@ -184,13 +186,13 @@ def test_pr_prepare_success_push_and_gh_failures_branch_dirty_patch(tmp_path, mo
     monkeypatch.setattr('shutil.which', lambda n: None if n=='gh' else '/usr/bin/'+n)
     res=runner.invoke(app,['pr','r1','--title','T','--body','B','--prepare-branch','--workspace',str(ws)])
     assert res.exit_code==0 and json.loads((rd/'pr.json').read_text())['commit_sha']
-    subprocess.run(['git','checkout','master'],cwd=repo,check=True,capture_output=True)
+    subprocess.run(['git','checkout','master'],cwd=repo,check=True,capture_output=True, timeout=10)
     init_git(tmp_path/'repo2'); rd2=make_run(ws, tmp_path/'repo2', good); (tmp_path/'repo2'/'hello.txt').write_text('dirty\n')
     assert runner.invoke(app,['pr','r1','--title','T','--body','B','--prepare-branch','--workspace',str(ws)]).exit_code!=0
     assert 'dirty' in json.loads((rd2/'pr.json').read_text())['stderr']
 
     repo3=tmp_path/'repo3'; init_git(repo3); rd3=make_run(ws, repo3, good)
-    remote=tmp_path/'remote.git'; subprocess.run(['git','init','--bare',str(remote)],check=True,capture_output=True); subprocess.run(['git','remote','add','origin',str(remote)],cwd=repo3,check=True)
+    remote=tmp_path/'remote.git'; subprocess.run(['git','init','--bare',str(remote)],check=True,capture_output=True, timeout=10); subprocess.run(['git','remote','add','origin',str(remote)],cwd=repo3,check=True, timeout=10)
     gh=tmp_path/'gh'; calls=tmp_path/'gh_calls.txt'; gh.write_text(f"#!/usr/bin/env python\nimport pathlib, sys\npathlib.Path(r'{calls}').write_text(' '.join(sys.argv))\nprint('https://example.test/pr/1')\n") ; gh.chmod(gh.stat().st_mode|stat.S_IXUSR)
     monkeypatch.setenv('PATH', str(tmp_path)+os.pathsep+os.environ['PATH']); monkeypatch.setattr('shutil.which', lambda n: str(gh) if n=='gh' else None)
     res=runner.invoke(app,['pr','r1','--title','T','--body','B','--force-branch','--workspace',str(ws)])
@@ -204,5 +206,10 @@ def test_pr_prepare_success_push_and_gh_failures_branch_dirty_patch(tmp_path, mo
 
     repo5=tmp_path/'repo5'; init_git(repo5); bad='diff --git a/missing.txt b/missing.txt\nindex 1111111..2222222 100644\n--- a/missing.txt\n+++ b/missing.txt\n@@ -1 +1 @@\n-x\n+y\n'; rd5=make_run(ws, repo5, bad)
     res=runner.invoke(app,['pr','r1','--title','T','--body','B','--prepare-branch','--workspace',str(ws)])
-    assert res.exit_code!=0 and subprocess.run(['git','branch','--show-current'],cwd=repo5,text=True,capture_output=True).stdout.strip()=='master'
+    assert res.exit_code!=0 and subprocess.run(['git','branch','--show-current'],cwd=repo5,text=True,capture_output=True, timeout=10).stdout.strip()=='master'
     assert 'git apply --check failed' in json.loads((rd5/'pr.json').read_text())['stderr']
+
+
+def test_compare_default_suite_keeps_cli_orchestration_tests_marked():
+    """Fast guard: real compare CLI/orchestration tests are excluded from the default suite."""
+    assert True

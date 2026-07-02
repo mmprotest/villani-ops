@@ -361,3 +361,26 @@ def test_candidate_evidence_primary_truth_surface_has_required_fields(tmp_path):
     assert ev['selected'] is True and ev['patch']=='yes' and ev['changed_files']==['src/x.py']
     assert ev['review_status']=='Passed' and ev['validation_status']=='Not run'
     assert any('Validation did not run' in b for b in ev['blockers'])
+
+
+def test_timeline_includes_review_validation_selection_and_human_labels(tmp_path):
+    rd=tmp_path/'runs'/'key-events'; rd.mkdir(parents=True)
+    (rd/'state.json').write_text(json.dumps({'run_id':'key-events','status':'completed'}))
+    (rd/'runtime_events.jsonl').write_text('\n'.join(json.dumps(e) for e in [
+        {'timestamp':'2026-07-02T00:00:01+00:00','type':'review_completed','payload':{'attempt_id':'candidate_003','result':'passed'}},
+        {'timestamp':'2026-07-02T00:00:02+00:00','type':'validation_completed','payload':{'attempt_id':'candidate_003','result':'not_run','warning':'Validation did not run'}},
+        {'timestamp':'2026-07-02T00:00:03+00:00','type':'winner_selected','payload':{'selected_attempt_id':'candidate_003','selection_basis':'best_effort_tournament_selection'}},
+        {'timestamp':'2026-07-02T00:00:04+00:00','type':'run_finalized','payload':{}},
+    ]))
+    tl=build_viewer_snapshot(rd)['timeline']
+    text=' '.join(e['title']+' '+e.get('subtitle','') for e in tl)
+    assert 'Review completed' in text and 'Validation completed' in text and 'Winner selected' in text
+    assert 'Candidate 003' in text and 'Not run' in text and 'Validation did not run' in text
+    assert 'review_completed' not in text and 'validation_completed' not in text
+
+
+def test_graph_detail_card_readable_before_raw_json(tmp_path):
+    rd=_decision_run(tmp_path, {'run_id':'detail-card','status':'completed','selection':{'selected_attempt_id':'candidate_003'},'candidates':[{'attempt_id':'candidate_003','status':'completed','patch_path':'x.patch','changed_files':['src/x.py'],'runner_status':'completed','review_status':'passed','validation_status':'not_run','acceptance_eligible':True}]})
+    html=write_offline_viewer(rd).read_text()
+    assert 'graphDetailsCard' in html and 'Raw node data' in html and 'humanDetailLabel' in html
+    assert html.index('graphDetailsCard') < html.index('Raw node data')

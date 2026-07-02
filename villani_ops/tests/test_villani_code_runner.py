@@ -126,10 +126,10 @@ time.sleep(30)
         res=VillaniCodeRunner().run(RunnerContext(attempt_id='a',repo_path=str(tmp_path),task_instruction='x',backend=b,timeout_seconds=1,run_dir=str(tmp_path/'run')))
         assert res.exit_code==124 and 'timed out' in res.stderr.lower()
         time.sleep(1.5)
-        ps=subprocess.run(['pgrep','-f',str(marker)],text=True,capture_output=True)
+        ps=subprocess.run(['pgrep','-f',str(marker)],text=True,capture_output=True, timeout=10)
         live=[]
         for pid in ps.stdout.split():
-            stat=subprocess.run(['ps','-o','stat=','-p',pid],text=True,capture_output=True).stdout.strip()
+            stat=subprocess.run(['ps','-o','stat=','-p',pid],text=True,capture_output=True, timeout=10).stdout.strip()
             if stat and 'Z' not in stat: live.append((pid, stat))
         assert not live, live
     finally:

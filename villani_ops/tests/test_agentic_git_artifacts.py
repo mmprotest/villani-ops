@@ -12,13 +12,13 @@ from villani_ops.core.acceptance import is_attempt_acceptance_eligible
 
 def _repo(tmp_path: Path) -> Path:
     repo = tmp_path / 'repo'; repo.mkdir()
-    subprocess.run(['git','init'], cwd=repo, check=True, capture_output=True)
-    subprocess.run(['git','config','user.email','t@example.invalid'], cwd=repo, check=True)
-    subprocess.run(['git','config','user.name','T'], cwd=repo, check=True)
+    subprocess.run(['git','init'], cwd=repo, check=True, capture_output=True, timeout=10)
+    subprocess.run(['git','config','user.email','t@example.invalid'], cwd=repo, check=True, timeout=10)
+    subprocess.run(['git','config','user.name','T'], cwd=repo, check=True, timeout=10)
     (repo/'tracked.txt').write_text('one\n')
     (repo/'delete.txt').write_text('bye\n')
-    subprocess.run(['git','add','-A'], cwd=repo, check=True)
-    subprocess.run(['git','commit','-m','base'], cwd=repo, check=True, capture_output=True)
+    subprocess.run(['git','add','-A'], cwd=repo, check=True, timeout=10)
+    subprocess.run(['git','commit','-m','base'], cwd=repo, check=True, capture_output=True, timeout=10)
     return repo
 
 
@@ -53,9 +53,9 @@ def test_generated_patch_passes_git_apply_check_against_clean_base(tmp_path):
     (repo/'new.txt').write_text('new\n')
     res = capture_git_patch(repo, tmp_path/'patch.diff')
     clean = tmp_path/'clean'
-    subprocess.run(['git','clone',str(repo),str(clean)], check=True, capture_output=True)
-    subprocess.run(['git','reset','--hard','HEAD'], cwd=clean, check=True, capture_output=True)
-    chk = subprocess.run(['git','apply','--check',res.patch_path], cwd=clean, text=True, capture_output=True)
+    subprocess.run(['git','clone',str(repo),str(clean)], check=True, capture_output=True, timeout=10)
+    subprocess.run(['git','reset','--hard','HEAD'], cwd=clean, check=True, capture_output=True, timeout=10)
+    chk = subprocess.run(['git','apply','--check',res.patch_path], cwd=clean, text=True, capture_output=True, timeout=10)
     assert chk.returncode == 0, chk.stderr
 
 
