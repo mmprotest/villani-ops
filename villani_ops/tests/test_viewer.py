@@ -384,3 +384,53 @@ def test_graph_detail_card_readable_before_raw_json(tmp_path):
     html=write_offline_viewer(rd).read_text()
     assert 'graphDetailsCard' in html and 'Raw node data' in html and 'humanDetailLabel' in html
     assert html.index('graphDetailsCard') < html.index('Raw node data')
+
+def test_decision_economics_and_why_winner_for_candidate_run(tmp_path):
+    rd=_decision_run(tmp_path, {'run_id':'econ','status':'completed','candidate_attempts':3,'selection':{'selected_attempt_id':'candidate_003'},'selection_basis':'best_effort_tournament_selection','backends':{'small':{'name':'small','model':'cheap','cost_per_1k_tokens':0.01},'large':{'name':'large','model':'capable','capability_score':10,'cost_per_1k_tokens':0.8}},'candidates':[
+        {'attempt_id':'candidate_001','status':'completed','review_status':'failed','validation_status':'failed','usage':{'total_tokens':1000,'total_cost':0.01}},
+        {'attempt_id':'candidate_002','status':'failed','review_status':'skipped','validation_status':'skipped'},
+        {'attempt_id':'candidate_003','status':'completed','patch_path':'x.patch','changed_files':['a.py','b.py'],'runner_status':'completed','review_status':'passed','validation_status':'not_run','acceptance_eligible':True,'usage':{'total_tokens':1300,'total_cost':0.22}},
+    ]})
+    (rd/'usage.json').write_text(json.dumps({'total_tokens':2300,'total_cost':0.23,'calls_count':2}))
+    snap=build_viewer_snapshot(rd)
+    econ=snap['decision_economics']
+    assert econ['status'] in {'available','partial'}
+    assert econ['actual']['attempts_run'] == 3
+    assert econ['actual']['model_calls'] == 2
+    assert econ['baseline']['name'] == 'Naive expensive baseline'
+    assert econ['baseline']['model_calls'] == 3
+    assert econ['savings']['cost_amount'] is not None
+    assert 'candidate_003' in snap['decision']['why_this_winner']
+    assert 'validation was not run' in snap['decision']['why_this_winner']
+    html=write_offline_viewer(rd).read_text()
+    assert html.index('Decision Summary') < html.index('Decision Economics') < html.index('Live Event Timeline') < html.index('Candidate Evidence') < html.index('Execution Graph')
+    assert 'Why this winner?' in html and 'Estimated savings' in html
+    assert '2 changed files' in json.dumps(snap['graph'])
+    assert any(c['tokens'] == 1300 and c['cost'] == 0.22 and c['selected'] for c in snap['candidate_evidence'])
+
+
+def test_decision_economics_unavailable_for_no_candidate_failure_and_duration_reason(tmp_path):
+    rd=tmp_path/'runs'/'short-fail'; rd.mkdir(parents=True)
+    (rd/'state.json').write_text(json.dumps({'run_id':'short-fail','status':'failed','failure_kind':'backend_connection_error','failure_message':'Could not connect','backend_model':'m'}))
+    (rd/'runtime_events.jsonl').write_text('\n'.join([
+        json.dumps({'timestamp':'2026-07-02T00:00:00.000+00:00','type':'run_started','payload':{}}),
+        json.dumps({'timestamp':'2026-07-02T00:00:00.400+00:00','type':'provider_failure','payload':{'failure_kind':'backend_connection_error','failure_message':'Could not connect'}}),
+        json.dumps({'timestamp':'2026-07-02T00:00:00.400+00:00','type':'run_finalized','payload':{}}),
+    ]))
+    snap=build_viewer_snapshot(rd)
+    assert snap['decision_economics']['status'] == 'unavailable'
+    assert snap['usage']['cost']['reason'].startswith('Backend failed before usage was available')
+    assert snap['run']['duration_seconds'] == 0.4
+    html=write_offline_viewer(rd).read_text()
+    assert 'Decision Economics unavailable because no candidates ran.' in html
+    assert '<1s' in html
+
+
+def test_render_final_report_includes_decision_economics(tmp_path):
+    rd=_decision_run(tmp_path, {'run_id':'report-econ','status':'completed','candidate_attempts':2,'selection':{'selected_attempt_id':'candidate_001'},'candidates':[{'attempt_id':'candidate_001','status':'completed','patch_path':'x.patch','changed_files':['x.py'],'runner_status':'completed','review_status':'passed','validation_status':'passed'}]})
+    (rd/'usage.json').write_text(json.dumps({'total_tokens':100,'total_cost':0.01,'calls_count':1}))
+    from villani_ops.viewer.adapter import render_final_report
+    report=render_final_report(build_viewer_snapshot(rd))
+    assert '## Decision Economics' in report
+    assert '- Stop reason:' in report
+    assert '- Candidate ID: candidate_001' in report

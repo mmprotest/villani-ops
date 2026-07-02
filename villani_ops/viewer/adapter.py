@@ -173,6 +173,15 @@ def _num(d,*keys):
             except ValueError: pass
     return 0
 
+def _maybe_num(d,*keys):
+    for k in keys:
+        v=d.get(k) if isinstance(d,dict) else None
+        if isinstance(v,(int,float)): return v
+        if isinstance(v,str):
+            try: return float(v)
+            except ValueError: pass
+    return None
+
 def _meaningful(src: Any) -> bool:
     if not isinstance(src, dict): return False
     for k in TOKEN_TOTAL_KEYS+TOKEN_IN_KEYS+TOKEN_OUT_KEYS+COST_KEYS+('calls_count','unavailable_calls_count'):
@@ -274,13 +283,101 @@ def _usage(run_dir, state, digest):
     elif calls and total and not unavailable and not n.get('pricing_missing'): cost_status='zero'; reason=None
     else:
         cost_status='unavailable'; reasons=[]
-        if not total or n.get('usage_missing') or unavailable: reasons.append('Usage data missing')
+        pf=_provider_failure_kind(state, _read_jsonl(Path(run_dir)/'runtime_events.jsonl'))
+        if pf and not _candidate_execution_happened(state, _read_jsonl(Path(run_dir)/'runtime_events.jsonl')): reasons.append('Backend failed before usage was available')
+        elif not total or n.get('usage_missing') or unavailable: reasons.append('Usage data missing')
         if total or n.get('pricing_missing') or unavailable: reasons.append('Backend pricing data missing')
         reason='; '.join(dict.fromkeys(reasons or ['Usage data missing']))
     return {'input_tokens':inp,'output_tokens':out,'total_tokens':total,'input_cost':0,'output_cost':0,'total_cost':amount,'calls_count':calls,'unavailable_calls_count':unavailable,'diagnostics':src.get('diagnostics',[]) if isinstance(src,dict) else [],'source':src.get('source') if isinstance(src,dict) else None,'tokens':{'status':'available' if total else 'unavailable','total':total or None,'input':inp or None,'output':out or None},'cost':{'status':cost_status,'amount':amount if (amount or calls) else None,'currency':'USD','reason':reason,'unavailable_calls_count':unavailable,'unavailable_calls_label':(f'{unavailable} unavailable call' + ('' if unavailable==1 else 's')) if unavailable else ''},'by_role':src.get('by_role',{}) if isinstance(src,dict) else {},'by_backend':src.get('by_backend',{}) if isinstance(src,dict) else {},'by_model':src.get('by_model',{}) if isinstance(src,dict) else {}}
 
 def _validation_status(c):
     return (c.get('validation_status') or (c.get('validation') or {}).get('status') or ('passed' if (c.get('validation') or {}).get('passed') is True else 'failed' if (c.get('validation') or {}).get('passed') is False else 'not_run'))
+
+def _candidate_id(c): return c.get('attempt_id') or c.get('candidate_id')
+
+def normalize_stop_reason(state: dict, candidates: list[dict], events: list[dict]) -> str:
+    fd=state.get('final_decision') or {}; sel=(state.get('selection') or {}).get('selected_attempt_id') or (state.get('selection') or {}).get('selected_candidate_id')
+    if state.get('failure_kind') in PROVIDER_FAILURE_KINDS or fd.get('failure_kind') in PROVIDER_FAILURE_KINDS:
+        return 'Stopped because backend connection failed before candidates ran.' if not candidates else 'Stopped because backend/provider failure prevented further progress.'
+    if sel:
+        win=next((c for c in candidates if _candidate_id(c)==sel), {})
+        val=str(_validation_status(win)).lower(); rev=str(win.get('review_status') or ('passed' if win.get('review') else 'unknown')).lower()
+        if val in {'passed','pass'} and rev in {'passed','pass','accepted'}: return f'Stopped because {sel} passed validation and review and was selected as the best available result.'
+        if rev in {'passed','pass','accepted'}: return f'Stopped because {sel} passed review and was selected as the best available result; validation did not run.'
+        return f'Stopped because {sel} was selected by best-effort selection as the best available candidate.'
+    if candidates and all(str(c.get('status','')).lower() in {'failed','rejected'} or str(_validation_status(c)).lower()=='failed' for c in candidates):
+        return 'Stopped because all configured candidates failed validation or execution.'
+    if state.get('status')=='failed': return 'Stopped because the run failed before a winner could be selected.'
+    return 'Stop reason unavailable.'
+
+def explain_winner(state: dict, candidates: list[dict]) -> str:
+    sel=(state.get('selection') or {}).get('selected_attempt_id') or (state.get('selection') or {}).get('selected_candidate_id')
+    if not sel: return 'No winner was selected.'
+    win=next((c for c in candidates if _candidate_id(c)==sel), {})
+    norm=normalize_candidate_evidence(win); rev=human_label(win.get('review_status') or ('passed' if win.get('review') else 'unknown')); val=human_label(_validation_status(win)); basis=human_label(state.get('selection_basis') or (state.get('selection') or {}).get('selection_basis') or '')
+    others=[c for c in candidates if _candidate_id(c)!=sel]; failed=sum(1 for c in others if str(c.get('status','')).lower() in {'failed','rejected'} or str(c.get('review_status','')).lower() in {'failed','rejected'} or str(_validation_status(c)).lower()=='failed')
+    pieces=[f'{sel} was selected']
+    if norm.patch=='yes': pieces.append('because it produced a patch')
+    elif norm.patch=='no': pieces.append('even though no patch was recorded')
+    else: pieces.append('with unknown patch evidence')
+    if norm.changed_files: pieces.append(f'changed {len(norm.changed_files)} file' + ('' if len(norm.changed_files)==1 else 's'))
+    pieces.append(f'review was {rev.lower()}')
+    pieces.append(f'validation was {val.lower()}')
+    if failed: pieces.append(f'{failed} other candidate' + ('' if failed==1 else 's') + ' failed review, validation, or execution')
+    if 'Best effort' in basis: pieces.append('selection was best effort, so treat this result as best available rather than fully verified')
+    return ', '.join(pieces).rstrip('.') + '.'
+
+def _max_attempts(state, candidates):
+    for k in ('max_attempts','candidate_attempts','candidate_attempts_requested','requested_candidates'):
+        v=_maybe_num(state,k)
+        if v is not None: return int(v)
+    strat=state.get('execution_strategy') or {}; v=_maybe_num(strat,'max_attempts')
+    return int(v) if v is not None else (len(candidates) or None)
+
+def _price_for_backend(b):
+    if not isinstance(b,dict): return None
+    for k in ('cost_per_1k_tokens','price_per_1k_tokens','total_cost_per_1k_tokens'):
+        v=_maybe_num(b,k)
+        if v is not None: return v
+    inp=_maybe_num(b,'input_cost_per_1k','prompt_cost_per_1k_tokens') or 0; out=_maybe_num(b,'output_cost_per_1k','completion_cost_per_1k_tokens') or 0
+    return (inp+out) if (inp or out) else None
+
+def _baseline_backend(state):
+    bs=state.get('backends') or state.get('backend_config') or state.get('configured_backends') or {}
+    items=[]
+    if isinstance(bs,dict): items=[{**(v if isinstance(v,dict) else {}),'name':k, **({'model':getattr(v,'model',None)} if not isinstance(v,dict) else {})} for k,v in bs.items()]
+    elif isinstance(bs,list): items=[b for b in bs if isinstance(b,dict)]
+    if not items and isinstance(state.get('backend'),dict): items=[state['backend']]
+    if not items: return {'name':state.get('backend_name'), 'model':state.get('backend_model') or state.get('model')}
+    def key(b): return (_maybe_num(b,'capability_score','capability_rank','capability') is not None, _maybe_num(b,'capability_score','capability_rank','capability') or -1, _price_for_backend(b) or -1)
+    return sorted(items, key=key)[-1]
+
+def normalize_decision_economics(run_state, candidates, usage, policy=None, backend_config=None, events=None) -> dict:
+    candidates=[c for c in (candidates or []) if isinstance(c,dict)]
+    if not candidates:
+        return {'status':'unavailable','reason':'Unavailable because no candidates ran','warnings':['Decision Economics unavailable because no candidates ran.']}
+    actual_attempts=len([c for c in candidates if _candidate_id(c) or c.get('status')])
+    max_attempts=_max_attempts(run_state,candidates)
+    calls=usage.get('calls_count') or None; total=usage.get('total_tokens') or None; cost=usage.get('total_cost') if usage.get('cost',{}).get('status') in {'available','partial','estimated','zero'} else None
+    base=(policy or {}).get('naive_baseline') if isinstance(policy,dict) else None
+    bb=_baseline_backend({**(run_state or {}), **({'backend_config':backend_config} if backend_config else {})})
+    base_calls=(base or {}).get('estimated_model_calls') or max_attempts or actual_attempts
+    avg=(total/actual_attempts) if total and actual_attempts else None
+    base_tokens=(base or {}).get('estimated_tokens') or (int(avg*base_calls) if avg else None)
+    price=_price_for_backend(bb); base_cost=(base or {}).get('estimated_cost')
+    basis=(base or {}).get('estimation_basis')
+    warnings=[]; status='available'
+    if base_cost is None and base_tokens is not None and price is not None:
+        base_cost=round((base_tokens/1000.0)*price, 6); basis='configured pricing and observed average tokens per attempt'; warnings.append('Estimated savings: naive baseline cost was estimated from configured pricing.')
+    elif base_cost is None:
+        status='partial'; warnings.append('Savings unavailable: baseline policy or pricing was not recorded.')
+    if max_attempts is None: status='partial'; warnings.append('Baseline attempts were inferred from candidates because policy maximum was unavailable.')
+    savings_cost=round(base_cost-cost, 6) if (base_cost is not None and cost is not None) else None
+    pct=round((savings_cost/base_cost)*100,1) if (savings_cost is not None and base_cost) else None
+    stokens=(base_tokens-total) if (base_tokens is not None and total is not None) else None
+    tpct=round((stokens/base_tokens)*100,1) if (stokens is not None and base_tokens) else None
+    if cost is None: status='partial'; warnings.append('Savings unavailable: actual cost was not recorded.')
+    return {'status':status,'actual':{'attempts_run':actual_attempts,'max_attempts_allowed':max_attempts,'model_calls':calls,'tokens':total,'cost':cost,'currency':'USD'},'baseline':{'name':(base or {}).get('name') or 'Naive expensive baseline','description':(base or {}).get('description') or 'Run the most capable configured backend for the maximum allowed attempts.','attempts':max_attempts,'backend':(base or {}).get('backend') or bb.get('name'),'model':(base or {}).get('model') or bb.get('model'),'model_calls':base_calls,'tokens':base_tokens,'cost':base_cost,'currency':(base or {}).get('currency') or 'USD','estimation_basis':basis or 'configured pricing and observed average tokens per attempt' if base_tokens is not None else None},'savings':{'cost_amount':savings_cost,'cost_percent':pct,'tokens':stokens,'tokens_percent':tpct,'attempts_avoided':(max_attempts-actual_attempts) if max_attempts is not None else None,'model_calls_avoided':(base_calls-calls) if (base_calls is not None and calls is not None) else None},'stop_reason':normalize_stop_reason(run_state,candidates,events or []),'warnings':list(dict.fromkeys(warnings))}
 
 def derive_decision_state(state: dict, digest: dict|None=None, candidates=None, usage=None, events=None) -> dict:
     digest=digest or {}
@@ -303,7 +400,9 @@ def derive_decision_state(state: dict, digest: dict|None=None, candidates=None, 
     label={'accepted':'Accepted','accepted_with_warnings':'Accepted with warnings','failed':'Failed','incomplete':'Incomplete','cancelled':'Cancelled'}.get(kind,'Unknown')
     severity={'accepted':'success','accepted_with_warnings':'warning','failed':'error','incomplete':'warning','cancelled':'warning'}.get(kind,'info')
     failure=state.get('failure_message') or (state.get('final_decision') or {}).get('failure_message') or ((state.get('final_decision') or {}).get('summary') if kind=='failed' else None)
-    return {'state':kind,'label':label,'severity':severity,'warnings':warnings,'failure_reason':failure}
+    stop_reason=normalize_stop_reason(state,cands,events or [])
+    why=explain_winner(state,cands)
+    return {'state':kind,'label':label,'severity':severity,'warnings':warnings,'failure_reason':failure,'stop_reason':stop_reason,'why_this_winner':why}
 
 def derive_decision_summary(state: dict, digest: dict) -> dict:
     base=derive_decision_state(state,digest)
@@ -316,7 +415,7 @@ def derive_decision_summary(state: dict, digest: dict) -> dict:
         warnings.append('Cost is unavailable because pricing data is missing.')
     label=base['label']; failure=base.get('failure_reason')
     changed=winner.get('changed_files') or (state.get('integration') or {}).get('changed_files') or []
-    return {'state':kind,'label':label,'severity':base.get('severity'),'winner':sel,'selection_basis':human_label(state.get('selection_basis') or (state.get('selection') or {}).get('selection_basis') or (state.get('selection') or {}).get('basis') or 'Unavailable'),'validation_status':human_label(_validation_status(winner)) if winner else 'Unknown','review_status':human_label(winner.get('review_status') or ('passed' if winner.get('review') else 'Unknown')),'runner_status':human_label(winner.get('runner_status') or winner.get('status') or status),'changed_files_count':len(changed),'changed_files':changed,'confidence':(state.get('tournament_ranking') or {}).get('selection_confidence') or (state.get('selection') or {}).get('confidence'),'failure_reason':human_label(failure) if failure in PROVIDER_FAILURE_KINDS else failure,'warnings':warnings,'next_step':'Start the backend server or update backend configuration.' if kind=='failed' else ('Run validation/review before trusting this result.' if kind in {'accepted_with_warnings','incomplete'} else '')}
+    return {'state':kind,'label':label,'severity':base.get('severity'),'winner':sel,'selection_basis':human_label(state.get('selection_basis') or (state.get('selection') or {}).get('selection_basis') or (state.get('selection') or {}).get('basis') or 'Unavailable'),'validation_status':human_label(_validation_status(winner)) if winner else 'Unknown','review_status':human_label(winner.get('review_status') or ('passed' if winner.get('review') else 'Unknown')),'runner_status':human_label(winner.get('runner_status') or winner.get('status') or status),'changed_files_count':len(changed),'changed_files':changed,'confidence':(state.get('tournament_ranking') or {}).get('selection_confidence') or (state.get('selection') or {}).get('confidence'),'failure_reason':human_label(failure) if failure in PROVIDER_FAILURE_KINDS else failure,'warnings':warnings,'next_step':'Start the backend server or update backend configuration.' if kind=='failed' else ('Run validation/review before trusting this result.' if kind in {'accepted_with_warnings','incomplete'} else ''),'stop_reason':base.get('stop_reason') or normalize_stop_reason(state,cands,[]),'why_this_winner':base.get('why_this_winner') or explain_winner(state,cands)}
 
 def candidate_evidence(state: dict) -> list[dict]:
     sel=(state.get('selection') or {}).get('selected_attempt_id') or (state.get('selection') or {}).get('selected_candidate_id')
@@ -327,7 +426,7 @@ def candidate_evidence(state: dict) -> list[dict]:
         if val!='passed': warns.append('Validation did not run' if val in {'not_run','missing','unknown','',None} else f'Validation {val}')
         if rev in {'not_run','Unknown','missing','unavailable',None}: warns.append('Review did not run')
         norm=normalize_candidate_evidence(c)
-        out.append({'candidate_id':c.get('attempt_id') or 'Unknown','status':human_label(c.get('status') or 'Unknown'),'patch':norm.patch,'changed_files':norm.changed_files,'runner_status':human_label(c.get('runner_status') or (f"exit {c.get('exit_code')}" if c.get('exit_code') is not None else 'Unknown')),'review_status':human_label(rev),'validation_status':human_label(val or 'Unknown'),'eligible':bool(c.get('acceptance_eligible')),'blockers':(c.get('acceptance_blockers') or [])+warns,'selected':c.get('attempt_id')==sel})
+        out.append({'candidate_id':c.get('attempt_id') or 'Unknown','status':human_label(c.get('status') or 'Unknown'),'patch':norm.patch,'changed_files':norm.changed_files,'runner_status':human_label(c.get('runner_status') or (f"exit {c.get('exit_code')}" if c.get('exit_code') is not None else 'Unknown')),'review_status':human_label(rev),'validation_status':human_label(val or 'Unknown'),'eligible':bool(c.get('acceptance_eligible')),'blockers':(c.get('acceptance_blockers') or [])+warns,'tokens':_maybe_num(c.get('usage') or c.get('usage_summary') or c.get('telemetry') or c.get('runner_telemetry') or {}, 'total_tokens','tokens_total','input_tokens'), 'cost':_maybe_num(c.get('usage') or c.get('usage_summary') or c.get('telemetry') or c.get('runner_telemetry') or {}, 'total_cost','cost','estimated_cost'), 'selected':c.get('attempt_id')==sel})
     return out
 
 def _backend_url_from_state_events(state, events):
@@ -425,6 +524,11 @@ def build_viewer_graph_layout(snapshot_or_state: dict[str,Any], events: list[dic
             edge(f'{cid}_candidate',f'{cid}_runner'); edge(f'{cid}_runner',f'{cid}_review'); edge(f'{cid}_review',f'{cid}_validation','failed' if vst=='failed' else 'active')
             if cid==sel: edge(f'{cid}_validation','final_decision','active')
         add('final_decision','Final decision: '+final_label,'final_decision',final_row,4,'failed' if final_label=='Failed' else 'selected',final_label,{'decision':final_label,'winner':sel,'selection_basis':human_label(state.get('selection_basis') or (state.get('selection') or {}).get('selection_basis') or ''),'review_status':human_label((next((c for c in candidates if (c.get('attempt_id') or c.get('candidate_id'))==sel),{}) or {}).get('review_status') or 'unknown'),'validation_status':human_label(_validation_status(next((c for c in candidates if (c.get('attempt_id') or c.get('candidate_id'))==sel),{}) or {})),'warnings':derive_decision_state(state, {}, candidates=candidates, events=events).get('warnings') or [],'failure_reason':state.get('failure_message'),'raw':{'status':state.get('status'),'final_decision':state.get('final_decision'),'selection':state.get('selection')}},None)
+        econ=normalize_decision_economics(state,candidates, _usage(Path(state.get('run_dir') or '.'), state, {}), events=events)
+        if econ.get('status')!='unavailable':
+            sav=econ.get('savings',{}).get('cost_amount'); label=('Savings: '+('$'+format(sav,'.2f')+' vs naive baseline' if sav is not None else 'unavailable'))
+            add('economics_badge',label,'economics',final_row,3,'completed',econ.get('stop_reason') or '',{'decision_economics':econ})
+            edge('economics_badge','final_decision')
         return {'kind':'candidate_lanes','nodes':nodes,'edges':edges,'responsive_class':'candidate-lanes'}
     decomposed=bool(state.get('decomposition') or state.get('decomposition_requested') or types & {'decomposition_submitted','subtask_attempt_started','integration_started'})
     fallback=bool(state.get('fallback_used') or 'candidate_fallback_started' in types)
@@ -482,4 +586,18 @@ def build_viewer_snapshot(run_dir: Path) -> dict[str, Any]:
     status=state.get('status') or digest.get('status') or ('running' if events else 'unknown')
     decision=derive_decision_summary(state,digest)
     evidence=candidate_evidence(state)
-    return _redact({'run':{'run_id':rid,'run_id_short':rid[:18]+('…' if len(rid)>18 else ''),'task':state.get('task') or state.get('objective') or digest.get('task') or '', 'status':status, 'mode':state.get('mode') or digest.get('mode') or 'performance','runner':state.get('runner') or digest.get('runner') or 'villani-code','model':_model(state, usage_rows, events), 'backend_name': _backend_name_from_state_events(state, events), 'backend_url': _backend_url_from_state_events(state, events), 'started_at':started, 'completed_at':finalized, 'duration_seconds':_duration(started, finalized),'progress_percent':pct,'progress_label':label,'result':state.get('final_decision') or digest.get('final_decision'),'run_dir':str(run_dir),'run_dir_short':'…/'+run_dir.name}, 'usage':usage, 'decision':decision, 'candidate_evidence':evidence, 'timeline':_timeline(events), 'graph':build_viewer_graph_layout(state,events), 'warnings':state.get('warnings') or digest.get('warnings') or [], 'errors':state.get('errors') or digest.get('errors') or [], 'artifacts':{'state':'state.json','events':'runtime_events.jsonl','graph':'orchestration_graph.json','usage':'usage.json'}})
+    economics=normalize_decision_economics(state,[c for c in state.get('candidates',[]) if isinstance(c,dict)],usage,state.get('policy') or state.get('execution_strategy'),events=events)
+    return _redact({'run':{'run_id':rid,'run_id_short':rid[:18]+('…' if len(rid)>18 else ''),'task':state.get('task') or state.get('objective') or digest.get('task') or '', 'status':status, 'mode':state.get('mode') or digest.get('mode') or 'performance','runner':state.get('runner') or digest.get('runner') or 'villani-code','model':_model(state, usage_rows, events), 'backend_name': _backend_name_from_state_events(state, events), 'backend_url': _backend_url_from_state_events(state, events), 'started_at':started, 'completed_at':finalized, 'duration_seconds':_duration(started, finalized),'progress_percent':pct,'progress_label':label,'result':state.get('final_decision') or digest.get('final_decision'),'run_dir':str(run_dir),'run_dir_short':'…/'+run_dir.name}, 'usage':usage, 'decision':decision, 'decision_economics':economics, 'candidate_evidence':evidence, 'timeline':_timeline(events), 'graph':build_viewer_graph_layout(state,events), 'warnings':state.get('warnings') or digest.get('warnings') or [], 'errors':state.get('errors') or digest.get('errors') or [], 'artifacts':{'state':'state.json','events':'runtime_events.jsonl','graph':'orchestration_graph.json','usage':'usage.json'}})
+
+def render_final_report(snapshot: dict[str, Any]) -> str:
+    r=snapshot.get('run') or {}; d=snapshot.get('decision') or {}; e=snapshot.get('decision_economics') or {}; rows=snapshot.get('candidate_evidence') or []
+    if rows:
+        a=e.get('actual') or {}; b=e.get('baseline') or {}; s=e.get('savings') or {}
+        lines=['# Villani Ops Final Report','','## Decision',f"- Decision: {d.get('label') or r.get('status')}",f"- Winner: {d.get('winner') or 'none'}",f"- Selection basis: {d.get('selection_basis') or 'Unavailable'}",f"- Stop reason: {d.get('stop_reason') or e.get('stop_reason') or 'Unavailable'}",f"- Review: {d.get('review_status') or 'Unavailable'}",f"- Validation: {d.get('validation_status') or 'Unavailable'}",f"- Warnings: {'; '.join(d.get('warnings') or []) or 'None'}",'','## Decision Economics',f"- Actual attempts: {a.get('attempts_run')}",f"- Max attempts: {a.get('max_attempts_allowed')}",f"- Attempts avoided: {(e.get('savings') or {}).get('attempts_avoided')}",f"- Actual tokens: {a.get('tokens')}",f"- Baseline tokens: {b.get('tokens')}",f"- Actual cost: {a.get('cost')}",f"- Baseline cost: {b.get('cost')}",f"- Estimated savings: {s.get('cost_amount')} ({s.get('cost_percent')}%)" if s.get('cost_amount') is not None else '- Estimated savings: unavailable',f"- Estimation basis: {b.get('estimation_basis') or '; '.join(e.get('warnings') or []) or 'Unavailable'}",'','## Candidate Evidence']
+        for c in rows:
+            lines += [f"- Candidate ID: {c.get('candidate_id')}",f"  - Patch: {c.get('patch')}",f"  - Changed files: {', '.join(c.get('changed_files') or []) or 'None'}",f"  - Runner status: {c.get('runner_status')}",f"  - Review status: {c.get('review_status')}",f"  - Validation status: {c.get('validation_status')}",f"  - Warnings/blockers: {', '.join(c.get('blockers') or []) or 'None'}",f"  - Selected: {bool(c.get('selected'))}"]
+        lines += ['','## Timeline Summary'] + [f"- {x.get('title')}: {x.get('subtitle') or ''}" for x in snapshot.get('timeline',[])[:20]] + ['','## Raw Artifacts',f"- viewer path: viewer/index.html",f"- state path: {snapshot.get('artifacts',{}).get('state','state.json')}",f"- event path: {snapshot.get('artifacts',{}).get('events','runtime_events.jsonl')}"]
+        return '\n'.join(lines)+'\n'
+    lines=['# Villani Ops Run Failed' if d.get('state')=='failed' else '# Villani Ops Final Report','',f"Run ID: {r.get('run_id')}",f"Status: {r.get('status')}",f"Decision: {d.get('label') or r.get('status')}",f"Stop reason: {d.get('stop_reason') or 'Unavailable'}",'', 'Decision Economics: unavailable because no candidates ran.']
+    if d.get('failure_reason'): lines += ['', f"Failure message: {d.get('failure_reason')}"]
+    return '\n'.join(lines)+'\n'
