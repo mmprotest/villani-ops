@@ -231,6 +231,8 @@ def run(ctx: typer.Context, repo: str|None=None, task: str|None=typer.Option(Non
                 import time; time.sleep(30); viewer_server.stop()
         except Exception as e:
             console.print(f'Warning: offline viewer could not be written: {e}')
+    if not d.accepted:
+        raise typer.Exit(1)
 
 
 @viewer_app.command('list')

@@ -220,3 +220,39 @@ def test_header_uses_decision_and_cost_reasons_visible(tmp_path):
     assert 'Accepted with warnings' in html and 'completed' in html
     assert 'Fix the failing calculator function' in html and 'qwen3.6-27b' in html and 'villani-code' in html and '20260702T004250Z-91ce53' in html
     assert 'Backend pricing data missing' in html and '1 unavailable call' in html
+
+
+def test_candidate_evidence_patch_aliases_and_changed_file_aliases(tmp_path):
+    cases=[
+        ({'attempt_id':'c1','patch_produced':True}, 'yes', []),
+        ({'attempt_id':'c2','has_patch':True}, 'yes', []),
+        ({'attempt_id':'c3','diff_path':'out.diff'}, 'yes', []),
+        ({'attempt_id':'c4','changed_files':['a.py']}, 'yes', ['a.py']),
+        ({'attempt_id':'c5','files_changed':['b.py']}, 'yes', ['b.py']),
+        ({'attempt_id':'c6'}, 'unknown', []),
+        ({'attempt_id':'c7','accepted_patch_application_status':'failed'}, 'no', []),
+    ]
+    rd=_decision_run(tmp_path, {'run_id':'patch-aliases','status':'completed','candidates':[c for c,_,__ in cases]})
+    ev=build_viewer_snapshot(rd)['candidate_evidence']
+    by_id={x['candidate_id']:x for x in ev}
+    for c, patch, files in cases:
+        assert by_id[c['attempt_id']]['patch'] == patch
+        assert by_id[c['attempt_id']]['changed_files'] == files
+    html=write_offline_viewer(rd).read_text()
+    assert 'Patch</th>' in html and 'b.py' in html
+
+
+def test_usage_normalizes_aliases_jsonl_state_runner_and_cost_reasons(tmp_path):
+    rd=tmp_path/'runs'/'usage-aliases'; rd.mkdir(parents=True)
+    (rd/'state.json').write_text(json.dumps({'run_id':'usage-aliases','status':'completed','runner_telemetry':{'tokens_in':3,'tokens_out':4,'estimated_cost':0.02}}))
+    (rd/'runtime_events.jsonl').write_text('')
+    (rd/'usage.jsonl').write_text(json.dumps({'prompt_tokens':10,'completion_tokens':5,'amount':0.03})+'\n')
+    u=build_viewer_snapshot(rd)['usage']
+    assert u['input_tokens'] == 13 and u['output_tokens'] == 9 and u['total_tokens'] == 22
+    assert round(u['total_cost'], 2) == 0.05
+
+
+def test_execution_graph_demoted_below_evidence_sections(tmp_path):
+    html=write_offline_viewer(fake_run(tmp_path)).read_text()
+    assert 'graphPanel--secondary' in html
+    assert html.index('Candidate Evidence') < html.index('Live Event Timeline') < html.index('Execution Graph')

@@ -53,7 +53,7 @@ def test_cli_non_performance_backend_output(monkeypatch, tmp_path):
     monkeypatch.setattr('villani_ops.controller.executor.VillaniOps.run', fake_run)
     for mode in ['cheap','balanced','quality']:
         res=runner.invoke(app, ['run','--repo',str(tmp_path),'--task','x','--mode',mode,'--orchestrator','graph'])
-        assert res.exit_code == 0, res.output
+        assert res.exit_code != 0, res.output
         assert f'Mode: {mode}' in res.output
         assert 'Primary backend: None/None' not in res.output
         assert 'Backend assignments' in res.output
