@@ -1,5 +1,5 @@
 from __future__ import annotations
-import os, subprocess, shutil, json, signal
+import os, subprocess, shutil, json, signal, time
 from pathlib import Path
 from .base import RunnerContext, RunnerResult
 from .villani_code_debug import write_runner_telemetry
@@ -58,34 +58,38 @@ class VillaniCodeRunner:
             if x is None: return ''
             if isinstance(x, bytes): return x.decode(errors='replace')
             return str(x)
-        def _descendants(pid: int) -> set[int]:
-            found=set(); stack=[pid]
-            while stack:
-                parent=stack.pop()
+        def _close_pipes(p):
+            for stream in (getattr(p,'stdin',None), getattr(p,'stdout',None), getattr(p,'stderr',None)):
                 try:
-                    listed=subprocess.run(['pgrep','-P',str(parent)], text=True, capture_output=True, timeout=1)
-                    kids=[int(x) for x in listed.stdout.split() if x.strip().isdigit()]
-                except Exception:
-                    kids=[]
-                for child in kids:
-                    if child not in found:
-                        found.add(child); stack.append(child)
-            return found
-        def _kill_process_tree(pid: int, sig, known: set[int]|None=None) -> None:
-            targets=set(known or set()) | _descendants(pid) | {pid}
-            if os.name == 'posix':
-                try:
-                    listed=subprocess.run(['pgrep','-g',str(pid)], text=True, capture_output=True, timeout=1)
-                    targets |= {int(x) for x in listed.stdout.split() if x.strip().isdigit()}
-                except Exception:
-                    pass
-                try: os.killpg(pid, sig)
+                    if stream: stream.close()
                 except Exception: pass
-            for target in sorted(targets, reverse=True):
-                try:
-                    if target != os.getpid(): os.kill(target, sig)
+        def _terminate_timed_out_process(p):
+            if not p: return
+            if os.name == 'posix':
+                try: pgid=os.getpgid(p.pid)
+                except Exception: pgid=p.pid
+                for sig, wait_s in ((signal.SIGTERM, 1.0), (signal.SIGKILL, 2.0)):
+                    try: os.killpg(pgid, sig)
+                    except ProcessLookupError: pass
+                    except Exception:
+                        try: os.kill(p.pid, sig)
+                        except Exception: pass
+                    deadline=time.monotonic()+wait_s
+                    while time.monotonic()<deadline and p.poll() is None:
+                        time.sleep(0.05)
+                    if p.poll() is not None: break
+            else:
+                try: p.terminate()
+                except Exception: pass
+                try: p.wait(timeout=1)
                 except Exception:
-                    pass
+                    try: p.kill()
+                    except Exception: pass
+                    try: p.wait(timeout=2)
+                    except Exception: pass
+            _close_pipes(p)
+            try: p.wait(timeout=0.2)
+            except Exception: pass
         proc=None
         try:
             popen_kwargs={'cwd':context.repo_path,'text':True,'stdout':subprocess.PIPE,'stderr':subprocess.PIPE,'env':{**os.environ, **context.env}}
@@ -94,26 +98,7 @@ class VillaniCodeRunner:
             stdout, stderr = proc.communicate(timeout=context.timeout_seconds)
             return _result(proc.returncode, stdout, stderr)
         except subprocess.TimeoutExpired as e:
-            if proc and proc.poll() is None:
-                known_children=_descendants(proc.pid) if os.name == 'posix' else set()
-                try:
-                    if os.name == 'posix': _kill_process_tree(proc.pid, signal.SIGTERM, known_children)
-                    else: proc.terminate()
-                    try: proc.communicate(timeout=1)
-                    except Exception: pass
-                    if os.name == 'posix':
-                        try: _kill_process_tree(proc.pid, signal.SIGKILL, known_children)
-                        except ProcessLookupError: pass
-                    elif proc.poll() is None: proc.kill()
-                    try: proc.communicate(timeout=2)
-                    except Exception: pass
-                except Exception:
-                    try:
-                        if os.name == 'posix': _kill_process_tree(proc.pid, signal.SIGKILL, known_children)
-                        else: proc.kill()
-                    except Exception: pass
-                    try: proc.communicate(timeout=2)
-                    except Exception: pass
+            _terminate_timed_out_process(proc)
             r=_result(124, _norm(getattr(e,'stdout',None)), _norm(getattr(e,'stderr',None))+f"\nCommand timed out after {context.timeout_seconds}s")
             r.token_accounting_warnings.append('Runner timed out; telemetry may be partial.')
             r.telemetry.setdefault('token_accounting_warnings', []).append('Runner timed out; telemetry may be partial.')

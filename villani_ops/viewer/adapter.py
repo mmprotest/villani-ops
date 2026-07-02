@@ -1,11 +1,47 @@
 from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
+from dataclasses import dataclass
 import json, re
 
 SECRET_KEY_RE = re.compile(r"(?i)(api[_-]?key|secret|password|authorization)")
 SECRET_VALUE_RE = re.compile(r"(?i)(bearer\s+[A-Za-z0-9._-]+|gh[pousr]_[A-Za-z0-9_]+|sk-[A-Za-z0-9_-]{12,})")
+
+@dataclass(frozen=True)
+class NormalizedCandidateEvidence:
+    patch: str
+    changed_files: list[str]
+    patch_status: str = 'unknown'
+
+def _truthy_patch_value(v: Any) -> bool:
+    if v is True: return True
+    if isinstance(v, str): return bool(v.strip())
+    if isinstance(v, (list, tuple, set, dict)): return bool(v)
+    return False
+
+def normalize_candidate_evidence(candidate: Mapping[str, Any]) -> NormalizedCandidateEvidence:
+    changed=[]
+    for key in ('changed_files','files_changed','modified_files'):
+        vals=candidate.get(key)
+        if isinstance(vals, list):
+            changed += [str(x) for x in vals if str(x).strip()]
+    meta=candidate.get('patch_metadata') or candidate.get('patch')
+    if isinstance(meta, dict):
+        for key in ('changed_files','files_changed','modified_files'):
+            vals=meta.get(key)
+            if isinstance(vals, list): changed += [str(x) for x in vals if str(x).strip()]
+    changed=list(dict.fromkeys(changed))
+    status=str(candidate.get('accepted_patch_application_status') or '').lower()
+    explicit_failed=status in {'failed','rejected','error','errored'}
+    has_patch=any(_truthy_patch_value(candidate.get(k)) for k in ('patch_produced','has_patch','patch','patch_path','diff_path')) or bool(changed)
+    if status and not explicit_failed: has_patch=True
+    artifacts=candidate.get('artifacts') or candidate.get('artifact_references') or candidate.get('artifact_paths')
+    artifact_blob=json.dumps(artifacts).lower() if artifacts else ''
+    if artifact_blob and any(x in artifact_blob for x in ('.patch','.diff','diff','patch')): has_patch=True
+    patch='yes' if has_patch else ('no' if explicit_failed else 'unknown')
+    return NormalizedCandidateEvidence(patch=patch, changed_files=changed, patch_status=status or 'unknown')
+
 PROVIDER_FAILURE_KINDS = {'backend_connection_error','backend_timeout','backend_http_error','backend_response_error'}
 EVENTS = {'run_started':'Run started','model_request_started':'Model request started','provider_failure':'Provider failure','backend_failure':'Backend failure','model_response_received':'Model response received','tool_call_started':'Tool call started','tool_call_completed':'Tool call completed','tool_call_failed':'Tool call failed','investigation_submitted':'Investigation submitted','classification_submitted':'Classification submitted','plan_submitted':'Plan submitted','decomposition_submitted':'Decomposition submitted','decomposition_validation_completed':'Decomposition validation completed','execution_path_selected':'Execution path selected','candidate_attempt_started':'Candidate attempt started','candidate_attempt_completed':'Candidate attempt completed','candidate_attempt_failed':'Candidate attempt failed','subtask_attempt_started':'Subtask attempt started','subtask_attempt_completed':'Subtask attempt completed','subtask_attempt_failed':'Subtask attempt failed','subtask_attempt_reviewed':'Subtask attempt reviewed','subtask_accepted':'Subtask accepted','subtask_failed':'Subtask failed','validation_started':'Validation started','validation_completed':'Validation completed','validation_failed':'Validation failed','candidate_attempt_reviewed':'Candidate attempt reviewed','selection_completed':'Selection completed','run_finalized':'Final decision','decomposition_deadlock_detected':'Decomposition deadlock detected','candidate_fallback_started':'Candidate fallback started','integration_started':'Integration started','integration_completed':'Integration completed','integration_failed':'Integration failed','recovery_injected':'Recovery injected','recovery_deterministic_action_executed':'Recovery action executed'}
 STATUS_BY_EVENT = {'run_started':'running','candidate_attempt_started':'running','subtask_attempt_started':'running','validation_started':'running','integration_started':'running','model_request_started':'running','tool_call_started':'running','candidate_fallback_started':'running','candidate_attempt_completed':'completed','subtask_attempt_completed':'completed','validation_completed':'completed','integration_completed':'completed','candidate_attempt_failed':'failed','subtask_attempt_failed':'failed','subtask_failed':'failed','validation_failed':'failed','integration_failed':'failed','subtask_accepted':'accepted','candidate_attempt_reviewed':'completed','subtask_attempt_reviewed':'completed','selection_completed':'selected','run_finalized':'completed','provider_failure':'failed','backend_failure':'failed','tool_call_failed':'failed','model_response_received':'completed','tool_call_completed':'completed','decomposition_deadlock_detected':'blocked'}
@@ -107,15 +143,23 @@ def _progress(state, events):
             if typ in types: pct,label=max(pct,val),lab
     return min(pct,99),label
 
+TOKEN_IN_KEYS=('input_tokens','prompt_tokens','tokens_in','total_input_tokens')
+TOKEN_OUT_KEYS=('output_tokens','completion_tokens','tokens_out','total_output_tokens')
+TOKEN_TOTAL_KEYS=('total_tokens','tokens_total')
+COST_KEYS=('total_cost','cost','cost_usd','estimated_cost','amount','usd')
+
 def _num(d,*keys):
     for k in keys:
         v=d.get(k) if isinstance(d,dict) else None
         if isinstance(v,(int,float)): return v
+        if isinstance(v,str):
+            try: return float(v)
+            except ValueError: pass
     return 0
 
 def _meaningful(src: Any) -> bool:
     if not isinstance(src, dict): return False
-    for k in ('total_tokens','input_tokens','output_tokens','total_cost','calls_count','unavailable_calls_count'):
+    for k in TOKEN_TOTAL_KEYS+TOKEN_IN_KEYS+TOKEN_OUT_KEYS+COST_KEYS+('calls_count','unavailable_calls_count'):
         try:
             if float(src.get(k) or 0) > 0: return True
         except (TypeError, ValueError): pass
@@ -125,13 +169,13 @@ def aggregate_usage_jsonl(run_dir: Path) -> dict:
     rows=_read_jsonl(Path(run_dir)/'usage.jsonl')
     out={'input_tokens':0,'output_tokens':0,'total_tokens':0,'input_cost':0.0,'output_cost':0.0,'total_cost':0.0,'calls_count':0,'unavailable_calls_count':0,'by_role':{},'by_backend':{},'by_model':{}}
     def add_bucket(bucket, r):
-        bucket['input_tokens']=bucket.get('input_tokens',0)+int(_num(r,'input_tokens','prompt_tokens'))
-        bucket['output_tokens']=bucket.get('output_tokens',0)+int(_num(r,'output_tokens','completion_tokens'))
-        tt=_num(r,'total_tokens') or int(_num(r,'input_tokens','prompt_tokens'))+int(_num(r,'output_tokens','completion_tokens'))
+        bucket['input_tokens']=bucket.get('input_tokens',0)+int(_num(r,*TOKEN_IN_KEYS))
+        bucket['output_tokens']=bucket.get('output_tokens',0)+int(_num(r,*TOKEN_OUT_KEYS))
+        tt=_num(r,'total_tokens') or int(_num(r,*TOKEN_IN_KEYS))+int(_num(r,*TOKEN_OUT_KEYS))
         bucket['total_tokens']=bucket.get('total_tokens',0)+int(tt)
         bucket['input_cost']=bucket.get('input_cost',0.0)+float(_num(r,'input_cost'))
         bucket['output_cost']=bucket.get('output_cost',0.0)+float(_num(r,'output_cost'))
-        bucket['total_cost']=bucket.get('total_cost',0.0)+float(_num(r,'total_cost','cost','usd'))
+        bucket['total_cost']=bucket.get('total_cost',0.0)+float(_num(r,*COST_KEYS))
         bucket['calls_count']=bucket.get('calls_count',0)+1
         if r.get('usage_source')=='unavailable' or r.get('cost_unavailable') or r.get('unavailable'):
             bucket['unavailable_calls_count']=bucket.get('unavailable_calls_count',0)+1
@@ -144,21 +188,47 @@ def aggregate_usage_jsonl(run_dir: Path) -> dict:
                 add_bucket(out[name][str(val)],r)
     return out
 
+def _usage_sources(run_dir: Path, state: dict, digest: dict) -> list[dict]:
+    cost=_read_json(run_dir/'cost_summary.json', {}) or {}
+    uj=_read_json(run_dir/'usage.json', {}) or {}
+    summary=uj.get('summary') if isinstance(uj.get('summary'),dict) else uj
+    sources=[cost, summary, state.get('usage_summary') if isinstance(state,dict) else {}, digest.get('usage') if isinstance(digest,dict) else {}, aggregate_usage_jsonl(run_dir)]
+    for c in state.get('candidates',[]) if isinstance(state.get('candidates'),list) else []:
+        if isinstance(c,dict):
+            for k in ('usage','usage_summary','telemetry','runner_telemetry'):
+                if isinstance(c.get(k),dict): sources.append(c[k])
+    for k in ('runner_telemetry','telemetry'):
+        if isinstance(state.get(k),dict): sources.append(state[k])
+    return [s for s in sources if isinstance(s,dict)]
+
 def _usage(run_dir, state, digest):
-    cost=_read_json(run_dir/'cost_summary.json', {}) or {}; uj=_read_json(run_dir/'usage.json', {}) or {}; summary=uj.get('summary') if isinstance(uj.get('summary'),dict) else uj
-    candidates=[cost, summary, state.get('usage_summary') if isinstance(state,dict) else {}, digest.get('usage') if isinstance(digest,dict) else {}, aggregate_usage_jsonl(run_dir)]
-    src=next((c for c in candidates if _meaningful(c)), {})
-    inp=_num(src,'input_tokens','prompt_tokens'); out=_num(src,'output_tokens','completion_tokens'); total=_num(src,'total_tokens') or inp+out
-    calls=int(_num(src,'calls_count')); unavailable=int(_num(src,'unavailable_calls_count','unavailable_calls'))
-    amount=_num(src,'total_cost','cost','usd')
-    missing_usage=bool(calls and not total and not amount)
+    merged={'input_tokens':0,'output_tokens':0,'total_tokens':0,'total_cost':0.0,'calls_count':0,'unavailable_calls_count':0,'estimated':False,'pricing_missing':False,'usage_missing':False}
+    meaningful=False
+    for src in _usage_sources(run_dir,state,digest):
+        if not _meaningful(src) and not src.get('pricing_missing') and not src.get('usage_missing'): continue
+        meaningful=True
+        inp=_num(src,*TOKEN_IN_KEYS); out=_num(src,*TOKEN_OUT_KEYS); total=_num(src,*TOKEN_TOTAL_KEYS) or inp+out; amount=_num(src,*COST_KEYS)
+        merged['input_tokens']+=inp; merged['output_tokens']+=out; merged['total_tokens']+=total; merged['total_cost']+=amount
+        merged['calls_count']+=int(_num(src,'calls_count','call_count') or (1 if (total or amount) else 0))
+        merged['unavailable_calls_count']+=int(_num(src,'unavailable_calls_count','unavailable_calls','missing_usage_calls'))
+        merged['estimated']=merged['estimated'] or bool(src.get('estimated') or src.get('cost_estimated') or src.get('estimated_cost'))
+        merged['pricing_missing']=merged['pricing_missing'] or bool(src.get('pricing_missing') or src.get('cost_unavailable'))
+        merged['usage_missing']=merged['usage_missing'] or bool(src.get('usage_missing') or src.get('usage_source')=='unavailable')
+    src=merged if meaningful else {}
+    inp=src.get('input_tokens',0); out=src.get('output_tokens',0); total=src.get('total_tokens',0) or inp+out
+    calls=int(src.get('calls_count',0)); unavailable=int(src.get('unavailable_calls_count',0)); amount=float(src.get('total_cost',0) or 0)
     if unavailable and amount: cost_status='partial'; reason='Some calls were missing usage data'
-    elif src.get('estimated'): cost_status='estimated'; reason='Estimated from token usage and configured pricing'
+    elif src.get('estimated') and amount: cost_status='estimated'; reason='Estimated from token usage and configured pricing'
     elif amount: cost_status='available'; reason=None
-    elif calls and not unavailable: cost_status='zero'; reason=None
-    else: cost_status='unavailable'; reason='Usage data is missing' if missing_usage else 'Backend pricing data missing'
-    if unavailable and not amount: cost_status='unavailable'; reason='Backend pricing data missing'
-    return {'input_tokens':inp,'output_tokens':out,'total_tokens':total,'input_cost':_num(src,'input_cost'),'output_cost':_num(src,'output_cost'),'total_cost':amount,'calls_count':calls,'unavailable_calls_count':unavailable,'tokens':{'status':'available' if total else 'unavailable','total':total or None,'input':inp or None,'output':out or None},'cost':{'status':cost_status,'amount':amount if (amount or calls) else None,'currency':'USD','reason':reason,'unavailable_calls_count':unavailable,'unavailable_calls_label':(f'{unavailable} unavailable call' + ('' if unavailable==1 else 's')) if unavailable else ''},'by_role':src.get('by_role',{}) if isinstance(src,dict) else {},'by_backend':src.get('by_backend',{}) if isinstance(src,dict) else {},'by_model':src.get('by_model',{}) if isinstance(src,dict) else {}}
+    elif calls and total and not unavailable and not src.get('pricing_missing'): cost_status='zero'; reason=None
+    else:
+        cost_status='unavailable'
+        reasons=[]
+        if not total or src.get('usage_missing') or unavailable: reasons.append('usage data missing')
+        if total or src.get('pricing_missing') or unavailable: reasons.append('backend pricing data missing')
+        reason='Cost unavailable: ' + ' and '.join(dict.fromkeys(reasons or ['usage data missing']))
+        if 'backend pricing data missing' in reason: reason += ' (Backend pricing data missing)'
+    return {'input_tokens':inp,'output_tokens':out,'total_tokens':total,'input_cost':0,'output_cost':0,'total_cost':amount,'calls_count':calls,'unavailable_calls_count':unavailable,'tokens':{'status':'available' if total else 'unavailable','total':total or None,'input':inp or None,'output':out or None},'cost':{'status':cost_status,'amount':amount if (amount or calls) else None,'currency':'USD','reason':reason,'unavailable_calls_count':unavailable,'unavailable_calls_label':(f'{unavailable} unavailable call' + ('' if unavailable==1 else 's')) if unavailable else ''},'by_role':{},'by_backend':{},'by_model':{}}
 
 def _validation_status(c):
     return (c.get('validation_status') or (c.get('validation') or {}).get('status') or ('passed' if (c.get('validation') or {}).get('passed') is True else 'failed' if (c.get('validation') or {}).get('passed') is False else 'not_run'))
@@ -207,7 +277,8 @@ def candidate_evidence(state: dict) -> list[dict]:
         warns=[]
         if val!='passed': warns.append('Validation did not run' if val in {'not_run','missing','unknown','',None} else f'Validation {val}')
         if rev in {'not_run','Unknown','missing','unavailable',None}: warns.append('Review did not run')
-        out.append({'candidate_id':c.get('attempt_id') or 'Unknown','status':c.get('status') or 'Unknown','patch':'yes' if c.get('patch_path') else 'no','changed_files':c.get('changed_files') or [],'runner_status':c.get('runner_status') or (f"exit {c.get('exit_code')}" if c.get('exit_code') is not None else 'Unknown'),'review_status':rev,'validation_status':val or 'Unknown','eligible':bool(c.get('acceptance_eligible')),'blockers':(c.get('acceptance_blockers') or [])+warns,'selected':c.get('attempt_id')==sel})
+        norm=normalize_candidate_evidence(c)
+        out.append({'candidate_id':c.get('attempt_id') or 'Unknown','status':c.get('status') or 'Unknown','patch':norm.patch,'changed_files':norm.changed_files,'runner_status':c.get('runner_status') or (f"exit {c.get('exit_code')}" if c.get('exit_code') is not None else 'Unknown'),'review_status':rev,'validation_status':val or 'Unknown','eligible':bool(c.get('acceptance_eligible')),'blockers':(c.get('acceptance_blockers') or [])+warns,'selected':c.get('attempt_id')==sel})
     return out
 
 def _model(state, usage, events):
