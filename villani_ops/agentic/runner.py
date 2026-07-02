@@ -40,18 +40,15 @@ def _provider_failure(exc: Exception, backend) -> tuple[str, str, bool]:
     return 'runner_error', str(exc) or exc.__class__.__name__, False
 
 def _write_final_report(run_dir: Path, state: OpsRunState):
+    try:
+        from villani_ops.viewer.adapter import build_viewer_snapshot, render_final_report
+        (Path(run_dir) / 'final_report.md').write_text(render_final_report(build_viewer_snapshot(Path(run_dir))), encoding='utf-8')
+        return
+    except Exception:
+        pass
     msg = state.failure_message or (state.final_decision or {}).get('summary') or ('Run completed' if state.status=='completed' else 'Run failed')
-    title = '# Villani Ops Run Report' if state.status=='completed' else '# Villani Ops Run Failed'
-    lines = [title, '', f'Run ID: {state.run_id}', f'Run directory: {run_dir}', f'Status: {state.status}']
+    lines = ['# Villani Ops Run Failed' if state.status!='completed' else '# Villani Ops Final Report', '', f'Run ID: {state.run_id}', f'Run directory: {run_dir}', f'Status: {state.status}', '', 'Decision Economics: unavailable because no candidates ran.']
     if state.failure_kind or state.status=='failed': lines += [f'Failure kind: {state.failure_kind or "runner_error"}', f'Failure message: {msg}']
-    if state.backend_name or state.backend_model or state.backend_url:
-        lines += ['', '## Backend', f'Name: {state.backend_name or "Unknown backend"}', f'Model: {state.backend_model or "Unknown model"}', f'URL: {state.backend_url or "Unknown URL"}']
-    if state.recoverable is not None: lines.append(f'Recoverable: {str(bool(state.recoverable)).lower()}')
-    if state.status=='completed':
-        lines += ['', f'Winner: {(state.selection or {}).get("selected_attempt_id") or "none"}', f'Validation/review status: {state.final_decision or {}}']
-        if state.warnings: lines += ['', 'Warnings:', *[f'- {w}' for w in state.warnings]]
-    else:
-        lines += ['', 'Next step: Start the backend server or update the backend configuration.']
     (Path(run_dir) / 'final_report.md').write_text('\n'.join(lines) + '\n', encoding='utf-8')
 
 def _write_failure_report(run_dir: Path, state: OpsRunState):
