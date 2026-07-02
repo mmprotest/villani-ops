@@ -6,8 +6,9 @@ import json, re
 
 SECRET_KEY_RE = re.compile(r"(?i)(api[_-]?key|secret|password|authorization)")
 SECRET_VALUE_RE = re.compile(r"(?i)(bearer\s+[A-Za-z0-9._-]+|gh[pousr]_[A-Za-z0-9_]+|sk-[A-Za-z0-9_-]{12,})")
-EVENTS = {'run_started':'Run started','investigation_submitted':'Investigation submitted','classification_submitted':'Classification submitted','plan_submitted':'Plan submitted','decomposition_submitted':'Decomposition submitted','decomposition_validation_completed':'Decomposition validation completed','execution_path_selected':'Execution path selected','candidate_attempt_started':'Candidate attempt started','candidate_attempt_completed':'Candidate attempt completed','candidate_attempt_failed':'Candidate attempt failed','subtask_attempt_started':'Subtask attempt started','subtask_attempt_completed':'Subtask attempt completed','subtask_attempt_failed':'Subtask attempt failed','subtask_attempt_reviewed':'Subtask attempt reviewed','subtask_accepted':'Subtask accepted','subtask_failed':'Subtask failed','validation_started':'Validation started','validation_completed':'Validation completed','validation_failed':'Validation failed','candidate_attempt_reviewed':'Candidate attempt reviewed','selection_completed':'Selection completed','run_finalized':'Final decision','decomposition_deadlock_detected':'Decomposition deadlock detected','candidate_fallback_started':'Candidate fallback started','integration_started':'Integration started','integration_completed':'Integration completed','integration_failed':'Integration failed','recovery_injected':'Recovery injected','recovery_deterministic_action_executed':'Recovery action executed'}
-STATUS_BY_EVENT = {'run_started':'running','candidate_attempt_started':'running','subtask_attempt_started':'running','validation_started':'running','integration_started':'running','candidate_fallback_started':'running','candidate_attempt_completed':'completed','subtask_attempt_completed':'completed','validation_completed':'completed','integration_completed':'completed','candidate_attempt_failed':'failed','subtask_attempt_failed':'failed','subtask_failed':'failed','validation_failed':'failed','integration_failed':'failed','subtask_accepted':'accepted','candidate_attempt_reviewed':'completed','subtask_attempt_reviewed':'completed','selection_completed':'selected','run_finalized':'completed','decomposition_deadlock_detected':'blocked'}
+PROVIDER_FAILURE_KINDS = {'backend_connection_error','backend_timeout','backend_http_error','backend_response_error'}
+EVENTS = {'run_started':'Run started','model_request_started':'Model request started','provider_failure':'Provider failure','backend_failure':'Backend failure','model_response_received':'Model response received','tool_call_started':'Tool call started','tool_call_completed':'Tool call completed','tool_call_failed':'Tool call failed','investigation_submitted':'Investigation submitted','classification_submitted':'Classification submitted','plan_submitted':'Plan submitted','decomposition_submitted':'Decomposition submitted','decomposition_validation_completed':'Decomposition validation completed','execution_path_selected':'Execution path selected','candidate_attempt_started':'Candidate attempt started','candidate_attempt_completed':'Candidate attempt completed','candidate_attempt_failed':'Candidate attempt failed','subtask_attempt_started':'Subtask attempt started','subtask_attempt_completed':'Subtask attempt completed','subtask_attempt_failed':'Subtask attempt failed','subtask_attempt_reviewed':'Subtask attempt reviewed','subtask_accepted':'Subtask accepted','subtask_failed':'Subtask failed','validation_started':'Validation started','validation_completed':'Validation completed','validation_failed':'Validation failed','candidate_attempt_reviewed':'Candidate attempt reviewed','selection_completed':'Selection completed','run_finalized':'Final decision','decomposition_deadlock_detected':'Decomposition deadlock detected','candidate_fallback_started':'Candidate fallback started','integration_started':'Integration started','integration_completed':'Integration completed','integration_failed':'Integration failed','recovery_injected':'Recovery injected','recovery_deterministic_action_executed':'Recovery action executed'}
+STATUS_BY_EVENT = {'run_started':'running','candidate_attempt_started':'running','subtask_attempt_started':'running','validation_started':'running','integration_started':'running','model_request_started':'running','tool_call_started':'running','candidate_fallback_started':'running','candidate_attempt_completed':'completed','subtask_attempt_completed':'completed','validation_completed':'completed','integration_completed':'completed','candidate_attempt_failed':'failed','subtask_attempt_failed':'failed','subtask_failed':'failed','validation_failed':'failed','integration_failed':'failed','subtask_accepted':'accepted','candidate_attempt_reviewed':'completed','subtask_attempt_reviewed':'completed','selection_completed':'selected','run_finalized':'completed','provider_failure':'failed','backend_failure':'failed','tool_call_failed':'failed','model_response_received':'completed','tool_call_completed':'completed','decomposition_deadlock_detected':'blocked'}
 
 def _read_json(path: Path, default: Any=None) -> Any:
     try:
@@ -55,6 +56,13 @@ def _subtitle(ev: dict[str,Any]) -> str:
     p=_payload(ev); t=ev.get('type') or ''; bits=[]
     if t=='classification_submitted': bits=[p.get('difficulty'), p.get('category')]
     elif t in {'plan_submitted','execution_path_selected'}: bits=[p.get('execution_path') or p.get('path') or p.get('plan_type')]
+    elif t in {'provider_failure','backend_failure'}:
+        bits=[p.get('failure_kind') or p.get('kind'), p.get('failure_message') or p.get('message'), p.get('backend') or p.get('backend_url') or p.get('backend_name')]
+        if p.get('recoverable') is not None: bits.append('recoverable='+str(p.get('recoverable')).lower())
+    elif t in {'model_request_started','model_response_received'}:
+        bits=[p.get('backend') or p.get('backend_url') or p.get('backend_name'), p.get('model')]
+    elif t.startswith('tool_call_'):
+        bits=[p.get('tool') or p.get('name'), p.get('status')]
     elif 'candidate' in t or t.startswith('validation_') or t=='selection_completed': bits=[humanize_id(_attempt_id(ev) or '')]
     elif t.startswith('subtask_'): bits=[humanize_id(_subtask_id(ev) or ''), _attempt_id(ev) and 'attempt '+str(_attempt_id(ev)).split('_')[-1]]
     elif t.startswith('integration_'): bits=[p.get('status')]
@@ -141,33 +149,55 @@ def _usage(run_dir, state, digest):
     candidates=[cost, summary, state.get('usage_summary') if isinstance(state,dict) else {}, digest.get('usage') if isinstance(digest,dict) else {}, aggregate_usage_jsonl(run_dir)]
     src=next((c for c in candidates if _meaningful(c)), {})
     inp=_num(src,'input_tokens','prompt_tokens'); out=_num(src,'output_tokens','completion_tokens'); total=_num(src,'total_tokens') or inp+out
-    return {'input_tokens':inp,'output_tokens':out,'total_tokens':total,'input_cost':_num(src,'input_cost'),'output_cost':_num(src,'output_cost'),'total_cost':_num(src,'total_cost','cost','usd'),'calls_count':int(_num(src,'calls_count')),'unavailable_calls_count':int(_num(src,'unavailable_calls_count','unavailable_calls')),'tokens':{'status':'available' if total else 'unavailable','total':total or None,'input':inp or None,'output':out or None},'cost':{'status':('partial' if int(_num(src,'unavailable_calls_count','unavailable_calls')) and _num(src,'total_cost','cost','usd') else ('estimated' if src.get('estimated') else ('available' if _num(src,'total_cost','cost','usd') else ('zero' if int(_num(src,'calls_count')) and not int(_num(src,'unavailable_calls_count','unavailable_calls')) else 'unavailable')))),'amount':_num(src,'total_cost','cost','usd') if (_num(src,'total_cost','cost','usd') or int(_num(src,'calls_count'))) else None,'currency':'USD','reason':'Backend pricing data is missing' if int(_num(src,'unavailable_calls_count','unavailable_calls')) or not _meaningful(src) else None},'by_role':src.get('by_role',{}) if isinstance(src,dict) else {},'by_backend':src.get('by_backend',{}) if isinstance(src,dict) else {},'by_model':src.get('by_model',{}) if isinstance(src,dict) else {}}
+    calls=int(_num(src,'calls_count')); unavailable=int(_num(src,'unavailable_calls_count','unavailable_calls'))
+    amount=_num(src,'total_cost','cost','usd')
+    missing_usage=bool(calls and not total and not amount)
+    if unavailable and amount: cost_status='partial'; reason='Some calls were missing usage data'
+    elif src.get('estimated'): cost_status='estimated'; reason='Estimated from token usage and configured pricing'
+    elif amount: cost_status='available'; reason=None
+    elif calls and not unavailable: cost_status='zero'; reason=None
+    else: cost_status='unavailable'; reason='Usage data is missing' if missing_usage else 'Backend pricing data missing'
+    if unavailable and not amount: cost_status='unavailable'; reason='Backend pricing data missing'
+    return {'input_tokens':inp,'output_tokens':out,'total_tokens':total,'input_cost':_num(src,'input_cost'),'output_cost':_num(src,'output_cost'),'total_cost':amount,'calls_count':calls,'unavailable_calls_count':unavailable,'tokens':{'status':'available' if total else 'unavailable','total':total or None,'input':inp or None,'output':out or None},'cost':{'status':cost_status,'amount':amount if (amount or calls) else None,'currency':'USD','reason':reason,'unavailable_calls_count':unavailable,'unavailable_calls_label':(f'{unavailable} unavailable call' + ('' if unavailable==1 else 's')) if unavailable else ''},'by_role':src.get('by_role',{}) if isinstance(src,dict) else {},'by_backend':src.get('by_backend',{}) if isinstance(src,dict) else {},'by_model':src.get('by_model',{}) if isinstance(src,dict) else {}}
 
 def _validation_status(c):
     return (c.get('validation_status') or (c.get('validation') or {}).get('status') or ('passed' if (c.get('validation') or {}).get('passed') is True else 'failed' if (c.get('validation') or {}).get('passed') is False else 'not_run'))
 
+def derive_decision_state(state: dict, digest: dict|None=None, candidates=None, usage=None, events=None) -> dict:
+    digest=digest or {}
+    status=str(state.get('status') or digest.get('status') or 'unknown').lower()
+    failure_kind=state.get('failure_kind') or (state.get('final_decision') or {}).get('failure_kind')
+    sel=(state.get('selection') or {}).get('selected_attempt_id') or (state.get('selection') or {}).get('selected_candidate_id') or digest.get('selected_attempt')
+    cands=candidates if candidates is not None else [c for c in state.get('candidates',[]) if isinstance(c,dict)]
+    winner=next((c for c in cands if c.get('attempt_id')==sel or c.get('candidate_id')==sel), {})
+    warnings=[]
+    if status=='failed' or failure_kind in PROVIDER_FAILURE_KINDS: kind='failed'
+    elif status=='interrupted': kind='cancelled'
+    elif not sel: kind='incomplete'
+    else:
+        val=(_validation_status(winner) or 'unknown').lower()
+        rev=(winner.get('review_status') or ('passed' if winner.get('review') else 'missing')).lower()
+        bad={'missing','not_run','skipped','unknown','absent','failed','unavailable',''}
+        kind='accepted' if val=='passed' and rev not in bad else 'accepted_with_warnings'
+        if val in bad: warnings.append('Validation did not run. Treat this result as unverified.' if val in {'missing','not_run','skipped','unknown','absent',''} else f'Validation status is {val}. Treat this result as unverified.')
+        if rev in bad: warnings.append('Review did not run. Treat this result as unreviewed.' if rev in {'missing','not_run','skipped','unknown','absent','','unavailable'} else f'Review status is {rev}. Treat this result as unreviewed.')
+    label={'accepted':'Accepted','accepted_with_warnings':'Accepted with warnings','failed':'Failed','incomplete':'Incomplete','cancelled':'Cancelled'}.get(kind,'Unknown')
+    severity={'accepted':'success','accepted_with_warnings':'warning','failed':'error','incomplete':'warning','cancelled':'warning'}.get(kind,'info')
+    failure=state.get('failure_message') or (state.get('final_decision') or {}).get('failure_message') or ((state.get('final_decision') or {}).get('summary') if kind=='failed' else None)
+    return {'state':kind,'label':label,'severity':severity,'warnings':warnings,'failure_reason':failure}
+
 def derive_decision_summary(state: dict, digest: dict) -> dict:
+    base=derive_decision_state(state,digest)
     status=str(state.get('status') or digest.get('status') or 'unknown')
     sel=(state.get('selection') or {}).get('selected_attempt_id') or (state.get('selection') or {}).get('selected_candidate_id') or digest.get('selected_attempt')
     cands=[c for c in state.get('candidates',[]) if isinstance(c,dict)]
     winner=next((c for c in cands if c.get('attempt_id')==sel), {})
-    warnings=[]
-    if status=='failed': kind='failed'
-    elif status=='interrupted': kind='cancelled'
-    elif not sel: kind='incomplete'
-    else:
-        val=_validation_status(winner)
-        rev=winner.get('review_status') or ('passed' if winner.get('review') else 'not_run')
-        if val=='passed' and rev not in {'not_run','missing','unknown','unavailable',None}: kind='accepted'
-        else: kind='accepted_with_warnings'
-        if val not in {'passed'}: warnings.append('Validation did not run. Treat this result as unverified.' if val in {'not_run','missing','skipped','unknown','',None} else f'Validation status is {val}. Treat this result as unverified.')
-        if rev in {'not_run','missing','unknown','unavailable',None}: warnings.append('Review did not run. Treat this result as unreviewed.')
+    kind=base['state']; warnings=list(base.get('warnings') or [])
     if (state.get('usage_summary') or {}).get('cost_unavailable') or _num(state.get('usage_summary') or {}, 'unavailable_calls_count'):
         warnings.append('Cost is unavailable because pricing data is missing.')
-    label={'accepted':'Accepted','accepted_with_warnings':'Accepted with warnings','failed':'Failed','incomplete':'Incomplete','cancelled':'Cancelled'}.get(kind,'Unknown')
-    failure=state.get('failure_message') or (state.get('final_decision') or {}).get('failure_message') or (state.get('final_decision') or {}).get('summary') if kind=='failed' else None
+    label=base['label']; failure=base.get('failure_reason')
     changed=winner.get('changed_files') or (state.get('integration') or {}).get('changed_files') or []
-    return {'state':kind,'label':label,'winner':sel,'selection_basis':state.get('selection_basis') or (state.get('selection') or {}).get('selection_basis') or (state.get('selection') or {}).get('basis') or 'Unavailable','validation_status':_validation_status(winner) if winner else 'Unknown','review_status':winner.get('review_status') or ('passed' if winner.get('review') else 'Unknown'),'runner_status':winner.get('runner_status') or winner.get('status') or status,'changed_files_count':len(changed),'changed_files':changed,'confidence':(state.get('tournament_ranking') or {}).get('selection_confidence') or (state.get('selection') or {}).get('confidence'),'failure_reason':failure,'warnings':warnings,'next_step':'Start the backend server or update backend configuration.' if kind=='failed' else ('Run validation/review before trusting this result.' if kind in {'accepted_with_warnings','incomplete'} else '')}
+    return {'state':kind,'label':label,'severity':base.get('severity'),'winner':sel,'selection_basis':state.get('selection_basis') or (state.get('selection') or {}).get('selection_basis') or (state.get('selection') or {}).get('basis') or 'Unavailable','validation_status':_validation_status(winner) if winner else 'Unknown','review_status':winner.get('review_status') or ('passed' if winner.get('review') else 'Unknown'),'runner_status':winner.get('runner_status') or winner.get('status') or status,'changed_files_count':len(changed),'changed_files':changed,'confidence':(state.get('tournament_ranking') or {}).get('selection_confidence') or (state.get('selection') or {}).get('confidence'),'failure_reason':failure,'warnings':warnings,'next_step':'Start the backend server or update backend configuration.' if kind=='failed' else ('Run validation/review before trusting this result.' if kind in {'accepted_with_warnings','incomplete'} else '')}
 
 def candidate_evidence(state: dict) -> list[dict]:
     sel=(state.get('selection') or {}).get('selected_attempt_id') or (state.get('selection') or {}).get('selected_candidate_id')
@@ -198,8 +228,35 @@ def _model(state, usage, events):
         if p.get('backend'): return str(p['backend'])
     return str(state.get('backend_name') or '')
 
+def _provider_failure_kind(state: dict[str,Any], events: list[dict[str,Any]]) -> str|None:
+    kind=state.get('failure_kind') or (state.get('final_decision') or {}).get('failure_kind')
+    if kind in PROVIDER_FAILURE_KINDS: return kind
+    for ev in events:
+        if ev.get('type') in {'provider_failure','backend_failure'}:
+            k=_payload(ev).get('failure_kind') or _payload(ev).get('kind')
+            if k in PROVIDER_FAILURE_KINDS: return k
+    return None
+
+def _candidate_execution_happened(state: dict[str,Any], events: list[dict[str,Any]]) -> bool:
+    if any(isinstance(c,dict) and c.get('attempt_id') for c in state.get('candidates',[]) or []): return True
+    return any('candidate_attempt_' in (e.get('type') or '') or (e.get('type') or '').startswith('validation_') or e.get('type')=='selection_completed' for e in events)
+
 def build_viewer_graph_layout(snapshot_or_state: dict[str,Any], events: list[dict[str,Any]]) -> dict[str,Any]:
     state=snapshot_or_state or {}; types=_event_types(events)
+    pf_kind=_provider_failure_kind(state, events)
+    if pf_kind and not _candidate_execution_happened(state, events):
+        pf_event=next((e for e in events if e.get('type') in {'provider_failure','backend_failure'}), {})
+        p=_payload(pf_event)
+        msg=state.get('failure_message') or p.get('failure_message') or p.get('message') or ''
+        backend=p.get('backend') or p.get('backend_url') or p.get('backend_name') or state.get('backend_name') or ''
+        nodes=[
+            {'id':'run_started','label':'Run started','type':'start','row':1,'col':1,'status':'completed' if 'run_started' in types else 'pending','subtitle':'Run initialized','summary':'Run initialized','details':{}},
+            {'id':'model_request','label':'Model request','type':'request','row':1,'col':2,'status':'completed' if 'model_request_started' in types else 'pending','subtitle':backend or 'Backend request','summary':backend or 'Backend request','details':{'backend':backend}},
+            {'id':'provider_failure','label':'Provider failure','type':'failure','row':1,'col':3,'status':'failed','subtitle':pf_kind,'summary':pf_kind,'details':{'failure_kind':pf_kind,'failure_message':msg,'backend':backend,'recoverable':state.get('recoverable', p.get('recoverable'))}},
+            {'id':'failed_finalization','label':'Failed finalization','type':'finalization','row':1,'col':4,'status':'failed','subtitle':'Failed','summary':'Failed','details':{'status':state.get('status'),'failure_kind':pf_kind,'failure_message':msg}},
+        ]
+        edges=[{'id':'edge_run_started_model_request','source':'run_started','target':'model_request','status':'active'},{'id':'edge_model_request_provider_failure','source':'model_request','target':'provider_failure','status':'failed'},{'id':'edge_provider_failure_failed_finalization','source':'provider_failure','target':'failed_finalization','status':'failed'}]
+        return {'kind':'provider_failure','nodes':nodes,'edges':edges}
     decomposed=bool(state.get('decomposition') or state.get('decomposition_requested') or types & {'decomposition_submitted','subtask_attempt_started','integration_started'})
     fallback=bool(state.get('fallback_used') or 'candidate_fallback_started' in types)
     dead=bool(state.get('decomposed_execution_status') in {'blocked','failed'} or 'decomposition_deadlock_detected' in types)
