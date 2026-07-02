@@ -12,9 +12,9 @@ from villani_ops.storage.files import FileStorage
 
 
 def git_repo(path: Path):
-    path.mkdir(); subprocess.run(['git','init'],cwd=path,check=True,capture_output=True)
-    subprocess.run(['git','config','user.email','a@b.c'],cwd=path,check=True); subprocess.run(['git','config','user.name','A'],cwd=path,check=True)
-    (path/'hello.txt').write_text('hello\n'); subprocess.run(['git','add','.'],cwd=path,check=True); subprocess.run(['git','commit','-m','init'],cwd=path,check=True,capture_output=True)
+    path.mkdir(); subprocess.run(['git','init'],cwd=path,check=True,capture_output=True, timeout=10)
+    subprocess.run(['git','config','user.email','a@b.c'],cwd=path,check=True, timeout=10); subprocess.run(['git','config','user.name','A'],cwd=path,check=True, timeout=10)
+    (path/'hello.txt').write_text('hello\n'); subprocess.run(['git','add','.'],cwd=path,check=True, timeout=10); subprocess.run(['git','commit','-m','init'],cwd=path,check=True,capture_output=True, timeout=10)
 
 
 def fake_villani(path: Path, exit_code=0):

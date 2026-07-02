@@ -1,6 +1,7 @@
 from pathlib import Path
 from typer.testing import CliRunner
 import pytest
+pytestmark = pytest.mark.integration
 from villani_ops.cli.main import app
 from villani_ops.core.backend import Backend
 from villani_ops.execution_policies import policy_for_mode

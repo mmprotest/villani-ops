@@ -124,7 +124,7 @@ def test_regression_action_shaped_payload_requests_decompose_node(tmp_path, monk
     from villani_ops.execution_policies import policy_for_mode
     from villani_ops.runners.base import RunnerResult
     import subprocess, os
-    repo=tmp_path/"repo"; repo.mkdir(); subprocess.run(["git","init"],cwd=repo,check=True,capture_output=True); subprocess.run(["git","config","user.email","a@b.c"],cwd=repo,check=True); subprocess.run(["git","config","user.name","A"],cwd=repo,check=True); (repo/"a.txt").write_text("a\n"); subprocess.run(["git","add","."],cwd=repo,check=True); subprocess.run(["git","commit","-m","init"],cwd=repo,check=True,capture_output=True)
+    repo=tmp_path/"repo"; repo.mkdir(); subprocess.run(["git","init"],cwd=repo,check=True,capture_output=True, timeout=10); subprocess.run(["git","config","user.email","a@b.c"],cwd=repo,check=True, timeout=10); subprocess.run(["git","config","user.name","A"],cwd=repo,check=True, timeout=10); (repo/"a.txt").write_text("a\n"); subprocess.run(["git","add","."],cwd=repo,check=True, timeout=10); subprocess.run(["git","commit","-m","init"],cwd=repo,check=True,capture_output=True, timeout=10)
     backend=Backend(name="b", provider="local", model="m", base_url="http://x", roles=["coding","review","classification","investigation","selection","policy"])
     raw={"thought":"The task spans checkout, pricing, inventory, orders, and receipts.","command":"ls -R","resulting_state":{"files":["src/signalshop/pricing.py","src/signalshop/inventory.py","src/signalshop/checkout.py","src/signalshop/orders.py","src/signalshop/receipts.py"]}}
     class Client:

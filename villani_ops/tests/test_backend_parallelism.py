@@ -4,6 +4,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pytest
+pytestmark = pytest.mark.integration
 from typer.testing import CliRunner
 
 from villani_ops.cli.main import app
@@ -311,7 +312,7 @@ def _run_e2e(tmp_path, attempts, max_parallel, outcomes=None):
 
 def git_repo_simple(path):
     import subprocess
-    path.mkdir(); subprocess.run(['git','init'],cwd=path,check=True,capture_output=True); subprocess.run(['git','config','user.email','a@b.c'],cwd=path,check=True); subprocess.run(['git','config','user.name','A'],cwd=path,check=True); (path/'f').write_text('x\n'); subprocess.run(['git','add','.'],cwd=path,check=True); subprocess.run(['git','commit','-m','init'],cwd=path,check=True,capture_output=True)
+    path.mkdir(); subprocess.run(['git','init'],cwd=path,check=True,capture_output=True, timeout=10); subprocess.run(['git','config','user.email','a@b.c'],cwd=path,check=True, timeout=10); subprocess.run(['git','config','user.name','A'],cwd=path,check=True, timeout=10); (path/'f').write_text('x\n'); subprocess.run(['git','add','.'],cwd=path,check=True, timeout=10); subprocess.run(['git','commit','-m','init'],cwd=path,check=True,capture_output=True, timeout=10)
 
 def _event_time(engine,node,action):
     return next(t for n,a,t in engine.events if n==node and a==action)
