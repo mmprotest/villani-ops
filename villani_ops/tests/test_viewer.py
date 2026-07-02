@@ -190,3 +190,33 @@ def test_normalized_usage_statuses(tmp_path):
     assert build_viewer_snapshot(rd)['usage']['cost']['status']=='estimated'
     (rd/'usage.json').write_text(json.dumps({'total_tokens':10,'total_cost':0.0,'calls_count':1,'unavailable_calls_count':0}))
     assert build_viewer_snapshot(rd)['usage']['cost']['status']=='zero'
+
+
+def test_provider_failure_graph_and_timeline_truthful(tmp_path):
+    rd=tmp_path/'runs'/'backend-fail'; rd.mkdir(parents=True)
+    state={'run_id':'backend-fail','status':'failed','failure_kind':'backend_connection_error','failure_message':'Could not connect','recoverable':True,'task':'Fix the failing calculator function','runner':'villani-code','backend_model':'qwen3.6-27b'}
+    (rd/'state.json').write_text(json.dumps(state))
+    (rd/'runtime_events.jsonl').write_text('\n'.join([
+        json.dumps({'timestamp':'2026-07-02T00:00:00+00:00','type':'run_started','payload':{}}),
+        json.dumps({'timestamp':'2026-07-02T00:00:01+00:00','type':'model_request_started','payload':{'backend':'local'}}),
+        json.dumps({'timestamp':'2026-07-02T00:00:02+00:00','type':'provider_failure','payload':{'failure_kind':'backend_connection_error','failure_message':'Could not connect','backend':'local','recoverable':True}}),
+        json.dumps({'timestamp':'2026-07-02T00:00:03+00:00','type':'run_finalized','payload':{}}),
+    ]))
+    snap=build_viewer_snapshot(rd)
+    labels=' '.join(n['label']+' '+n.get('subtitle','') for n in snap['graph']['nodes'])
+    assert snap['graph']['kind']=='provider_failure'
+    assert 'Model request' in labels and 'Provider failure' in labels and 'backend_connection_error' in labels
+    assert not any(x in labels for x in ['Candidates','Validation','Review','Selection'])
+    tl=' '.join(e['title']+' '+e.get('subtitle','') for e in snap['timeline'])
+    assert 'Model request started' in tl and 'Provider failure' in tl and 'backend_connection_error' in tl and 'Could not connect' in tl and 'recoverable=true' in tl
+    html=write_offline_viewer(rd).read_text()
+    assert 'Provider failure' in html and 'backend_connection_error' in html and 'Candidates' not in json.dumps(snap['graph'])
+
+
+def test_header_uses_decision_and_cost_reasons_visible(tmp_path):
+    rd=_decision_run(tmp_path, {'run_id':'20260702T004250Z-91ce53','status':'completed','task':'Fix the failing calculator function','runner':'villani-code','backend_model':'qwen3.6-27b','selection':{'selected_attempt_id':'candidate_003'},'candidates':[{'attempt_id':'candidate_003','validation_status':'not_run','review_status':'passed'}]})
+    (rd/'usage.json').write_text(json.dumps({'total_tokens':10,'calls_count':1,'unavailable_calls_count':1}))
+    html=write_offline_viewer(rd).read_text()
+    assert 'Accepted with warnings' in html and 'completed' in html
+    assert 'Fix the failing calculator function' in html and 'qwen3.6-27b' in html and 'villani-code' in html and '20260702T004250Z-91ce53' in html
+    assert 'Backend pricing data missing' in html and '1 unavailable call' in html

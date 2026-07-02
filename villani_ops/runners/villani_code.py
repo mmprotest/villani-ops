@@ -1,5 +1,5 @@
 from __future__ import annotations
-import os, subprocess, shutil, json
+import os, subprocess, shutil, json, signal
 from pathlib import Path
 from .base import RunnerContext, RunnerResult
 from .villani_code_debug import write_runner_telemetry
@@ -58,11 +58,63 @@ class VillaniCodeRunner:
             if x is None: return ''
             if isinstance(x, bytes): return x.decode(errors='replace')
             return str(x)
+        def _descendants(pid: int) -> set[int]:
+            found=set(); stack=[pid]
+            while stack:
+                parent=stack.pop()
+                try:
+                    listed=subprocess.run(['pgrep','-P',str(parent)], text=True, capture_output=True, timeout=1)
+                    kids=[int(x) for x in listed.stdout.split() if x.strip().isdigit()]
+                except Exception:
+                    kids=[]
+                for child in kids:
+                    if child not in found:
+                        found.add(child); stack.append(child)
+            return found
+        def _kill_process_tree(pid: int, sig, known: set[int]|None=None) -> None:
+            targets=set(known or set()) | _descendants(pid) | {pid}
+            if os.name == 'posix':
+                try:
+                    listed=subprocess.run(['pgrep','-g',str(pid)], text=True, capture_output=True, timeout=1)
+                    targets |= {int(x) for x in listed.stdout.split() if x.strip().isdigit()}
+                except Exception:
+                    pass
+                try: os.killpg(pid, sig)
+                except Exception: pass
+            for target in sorted(targets, reverse=True):
+                try:
+                    if target != os.getpid(): os.kill(target, sig)
+                except Exception:
+                    pass
+        proc=None
         try:
-            p=subprocess.run(cmd, cwd=context.repo_path, text=True, capture_output=True, timeout=context.timeout_seconds, env={**os.environ, **context.env})
-            return _result(p.returncode, p.stdout, p.stderr)
+            popen_kwargs={'cwd':context.repo_path,'text':True,'stdout':subprocess.PIPE,'stderr':subprocess.PIPE,'env':{**os.environ, **context.env}}
+            if os.name == 'posix': popen_kwargs['start_new_session']=True
+            proc=subprocess.Popen(cmd, **popen_kwargs)
+            stdout, stderr = proc.communicate(timeout=context.timeout_seconds)
+            return _result(proc.returncode, stdout, stderr)
         except subprocess.TimeoutExpired as e:
-            r=_result(124, _norm(e.stdout), _norm(e.stderr)+f"\nCommand timed out after {context.timeout_seconds}s")
+            if proc and proc.poll() is None:
+                known_children=_descendants(proc.pid) if os.name == 'posix' else set()
+                try:
+                    if os.name == 'posix': _kill_process_tree(proc.pid, signal.SIGTERM, known_children)
+                    else: proc.terminate()
+                    try: proc.communicate(timeout=1)
+                    except Exception: pass
+                    if os.name == 'posix':
+                        try: _kill_process_tree(proc.pid, signal.SIGKILL, known_children)
+                        except ProcessLookupError: pass
+                    elif proc.poll() is None: proc.kill()
+                    try: proc.communicate(timeout=2)
+                    except Exception: pass
+                except Exception:
+                    try:
+                        if os.name == 'posix': _kill_process_tree(proc.pid, signal.SIGKILL, known_children)
+                        else: proc.kill()
+                    except Exception: pass
+                    try: proc.communicate(timeout=2)
+                    except Exception: pass
+            r=_result(124, _norm(getattr(e,'stdout',None)), _norm(getattr(e,'stderr',None))+f"\nCommand timed out after {context.timeout_seconds}s")
             r.token_accounting_warnings.append('Runner timed out; telemetry may be partial.')
             r.telemetry.setdefault('token_accounting_warnings', []).append('Runner timed out; telemetry may be partial.')
             Path(telemetry_path).write_text(json.dumps(r.telemetry, indent=2))

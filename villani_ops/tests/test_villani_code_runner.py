@@ -105,3 +105,33 @@ def test_debug_flags_and_api_key_redaction_remain_present(tmp_path, monkeypatch)
     assert _value_after(args, '--api-key') == 'secret'
     assert 'secret' not in (run / 'villani_code_command.json').read_text()
     assert _value_after(command_artifact, '--api-key') == '***REDACTED***'
+
+
+def test_villani_code_runner_timeout_kills_child_process_group(tmp_path):
+    import os, stat, time, subprocess
+    from villani_ops.runners.villani_code import VillaniCodeRunner
+    from villani_ops.runners.base import RunnerContext
+    from villani_ops.core.backend import Backend
+    marker=tmp_path/'child_alive.txt'
+    exe=tmp_path/'villani-code'
+    exe.write_text(f'''#!/usr/bin/env python3
+import subprocess, time, pathlib
+subprocess.Popen(["/bin/sh","-c","while true; do echo alive > {marker}; sleep 1; done"])
+time.sleep(30)
+''')
+    exe.chmod(exe.stat().st_mode | stat.S_IXUSR)
+    old=os.environ.get('PATH'); os.environ['PATH']=str(tmp_path)+os.pathsep+os.environ.get('PATH','')
+    try:
+        b=Backend(name='b',provider='local',model='m',api_key='dummy',metadata={'allow_dummy_api_key':True})
+        res=VillaniCodeRunner().run(RunnerContext(attempt_id='a',repo_path=str(tmp_path),task_instruction='x',backend=b,timeout_seconds=1,run_dir=str(tmp_path/'run')))
+        assert res.exit_code==124 and 'timed out' in res.stderr.lower()
+        time.sleep(1.5)
+        ps=subprocess.run(['pgrep','-f',str(marker)],text=True,capture_output=True)
+        live=[]
+        for pid in ps.stdout.split():
+            stat=subprocess.run(['ps','-o','stat=','-p',pid],text=True,capture_output=True).stdout.strip()
+            if stat and 'Z' not in stat: live.append((pid, stat))
+        assert not live, live
+    finally:
+        if old is None: os.environ.pop('PATH',None)
+        else: os.environ['PATH']=old
