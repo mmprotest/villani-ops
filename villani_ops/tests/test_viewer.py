@@ -171,8 +171,8 @@ def test_graph_and_candidate_evidence_expose_winner_missing_validation_and_failu
     rd=_decision_run(tmp_path, {'run_id':'graph2','status':'failed','selection':{'selected_attempt_id':'candidate_001'},'candidates':[{'attempt_id':'candidate_001','status':'completed','validation_status':'not_run','changed_files':['a.py']},{'attempt_id':'candidate_002','status':'failed'}]})
     snap=build_viewer_snapshot(rd)
     assert any(n['subtitle']=='Selected winner' for n in snap['graph']['nodes'])
-    assert any(n['id']=='validation_group' and n['status']=='missing' for n in snap['graph']['nodes'])
-    assert any(n['id']=='finalization_group' and n['status']=='failed' for n in snap['graph']['nodes'])
+    assert any(n['type']=='validation' and n['status']=='missing' for n in snap['graph']['nodes'])
+    assert any(n['id']=='final_decision' and n['status']=='failed' for n in snap['graph']['nodes'])
     assert {c['candidate_id'] for c in snap['candidate_evidence']} == {'candidate_001','candidate_002'}
 
 
@@ -248,14 +248,14 @@ def test_usage_normalizes_aliases_jsonl_state_runner_and_cost_reasons(tmp_path):
     (rd/'runtime_events.jsonl').write_text('')
     (rd/'usage.jsonl').write_text(json.dumps({'prompt_tokens':10,'completion_tokens':5,'amount':0.03})+'\n')
     u=build_viewer_snapshot(rd)['usage']
-    assert u['input_tokens'] == 13 and u['output_tokens'] == 9 and u['total_tokens'] == 22
-    assert round(u['total_cost'], 2) == 0.05
+    assert u['input_tokens'] == 10 and u['output_tokens'] == 5 and u['total_tokens'] == 15
+    assert round(u['total_cost'], 2) == 0.03
 
 
 def test_execution_graph_demoted_below_evidence_sections(tmp_path):
     html=write_offline_viewer(fake_run(tmp_path)).read_text()
     assert 'graphPanel--secondary' in html
-    assert html.index('Candidate Evidence') < html.index('Live Event Timeline') < html.index('Execution Graph')
+    assert html.index('Live Event Timeline') < html.index('Candidate Evidence') < html.index('Execution Graph')
 
 
 def test_backend_failure_model_metadata_not_derived_from_v1_url(tmp_path):
@@ -303,3 +303,61 @@ def test_warning_graph_has_candidate_rows_winner_warning_and_human_labels(tmp_pa
     assert 'Warning: validation not run' in graph
     assert 'best_effort_tournament_selection' not in graph
     assert all('details' in n for n in snap['graph']['nodes'])
+
+
+def test_usage_duplicate_summaries_are_not_double_counted(tmp_path):
+    rd=tmp_path/'runs'/'dup-summary'; rd.mkdir(parents=True)
+    (rd/'state.json').write_text(json.dumps({'run_id':'dup-summary','status':'completed'}))
+    (rd/'runtime_events.jsonl').write_text('')
+    (rd/'usage.json').write_text(json.dumps({'prompt_tokens':1000,'completion_tokens':1300,'total_cost':0.23,'calls_count':1}))
+    (rd/'cost_summary.json').write_text(json.dumps({'input_tokens':1000,'output_tokens':1300,'total_tokens':2300,'total_cost':0.23,'calls_count':1}))
+    snap=build_viewer_snapshot(rd)
+    assert snap['usage']['total_tokens'] == 2300
+    assert snap['usage']['total_cost'] == 0.23
+    assert any('duplicate summary ignored' in x.lower() for x in snap['usage']['diagnostics'])
+    html=write_offline_viewer(rd).read_text()
+    assert '&quot;total_tokens&quot;:2300' in html or 'total_tokens' in html
+
+
+def test_usage_jsonl_priority_and_call_id_dedupe(tmp_path):
+    rd=tmp_path/'runs'/'jsonl-priority'; rd.mkdir(parents=True)
+    (rd/'state.json').write_text(json.dumps({'run_id':'jsonl-priority','status':'completed'}))
+    (rd/'runtime_events.jsonl').write_text('')
+    (rd/'usage.jsonl').write_text('\n'.join([
+        json.dumps({'call_id':'a','prompt_tokens':10,'completion_tokens':5,'cost_usd':0.01}),
+        json.dumps({'call_id':'a','prompt_tokens':10,'completion_tokens':5,'cost_usd':0.01}),
+        json.dumps({'call_id':'b','tokens_in':20,'tokens_out':7,'estimated_cost':0.02}),
+    ]))
+    (rd/'usage.json').write_text(json.dumps({'total_tokens':999,'total_cost':9.99,'calls_count':1}))
+    u=build_viewer_snapshot(rd)['usage']
+    assert u['input_tokens'] == 30 and u['output_tokens'] == 12 and u['total_tokens'] == 42
+    assert round(u['total_cost'], 2) == 0.03
+    assert u['calls_count'] == 2
+
+
+def test_candidate_lane_graph_contains_statuses_and_hooks(tmp_path):
+    rd=_decision_run(tmp_path, {'run_id':'lanes','status':'completed','selection':{'selected_attempt_id':'candidate_003'},'selection_basis':'best_effort_tournament_selection','candidates':[
+        {'attempt_id':'candidate_001','status':'completed','runner_status':'completed','review_status':'passed','validation_status':'not_run','changed_files':['a.py'],'patch_path':'a.patch'},
+        {'attempt_id':'candidate_002','status':'completed','runner_status':'completed','review_status':'failed','validation_status':'skipped'},
+        {'attempt_id':'candidate_003','status':'completed','runner_status':'completed','review_status':'passed','validation_status':'not_run','changed_files':['b.py','c.py'],'patch_produced':True,'acceptance_eligible':True},
+    ]})
+    snap=build_viewer_snapshot(rd)
+    graph=snap['graph']
+    assert graph['kind'] == 'candidate_lanes'
+    labels=' '.join(n['label']+' '+n.get('subtitle','')+' '+str(n.get('badge') or '') for n in graph['nodes'])
+    assert 'Candidate 001' in labels and 'Candidate 002' in labels and 'Candidate 003' in labels
+    assert 'Runner completed' in labels and 'Review failed' in labels and 'Validation not run' in labels
+    assert 'Winner' in labels and 'Patch yes' in labels and '2 changed files' in labels
+    assert 'not_run' not in labels and 'best_effort_tournament_selection' not in labels
+    html=write_offline_viewer(rd).read_text()
+    assert 'data-node-id' in html and 'data-candidate-id' in html and 'data-node-kind' in html and 'data-detail-json' in html
+    assert html.index('Live Event Timeline') < html.index('Candidate Evidence') < html.index('Execution Graph')
+
+
+def test_candidate_evidence_primary_truth_surface_has_required_fields(tmp_path):
+    rd=_decision_run(tmp_path, {'run_id':'evidence-primary','status':'completed','selection':{'selected_attempt_id':'candidate_003'},'candidates':[{'attempt_id':'candidate_003','status':'completed','patch_path':'x.patch','changed_files':['src/x.py'],'runner_status':'completed','review_status':'passed','validation_status':'not_run','acceptance_eligible':True}]})
+    snap=build_viewer_snapshot(rd)
+    ev=snap['candidate_evidence'][0]
+    assert ev['selected'] is True and ev['patch']=='yes' and ev['changed_files']==['src/x.py']
+    assert ev['review_status']=='Passed' and ev['validation_status']=='Not run'
+    assert any('Validation did not run' in b for b in ev['blockers'])

@@ -1,3 +1,6 @@
+import pytest
+
+pytestmark = pytest.mark.integration
 import json, os, stat, subprocess
 from pathlib import Path
 from typer.testing import CliRunner

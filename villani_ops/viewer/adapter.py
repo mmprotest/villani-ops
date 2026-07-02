@@ -178,21 +178,42 @@ def _meaningful(src: Any) -> bool:
         except (TypeError, ValueError): pass
     return False
 
+def _normalize_usage_record(src: dict[str, Any]) -> dict[str, Any]:
+    inp=_num(src,*TOKEN_IN_KEYS); out=_num(src,*TOKEN_OUT_KEYS); total=_num(src,*TOKEN_TOTAL_KEYS) or inp+out; amount=_num(src,*COST_KEYS)
+    return {'input_tokens':inp,'output_tokens':out,'total_tokens':total,'total_cost':amount,'calls_count':int(_num(src,'calls_count','call_count') or (1 if (total or amount or src.get('usage_source')=='unavailable') else 0)),'unavailable_calls_count':int(_num(src,'unavailable_calls_count','unavailable_calls','missing_usage_calls') or (1 if src.get('usage_source')=='unavailable' or src.get('unavailable') else 0)),'estimated':bool(src.get('estimated') or src.get('cost_estimated') or src.get('estimated_cost')),'pricing_missing':bool(src.get('pricing_missing') or src.get('cost_unavailable') or src.get('unavailable_reason')=='pricing_missing'),'usage_missing':bool(src.get('usage_missing') or src.get('usage_source')=='unavailable' or src.get('unavailable_reason'))}
+
+def _call_key(r: dict[str, Any], source: str, index: int) -> str:
+    for k in ('call_id','request_id','model_call_id','event_id','id'):
+        if r.get(k): return f'id:{r[k]}'
+    bits=[r.get('candidate_id') or r.get('attempt_id'), r.get('role') or r.get('phase'), r.get('attempt'), r.get('started_at') or r.get('timestamp')]
+    if all(bits): return 'candidate:' + ':'.join(map(str,bits))
+    return f'{source}:{index}'
+
 def aggregate_usage_jsonl(run_dir: Path) -> dict:
     rows=_read_jsonl(Path(run_dir)/'usage.jsonl')
-    out={'input_tokens':0,'output_tokens':0,'total_tokens':0,'input_cost':0.0,'output_cost':0.0,'total_cost':0.0,'calls_count':0,'unavailable_calls_count':0,'by_role':{},'by_backend':{},'by_model':{}}
+    out={'input_tokens':0,'output_tokens':0,'total_tokens':0,'input_cost':0.0,'output_cost':0.0,'total_cost':0.0,'calls_count':0,'unavailable_calls_count':0,'by_role':{},'by_backend':{},'by_model':{},'source':'usage.jsonl','call_level':False,'diagnostics':[]}
+    seen=set()
     def add_bucket(bucket, r):
-        bucket['input_tokens']=bucket.get('input_tokens',0)+int(_num(r,*TOKEN_IN_KEYS))
-        bucket['output_tokens']=bucket.get('output_tokens',0)+int(_num(r,*TOKEN_OUT_KEYS))
-        tt=_num(r,'total_tokens') or int(_num(r,*TOKEN_IN_KEYS))+int(_num(r,*TOKEN_OUT_KEYS))
-        bucket['total_tokens']=bucket.get('total_tokens',0)+int(tt)
+        n=_normalize_usage_record(r)
+        bucket['input_tokens']=bucket.get('input_tokens',0)+n['input_tokens']
+        bucket['output_tokens']=bucket.get('output_tokens',0)+n['output_tokens']
+        bucket['total_tokens']=bucket.get('total_tokens',0)+n['total_tokens']
         bucket['input_cost']=bucket.get('input_cost',0.0)+float(_num(r,'input_cost'))
         bucket['output_cost']=bucket.get('output_cost',0.0)+float(_num(r,'output_cost'))
-        bucket['total_cost']=bucket.get('total_cost',0.0)+float(_num(r,*COST_KEYS))
-        bucket['calls_count']=bucket.get('calls_count',0)+1
-        if r.get('usage_source')=='unavailable' or r.get('cost_unavailable') or r.get('unavailable'):
-            bucket['unavailable_calls_count']=bucket.get('unavailable_calls_count',0)+1
-    for r in rows:
+        bucket['total_cost']=bucket.get('total_cost',0.0)+n['total_cost']
+        bucket['calls_count']=bucket.get('calls_count',0)+max(1,n['calls_count'])
+        bucket['unavailable_calls_count']=bucket.get('unavailable_calls_count',0)+n['unavailable_calls_count']
+        bucket['estimated']=bucket.get('estimated',False) or n['estimated']
+        bucket['pricing_missing']=bucket.get('pricing_missing',False) or n['pricing_missing']
+        bucket['usage_missing']=bucket.get('usage_missing',False) or n['usage_missing']
+    for i,r in enumerate(rows):
+        if not isinstance(r,dict): continue
+        key=_call_key(r,'usage.jsonl',i)
+        out['call_level']=True
+        if key in seen:
+            out['diagnostics'].append('Duplicate call usage ignored.')
+            continue
+        seen.add(key)
         add_bucket(out,r)
         for field, name in (('role','by_role'),('backend_name','by_backend'),('model','by_model')):
             val=r.get(field)
@@ -201,47 +222,59 @@ def aggregate_usage_jsonl(run_dir: Path) -> dict:
                 add_bucket(out[name][str(val)],r)
     return out
 
-def _usage_sources(run_dir: Path, state: dict, digest: dict) -> list[dict]:
-    cost=_read_json(run_dir/'cost_summary.json', {}) or {}
-    uj=_read_json(run_dir/'usage.json', {}) or {}
-    summary=uj.get('summary') if isinstance(uj.get('summary'),dict) else uj
-    sources=[cost, summary, state.get('usage_summary') if isinstance(state,dict) else {}, digest.get('usage') if isinstance(digest,dict) else {}, aggregate_usage_jsonl(run_dir)]
+def _summary_from_json(path: Path, source: str) -> dict:
+    data=_read_json(path, {}) or {}
+    if not isinstance(data,dict): return {}
+    summary=data.get('summary') if isinstance(data.get('summary'),dict) else data
+    if not isinstance(summary,dict): return {}
+    out={**summary,'source':source,'call_level':False}
+    if isinstance(data.get('records'),list): out['has_records']=True
+    return out
+
+def _candidate_usage_sources(state: dict) -> list[dict]:
+    sources=[]
     for c in state.get('candidates',[]) if isinstance(state.get('candidates'),list) else []:
         if isinstance(c,dict):
             for k in ('usage','usage_summary','telemetry','runner_telemetry'):
-                if isinstance(c.get(k),dict): sources.append(c[k])
-    for k in ('runner_telemetry','telemetry'):
-        if isinstance(state.get(k),dict): sources.append(state[k])
-    return [s for s in sources if isinstance(s,dict)]
+                if isinstance(c.get(k),dict): sources.append({**c[k], 'source':f'candidate:{c.get("attempt_id") or c.get("candidate_id")}'})
+    return sources
+
+def _canonical_usage_source(run_dir: Path, state: dict, digest: dict) -> dict:
+    diagnostics=[]
+    jsonl=aggregate_usage_jsonl(run_dir)
+    usage_summary=_summary_from_json(run_dir/'usage.json','usage.json')
+    cost_summary=_summary_from_json(run_dir/'cost_summary.json','cost_summary.json')
+    summaries=[x for x in (usage_summary,cost_summary) if _meaningful(x) or x.get('pricing_missing') or x.get('usage_missing')]
+    if jsonl.get('call_level') and (_meaningful(jsonl) or jsonl.get('calls_count')):
+        if summaries: diagnostics.append('Usage summary used canonical source; duplicate summary ignored.')
+        jsonl['diagnostics']=(jsonl.get('diagnostics') or [])+diagnostics
+        return jsonl
+    if _meaningful(usage_summary) or usage_summary.get('pricing_missing') or usage_summary.get('usage_missing'):
+        if _meaningful(cost_summary): diagnostics.append('Usage summary used canonical source; duplicate summary ignored.')
+        usage_summary['diagnostics']=diagnostics
+        return usage_summary
+    if _meaningful(cost_summary) or cost_summary.get('pricing_missing') or cost_summary.get('usage_missing'):
+        cost_summary['diagnostics']=diagnostics
+        return cost_summary
+    for src in [state.get('usage_summary') if isinstance(state,dict) else {}, digest.get('usage') if isinstance(digest,dict) else {}, *_candidate_usage_sources(state), state.get('runner_telemetry') if isinstance(state.get('runner_telemetry'),dict) else {}, state.get('telemetry') if isinstance(state.get('telemetry'),dict) else {}]:
+        if isinstance(src,dict) and (_meaningful(src) or src.get('pricing_missing') or src.get('usage_missing')):
+            return src
+    return {}
 
 def _usage(run_dir, state, digest):
-    merged={'input_tokens':0,'output_tokens':0,'total_tokens':0,'total_cost':0.0,'calls_count':0,'unavailable_calls_count':0,'estimated':False,'pricing_missing':False,'usage_missing':False}
-    meaningful=False
-    for src in _usage_sources(run_dir,state,digest):
-        if not _meaningful(src) and not src.get('pricing_missing') and not src.get('usage_missing'): continue
-        meaningful=True
-        inp=_num(src,*TOKEN_IN_KEYS); out=_num(src,*TOKEN_OUT_KEYS); total=_num(src,*TOKEN_TOTAL_KEYS) or inp+out; amount=_num(src,*COST_KEYS)
-        merged['input_tokens']+=inp; merged['output_tokens']+=out; merged['total_tokens']+=total; merged['total_cost']+=amount
-        merged['calls_count']+=int(_num(src,'calls_count','call_count') or (1 if (total or amount) else 0))
-        merged['unavailable_calls_count']+=int(_num(src,'unavailable_calls_count','unavailable_calls','missing_usage_calls'))
-        merged['estimated']=merged['estimated'] or bool(src.get('estimated') or src.get('cost_estimated') or src.get('estimated_cost'))
-        merged['pricing_missing']=merged['pricing_missing'] or bool(src.get('pricing_missing') or src.get('cost_unavailable'))
-        merged['usage_missing']=merged['usage_missing'] or bool(src.get('usage_missing') or src.get('usage_source')=='unavailable')
-    src=merged if meaningful else {}
-    inp=src.get('input_tokens',0); out=src.get('output_tokens',0); total=src.get('total_tokens',0) or inp+out
-    calls=int(src.get('calls_count',0)); unavailable=int(src.get('unavailable_calls_count',0)); amount=float(src.get('total_cost',0) or 0)
+    src=_canonical_usage_source(Path(run_dir),state,digest)
+    n=_normalize_usage_record(src) if src else {'input_tokens':0,'output_tokens':0,'total_tokens':0,'total_cost':0,'calls_count':0,'unavailable_calls_count':0,'estimated':False,'pricing_missing':False,'usage_missing':False}
+    inp=n['input_tokens']; out=n['output_tokens']; total=n['total_tokens'] or inp+out; calls=n['calls_count']; unavailable=n['unavailable_calls_count']; amount=float(n['total_cost'] or 0)
     if unavailable and amount: cost_status='partial'; reason='Some calls were missing usage data'
-    elif src.get('estimated') and amount: cost_status='estimated'; reason='Estimated from token usage and configured pricing'
+    elif n.get('estimated') and amount: cost_status='estimated'; reason='Estimated from token usage and configured pricing'
     elif amount: cost_status='available'; reason=None
-    elif calls and total and not unavailable and not src.get('pricing_missing'): cost_status='zero'; reason=None
+    elif calls and total and not unavailable and not n.get('pricing_missing'): cost_status='zero'; reason=None
     else:
-        cost_status='unavailable'
-        reasons=[]
-        if not total or src.get('usage_missing') or unavailable: reasons.append('usage data missing')
-        if total or src.get('pricing_missing') or unavailable: reasons.append('backend pricing data missing')
-        reason='Cost unavailable: ' + ' and '.join(dict.fromkeys(reasons or ['usage data missing']))
-        if 'backend pricing data missing' in reason: reason += ' (Backend pricing data missing)'
-    return {'input_tokens':inp,'output_tokens':out,'total_tokens':total,'input_cost':0,'output_cost':0,'total_cost':amount,'calls_count':calls,'unavailable_calls_count':unavailable,'tokens':{'status':'available' if total else 'unavailable','total':total or None,'input':inp or None,'output':out or None},'cost':{'status':cost_status,'amount':amount if (amount or calls) else None,'currency':'USD','reason':reason,'unavailable_calls_count':unavailable,'unavailable_calls_label':(f'{unavailable} unavailable call' + ('' if unavailable==1 else 's')) if unavailable else ''},'by_role':{},'by_backend':{},'by_model':{}}
+        cost_status='unavailable'; reasons=[]
+        if not total or n.get('usage_missing') or unavailable: reasons.append('Usage data missing')
+        if total or n.get('pricing_missing') or unavailable: reasons.append('Backend pricing data missing')
+        reason='; '.join(dict.fromkeys(reasons or ['Usage data missing']))
+    return {'input_tokens':inp,'output_tokens':out,'total_tokens':total,'input_cost':0,'output_cost':0,'total_cost':amount,'calls_count':calls,'unavailable_calls_count':unavailable,'diagnostics':src.get('diagnostics',[]) if isinstance(src,dict) else [],'source':src.get('source') if isinstance(src,dict) else None,'tokens':{'status':'available' if total else 'unavailable','total':total or None,'input':inp or None,'output':out or None},'cost':{'status':cost_status,'amount':amount if (amount or calls) else None,'currency':'USD','reason':reason,'unavailable_calls_count':unavailable,'unavailable_calls_label':(f'{unavailable} unavailable call' + ('' if unavailable==1 else 's')) if unavailable else ''},'by_role':src.get('by_role',{}) if isinstance(src,dict) else {},'by_backend':src.get('by_backend',{}) if isinstance(src,dict) else {},'by_model':src.get('by_model',{}) if isinstance(src,dict) else {}}
 
 def _validation_status(c):
     return (c.get('validation_status') or (c.get('validation') or {}).get('status') or ('passed' if (c.get('validation') or {}).get('passed') is True else 'failed' if (c.get('validation') or {}).get('passed') is False else 'not_run'))
@@ -358,6 +391,38 @@ def build_viewer_graph_layout(snapshot_or_state: dict[str,Any], events: list[dic
         ]
         edges=[{'id':'edge_run_started_model_request','source':'run_started','target':'model_request','status':'active'},{'id':'edge_model_request_provider_failure','source':'model_request','target':'provider_failure','status':'failed'},{'id':'edge_provider_failure_failed_finalization','source':'provider_failure','target':'failed_finalization','status':'failed'}]
         return {'kind':'provider_failure','nodes':nodes,'edges':edges}
+
+    candidates=[c for c in state.get('candidates',[]) if isinstance(c,dict)]
+    if candidates:
+        sel=(state.get('selection') or {}).get('selected_attempt_id') or (state.get('selection') or {}).get('selected_candidate_id')
+        nodes=[]; edges=[]
+        def add(id,label,type,row,col,status='pending',summary='',details=None,badge=None):
+            nodes.append({'id':id,'label':label,'type':type,'kind':type,'row':row,'col':col,'status':status,'subtitle':summary,'summary':summary,'details':details or {},'badge':badge,'candidate_id':details.get('candidate_id') if isinstance(details,dict) else None})
+        def edge(a,b,status='active'):
+            edges.append({'id':f'edge_{a}_{b}','source':a,'target':b,'status':status})
+        final_label=derive_decision_state(state, {}, candidates=candidates, events=events)['label']
+        final_row=len(candidates)+1
+        for i,c in enumerate(candidates,1):
+            cid=c.get('attempt_id') or c.get('candidate_id') or f'candidate_{i:03d}'
+            hcid=humanize_id(cid)
+            norm=normalize_candidate_evidence(c)
+            changed=norm.changed_files
+            detail={'candidate_id':cid,'stage':'candidate','status':c.get('status'),'changed_files':changed,'patch_evidence':norm.patch,'raw':c}
+            add(f'{cid}_candidate',(hcid + (f' · {len(changed)} changed file{"s" if len(changed)!=1 else ""} · Patch {norm.patch}' if cid==sel else '')),'candidate',i,1,'selected' if cid==sel else human_label(c.get('status') or 'completed').lower().replace(' ','_'),('Selected winner' if cid==sel else f"{len(changed)} changed file{'s' if len(changed)!=1 else ''} · Patch {norm.patch}"),detail,'Winner' if cid==sel else None)
+            rstat=c.get('runner_status') or c.get('status') or ('completed' if c.get('exit_code')==0 else 'failed' if c.get('exit_code') else 'unknown')
+            add(f'{cid}_runner','Runner '+human_label(rstat).lower(),'runner',i,2,'failed' if str(rstat).lower() in {'failed','error'} else 'completed',f"exit {c.get('exit_code')}" if c.get('exit_code') is not None else 'Runner status',{'candidate_id':cid,'stage':'runner','status':rstat,'raw':c.get('runner') or c})
+            rev=c.get('review_status') or (c.get('review') or {}).get('decision') or ('passed' if c.get('review') else 'unknown')
+            rev_label='Review passed' if str(rev).lower() in {'pass','passed','accepted'} else ('Review failed' if str(rev).lower() in {'fail','failed','rejected'} else 'Review '+human_label(rev).lower())
+            add(f'{cid}_review',rev_label,'review',i,3,'failed' if 'failed' in rev_label.lower() else 'completed',human_label(rev),{'candidate_id':cid,'stage':'review','status':rev,'raw':c.get('review') or rev},'Failed' if 'failed' in rev_label.lower() else None)
+            val=_validation_status(c); val_l=str(val).lower()
+            if val_l in {'not_run','missing','unknown','skipped','absent',''}: vlabel='Validation not run' if val_l!='skipped' else 'Validation skipped'; vst='missing'; badge='Warning'
+            elif val_l in {'passed','pass'}: vlabel='Validation passed'; vst='completed'; badge=None
+            else: vlabel='Validation failed'; vst='failed'; badge='Failed'
+            add(f'{cid}_validation',vlabel,'validation',i,4,vst,('Warning: validation not run' if vst=='missing' else human_label(val)),{'candidate_id':cid,'stage':'validation','status':val,'warnings':['Validation did not run'] if vst=='missing' else [],'raw':c.get('validation') or val},badge)
+            edge(f'{cid}_candidate',f'{cid}_runner'); edge(f'{cid}_runner',f'{cid}_review'); edge(f'{cid}_review',f'{cid}_validation','failed' if vst=='failed' else 'active')
+            if cid==sel: edge(f'{cid}_validation','final_decision','active')
+        add('final_decision','Final decision: '+final_label,'final_decision',final_row,4,'failed' if final_label=='Failed' else 'selected',final_label,{'status':state.get('status'),'final_decision':state.get('final_decision'),'selection':state.get('selection')},None)
+        return {'kind':'candidate_lanes','nodes':nodes,'edges':edges,'responsive_class':'candidate-lanes'}
     decomposed=bool(state.get('decomposition') or state.get('decomposition_requested') or types & {'decomposition_submitted','subtask_attempt_started','integration_started'})
     fallback=bool(state.get('fallback_used') or 'candidate_fallback_started' in types)
     dead=bool(state.get('decomposed_execution_status') in {'blocked','failed'} or 'decomposition_deadlock_detected' in types)

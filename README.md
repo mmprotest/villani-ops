@@ -216,3 +216,27 @@ Known limitations:
 - If no authoritative validation exists, selection may be best-effort.
 
 The current release is for testing the orchestration loop, candidate tournament, artifact trail, and local-first workflow.
+
+## Test suites
+
+The default pytest command is the fast development suite. It excludes slow,
+integration, and end-to-end tests so normal local validation stays responsive:
+
+```bash
+python -m pytest -q
+```
+
+Run the excluded suites explicitly when validating orchestration flows or slower
+process behavior:
+
+```bash
+python -m pytest -m slow -q
+python -m pytest -m integration -q
+python -m pytest -m e2e -q
+python -m pytest -m "slow or integration or e2e" -q
+```
+
+Slow/integration/e2e tests cover full agentic orchestration, real runner process
+flows, long subprocess cleanup scenarios, and larger scenario fixtures. Fast
+viewer, storage, CLI fake-backend, usage-normalization, graph-rendering, and
+bounded subprocess unit tests remain in the default suite.

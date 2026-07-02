@@ -1,3 +1,6 @@
+import pytest
+
+pytestmark = pytest.mark.integration
 from pathlib import Path
 from types import SimpleNamespace
 
