@@ -205,12 +205,12 @@ def test_provider_failure_graph_and_timeline_truthful(tmp_path):
     snap=build_viewer_snapshot(rd)
     labels=' '.join(n['label']+' '+n.get('subtitle','') for n in snap['graph']['nodes'])
     assert snap['graph']['kind']=='provider_failure'
-    assert 'Model request' in labels and 'Provider failure' in labels and 'backend_connection_error' in labels
+    assert 'Model request' in labels and 'Provider failure' in labels and 'Backend connection error' in labels and 'backend_connection_error' not in labels
     assert not any(x in labels for x in ['Candidates','Validation','Review','Selection'])
     tl=' '.join(e['title']+' '+e.get('subtitle','') for e in snap['timeline'])
-    assert 'Model request started' in tl and 'Provider failure' in tl and 'backend_connection_error' in tl and 'Could not connect' in tl and 'recoverable=true' in tl
+    assert 'Model request started' in tl and 'Provider failure' in tl and 'Backend connection error' in tl and 'Could not connect' in tl and 'recoverable=true' in tl
     html=write_offline_viewer(rd).read_text()
-    assert 'Provider failure' in html and 'backend_connection_error' in html and 'Candidates' not in json.dumps(snap['graph'])
+    assert 'Provider failure' in html and 'Backend connection error' in html and 'Candidates' not in json.dumps(snap['graph'])
 
 
 def test_header_uses_decision_and_cost_reasons_visible(tmp_path):
@@ -256,3 +256,50 @@ def test_execution_graph_demoted_below_evidence_sections(tmp_path):
     html=write_offline_viewer(fake_run(tmp_path)).read_text()
     assert 'graphPanel--secondary' in html
     assert html.index('Candidate Evidence') < html.index('Live Event Timeline') < html.index('Execution Graph')
+
+
+def test_backend_failure_model_metadata_not_derived_from_v1_url(tmp_path):
+    rd=tmp_path/'runs'/'backend-model'; rd.mkdir(parents=True)
+    state={'run_id':'backend-model','status':'failed','failure_kind':'backend_connection_error','failure_message':'Could not connect','backend_model':'qwen3.6-27b','backend_name':'local','backend_url':'http://127.0.0.1:9/v1'}
+    (rd/'state.json').write_text(json.dumps(state))
+    (rd/'runtime_events.jsonl').write_text('\n'.join([
+        json.dumps({'timestamp':'2026-07-02T00:00:01+00:00','type':'model_request_started','payload':{'backend_name':'local','model':'qwen3.6-27b','backend_url':'http://127.0.0.1:9/v1'}}),
+        json.dumps({'timestamp':'2026-07-02T00:00:02+00:00','type':'provider_failure','payload':{'failure_kind':'backend_connection_error','failure_message':'Could not connect','backend_url':'http://127.0.0.1:9/v1'}}),
+    ]))
+    snap=build_viewer_snapshot(rd)
+    assert snap['run']['model']=='qwen3.6-27b'
+    assert snap['run']['backend_url'].endswith('/v1')
+    assert 'v1' != snap['run']['model']
+    details=json.dumps(snap['graph'])
+    assert 'http://127.0.0.1:9/v1' in details
+
+
+def test_missing_model_renders_unknown_model(tmp_path):
+    rd=tmp_path/'runs'/'missing-model'; rd.mkdir(parents=True)
+    (rd/'state.json').write_text(json.dumps({'run_id':'missing-model','status':'failed','backend_url':'http://127.0.0.1:9/v1'}))
+    (rd/'runtime_events.jsonl').write_text('')
+    assert build_viewer_snapshot(rd)['run']['model']=='Unknown model'
+
+
+def test_decision_summary_labels_are_humanized_and_raw_state_preserved(tmp_path):
+    rd=_decision_run(tmp_path, {'run_id':'human','status':'failed','failure_kind':'backend_connection_error','failure_message':'backend_connection_error','selection_basis':'best_effort_tournament_selection','final_decision':{'failure_kind':'backend_connection_error'}})
+    snap=build_viewer_snapshot(rd)
+    assert snap['decision']['selection_basis']=='Best effort selection'
+    assert snap['decision']['failure_reason']=='Backend connection error'
+    html=write_offline_viewer(rd).read_text()
+    assert 'Best effort selection' in html and 'Backend connection error' in html
+    assert 'backend_connection_error' in html  # raw details remain available
+
+
+def test_warning_graph_has_candidate_rows_winner_warning_and_human_labels(tmp_path):
+    rd=_decision_run(tmp_path, {'run_id':'warn-graph','status':'completed','selection':{'selected_attempt_id':'candidate_003'},'selection_basis':'best_effort_tournament_selection','candidates':[
+        {'attempt_id':'candidate_001','status':'completed','review_status':'passed','validation_status':'not_run'},
+        {'attempt_id':'candidate_002','status':'failed','review_status':'failed','validation_status':'skipped'},
+        {'attempt_id':'candidate_003','status':'completed','review_status':'passed','validation_status':'not_run','changed_files':['a.py']},
+    ]})
+    snap=build_viewer_snapshot(rd)
+    graph=json.dumps(snap['graph'])
+    assert 'Candidate 003' in graph and 'Selected winner' in graph
+    assert 'Warning: validation not run' in graph
+    assert 'best_effort_tournament_selection' not in graph
+    assert all('details' in n for n in snap['graph']['nodes'])
