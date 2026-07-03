@@ -1,0 +1,1 @@
+{"run_id":"r1","objective":"- set up Git server over SSH at git@localhost:/git/project\n- password authentication with password password\n- deploy main and dev branches to HTTPS endpoints\n- self-signed certificate\n- post-receive hook\n- deployment within 3 seconds","repo":"/no/such/repo","model":"m","provider":"p","created_at":"2026-01-01T00:00:00Z"}

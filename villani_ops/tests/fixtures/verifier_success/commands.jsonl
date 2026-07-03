@@ -1,0 +1,8 @@
+{"ts":"1","command":"python setup.py","cwd":"/","exit_code":2,"stderr":"syntax error"}
+{"ts":"2","command":"chmod +x /git/project/hooks/post-receive","cwd":"/","exit_code":1,"stderr":"No such file or directory"}
+{"event":"command_environment_sanitized","ts":"2.5"}
+{"ts":"3","command":"service ssh restart && nginx -t","cwd":"/","exit_code":0,"stdout":"syntax is ok\ntest is successful"}
+{"ts":"4","command":"git clone git@localhost:/git/project /tmp/clone","cwd":"/","exit_code":0,"stdout":"Cloning into '/tmp/clone'..."}
+{"ts":"5","command":"git push origin main","cwd":"/tmp/clone","exit_code":0,"stdout":"main -> main"}
+{"ts":"6","command":"git push origin dev","cwd":"/tmp/clone","exit_code":0,"stdout":"dev -> dev"}
+{"ts":"7","command":"curl -sk https://localhost:8443/index.html && curl -sk https://localhost:8443/dev/index.html","cwd":"/","exit_code":0,"stdout":"PASS: Main branch serves correct content\nPASS: Dev branch serves correct content\nDeployment completed in 1s"}
