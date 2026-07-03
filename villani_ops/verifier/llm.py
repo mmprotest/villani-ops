@@ -76,9 +76,17 @@ def select_verifier_backend(workspace='.villani-ops', backend_name=None, base_ur
     key=b.resolved_api_key() or ('dummy' if _is_local(bu) else None)
     if not key: raise VerifierConfigurationError(f'verifier backend {b.name} has no usable API key')
     return {'name':b.name,'backend':b.name,'baseUrl':bu,'model':mo,'apiKey':key}
-def _chat(cfg,messages,timeout):
-    r=httpx.post(cfg['baseUrl'].rstrip('/')+'/chat/completions',headers={'Authorization':f"Bearer {cfg['apiKey']}"},json={'model':cfg['model'],'messages':messages,'temperature':0},timeout=timeout)
-    r.raise_for_status(); return r.json()['choices'][0]['message'].get('content','')
+def _chat(cfg,messages,timeout, trace=None):
+    started=time.time(); raw=None; status="ok"; http_status=None
+    try:
+        r=httpx.post(cfg['baseUrl'].rstrip('/')+'/chat/completions',headers={'Authorization':f"Bearer {cfg['apiKey']}"},json={'model':cfg['model'],'messages':messages,'temperature':0},timeout=timeout)
+        http_status=getattr(r,'status_code',None); r.raise_for_status(); raw=r.json(); return raw['choices'][0]['message'].get('content','')
+    except Exception:
+        status='error'; raise
+    finally:
+        if trace is not None:
+            trace.append_jsonl('llm_raw_responses.jsonl',{'index':getattr(trace,'llm_call_count',0),'createdAt':__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat(),'durationMs':int((time.time()-started)*1000),'provider':'openai-compatible','baseUrl':cfg.get('baseUrl'),'model':cfg.get('model'),'status':status,'httpStatus':http_status,'usage':(raw or {}).get('usage') if isinstance(raw,dict) else None,'raw':raw})
+            trace.llm_call_count=getattr(trace,'llm_call_count',0)+1
 def _parse(s):
     try: obj=json.loads(s)
     except Exception as e: raise VerifierSchemaError(str(e))
@@ -102,10 +110,15 @@ Rules: result must be 1 or 0. verdict must be success when result is 1. verdict 
 Tool-call schema:
 { "type": "tool_call", "tool": "search_commands", "args": {"query": "PASS", "limit": 10} }
 Return exactly one JSON object."""
-def _repair(cfg,bad,timeout):
+def _repair(cfg,bad,timeout, trace=None):
     msg=[{'role':'system','content':'Return only valid JSON. No markdown fences.'},{'role':'user','content':'Repair this invalid verifier response to required final_verdict schema. '+_schema_text()+'\nPrevious invalid response:\n'+bad}]
-    return _parse(_chat(cfg,msg,timeout))
-def calibrate(det, verdict):
+    if trace is not None:
+        for m in msg: trace.append_jsonl('llm_messages.jsonl',{'index':getattr(trace,'msg_count',0),'role':m['role'],'name':None,'content':m['content'],'createdAt':__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat(),'chars':len(str(m['content']))}); trace.msg_count=getattr(trace,'msg_count',0)+1
+    content=_chat(cfg,msg,timeout,trace=trace)
+    if trace is not None:
+        trace.append_jsonl('llm_messages.jsonl',{'index':getattr(trace,'msg_count',0),'role':'assistant','name':None,'content':content,'createdAt':__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat(),'chars':len(str(content))}); trace.msg_count=getattr(trace,'msg_count',0)+1
+    return _parse(content)
+def calibrate(det, verdict, trace=None):
     raw={'result':verdict.get('result'),'verdict':verdict['verdict'],'confidence':float(verdict.get('confidence',0)),'reason':verdict.get('reason','')}; changed=False
     validations=det['evidenceByCategory']['finalEndToEndValidation']+det['evidenceByCategory']['testValidation']+det['evidenceByCategory']['serviceValidation']
     active=det['evidenceByCategory']['activeFailures']
@@ -118,31 +131,50 @@ def calibrate(det, verdict):
         verdict.update({'result':1,'verdict':'success','recommendedAction':'accept','confidence':min(max(float(verdict.get('confidence',0)),.75),.9)}); changed=True
     if changed: verdict.setdefault('riskFlags',[]).append('Calibration changed the LLM result based on deterministic evidence checks.')
     verdict.setdefault('uncertainty', {'level':'medium','reasons':[]})
+    cal={'schemaVersion':'villani-ops-verifier-calibration-v1','before':raw,'after':{'result':verdict.get('result'),'verdict':verdict.get('verdict'),'confidence':verdict.get('confidence')},'changes':([] if not changed else [{'field':'result/verdict/confidence','from':raw,'to':{'result':verdict.get('result'),'verdict':verdict.get('verdict'),'confidence':verdict.get('confidence')},'reason':'Calibration adjusted verdict using deterministic evidence checks.'}]),'rulesApplied':(['deterministic_evidence_consistency'] if changed else [])}
+    if trace is not None: trace.write_json('calibration.json',cal)
+    verdict['_calibration']=cal
     verdict['llmRawVerdict']=raw; return verdict
-def llm_result(run, det, workspace='.villani-ops', backend=None, base_url=None, model=None, timeout_seconds=180, max_tool_calls=12, max_tool_result_chars=12000, max_read_lines=160):
+def llm_result(run, det, workspace='.villani-ops', backend=None, base_url=None, model=None, timeout_seconds=180, max_tool_calls=12, max_tool_result_chars=12000, max_read_lines=160, trace=None):
     cfg=select_verifier_backend(workspace,backend,base_url,model); tools=VerifierTools(run,det.get('repoDir'),max_tool_result_chars,max_read_lines)
     packet=build_packet(run,det.get('repoDir'))
     messages=[{'role':'system','content':SYSTEM},{'role':'user','content':'Objective:\n'+str(run.objective)+'\nAvailable tools: '+', '.join(TOOLS)+'\n'+_schema_text()+'\nEvidence packet:\n'+json.dumps(packet,default=str)}]
+    if trace is not None:
+        trace.msg_count=getattr(trace,'msg_count',0)
+        for m in messages:
+            trace.append_jsonl('llm_messages.jsonl',{'index':trace.msg_count,'role':m['role'],'name':None,'content':m['content'],'createdAt':__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat(),'chars':len(str(m['content']))}); trace.msg_count+=1
     used=[]; deadline=time.monotonic()+timeout_seconds; calls=0; content=''
     while True:
         if time.monotonic()>deadline: raise VerifierLlmError('tool loop timeout')
-        try: content=_chat(cfg,messages,max(1,deadline-time.monotonic()))
+        try: content=_chat(cfg,messages,max(1,deadline-time.monotonic()),trace=trace)
         except Exception as e:
             raise VerifierLlmError(f'HTTP failure: {e}')
         try: obj=_parse(content)
         except VerifierSchemaError:
-            try: obj=_repair(cfg,content,max(1,deadline-time.monotonic()))
+            try: obj=_repair(cfg,content,max(1,deadline-time.monotonic()),trace=trace)
             except Exception as e: raise VerifierSchemaError(f'invalid JSON after repair: {e}')
         if obj.get('type')=='tool_call':
             if calls>=max_tool_calls:
                 messages.append({'role':'user','content':'Maximum tool calls reached. Return final_verdict JSON using evidence gathered so far.'});
                 max_tool_calls=-1; continue
-            name=obj.get('tool'); args=obj.get('args') or {}; calls+=1; used.append({'tool':name,'reason':'LLM requested tool'})
+            name=obj.get('tool'); args=obj.get('args') or {}; idx=calls; calls+=1; used.append({'tool':name,'reason':'LLM requested tool'})
+            start=time.time(); status='ok'; err=None
             try: res=tools.dispatch(name,args)
-            except Exception as e: res=json.dumps({'error':str(e)})
+            except Exception as e: res=json.dumps({'error':str(e)}); status='error'; err=str(e)
+            if trace is not None:
+                trace.append_jsonl('tool_calls.jsonl',{'index':idx,'tool':name,'args':args,'startedAt':__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat(),'completedAt':__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat(),'durationMs':int((time.time()-start)*1000),'status':status,'resultChars':len(res),'truncated':len(res)>=max_tool_result_chars,'error':err,'reason':'LLM requested tool call.'})
+                trace.append_jsonl('tool_observations.jsonl',{'toolCallIndex':idx,'tool':name,'observation':None,'observationText':res,'chars':len(res),'truncated':len(res)>=max_tool_result_chars})
             messages.append({'role':'assistant','content':json.dumps(obj)})
             messages.append({'role':'user','content':'Tool result for '+str(name)+':\n'+res})
+            if trace is not None:
+                for m in messages[-2:]: trace.append_jsonl('llm_messages.jsonl',{'index':trace.msg_count,'role':m['role'],'name':None,'content':m['content'],'createdAt':__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat(),'chars':len(str(m['content']))}); trace.msg_count+=1
             continue
-        obj=calibrate(det,obj); break
+        
+        if trace is not None:
+            trace.append_jsonl('llm_messages.jsonl',{'index':trace.msg_count,'role':'assistant','name':None,'content':content,'createdAt':__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat(),'chars':len(str(content))}); trace.msg_count+=1
+            trace.write_json('llm_final_verdict_raw.json',{'rawText':content,'parsed':obj})
+            parsed={'schemaVersion':'villani-ops-verifier-llm-verdict-v1',**{k:obj.get(k) for k in ['result','verdict','confidence','recommendedAction','reason','requirementResults','successEvidence','failureEvidence','recoveredFailures','missingEvidence','riskFlags','uncertainty','toolsUsed']}}
+            trace.write_json('llm_final_verdict_parsed.json',parsed)
+        obj=calibrate(det,obj,trace=trace); break
     det.update({'result':obj['result'],'verdict':obj['verdict'],'confidence':obj['confidence'],'recommendedAction':obj['recommendedAction'],'reason':obj['reason'],'requirementResults':obj.get('requirementResults',det['requirementResults']),'successEvidence':obj.get('successEvidence',det['successEvidence']),'failureEvidence':obj.get('failureEvidence',det['failureEvidence']),'recoveredFailures':obj.get('recoveredFailures',det['recoveredFailures']),'missingEvidence':obj.get('missingEvidence',det['missingEvidence']),'riskFlags':obj.get('riskFlags',det['riskFlags']),'toolsUsed':used+obj.get('toolsUsed',[]),'llmRawVerdict':obj.get('llmRawVerdict',{}),'verifier':{'mode':'llm_tool_loop','backend':cfg['backend'],'model':cfg['model'],'baseUrl':cfg['baseUrl'],'promptVersion':PROMPT_VERSION}})
     return det
