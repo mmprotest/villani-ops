@@ -36,13 +36,13 @@ def test_tool_loop_calls_search_commands(monkeypatch, tmp_path):
                 calls.append('first')
                 return {'choices':[{'message':{'content':json.dumps({'type':'tool_call','tool':'search_commands','args':{'query':'PASS','limit':2}})}}]}
             assert 'Tool result for search_commands' in self.payload['messages'][-1]['content']
-            return {'choices':[{'message':{'content':json.dumps({'type':'final_verdict','verdict':'success','confidence':0.95,'recommendedAction':'accept','reason':'PASS evidence found','requirementResults':[],'successEvidence':['PASS evidence'],'failureEvidence':[],'recoveredFailures':[],'missingEvidence':[],'riskFlags':[],'toolsUsed':[]})}}]}
+            return {'choices':[{'message':{'content':json.dumps({'type':'final_verdict','result':1,'verdict':'success','confidence':0.95,'recommendedAction':'accept','reason':'PASS evidence found','requirementResults':[],'successEvidence':['PASS evidence'],'failureEvidence':[],'recoveredFailures':[],'missingEvidence':[],'riskFlags':[],'toolsUsed':[]})}}]}
     def fake_post(*args,**kwargs):
         r=Resp(); r.payload=kwargs['json']; return r
     monkeypatch.setattr(httpx,'post',fake_post)
     res=llm_result(run,det,workspace=str(tmp_path))
     assert res['toolsUsed'][0]['tool']=='search_commands'
-    assert res['llmRawVerdict']['verdict']=='success'
+    assert res['llmRawVerdict']['verdict']=='success' and res['result']==1
     assert res['confidence']==0.9
 
 def test_read_debug_file_blocks_symlink_escape(tmp_path):
@@ -84,3 +84,13 @@ def test_llm_invalid_json_after_repair_is_error(monkeypatch, tmp_path):
     monkeypatch.setattr(httpx,'post',lambda *a,**k: Resp())
     with pytest.raises(Exception) as ei: llm_result(run,det,workspace=str(tmp_path))
     assert 'invalid JSON after repair' in str(ei.value)
+
+def test_llm_binary_schema_accepts_and_rejects_unclear():
+    from villani_ops.verifier.llm import _parse
+    from villani_ops.verifier.errors import VerifierSchemaError
+    assert _parse(json.dumps({'type':'final_verdict','result':1,'verdict':'success','confidence':.8,'recommendedAction':'accept','reason':'ok'}))['result']==1
+    assert _parse(json.dumps({'type':'final_verdict','result':0,'verdict':'failure','confidence':.7,'recommendedAction':'reject','reason':'bad'}))['result']==0
+    with pytest.raises(VerifierSchemaError):
+        _parse(json.dumps({'type':'final_verdict','result':None,'verdict':'unclear','confidence':.5,'recommendedAction':'inspect_manually','reason':'no'}))
+    with pytest.raises(VerifierSchemaError):
+        _parse(json.dumps({'type':'final_verdict','result':1,'verdict':'failure','confidence':.5,'recommendedAction':'inspect_manually','reason':'mismatch'}))

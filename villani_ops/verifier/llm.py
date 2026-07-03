@@ -6,18 +6,31 @@ from .deterministic import build_packet, PROMPT_VERSION
 from .tools import VerifierTools
 from .errors import *
 ROLES={'review','selection','classification','policy','coding'}
-SYSTEM='''You are the mandatory verifier for Villani Code runs inside Villani Ops.
+SYSTEM='''You are the mandatory binary verifier for Villani Code runs inside Villani Ops.
 
 You are not a coding agent.
 You are not a repair agent.
 You judge whether the run likely solved the user's objective using Villani Code debug artifacts and optional repo evidence.
+
+You must make a binary prediction when verification completes.
+
+Return result 1 if the run likely solved the task.
+Return result 0 if the run likely did not solve the task.
+
+Do not return unclear.
+Do not return unknown.
+Do not abstain.
+No unclear verdict is allowed.
+
+If evidence is incomplete, noisy, or contradictory, use the evidence you have and make the most conservative prediction.
+False accepts are worse than false rejects.
 
 You receive an initial evidence packet. The packet may be incomplete, noisy, or wrong. The deterministic evidence extractor is not authoritative.
 
 You have read-only tools for inspecting debug files, command records, tool calls, transcripts, diffs, and repo files.
 
 Use tools when:
-- a material requirement is unclear
+- a material requirement is uncertain
 - success evidence looks weak
 - failure evidence may have been recovered
 - the final answer makes an unsupported claim
@@ -26,31 +39,14 @@ Use tools when:
 - you need to confirm whether a command actually passed or failed
 
 Do not use tools aimlessly.
-
 Do not trust the agent's final answer unless supported by artifacts.
-
 Earlier failures do not imply failure if later validation shows recovery.
-
 A zero exit code does not prove success if output contains failure text.
-
 A non-zero exit code does not prove final failure if a later end-to-end validation resolves the issue.
-
 Visible validation passing is strong evidence but not proof.
-
-Return success only when every material requirement is satisfied or strongly supported.
-
-Return failure when active blocking evidence shows the task was not solved.
-
-Return unclear when evidence is incomplete, noisy, contradictory, or insufficient.
-
-False accepts are worse than false rejects.
-
-Return exactly one JSON object.
-Do not wrap JSON in markdown.
-Do not include commentary outside JSON.
-Use tool_call when more evidence is needed.
-Use final_verdict when you are ready to decide.
-If max tool calls are reached, make the most conservative final decision from available evidence.
+Return result 1 only when the evidence supports that the material requirements were satisfied.
+Return result 0 when active blocking evidence remains, material requirements are unsatisfied, or evidence is too weak to safely accept.
+Return only valid JSON.
 '''
 TOOLS=['list_debug_files','read_debug_file','search_debug_file','search_commands','read_command','search_tool_calls','read_tool_call','search_transcript','list_repo_files','read_repo_file','search_repo','read_diff','search_diff']
 
@@ -87,31 +83,41 @@ def _parse(s):
     try: obj=json.loads(s)
     except Exception as e: raise VerifierSchemaError(str(e))
     if obj.get('type')=='tool_call': return obj
-    if obj.get('type') is None and obj.get('verdict') in {'success','failure','unclear'}: obj['type']='final_verdict'
-    if obj.get('type')!='final_verdict' or obj.get('verdict') not in {'success','failure','unclear'}: raise VerifierSchemaError('invalid final verdict schema')
-    obj.setdefault('confidence',0.0); obj.setdefault('recommendedAction','inspect_manually')
+    if obj.get('type') is None and ('result' in obj or obj.get('verdict') in {'success','failure'}): obj['type']='final_verdict'
+    if obj.get('type')!='final_verdict': raise VerifierSchemaError('invalid final verdict schema')
+    if obj.get('result') not in (0,1): raise VerifierSchemaError('final verdict result must be 0 or 1')
+    if obj.get('verdict') not in {'success','failure'}: raise VerifierSchemaError('final verdict verdict must be success or failure')
+    if (obj['result']==1 and obj['verdict']!='success') or (obj['result']==0 and obj['verdict']!='failure'): raise VerifierSchemaError('result/verdict mismatch')
+    if obj.get('recommendedAction') not in {'accept','reject','retry_same_model','retry_higher_model','run_more_tests','inspect_manually'}: obj['recommendedAction']='inspect_manually'
+    obj.setdefault('confidence',0.0)
     for k in ['reason','requirementResults','successEvidence','failureEvidence','recoveredFailures','missingEvidence','riskFlags','toolsUsed']: obj.setdefault(k, [] if k!='reason' else '')
+    obj.setdefault('uncertainty', {'level':'medium','reasons':[]})
+    for r in obj.get('requirementResults') or []:
+        if r.get('status') not in {'satisfied','unsatisfied'}: raise VerifierSchemaError('invalid requirement status')
     return obj
 def _schema_text():
-    return 'Final verdict schema (return exactly this shape):\n{\n  "type": "final_verdict",\n  "verdict": "success | failure | unclear",\n  "confidence": 0.0,\n  "recommendedAction": "accept | retry_same_model | retry_higher_model | run_more_tests | inspect_manually",\n  "reason": "short explanation grounded in evidence",\n  "requirementResults": [\n    {"id": "string", "requirement": "string", "status": "satisfied | unsatisfied | unclear", "evidence": ["string"], "risks": ["string"]}\n  ],\n  "successEvidence": ["string"],\n  "failureEvidence": ["string"],\n  "recoveredFailures": ["string"],\n  "missingEvidence": ["string"],\n  "riskFlags": ["string"],\n  "toolsUsed": [{"tool": "string", "reason": "string"}]\n}\nTool-call schema:\n{\n  "type": "tool_call",\n  "tool": "search_commands",\n  "args": {"query": "PASS", "limit": 10}\n}\nReturn exactly one JSON object.\nDo not wrap JSON in markdown.\nDo not include commentary outside JSON.\nUse tool_call when more evidence is needed.\nUse final_verdict when you are ready to decide.\nIf max tool calls are reached, make the most conservative final decision from available evidence.'
+    return """Final verdict schema (return exactly this shape):
+{ "type": "final_verdict", "result": 1, "verdict": "success", "confidence": 0.84, "recommendedAction": "accept", "reason": "short explanation grounded in evidence", "requirementResults": [{"id":"string","requirement":"string","status":"satisfied | unsatisfied","evidence":["string"],"risks":["string"]}], "successEvidence": ["string"], "failureEvidence": ["string"], "recoveredFailures": ["string"], "missingEvidence": ["string"], "riskFlags": ["string"], "uncertainty": {"level": "low | medium | high", "reasons": ["string"]}, "toolsUsed": [{"tool":"string","reason":"string"}] }
+Rules: result must be 1 or 0. verdict must be success when result is 1. verdict must be failure when result is 0. requirementResults.status must be satisfied or unsatisfied only. Do not return unclear. Do not return unknown. Do not return null result. If evidence is incomplete, make the best conservative prediction and explain uncertainty. False accepts are worse than false rejects.
+Tool-call schema:
+{ "type": "tool_call", "tool": "search_commands", "args": {"query": "PASS", "limit": 10} }
+Return exactly one JSON object."""
 def _repair(cfg,bad,timeout):
     msg=[{'role':'system','content':'Return only valid JSON. No markdown fences.'},{'role':'user','content':'Repair this invalid verifier response to required final_verdict schema. '+_schema_text()+'\nPrevious invalid response:\n'+bad}]
     return _parse(_chat(cfg,msg,timeout))
 def calibrate(det, verdict):
-    raw={'verdict':verdict['verdict'],'confidence':float(verdict.get('confidence',0)),'reason':verdict.get('reason','')}; changed=False
+    raw={'result':verdict.get('result'),'verdict':verdict['verdict'],'confidence':float(verdict.get('confidence',0)),'reason':verdict.get('reason','')}; changed=False
     validations=det['evidenceByCategory']['finalEndToEndValidation']+det['evidenceByCategory']['testValidation']+det['evidenceByCategory']['serviceValidation']
-    if verdict['verdict']=='success':
-        top=verdict.get('successEvidence') or det.get('successEvidence',[])
-        top_txt='\n'.join(str(x).lower() for x in top[:3])
-        only_weak=bool(top) and not any(sig in top_txt for sig in ['git clone','git push','pass:','curl','https://','pytest','test successful','serves correct content'])
-        if not validations or any(r.get('status')=='unsatisfied' for r in verdict.get('requirementResults',[])) or det['evidenceByCategory']['activeFailures'] or (only_weak and not validations):
-            verdict['verdict']='unclear'; verdict['recommendedAction']='inspect_manually'; changed=True
-        if only_weak:
-            verdict.setdefault('riskFlags',[]).append('Top success evidence is setup or inspection rather than validation.')
+    active=det['evidenceByCategory']['activeFailures']
+    reqs=verdict.get('requirementResults',[])
+    if verdict['result']==1:
+        if not validations or any(r.get('status')=='unsatisfied' for r in reqs) or active:
+            verdict.update({'result':0,'verdict':'failure','recommendedAction':'run_more_tests','confidence':min(float(verdict.get('confidence',0)) or .6,.65)}); changed=True
         verdict['confidence']=min(float(verdict.get('confidence',0)),.9)
-    elif verdict['verdict']=='failure' and validations and det['evidenceByCategory']['recoveredFailures']:
-        verdict['verdict']='unclear'; verdict['recommendedAction']='inspect_manually'; changed=True
-    if changed: verdict.setdefault('riskFlags',[]).append('Calibration changed the LLM verdict based on deterministic evidence checks.')
+    elif verdict['result']==0 and det['evidenceByCategory']['finalEndToEndValidation'] and not active and not any(r.get('status')=='unsatisfied' for r in det.get('requirementResults',[])):
+        verdict.update({'result':1,'verdict':'success','recommendedAction':'accept','confidence':min(max(float(verdict.get('confidence',0)),.75),.9)}); changed=True
+    if changed: verdict.setdefault('riskFlags',[]).append('Calibration changed the LLM result based on deterministic evidence checks.')
+    verdict.setdefault('uncertainty', {'level':'medium','reasons':[]})
     verdict['llmRawVerdict']=raw; return verdict
 def llm_result(run, det, workspace='.villani-ops', backend=None, base_url=None, model=None, timeout_seconds=180, max_tool_calls=12, max_tool_result_chars=12000, max_read_lines=160):
     cfg=select_verifier_backend(workspace,backend,base_url,model); tools=VerifierTools(run,det.get('repoDir'),max_tool_result_chars,max_read_lines)
@@ -138,5 +144,5 @@ def llm_result(run, det, workspace='.villani-ops', backend=None, base_url=None, 
             messages.append({'role':'user','content':'Tool result for '+str(name)+':\n'+res})
             continue
         obj=calibrate(det,obj); break
-    det.update({'verdict':obj['verdict'],'confidence':obj['confidence'],'recommendedAction':obj['recommendedAction'],'reason':obj['reason'],'requirementResults':obj.get('requirementResults',det['requirementResults']),'successEvidence':obj.get('successEvidence',det['successEvidence']),'failureEvidence':obj.get('failureEvidence',det['failureEvidence']),'recoveredFailures':obj.get('recoveredFailures',det['recoveredFailures']),'missingEvidence':obj.get('missingEvidence',det['missingEvidence']),'riskFlags':obj.get('riskFlags',det['riskFlags']),'toolsUsed':used+obj.get('toolsUsed',[]),'llmRawVerdict':obj.get('llmRawVerdict',{}),'verifier':{'mode':'llm_tool_loop','backend':cfg['backend'],'model':cfg['model'],'baseUrl':cfg['baseUrl'],'promptVersion':PROMPT_VERSION}})
+    det.update({'result':obj['result'],'verdict':obj['verdict'],'confidence':obj['confidence'],'recommendedAction':obj['recommendedAction'],'reason':obj['reason'],'requirementResults':obj.get('requirementResults',det['requirementResults']),'successEvidence':obj.get('successEvidence',det['successEvidence']),'failureEvidence':obj.get('failureEvidence',det['failureEvidence']),'recoveredFailures':obj.get('recoveredFailures',det['recoveredFailures']),'missingEvidence':obj.get('missingEvidence',det['missingEvidence']),'riskFlags':obj.get('riskFlags',det['riskFlags']),'toolsUsed':used+obj.get('toolsUsed',[]),'llmRawVerdict':obj.get('llmRawVerdict',{}),'verifier':{'mode':'llm_tool_loop','backend':cfg['backend'],'model':cfg['model'],'baseUrl':cfg['baseUrl'],'promptVersion':PROMPT_VERSION}})
     return det

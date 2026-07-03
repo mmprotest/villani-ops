@@ -1,8 +1,8 @@
 from __future__ import annotations
 from dataclasses import dataclass, field, asdict
 from typing import Any, Literal
-VerifierVerdict = Literal['success','failure','unclear','error']
-VerifierAction = Literal['accept','retry_same_model','retry_higher_model','run_more_tests','inspect_manually']
+VerifierVerdict = Literal['success','failure','error']
+VerifierAction = Literal['accept','reject','retry_same_model','retry_higher_model','run_more_tests','inspect_manually']
 @dataclass
 class CommandRecord:
     ts:str|None=None; toolCallId:str|None=None; command:str|None=None; cwd:str|None=None; exitCode:int|None=None; stdout:str|None=None; stderr:str|None=None; truncated:bool=False; event:str|None=None; raw:Any=None; index:int=0
@@ -20,7 +20,7 @@ class EvidenceItem:
     kind:str; source:str; confidence:str; text:str; commandId:str|None=None; turnIndex:int|None=None; timestamp:str|None=None; order:int=0
 @dataclass
 class RequirementCheck:
-    id:str; requirement:str; status:str='unclear'; evidence:list[EvidenceItem]=field(default_factory=list); risks:list[EvidenceItem]=field(default_factory=list)
+    id:str; requirement:str; status:str='unsatisfied'; evidence:list[EvidenceItem]=field(default_factory=list); risks:list[EvidenceItem]=field(default_factory=list)
 @dataclass
 class DebugRun:
     debugDir:str; runId:str|None=None; objective:str|None=None; repoFromMetadata:str|None=None; model:str|None=None; provider:str|None=None; status:str|None=None; startedAt:str|None=None; endedAt:str|None=None; durationMs:int|None=None; sessionMeta:Any=None; summary:Any=None; finalSummary:Any=None; commands:list[CommandRecord]=field(default_factory=list); toolCalls:list[ToolCallRecord]=field(default_factory=list); patches:list[PatchRecord]=field(default_factory=list); modelResponses:list[ModelResponseRecord]=field(default_factory=list); validations:list[ValidationRecord]=field(default_factory=list); parseWarnings:list[str]=field(default_factory=list); missingArtifacts:list[str]=field(default_factory=list)

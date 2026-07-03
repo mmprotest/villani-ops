@@ -131,7 +131,7 @@ def verifier(
     repo_dir: str | None = typer.Option(None, '--repo-dir', help='Optional repository directory for extra evidence.'),
     json_output: bool = typer.Option(False, '--json', help='Print verifier result JSON only.'),
     out: str | None = typer.Option(None, '--out', help='Write full verifier result JSON to this path.'),
-    no_llm: bool = typer.Option(False, '--no-llm', help='Disable mandatory LLM verifier for debugging only.'),
+    no_llm: bool = typer.Option(False, '--no-llm', help='Disable mandatory LLM verifier; returns a deterministic binary prediction (result 1 predicted solved, result 0 predicted not solved).'),
     base_url: str | None = typer.Option(None, '--base-url', help='OpenAI-compatible base URL.'),
     model: str | None = typer.Option(None, '--model', help='Verifier model name.'),
     workspace: str = typer.Option('.villani-ops', '--workspace'),
@@ -163,7 +163,7 @@ def verifier(
     except typer.Exit:
         raise
     except Exception as e:
-        result={'schemaVersion':'villani-ops-verifier-result-v2','verdict':'error','confidence':1.0,'recommendedAction':'inspect_manually','reason':str(e),'requirementResults':[],'successEvidence':[],'failureEvidence':[],'recoveredFailures':[],'missingEvidence':[],'riskFlags':[],'evidenceByCategory':{},'toolsUsed':[],'llmRawVerdict':{},'artifactsUsed':{},'deterministicChecks':{},'debugDir':debug_dir,'repoDir':repo_dir,'createdAt':'','verifier':{'mode':'deterministic' if no_llm else 'llm_tool_loop'}}
+        result={'schemaVersion':'villani-ops-verifier-result-v3','result':None,'verdict':'error','confidence':0.0,'recommendedAction':'inspect_manually','reason':str(e),'requirementResults':[],'successEvidence':[],'failureEvidence':[],'recoveredFailures':[],'missingEvidence':[],'riskFlags':[],'uncertainty':{'level':'high','reasons':['Verifier infrastructure error.']},'evidenceByCategory':{},'toolsUsed':[],'llmRawVerdict':{},'artifactsUsed':{},'deterministicChecks':{},'debugDir':debug_dir,'repoDir':repo_dir,'createdAt':'','verifier':{'mode':'deterministic' if no_llm else 'llm_tool_loop'}}
         if json_output:
             typer.echo(json.dumps(result))
         else:
