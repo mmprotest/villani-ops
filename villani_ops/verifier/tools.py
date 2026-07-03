@@ -19,14 +19,25 @@ def _secret(rel:str):
     name=Path(rel).name
     return name in SECRET_NAMES or name.startswith('.env.') or name.endswith(SECRET_SUFFIXES)
 def _safe(root:Path, rel:str, block_secret=True):
-    if not rel or os.path.isabs(rel) or '..' in Path(rel).parts: raise VerifierToolError('unsafe path')
+    rel_path=Path(rel or '')
+    if not rel: raise VerifierToolError('unsafe path')
+    if rel_path.is_absolute(): raise VerifierToolError('absolute paths are blocked')
+    if '..' in rel_path.parts: raise VerifierToolError('path traversal is blocked')
     if block_secret and _secret(rel): raise VerifierToolError('secret-looking path blocked')
-    p=(root/rel).resolve(); rr=root.resolve()
-    if not (p==rr or rr in p.parents): raise VerifierToolError('path escapes root')
-    if p.is_symlink(): raise VerifierToolError('symlinks are blocked')
-    if not p.exists() or not p.is_file(): raise VerifierToolError('file not found')
-    if _is_binary(p): raise VerifierToolError('binary file blocked')
-    return p
+    root_resolved=root.resolve()
+    candidate=root/rel_path
+    current=root
+    for part in rel_path.parts:
+        current=current/part
+        if current.exists() and current.is_symlink(): raise VerifierToolError('symlinks are blocked')
+    resolved=candidate.resolve()
+    try:
+        resolved.relative_to(root_resolved)
+    except ValueError:
+        raise VerifierToolError('path escapes allowed root')
+    if not resolved.exists() or not resolved.is_file(): raise VerifierToolError('file not found')
+    if _is_binary(resolved): raise VerifierToolError('binary file blocked')
+    return resolved
 
 class VerifierTools:
     def __init__(self, run, repo_dir=None, max_chars=12000, max_lines=160):

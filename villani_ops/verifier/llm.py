@@ -7,16 +7,51 @@ from .tools import VerifierTools
 from .errors import *
 ROLES={'review','selection','classification','policy','coding'}
 SYSTEM='''You are the mandatory verifier for Villani Code runs inside Villani Ops.
-You are not a coding agent. You are not a repair agent.
+
+You are not a coding agent.
+You are not a repair agent.
 You judge whether the run likely solved the user's objective using Villani Code debug artifacts and optional repo evidence.
+
 You receive an initial evidence packet. The packet may be incomplete, noisy, or wrong. The deterministic evidence extractor is not authoritative.
+
 You have read-only tools for inspecting debug files, command records, tool calls, transcripts, diffs, and repo files.
-Use tools when material requirements are unclear, success evidence is weak, failures may be recovered, claims unsupported, evidence contradictory, file contents matter, or command pass/fail needs confirmation.
-Do not use tools aimlessly. Do not trust the agent's final answer unless supported by artifacts. Earlier failures do not imply failure if later validation shows recovery.
-A zero exit code does not prove success if output contains failure text. A non-zero exit code does not prove final failure if later validation resolves it.
-Visible validation passing is strong evidence but not proof. Return success only when every material requirement is satisfied or strongly supported.
-Return failure when active blocking evidence shows the task was not solved. Return unclear when evidence is incomplete/noisy/contradictory/insufficient. False accepts are worse than false rejects.
-Return either {"type":"tool_call","tool":"search_commands","args":{...}} or final verdict JSON with type final_verdict. Return only valid JSON for the final verdict.'''
+
+Use tools when:
+- a material requirement is unclear
+- success evidence looks weak
+- failure evidence may have been recovered
+- the final answer makes an unsupported claim
+- the packet contains contradictory evidence
+- the task depends on file contents or diffs
+- you need to confirm whether a command actually passed or failed
+
+Do not use tools aimlessly.
+
+Do not trust the agent's final answer unless supported by artifacts.
+
+Earlier failures do not imply failure if later validation shows recovery.
+
+A zero exit code does not prove success if output contains failure text.
+
+A non-zero exit code does not prove final failure if a later end-to-end validation resolves the issue.
+
+Visible validation passing is strong evidence but not proof.
+
+Return success only when every material requirement is satisfied or strongly supported.
+
+Return failure when active blocking evidence shows the task was not solved.
+
+Return unclear when evidence is incomplete, noisy, contradictory, or insufficient.
+
+False accepts are worse than false rejects.
+
+Return exactly one JSON object.
+Do not wrap JSON in markdown.
+Do not include commentary outside JSON.
+Use tool_call when more evidence is needed.
+Use final_verdict when you are ready to decide.
+If max tool calls are reached, make the most conservative final decision from available evidence.
+'''
 TOOLS=['list_debug_files','read_debug_file','search_debug_file','search_commands','read_command','search_tool_calls','read_tool_call','search_transcript','list_repo_files','read_repo_file','search_repo','read_diff','search_diff']
 
 def _is_local(url):
@@ -57,33 +92,36 @@ def _parse(s):
     obj.setdefault('confidence',0.0); obj.setdefault('recommendedAction','inspect_manually')
     for k in ['reason','requirementResults','successEvidence','failureEvidence','recoveredFailures','missingEvidence','riskFlags','toolsUsed']: obj.setdefault(k, [] if k!='reason' else '')
     return obj
+def _schema_text():
+    return 'Final verdict schema (return exactly this shape):\n{\n  "type": "final_verdict",\n  "verdict": "success | failure | unclear",\n  "confidence": 0.0,\n  "recommendedAction": "accept | retry_same_model | retry_higher_model | run_more_tests | inspect_manually",\n  "reason": "short explanation grounded in evidence",\n  "requirementResults": [\n    {"id": "string", "requirement": "string", "status": "satisfied | unsatisfied | unclear", "evidence": ["string"], "risks": ["string"]}\n  ],\n  "successEvidence": ["string"],\n  "failureEvidence": ["string"],\n  "recoveredFailures": ["string"],\n  "missingEvidence": ["string"],\n  "riskFlags": ["string"],\n  "toolsUsed": [{"tool": "string", "reason": "string"}]\n}\nTool-call schema:\n{\n  "type": "tool_call",\n  "tool": "search_commands",\n  "args": {"query": "PASS", "limit": 10}\n}\nReturn exactly one JSON object.\nDo not wrap JSON in markdown.\nDo not include commentary outside JSON.\nUse tool_call when more evidence is needed.\nUse final_verdict when you are ready to decide.\nIf max tool calls are reached, make the most conservative final decision from available evidence.'
 def _repair(cfg,bad,timeout):
-    msg=[{'role':'system','content':'Return only valid JSON. No markdown fences.'},{'role':'user','content':'Repair this invalid verifier response to required final_verdict schema. Previous invalid response:\n'+bad}]
+    msg=[{'role':'system','content':'Return only valid JSON. No markdown fences.'},{'role':'user','content':'Repair this invalid verifier response to required final_verdict schema. '+_schema_text()+'\nPrevious invalid response:\n'+bad}]
     return _parse(_chat(cfg,msg,timeout))
 def calibrate(det, verdict):
-    raw={'verdict':verdict['verdict'],'confidence':float(verdict.get('confidence',0))}; changed=False
+    raw={'verdict':verdict['verdict'],'confidence':float(verdict.get('confidence',0)),'reason':verdict.get('reason','')}; changed=False
     validations=det['evidenceByCategory']['finalEndToEndValidation']+det['evidenceByCategory']['testValidation']+det['evidenceByCategory']['serviceValidation']
     if verdict['verdict']=='success':
-        if not validations or any(r.get('status')=='unsatisfied' for r in verdict.get('requirementResults',[])) or det['evidenceByCategory']['activeFailures']:
+        top=verdict.get('successEvidence') or det.get('successEvidence',[])
+        top_txt='\n'.join(str(x).lower() for x in top[:3])
+        only_weak=bool(top) and not any(sig in top_txt for sig in ['git clone','git push','pass:','curl','https://','pytest','test successful','serves correct content'])
+        if not validations or any(r.get('status')=='unsatisfied' for r in verdict.get('requirementResults',[])) or det['evidenceByCategory']['activeFailures'] or (only_weak and not validations):
             verdict['verdict']='unclear'; verdict['recommendedAction']='inspect_manually'; changed=True
+        if only_weak:
+            verdict.setdefault('riskFlags',[]).append('Top success evidence is setup or inspection rather than validation.')
         verdict['confidence']=min(float(verdict.get('confidence',0)),.9)
     elif verdict['verdict']=='failure' and validations and det['evidenceByCategory']['recoveredFailures']:
         verdict['verdict']='unclear'; verdict['recommendedAction']='inspect_manually'; changed=True
     if changed: verdict.setdefault('riskFlags',[]).append('Calibration changed the LLM verdict based on deterministic evidence checks.')
     verdict['llmRawVerdict']=raw; return verdict
 def llm_result(run, det, workspace='.villani-ops', backend=None, base_url=None, model=None, timeout_seconds=180, max_tool_calls=12, max_tool_result_chars=12000, max_read_lines=160):
-    legacy_optional = det.get('verifier',{}).get('mode') == 'deterministic' and not backend and not base_url and not model
     cfg=select_verifier_backend(workspace,backend,base_url,model); tools=VerifierTools(run,det.get('repoDir'),max_tool_result_chars,max_read_lines)
     packet=build_packet(run,det.get('repoDir'))
-    messages=[{'role':'system','content':SYSTEM},{'role':'user','content':'Objective:\n'+str(run.objective)+'\nAvailable tools: '+', '.join(TOOLS)+'\nFinal schema: final_verdict JSON.\nEvidence packet:\n'+json.dumps(packet,default=str)}]
+    messages=[{'role':'system','content':SYSTEM},{'role':'user','content':'Objective:\n'+str(run.objective)+'\nAvailable tools: '+', '.join(TOOLS)+'\n'+_schema_text()+'\nEvidence packet:\n'+json.dumps(packet,default=str)}]
     used=[]; deadline=time.monotonic()+timeout_seconds; calls=0; content=''
     while True:
         if time.monotonic()>deadline: raise VerifierLlmError('tool loop timeout')
         try: content=_chat(cfg,messages,max(1,deadline-time.monotonic()))
         except Exception as e:
-            if legacy_optional:
-                det.setdefault('riskFlags',[]).append({'kind':'risk','source':'derived','confidence':'medium','text':f'LLM verifier failed; deterministic result used: {e}'})
-                return det
             raise VerifierLlmError(f'HTTP failure: {e}')
         try: obj=_parse(content)
         except VerifierSchemaError:
