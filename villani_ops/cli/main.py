@@ -175,7 +175,7 @@ def verifier(
         result['traceDir']=str(tw.trace_dir) if tw.trace_dir else None; result['traceId']=tw.trace_id; result['traceLevel']=trace_level; result['toolCallCount']=len(result.get('toolsUsed') or []); result['llmCallCount']=getattr(tw,'llm_call_count',0)
         if not trace: result.setdefault('riskFlags',[]).append('Verifier trace was disabled; run cannot be fully audited.')
         if trace and tw.trace_dir is None: result.setdefault('riskFlags',[]).append('Verifier trace could not be created; run cannot be fully audited.')
-        tw.write_text('verifier_transcript.md', transcript(result, packet, None, tw.trace_dir))
+        tw.write_text('verifier_transcript.md', transcript(result, packet, result.get('calibration'), tw.trace_dir))
         tw.finish(result)
         output_path = Path(out) if out else (Path(debug_dir) / 'verification.json' if not json_output else None)
         if output_path:

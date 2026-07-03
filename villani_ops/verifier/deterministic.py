@@ -2,16 +2,42 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import re, shlex
 from .types import *
-from .extract import extract_requirements, extract_evidence, is_validation_command
+from .extract import extract_requirements, extract_evidence, is_validation_command, _basename
 from .timeline import build_timeline
 PROMPT_VERSION='villani-ops-verifier-binary-tool-loop-v1'
 RESULT_SCHEMA_VERSION='villani-ops-verifier-result-v3'
-CATS=['finalEndToEndValidation','testValidation','serviceValidation','repoMutation','fileMutation','setupEvidence','inspectionEvidence','cleanupEvidence','agentClaims','activeFailures','recoveredFailures','missingEvidence','riskFlags']
+CATS=['finalEndToEndValidation','testValidation','serviceValidation','deliverableEvidence','repoMutation','fileMutation','setupEvidence','inspectionEvidence','cleanupEvidence','agentClaims','activeFailures','recoveredFailures','missingEvidence','riskFlags']
 
 def re_words(s): return re.findall(r'[a-zA-Z0-9_./:-]+',(s or '').lower())
 def command_text(c): return c.command or ''
 def command_output_text(c): return ((c.stdout or '')+'\n'+(c.stderr or '')).strip()
 def _all(c): return (command_text(c)+'\n'+command_output_text(c)).lower()
+INLINE_RE=re.compile(r"(python\d*|node|ruby|perl|cat)\s+-?\s*<<['\"]?(PY|EOF|JS|RB|PL)",re.I)
+def is_inline_experiment(c): return bool(INLINE_RE.search(command_text(c) or ''))
+def _deliverable_links(c,spec):
+    txt=(command_text(c)+'\n'+command_output_text(c)).lower(); links=[]
+    for p in (spec.required_files+spec.required_output_files+spec.required_edited_files):
+        b=_basename(p).lower(); stem=b.split('.')[0]
+        if b and (b in txt or p.lower() in txt or re.search(rf'\b(from|import)\s+{re.escape(stem)}\b',txt)): links.append(p)
+    for u in spec.required_endpoints:
+        if u.lower() in txt: links.append(u)
+    return list(dict.fromkeys(links))
+def annotate_validation(item,c,spec):
+    links=_deliverable_links(c,spec); inline=is_inline_experiment(c); txt=_all(c)
+    item.deliverableLinked=bool(links); item.deliverableLinks=links
+    if links and not inline:
+        item.validationStrength='strong'
+    elif links and inline and ('import' in txt or any(f'from {_basename(p).split(".")[0].lower()}' in txt for p in links)):
+        item.validationStrength='strong'
+    elif inline:
+        item.validationStrength='weak'
+        item.validationWeakness='inline script defines local implementation instead of testing final deliverable' if any(f"def {fn.lower()}" in txt for fn in spec.required_functions) else 'inline heredoc does not import or execute required file'
+    elif re.search(r'\b(pass|all correctness tests passed)\b',txt,re.I) and not links:
+        item.validationStrength='weak'; item.validationWeakness='generic PASS output is not tied to a required deliverable'
+    else:
+        item.validationStrength='medium' if links else 'weak'
+        if not links and (spec.required_files or spec.required_endpoints): item.validationWeakness='validation is not linked to required deliverable'
+    return item
 def _cmd0(c):
     try: return shlex.split(command_text(c) or '')[0].lower()
     except Exception: return (command_text(c) or '').strip().split(' ')[0].lower()
@@ -90,9 +116,10 @@ def is_final_end_to_end_validation_command(c, run_context=None):
         return _strong_final_signal(c) or is_service_validation_command(c) or is_test_validation_command(c)
     return _strong_final_signal(c)
 
-def _item(c, confidence='medium'):
+def _item(c, confidence='medium', spec=None):
     blob=command_output_text(c)[:300]
-    return EvidenceItem('command','commands',confidence,f'command[{c.index}] exit={c.exitCode}: {c.command} :: {blob.strip()}',c.toolCallId,timestamp=c.ts,order=c.index)
+    item=EvidenceItem('command','commands',confidence,f'command[{c.index}] exit={c.exitCode}: {c.command} :: {blob.strip()}',c.toolCallId,timestamp=c.ts,order=c.index)
+    return annotate_validation(item,c,spec) if spec else item
 
 def _classify_failures(run, failures, window):
     active=[]; recovered=[]; post=0; strong_final=window is not None
@@ -111,17 +138,19 @@ def _classify_failures(run, failures, window):
             active.append(f)
     return active,recovered,post
 
-def _cat(run, success, active, recovered, risks, missing, mutations, window):
+def _cat(run, success, active, recovered, risks, missing, mutations, window, inspections=None, deliverables=None, spec=None):
     ev={k:[] for k in CATS}
     for e in missing: ev['missingEvidence'].append(e)
     for e in risks: ev['riskFlags'].append(e)
     for e in active: ev['activeFailures'].append(e)
     for e in recovered: ev['recoveredFailures'].append(e)
     for m in mutations: ev['fileMutation'].append(m)
+    for x in inspections or []: ev['inspectionEvidence'].append(x)
+    for x in deliverables or []: ev['deliverableEvidence'].append(x)
     ctx={'window':window}
     for c in run.commands:
         if c.event and not c.command: continue
-        item=_item(c,'high' if c.exitCode==0 else 'medium')
+        item=_item(c,'high' if c.exitCode==0 else 'medium',spec)
         if is_final_end_to_end_validation_command(c,ctx): ev['finalEndToEndValidation'].append(item)
         if is_test_validation_command(c): ev['testValidation'].append(item)
         if is_service_validation_command(c): ev['serviceValidation'].append(item)
@@ -136,7 +165,7 @@ def _cat(run, success, active, recovered, risks, missing, mutations, window):
 
 def _top_success(cats):
     out=[]
-    for k in ['finalEndToEndValidation','testValidation','serviceValidation','repoMutation','fileMutation','setupEvidence','inspectionEvidence','agentClaims']:
+    for k in ['finalEndToEndValidation','testValidation','serviceValidation','deliverableEvidence','repoMutation','fileMutation','setupEvidence','inspectionEvidence','agentClaims']:
         out.extend(cats.get(k,[]))
     return out[:20]
 
@@ -146,20 +175,23 @@ def build_packet(run:DebugRun, repo_dir=None):
         if ev.kind=='command' and ev.command_index is not None:
             c=next((x for x in run.commands if x.index==ev.command_index),None)
             if c is not None: setattr(c,'_timeline_order',ev.order)
-    reqs=extract_requirements(run.objective); success,failures,risks,missing,mutations,validations=extract_evidence(run)
+    reqs=extract_requirements(run.objective); success,failures,risks,missing,mutations,validations,inspections,deliverables,spec=extract_evidence(run)
     order_by_cmd={getattr(c,'index',None):getattr(c,'_timeline_order',c.index) for c in run.commands}
     order_by_tool={ev.tool_call_id:ev.order for ev in build_timeline(run) if ev.kind=='tool_call' and ev.tool_call_id}
-    for e in failures+success+mutations:
+    for e in failures+success+mutations+inspections+deliverables:
         if getattr(e,'source',None)=='commands': e.order=order_by_cmd.get(next((c.index for c in run.commands if c.toolCallId==e.commandId and e.text.startswith(f'command[{c.index}]')), e.order), e.order)
         elif getattr(e,'source',None)=='tool_calls' and e.commandId in order_by_tool: e.order=order_by_tool[e.commandId]
     window=detect_final_validation_window(run); active,recovered,post=_classify_failures(run,failures,window)
-    cats=_cat(run,success,active,recovered,risks,missing,mutations,window); corpus='\n'.join([e.text for xs in cats.values() for e in xs]).lower()
+    cats=_cat(run,success,active,recovered,risks,missing,mutations,window,inspections,deliverables,spec); corpus='\n'.join([e.text for xs in cats.values() for e in xs]).lower()
     validations2=cats['finalEndToEndValidation']+cats['testValidation']+cats['serviceValidation']
     for r in reqs:
         words=[w for w in re_words(r.requirement) if len(w)>3]; hits=sum(1 for w in words[:8] if w in corpus)
         ok=(r.id=='final_validation_present' and bool(validations2)) or (r.id=='no_blocking_failures' and not active) or hits>=max(1,min(3,len(words)//3)) or (bool(validations2) and bool(mutations))
         r.status='satisfied' if ok else 'unsatisfied'; r.evidence=validations2[:3] if ok else []; r.risks=missing[:2] if not ok else []
-    return {'schemaVersion':'villani-ops-verifier-packet-v2','objective':run.objective,'run':{'debugDir':run.debugDir,'repoDir':repo_dir,'runId':run.runId,'model':run.model,'provider':run.provider,'status':run.status,'durationMs':run.durationMs},'requirements':to_jsonable(reqs),'evidence':to_jsonable(cats),'artifactIndex':{'debugFiles':[],'commandCount':len(run.commands),'toolCallCount':len(run.toolCalls),'patchCount':len(run.patches),'modelResponseCount':len(run.modelResponses)},'deterministicChecks':{'finalValidationWindow':window,'activeFailureCount':len(cats['activeFailures']),'recoveredFailureCount':len(cats['recoveredFailures']),'postValidationRiskCount':post}}
+    validated=list(dict.fromkeys([l for e in cats['deliverableEvidence']+validations2 for l in (e.get('deliverableLinks') if isinstance(e,dict) else getattr(e,'deliverableLinks',[]))]))
+    required=list(dict.fromkeys(spec.required_files+spec.required_endpoints))
+    assessment={'requiredDeliverables':required,'validatedDeliverables':validated,'missingDeliverables':[x for x in required if _basename(x) not in [_basename(y) for y in validated] and x not in validated],'weakValidationReasons':[getattr(e,'validationWeakness',None) for e in validations2 if getattr(e,'validationWeakness',None)]}
+    return {'schemaVersion':'villani-ops-verifier-packet-v2','objective':run.objective,'run':{'debugDir':run.debugDir,'repoDir':repo_dir,'runId':run.runId,'model':run.model,'provider':run.provider,'status':run.status,'durationMs':run.durationMs},'deliverableSpec':to_jsonable(spec),'deliverableAssessment':assessment,'requirements':to_jsonable(reqs),'evidence':to_jsonable(cats),'artifactIndex':{'debugFiles':[],'commandCount':len(run.commands),'toolCallCount':len(run.toolCalls),'patchCount':len(run.patches),'modelResponseCount':len(run.modelResponses)},'deterministicChecks':{'finalValidationWindow':window,'activeFailureCount':len(cats['activeFailures']),'recoveredFailureCount':len(cats['recoveredFailures']),'postValidationRiskCount':post}}
 
 def deterministic_result(run:DebugRun, repo_dir=None, mode='deterministic', model=None, base_url=None):
     pkt=build_packet(run,repo_dir); cats=pkt['evidence']; active=cats['activeFailures']; validations=cats['finalEndToEndValidation']+cats['testValidation']+cats['serviceValidation']; status=(run.status or '').lower(); sat=sum(1 for r in pkt['requirements'] if r['status']=='satisfied'); coverage=sat/max(1,len(pkt['requirements']))
@@ -171,4 +203,4 @@ def deterministic_result(run:DebugRun, repo_dir=None, mode='deterministic', mode
     risks=cats['riskFlags']
     if mode=='deterministic': risks.append({'kind':'risk','source':'derived','confidence':'high','text':'LLM verifier was explicitly disabled; deterministic binary prediction is not authoritative.'})
     checks=pkt['deterministicChecks']; checks.update({'validationEvidenceCount':len(validations),'requirementCoverage':coverage})
-    return {'schemaVersion':RESULT_SCHEMA_VERSION,'result':(1 if verdict=='success' else 0),'verdict':verdict,'confidence':conf,'recommendedAction':action,'reason':reason,'requirementResults':pkt['requirements'],'successEvidence':to_jsonable(_top_success(cats)),'failureEvidence':active[:20],'recoveredFailures':cats['recoveredFailures'][:20],'missingEvidence':cats['missingEvidence'][:20],'riskFlags':risks,'uncertainty':{'level':('low' if verdict=='success' and conf>=.8 else 'high' if not validations else 'medium'),'reasons':([] if validations else ['No strong validation evidence was found.'])},'evidenceByCategory':cats,'toolsUsed':[],'llmRawVerdict':{},'artifactsUsed':pkt['artifactIndex'],'deterministicChecks':checks,'debugDir':run.debugDir,'repoDir':repo_dir,'createdAt':datetime.now(timezone.utc).isoformat(),'verifier':{'mode':mode,'model':model,'baseUrl':base_url,'promptVersion':PROMPT_VERSION}}
+    return {'schemaVersion':RESULT_SCHEMA_VERSION,'result':(1 if verdict=='success' else 0),'verdict':verdict,'confidence':conf,'recommendedAction':action,'reason':reason,'requirementResults':pkt['requirements'],'deliverableAssessment':pkt.get('deliverableAssessment'),'successEvidence':to_jsonable(_top_success(cats)),'failureEvidence':active[:20],'recoveredFailures':cats['recoveredFailures'][:20],'missingEvidence':cats['missingEvidence'][:20],'riskFlags':risks,'uncertainty':{'level':('low' if verdict=='success' and conf>=.8 else 'high' if not validations else 'medium'),'reasons':([] if validations else ['No strong validation evidence was found.'])},'evidenceByCategory':cats,'toolsUsed':[],'llmRawVerdict':{},'artifactsUsed':pkt['artifactIndex'],'deterministicChecks':checks,'debugDir':run.debugDir,'repoDir':repo_dir,'createdAt':datetime.now(timezone.utc).isoformat(),'verifier':{'mode':mode,'model':model,'baseUrl':base_url,'promptVersion':PROMPT_VERSION}}

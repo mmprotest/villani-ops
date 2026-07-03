@@ -23,7 +23,7 @@ def test_loader_success_and_missing():
         with pytest.raises(FileNotFoundError): load_debug_run(d)
 def test_evidence_extractor():
     r=load_debug_run(FIX/'verifier_success')
-    s,f,_,m,mut,val=extract_evidence(r)
+    s,f,_,m,mut,val,*_=extract_evidence(r)
     assert is_validation_command('curl -sk https://x')
     assert any('PASS' in e.text for e in s)
     assert any('syntax error' in e.text for e in f)
