@@ -44,6 +44,14 @@ Earlier failures do not imply failure if later validation shows recovery.
 A zero exit code does not prove success if output contains failure text.
 A non-zero exit code does not prove final failure if a later end-to-end validation resolves the issue.
 Visible validation passing is strong evidence but not proof.
+You must distinguish between evidence that validates the actual deliverable and evidence that only validates an exploratory experiment.
+Strong evidence validates the actual file, output, service, endpoint, command, function, or behavior required by the objective.
+Weak evidence includes inline scripts that define local implementations, generic PASS strings, exploratory benchmarks, setup checks, or agent claims that are not tied to the final deliverable.
+For code tasks, a test is strongest when it imports/runs the final changed file or project entrypoint.
+For file-output tasks, a successful Write to the required output file is meaningful deliverable evidence, especially if the content structure matches the objective.
+For service tasks, endpoint checks against the required URL/service with expected content are strong evidence.
+Do not treat generic PASS output as sufficient if it does not exercise the final deliverable.
+If deterministic validation counters conflict with your analysis of deliverable linkage, explain the conflict and make the binary judgement from the stronger evidence.
 Return result 1 only when the evidence supports that the material requirements were satisfied.
 Return result 0 when active blocking evidence remains, material requirements are unsatisfied, or evidence is too weak to safely accept.
 Return only valid JSON.
@@ -100,12 +108,13 @@ def _parse(s):
     obj.setdefault('confidence',0.0)
     for k in ['reason','requirementResults','successEvidence','failureEvidence','recoveredFailures','missingEvidence','riskFlags','toolsUsed']: obj.setdefault(k, [] if k!='reason' else '')
     obj.setdefault('uncertainty', {'level':'medium','reasons':[]})
+    obj.setdefault('deliverableAssessment', {'requiredDeliverables':[],'validatedDeliverables':[],'missingDeliverables':[],'weakValidationReasons':[]})
     for r in obj.get('requirementResults') or []:
         if r.get('status') not in {'satisfied','unsatisfied'}: raise VerifierSchemaError('invalid requirement status')
     return obj
 def _schema_text():
     return """Final verdict schema (return exactly this shape):
-{ "type": "final_verdict", "result": 1, "verdict": "success", "confidence": 0.84, "recommendedAction": "accept", "reason": "short explanation grounded in evidence", "requirementResults": [{"id":"string","requirement":"string","status":"satisfied | unsatisfied","evidence":["string"],"risks":["string"]}], "successEvidence": ["string"], "failureEvidence": ["string"], "recoveredFailures": ["string"], "missingEvidence": ["string"], "riskFlags": ["string"], "uncertainty": {"level": "low | medium | high", "reasons": ["string"]}, "toolsUsed": [{"tool":"string","reason":"string"}] }
+{ "type": "final_verdict", "result": 1, "verdict": "success", "confidence": 0.84, "recommendedAction": "accept", "reason": "short explanation grounded in evidence", "deliverableAssessment": {"requiredDeliverables":["string"],"validatedDeliverables":["string"],"missingDeliverables":["string"],"weakValidationReasons":["string"]}, "requirementResults": [{"id":"string","requirement":"string","status":"satisfied | unsatisfied","evidence":["string"],"risks":["string"]}], "successEvidence": ["string"], "failureEvidence": ["string"], "recoveredFailures": ["string"], "missingEvidence": ["string"], "riskFlags": ["string"], "uncertainty": {"level": "low | medium | high", "reasons": ["string"]}, "toolsUsed": [{"tool":"string","reason":"string"}] }
 Rules: result must be 1 or 0. verdict must be success when result is 1. verdict must be failure when result is 0. requirementResults.status must be satisfied or unsatisfied only. Do not return unclear. Do not return unknown. Do not return null result. If evidence is incomplete, make the best conservative prediction and explain uncertainty. False accepts are worse than false rejects.
 Tool-call schema:
 { "type": "tool_call", "tool": "search_commands", "args": {"query": "PASS", "limit": 10} }
@@ -118,20 +127,53 @@ def _repair(cfg,bad,timeout, trace=None):
     if trace is not None:
         trace.append_jsonl('llm_messages.jsonl',{'index':getattr(trace,'msg_count',0),'role':'assistant','name':None,'content':content,'createdAt':__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat(),'chars':len(str(content))}); trace.msg_count=getattr(trace,'msg_count',0)+1
     return _parse(content)
-def calibrate(det, verdict, trace=None):
+def _adjudication_input(det, verdict, contradictions):
+    cats=det.get('evidenceByCategory',{})
+    return {'originalLlmVerdict':{k:verdict.get(k) for k in ['result','verdict','confidence','reason','recommendedAction','deliverableAssessment']},'deterministicContradictions':contradictions,'activeFailures':cats.get('activeFailures',[]),'recoveredFailures':cats.get('recoveredFailures',[]),'deliverableEvidence':cats.get('deliverableEvidence',[]),'finalEndToEndValidation':cats.get('finalEndToEndValidation',[]),'testValidation':cats.get('testValidation',[]),'serviceValidation':cats.get('serviceValidation',[]),'toolObservations':det.get('toolsUsed',[]),'instruction':'Decide whether to keep or change the binary result. False accepts are worse than false rejects.'}
+def run_verifier_adjudication(cfg, adjudication_input, timeout, trace=None):
+    schema='Return JSON: {"type":"adjudication_verdict","result":1,"verdict":"success","confidence":0.84,"recommendedAction":"accept","reason":"...","changedOriginalResult":false,"riskFlags":["..."]}'
+    msgs=[{'role':'system','content':SYSTEM+'\nYou are adjudicating a conflict between an LLM verifier verdict and deterministic evidence. Return only JSON.'},{'role':'user','content':schema+'\nAdjudication input:\n'+json.dumps(adjudication_input,default=str)}]
+    if trace is not None:
+        for m in msgs: trace.append_jsonl('llm_messages.jsonl',{'index':getattr(trace,'msg_count',0),'role':m['role'],'name':None,'content':m['content'],'createdAt':__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat(),'chars':len(str(m['content']))}); trace.msg_count=getattr(trace,'msg_count',0)+1
+    raw=_chat(cfg,msgs,timeout,trace=trace)
+    obj=json.loads(raw)
+    if obj.get('type')!='adjudication_verdict' or obj.get('result') not in (0,1): raise VerifierSchemaError('invalid adjudication schema')
+    obj['verdict']='success' if obj['result']==1 else 'failure'
+    return obj
+def calibrate(det, verdict, trace=None, cfg=None, timeout=30):
     raw={'result':verdict.get('result'),'verdict':verdict['verdict'],'confidence':float(verdict.get('confidence',0)),'reason':verdict.get('reason','')}; changed=False
-    validations=det['evidenceByCategory']['finalEndToEndValidation']+det['evidenceByCategory']['testValidation']+det['evidenceByCategory']['serviceValidation']
-    active=det['evidenceByCategory']['activeFailures']
-    reqs=verdict.get('requirementResults',[])
-    if verdict['result']==1:
-        if not validations or any(r.get('status')=='unsatisfied' for r in reqs) or active:
-            verdict.update({'result':0,'verdict':'failure','recommendedAction':'run_more_tests','confidence':min(float(verdict.get('confidence',0)) or .6,.65)}); changed=True
-        verdict['confidence']=min(float(verdict.get('confidence',0)),.9)
-    elif verdict['result']==0 and det['evidenceByCategory']['finalEndToEndValidation'] and not active and not any(r.get('status')=='unsatisfied' for r in det.get('requirementResults',[])):
-        verdict.update({'result':1,'verdict':'success','recommendedAction':'accept','confidence':min(max(float(verdict.get('confidence',0)),.75),.9)}); changed=True
-    if changed: verdict.setdefault('riskFlags',[]).append('Calibration changed the LLM result based on deterministic evidence checks.')
+    cats=det.get('evidenceByCategory',{})
+    validations=cats.get('finalEndToEndValidation',[])+cats.get('testValidation',[])+cats.get('serviceValidation',[])
+    strong=[v for v in validations if isinstance(v,dict) and v.get('validationStrength')=='strong']
+    active=cats.get('activeFailures',[])
+    verdict['verdict']='success' if verdict['result']==1 else 'failure'
+    rules=['schema_consistency']
+    contradictions=[]
+    if verdict['result']==1 and active: contradictions.append('LLM success but deterministic active failures remain.')
+    if verdict['result']==0 and (strong or cats.get('finalEndToEndValidation')): contradictions.append('LLM failure but deterministic validation evidence looks strong.')
+    da=det.get('deliverableAssessment') or {}
+    if verdict['result']==1 and da.get('requiredDeliverables') and not (cats.get('deliverableEvidence') or strong): contradictions.append('LLM success but deterministic deliverable evidence is missing.')
+    if verdict['result']==0 and cats.get('deliverableEvidence') and strong: contradictions.append('LLM failure but deliverable evidence and strong validation exist.')
+    adj_in=None; adj=None
+    if contradictions:
+        rules.append('evidence_arbitration_adjudication')
+        adj_in=_adjudication_input(det,verdict,contradictions)
+        if cfg is not None:
+            try:
+                adj=run_verifier_adjudication(cfg,adj_in,timeout,trace=trace)
+                if adj.get('result') != verdict.get('result'):
+                    old=raw.copy()
+                    verdict.update({'result':adj['result'],'verdict':adj['verdict'],'confidence':adj.get('confidence',verdict.get('confidence')),'recommendedAction':adj.get('recommendedAction',verdict.get('recommendedAction')),'reason':adj.get('reason',verdict.get('reason'))})
+                    changed=True; raw=old
+                verdict.setdefault('riskFlags',[]).extend(adj.get('riskFlags') or ['Deterministic disagreement adjudicated.'])
+            except Exception as e:
+                verdict.setdefault('riskFlags',[]).append(f'Adjudication failed; kept original LLM verdict: {e}')
+        else:
+            verdict.setdefault('riskFlags',[]).append('Deterministic disagreement noted; kept original LLM verdict without hard calibration flip.')
+    if verdict['result']==1 and float(verdict.get('confidence',0))>.9:
+        verdict['confidence']=.9; verdict.setdefault('riskFlags',[]).append('Success confidence capped at 0.9.'); rules.append('success_confidence_cap')
     verdict.setdefault('uncertainty', {'level':'medium','reasons':[]})
-    cal={'schemaVersion':'villani-ops-verifier-calibration-v1','before':raw,'after':{'result':verdict.get('result'),'verdict':verdict.get('verdict'),'confidence':verdict.get('confidence')},'changes':([] if not changed else [{'field':'result/verdict/confidence','from':raw,'to':{'result':verdict.get('result'),'verdict':verdict.get('verdict'),'confidence':verdict.get('confidence')},'reason':'Calibration adjusted verdict using deterministic evidence checks.'}]),'rulesApplied':(['deterministic_evidence_consistency'] if changed else [])}
+    cal={'schemaVersion':'villani-ops-verifier-calibration-v1','before':raw,'after':{'result':verdict.get('result'),'verdict':verdict.get('verdict'),'confidence':verdict.get('confidence'),'reason':verdict.get('reason')},'changes':([] if not changed else [{'field':'result/verdict/confidence/reason','from':raw,'to':{'result':verdict.get('result'),'verdict':verdict.get('verdict'),'confidence':verdict.get('confidence'),'reason':verdict.get('reason')},'reason':'Adjudication changed the LLM result based on hard contradictory evidence.'}]),'rulesApplied':rules,'adjudicationInputSummary':adj_in,'adjudicationResult':adj}
     if trace is not None: trace.write_json('calibration.json',cal)
     verdict['_calibration']=cal
     verdict['llmRawVerdict']=raw; return verdict
@@ -173,8 +215,8 @@ def llm_result(run, det, workspace='.villani-ops', backend=None, base_url=None, 
         if trace is not None:
             trace.append_jsonl('llm_messages.jsonl',{'index':trace.msg_count,'role':'assistant','name':None,'content':content,'createdAt':__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat(),'chars':len(str(content))}); trace.msg_count+=1
             trace.write_json('llm_final_verdict_raw.json',{'rawText':content,'parsed':obj})
-            parsed={'schemaVersion':'villani-ops-verifier-llm-verdict-v1',**{k:obj.get(k) for k in ['result','verdict','confidence','recommendedAction','reason','requirementResults','successEvidence','failureEvidence','recoveredFailures','missingEvidence','riskFlags','uncertainty','toolsUsed']}}
+            parsed={'schemaVersion':'villani-ops-verifier-llm-verdict-v1',**{k:obj.get(k) for k in ['result','verdict','confidence','recommendedAction','reason','deliverableAssessment','requirementResults','successEvidence','failureEvidence','recoveredFailures','missingEvidence','riskFlags','uncertainty','toolsUsed']}}
             trace.write_json('llm_final_verdict_parsed.json',parsed)
-        obj=calibrate(det,obj,trace=trace); break
-    det.update({'result':obj['result'],'verdict':obj['verdict'],'confidence':obj['confidence'],'recommendedAction':obj['recommendedAction'],'reason':obj['reason'],'requirementResults':obj.get('requirementResults',det['requirementResults']),'successEvidence':obj.get('successEvidence',det['successEvidence']),'failureEvidence':obj.get('failureEvidence',det['failureEvidence']),'recoveredFailures':obj.get('recoveredFailures',det['recoveredFailures']),'missingEvidence':obj.get('missingEvidence',det['missingEvidence']),'riskFlags':obj.get('riskFlags',det['riskFlags']),'toolsUsed':used+obj.get('toolsUsed',[]),'llmRawVerdict':obj.get('llmRawVerdict',{}),'verifier':{'mode':'llm_tool_loop','backend':cfg['backend'],'model':cfg['model'],'baseUrl':cfg['baseUrl'],'promptVersion':PROMPT_VERSION}})
+        obj=calibrate(det,obj,trace=trace,cfg=cfg,timeout=max(1,deadline-time.monotonic())); break
+    det.update({'result':obj['result'],'verdict':obj['verdict'],'confidence':obj['confidence'],'recommendedAction':obj['recommendedAction'],'reason':obj['reason'],'deliverableAssessment':obj.get('deliverableAssessment',det.get('deliverableAssessment')),'requirementResults':obj.get('requirementResults',det['requirementResults']),'successEvidence':obj.get('successEvidence',det['successEvidence']),'failureEvidence':obj.get('failureEvidence',det['failureEvidence']),'recoveredFailures':obj.get('recoveredFailures',det['recoveredFailures']),'missingEvidence':obj.get('missingEvidence',det['missingEvidence']),'riskFlags':obj.get('riskFlags',det['riskFlags']),'toolsUsed':used+obj.get('toolsUsed',[]),'llmRawVerdict':obj.get('llmRawVerdict',{}),'calibration':obj.get('_calibration',{}),'verifier':{'mode':'llm_tool_loop','backend':cfg['backend'],'model':cfg['model'],'baseUrl':cfg['baseUrl'],'promptVersion':PROMPT_VERSION}})
     return det

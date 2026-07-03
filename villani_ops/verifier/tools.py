@@ -54,8 +54,12 @@ class VerifierTools:
         for p in sorted(self.debug.iterdir()):
             if p.is_file() and not p.name.startswith('.') and not _is_binary(p) and not _secret(p.name): files.append(p.name)
         return {'files':files}
-    def read_debug_file(self,path,startLine=1,maxLines=None,**args): return self._read_lines(_safe(self.debug,path,True),startLine,maxLines)
-    def search_debug_file(self,path,query,limit=10,**args): return self._search_file(_safe(self.debug,path,True),query,limit)
+    def _path_arg(self,path=None,filename=None,**args):
+        p=path or filename
+        if not p: raise VerifierToolError('path or filename is required')
+        return p
+    def read_debug_file(self,path=None,filename=None,startLine=1,maxLines=None,**args): return self._read_lines(_safe(self.debug,self._path_arg(path,filename),True),startLine,maxLines)
+    def search_debug_file(self,path=None,filename=None,query='',limit=10,**args): return self._search_file(_safe(self.debug,self._path_arg(path,filename),True),query,limit)
     def _search_file(self,p,query,limit):
         q=str(query).lower(); m=[]
         for i,line in enumerate(p.read_text(errors='replace').splitlines(),1):
@@ -103,9 +107,9 @@ class VerifierTools:
             if p.is_file() and not(parts&IGNORE) and fnmatch.fnmatch(rel,glob) and not _secret(rel) and not _is_binary(p): files.append(rel)
             if len(files)>=int(limit): break
         return {'available':True,'files':files}
-    def read_repo_file(self,path,startLine=1,maxLines=None,**args):
+    def read_repo_file(self,path=None,filename=None,startLine=1,maxLines=None,**args):
         if not self.repo or not self.repo.is_dir(): return self._repo_unavail()
-        return self._read_lines(_safe(self.repo,path,True),startLine,maxLines)
+        return self._read_lines(_safe(self.repo,self._path_arg(path,filename),True),startLine,maxLines)
     def search_repo(self,query,glob='**/*',limit=20,**args):
         if not self.repo or not self.repo.is_dir(): return self._repo_unavail()
         out=[]
@@ -121,8 +125,8 @@ class VerifierTools:
             p=self.debug/name
             if p.exists(): out += [{**m,'source':name} for m in self._search_file(p,query,max(1,int(limit)-len(out)))['matches']]
         return {'matches':out[:int(limit)]}
-    def read_diff(self,path,startLine=1,maxLines=None,**args):
-        rel=str(path); closest=[]
+    def read_diff(self,path=None,filename=None,startLine=1,maxLines=None,**args):
+        rel=str(self._path_arg(path,filename)); closest=[]
         for name in DIFFS:
             p=self.debug/name
             if p.exists() and rel in p.read_text(errors='replace'):

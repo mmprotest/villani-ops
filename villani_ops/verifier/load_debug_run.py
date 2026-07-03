@@ -7,7 +7,7 @@ def _read_json(path:Path, missing:list[str]):
     if not path.exists(): missing.append(path.name); return None
     return json.loads(path.read_text(encoding='utf-8'))
 def _cmd(r,i): return CommandRecord(ts=r.get('ts'),toolCallId=r.get('tool_call_id'),command=r.get('command'),cwd=r.get('cwd'),exitCode=r.get('exit_code'),stdout=r.get('stdout'),stderr=r.get('stderr'),truncated=bool(r.get('truncated')),event=r.get('event'),raw=r,index=i)
-def _tool(r,i): return ToolCallRecord(toolCallId=r.get('tool_call_id'),turnIndex=r.get('turn_index'),toolName=r.get('tool_name'),toolCategory=r.get('tool_category'),startedAt=r.get('started_at'),endedAt=r.get('ended_at'),durationMs=r.get('duration_ms'),status=r.get('status'),args=r.get('args') or r.get('normalized_args_summary'),resultSummary=r.get('result_summary'),error=r.get('error'),raw=r,index=i)
+def _tool(r,i): return ToolCallRecord(toolCallId=r.get('tool_call_id') or r.get('toolCallId'),turnIndex=r.get('turn_index') or r.get('turnIndex'),toolName=r.get('tool_name') or r.get('toolName') or r.get('name'),toolCategory=r.get('tool_category') or r.get('toolCategory'),startedAt=r.get('started_at') or r.get('startedAt'),endedAt=r.get('ended_at') or r.get('endedAt'),durationMs=r.get('duration_ms') or r.get('durationMs'),status=r.get('status'),args=r.get('args') or r.get('arguments') or r.get('normalized_args_summary'),resultSummary=r.get('result_summary') or r.get('resultSummary'),error=r.get('error'),raw=r,index=i)
 def load_debug_run(debug_dir:str|Path)->DebugRun:
     d=Path(debug_dir)
     if not d.exists() or not d.is_dir(): raise FileNotFoundError(f'debug directory does not exist: {d}')

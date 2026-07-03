@@ -122,7 +122,7 @@ def timeline_rows(run, packet):
     rows=[]
     for ev in build_timeline(run):
         cat=cat_by_order.get(ev.order)
-        rows.append({'order':ev.order,'kind':ev.kind,'source':ev.source+'.jsonl' if not ev.source.endswith('.jsonl') else ev.source,'commandIndex':ev.command_index,'toolCallIndex':ev.tool_call_index,'toolCallId':ev.tool_call_id,'turnIndex':ev.turn_index,'timestamp':ev.timestamp,'status':ev.status,'summary':ev.text[:500],'isValidationCandidate':cat in {'finalEndToEndValidation','testValidation','serviceValidation'},'isFailure':cat=='activeFailures','isRecovered':cat=='recoveredFailures','category':cat})
+        rows.append({'order':ev.order,'kind':ev.kind,'source':ev.source+'.jsonl' if not ev.source.endswith('.jsonl') else ev.source,'commandIndex':ev.command_index,'toolCallIndex':ev.tool_call_index,'toolCallId':ev.tool_call_id,'turnIndex':ev.turn_index,'timestamp':ev.timestamp,'status':ev.status,'summary':ev.text[:500],'isValidationCandidate':cat in {'finalEndToEndValidation','testValidation','serviceValidation','deliverableEvidence'},'isFailure':cat=='activeFailures','isRecovered':cat=='recoveredFailures','category':cat})
     return rows
 
 def failure_classification(packet):
@@ -146,17 +146,18 @@ def validation_windows(run, selected):
         score=0; sig=[]
         for c in cluster:
             sc,s=_signal_score(c); score+=sc; sig+=s
-        if score>0: rows.append({'startOrder':min(getattr(c,'_timeline_order',c.index) for c in cluster),'endOrder':max(getattr(c,'_timeline_order',c.index) for c in cluster),'score':score,'reason':'validation signal cluster','signals':sig[:20]})
+        if score>0: rows.append({'startOrder':min(getattr(c,'_timeline_order',c.index) for c in cluster),'endOrder':max(getattr(c,'_timeline_order',c.index) for c in cluster),'score':score,'reason':'validation signal cluster','signals':sig[:20],'validationStrength':'strong' if score>=5 else 'medium'})
     return {'schemaVersion':'villani-ops-verifier-validation-windows-v1','selected':selected,'candidates':rows}
 
 def transcript(result, packet=None, calibration=None, trace_dir=None):
     v=result.get('verifier') or {}; lines=['# Villani Ops Verifier Trace','','## Summary',f"- Result: {result.get('result')}",f"- Verdict: {result.get('verdict')}",f"- Confidence: {result.get('confidence')}",f"- Recommended action: {result.get('recommendedAction')}",f"- Debug dir: {result.get('debugDir')}",f"- Backend: {v.get('backend')}",f"- Model: {v.get('model')}",f"- Trace dir: {trace_dir or result.get('traceDir')}",'','## Objective','',str((packet or {}).get('objective') or ''),'','## Extracted Requirements']
     for r in result.get('requirementResults') or []: lines.append(f"- {r.get('id')}: {r.get('status')} — {r.get('requirement')}")
+    lines += ['','## Deliverable Assessment','',json.dumps(result.get('deliverableAssessment') or (packet or {}).get('deliverableAssessment') or {},indent=2,default=str)]
     lines += ['','## Selected Validation Window','',json.dumps((result.get('deterministicChecks') or {}).get('finalValidationWindow'),indent=2,default=str),'','## Top Success Evidence']
     for e in (result.get('successEvidence') or [])[:10]: lines.append(f"- {e.get('text') if isinstance(e,dict) else e}")
     lines += ['','## Failure Classification','','### Active Failures']
     for e in result.get('failureEvidence') or []: lines.append(f"- {e.get('text') if isinstance(e,dict) else e}")
     lines += ['','### Recovered Failures']
     for e in result.get('recoveredFailures') or []: lines.append(f"- {e.get('text') if isinstance(e,dict) else e}")
-    lines += ['','### Post-Validation Risks','','See failure_classification.json.','','## LLM Tool Loop','','See llm_messages.jsonl, tool_calls.jsonl, and tool_observations.jsonl.','','### Final LLM Verdict','',json.dumps(result.get('llmRawVerdict'),indent=2,default=str),'','## Calibration','',json.dumps(calibration or {'changes':[],'rulesApplied':[]},indent=2,default=str),'','## Final Result','',json.dumps(result,indent=2,default=str)]
+    lines += ['','### Post-Validation Risks','','See failure_classification.json.','','## LLM Tool Loop','','See llm_messages.jsonl, tool_calls.jsonl, and tool_observations.jsonl.','','### Final LLM Verdict','',json.dumps(result.get('llmRawVerdict'),indent=2,default=str),'','## Calibration / Adjudication','',json.dumps(calibration or result.get('calibration') or {'changes':[],'rulesApplied':[]},indent=2,default=str),'','## Final Result','',json.dumps(result,indent=2,default=str)]
     return '\n'.join(lines)+'\n'
