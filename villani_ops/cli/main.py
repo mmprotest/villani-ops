@@ -125,6 +125,45 @@ def policy_create_default(name: str=typer.Option('balanced'), workspace: str='.v
     s=storage(workspace); s.init_workspace(); backends=s.load_backends(); attempts=[AttemptPlan(backend=b.name, max_attempts=1, timeout_seconds=DEFAULT_TIMEOUT_SECONDS, runner='shell') for b in backends.values()]
     pol=Policy(name=name, attempts=attempts); path=s.workspace/'policies'/f'{name}.yaml'; pol.save(path); console.print(f'Created policy at {path}')
 
+@app.command()
+def verifier(
+    debug_dir: str = typer.Option(..., '--debug-dir', help='Villani Code debug artifact directory.'),
+    repo_dir: str | None = typer.Option(None, '--repo-dir', help='Optional repository directory for extra evidence.'),
+    json_output: bool = typer.Option(False, '--json', help='Print verifier result JSON only.'),
+    out: str | None = typer.Option(None, '--out', help='Write full verifier result JSON to this path.'),
+    no_llm: bool = typer.Option(False, '--no-llm', help='Disable optional LLM verifier.'),
+    base_url: str | None = typer.Option(None, '--base-url', help='OpenAI-compatible base URL.'),
+    model: str | None = typer.Option(None, '--model', help='Verifier model name.'),
+):
+    from villani_ops.verifier import load_debug_run, deterministic_result, llm_result
+    from villani_ops.verifier.render import render, exit_code
+    try:
+        run = load_debug_run(debug_dir)
+        resolved_repo = None
+        candidate = Path(repo_dir) if repo_dir else (Path(run.repoFromMetadata) if run.repoFromMetadata else None)
+        if candidate and candidate.exists() and candidate.is_dir():
+            resolved_repo = str(candidate)
+        result = deterministic_result(run, repo_dir=resolved_repo, mode='deterministic' if no_llm else 'hybrid', model=model, base_url=base_url)
+        if not no_llm:
+            result = llm_result(run, result, base_url=base_url, model=model)
+        output_path = Path(out) if out else (Path(debug_dir) / 'verification.json' if not json_output else None)
+        if output_path:
+            output_path.write_text(json.dumps(result, indent=2), encoding='utf-8')
+        if json_output:
+            typer.echo(json.dumps(result))
+        else:
+            console.print(render(result), soft_wrap=True)
+        raise typer.Exit(exit_code(result.get('verdict')))
+    except typer.Exit:
+        raise
+    except Exception as e:
+        result={'schemaVersion':'villani-ops-verifier-result-v1','verdict':'error','confidence':1.0,'recommendedAction':'inspect_manually','reason':str(e),'requirementResults':[],'successEvidence':[],'failureEvidence':[],'recoveredFailures':[],'missingEvidence':[],'riskFlags':[],'artifactsUsed':{},'deterministicChecks':{},'debugDir':debug_dir,'repoDir':repo_dir,'createdAt':'','verifier':{'mode':'deterministic'}}
+        if json_output:
+            typer.echo(json.dumps(result))
+        else:
+            console.print(f'Verifier error: {e}')
+        raise typer.Exit(3)
+
 @app.command(context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
 def run(ctx: typer.Context, repo: str|None=None, task: str|None=typer.Option(None,'--task'), task_id: str|None=None, success_criteria: str|None=None, mode: str=typer.Option('performance', '--mode', help='Execution mode: performance, cheap, balanced, or quality'), runner: str=typer.Option('villani-code', '--runner'), candidate_attempts: int=typer.Option(3, '--candidate-attempts', min=1, max=8), timeout_seconds: int|None=typer.Option(None, '--timeout-seconds', help=f'Maximum run timeout in seconds (default: {DEFAULT_TIMEOUT_SECONDS}).'), classify: bool=typer.Option(True, '--classify/--no-classify'), non_interactive: bool=False, quiet: bool=typer.Option(False, '--quiet'), verbose: bool=typer.Option(False, '--verbose'), orchestrator: str=typer.Option('adaptive', '--orchestrator', help='Orchestrator architecture: adaptive (default; agentic single-task constrained), agentic (decomposition-capable), or graph (explicit legacy). adaptive: Agentic orchestration constrained to the single-task execution path. The orchestrator investigates, plans, attempts, validates, reviews, observes, and retries within the candidate-attempt budget, but cannot decompose the task.'), ui: bool=typer.Option(False, '--ui', help='Start local run viewer'), no_ui: bool=typer.Option(False, '--no-ui', help='Disable local run viewer'), ui_port: int=typer.Option(8765, '--ui-port'), open_ui: bool=typer.Option(False, '--open-ui'), tournament_budget_policy: str=typer.Option('off', '--tournament-budget-policy', help='Tournament budget policy: off, guarded, or planned'), workspace: str='.villani-ops'):
     forbidden = {

@@ -1,0 +1,2 @@
+{"tool_call_id":"t1","turn_index":1,"tool_name":"shell","status":"failed","error":"command refused: rm -rf blocked"}
+{"tool_call_id":"t2","turn_index":2,"tool_name":"apply_patch","status":"completed","result_summary":"ok"}

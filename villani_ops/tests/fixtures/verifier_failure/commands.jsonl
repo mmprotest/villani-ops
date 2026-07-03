@@ -1,0 +1,1 @@
+{"ts":"1","command":"curl -sk https://localhost:8443/index.html","cwd":"/","exit_code":1,"stdout":"FAIL: Main branch wrong content"}
