@@ -131,9 +131,15 @@ def verifier(
     repo_dir: str | None = typer.Option(None, '--repo-dir', help='Optional repository directory for extra evidence.'),
     json_output: bool = typer.Option(False, '--json', help='Print verifier result JSON only.'),
     out: str | None = typer.Option(None, '--out', help='Write full verifier result JSON to this path.'),
-    no_llm: bool = typer.Option(False, '--no-llm', help='Disable optional LLM verifier.'),
+    no_llm: bool = typer.Option(False, '--no-llm', help='Disable mandatory LLM verifier for debugging only.'),
     base_url: str | None = typer.Option(None, '--base-url', help='OpenAI-compatible base URL.'),
     model: str | None = typer.Option(None, '--model', help='Verifier model name.'),
+    workspace: str = typer.Option('.villani-ops', '--workspace'),
+    backend: str | None = typer.Option(None, '--backend'),
+    verifier_timeout_seconds: int = typer.Option(180, '--verifier-timeout-seconds'),
+    max_verifier_tool_calls: int = typer.Option(12, '--max-verifier-tool-calls'),
+    max_tool_result_chars: int = typer.Option(12000, '--max-tool-result-chars'),
+    max_read_lines: int = typer.Option(160, '--max-read-lines'),
 ):
     from villani_ops.verifier import load_debug_run, deterministic_result, llm_result
     from villani_ops.verifier.render import render, exit_code
@@ -143,9 +149,9 @@ def verifier(
         candidate = Path(repo_dir) if repo_dir else (Path(run.repoFromMetadata) if run.repoFromMetadata else None)
         if candidate and candidate.exists() and candidate.is_dir():
             resolved_repo = str(candidate)
-        result = deterministic_result(run, repo_dir=resolved_repo, mode='deterministic' if no_llm else 'hybrid', model=model, base_url=base_url)
+        result = deterministic_result(run, repo_dir=resolved_repo, mode='deterministic' if no_llm else 'llm_tool_loop', model=model, base_url=base_url)
         if not no_llm:
-            result = llm_result(run, result, base_url=base_url, model=model)
+            result = llm_result(run, result, workspace=workspace, backend=backend, base_url=base_url, model=model, timeout_seconds=verifier_timeout_seconds, max_tool_calls=max_verifier_tool_calls, max_tool_result_chars=max_tool_result_chars, max_read_lines=max_read_lines)
         output_path = Path(out) if out else (Path(debug_dir) / 'verification.json' if not json_output else None)
         if output_path:
             output_path.write_text(json.dumps(result, indent=2), encoding='utf-8')
@@ -157,7 +163,7 @@ def verifier(
     except typer.Exit:
         raise
     except Exception as e:
-        result={'schemaVersion':'villani-ops-verifier-result-v1','verdict':'error','confidence':1.0,'recommendedAction':'inspect_manually','reason':str(e),'requirementResults':[],'successEvidence':[],'failureEvidence':[],'recoveredFailures':[],'missingEvidence':[],'riskFlags':[],'artifactsUsed':{},'deterministicChecks':{},'debugDir':debug_dir,'repoDir':repo_dir,'createdAt':'','verifier':{'mode':'deterministic'}}
+        result={'schemaVersion':'villani-ops-verifier-result-v2','verdict':'error','confidence':1.0,'recommendedAction':'inspect_manually','reason':str(e),'requirementResults':[],'successEvidence':[],'failureEvidence':[],'recoveredFailures':[],'missingEvidence':[],'riskFlags':[],'evidenceByCategory':{},'toolsUsed':[],'llmRawVerdict':{},'artifactsUsed':{},'deterministicChecks':{},'debugDir':debug_dir,'repoDir':repo_dir,'createdAt':'','verifier':{'mode':'deterministic' if no_llm else 'llm_tool_loop'}}
         if json_output:
             typer.echo(json.dumps(result))
         else:

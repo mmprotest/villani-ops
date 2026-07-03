@@ -1,0 +1,46 @@
+from __future__ import annotations
+import json, httpx, pytest
+from pathlib import Path
+from villani_ops.core.backend import Backend
+from villani_ops.storage.files import FileStorage
+from villani_ops.verifier.load_debug_run import load_debug_run
+from villani_ops.verifier.deterministic import deterministic_result
+from villani_ops.verifier.llm import llm_result, select_verifier_backend
+from villani_ops.verifier.tools import VerifierTools
+from villani_ops.verifier.errors import VerifierToolError
+
+FIX=Path(__file__).parent/'fixtures'/'verifier_success'
+
+def test_backend_selection_prefers_capability_and_localhost_dummy(tmp_path):
+    s=FileStorage(tmp_path); s.init_workspace()
+    s.save_backends({
+        'weak': Backend(name='weak',provider='local',base_url='http://127.0.0.1:1234/v1',model='a',roles=['review'],capability_score=1,output_cost_per_million=0),
+        'strong': Backend(name='strong',provider='local',base_url='http://127.0.0.1:1234/v1',model='b',roles=['coding'],capability_score=9,output_cost_per_million=99),
+    })
+    cfg=select_verifier_backend(str(tmp_path))
+    assert cfg['backend']=='strong' and cfg['apiKey']=='dummy'
+
+def test_read_debug_file_blocks_unsafe_paths():
+    tools=VerifierTools(load_debug_run(FIX))
+    with pytest.raises(VerifierToolError): tools.read_debug_file('/etc/passwd')
+    with pytest.raises(VerifierToolError): tools.read_debug_file('../session_meta.json')
+
+def test_tool_loop_calls_search_commands(monkeypatch, tmp_path):
+    run=load_debug_run(FIX); det=deterministic_result(run, mode='llm_tool_loop')
+    s=FileStorage(tmp_path); s.init_workspace(); s.save_backends({'b':Backend(name='b',provider='local',base_url='http://127.0.0.1:1234/v1',model='m',roles=['review'],capability_score=1)})
+    calls=[]
+    class Resp:
+        def raise_for_status(self): pass
+        def json(self):
+            if not calls:
+                calls.append('first')
+                return {'choices':[{'message':{'content':json.dumps({'type':'tool_call','tool':'search_commands','args':{'query':'PASS','limit':2}})}}]}
+            assert 'Tool result for search_commands' in self.payload['messages'][-1]['content']
+            return {'choices':[{'message':{'content':json.dumps({'type':'final_verdict','verdict':'success','confidence':0.95,'recommendedAction':'accept','reason':'PASS evidence found','requirementResults':[],'successEvidence':['PASS evidence'],'failureEvidence':[],'recoveredFailures':[],'missingEvidence':[],'riskFlags':[],'toolsUsed':[]})}}]}
+    def fake_post(*args,**kwargs):
+        r=Resp(); r.payload=kwargs['json']; return r
+    monkeypatch.setattr(httpx,'post',fake_post)
+    res=llm_result(run,det,workspace=str(tmp_path))
+    assert res['toolsUsed'][0]['tool']=='search_commands'
+    assert res['llmRawVerdict']['verdict']=='success'
+    assert res['confidence']==0.9
