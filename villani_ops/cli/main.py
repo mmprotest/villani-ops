@@ -140,18 +140,43 @@ def verifier(
     max_verifier_tool_calls: int = typer.Option(12, '--max-verifier-tool-calls'),
     max_tool_result_chars: int = typer.Option(12000, '--max-tool-result-chars'),
     max_read_lines: int = typer.Option(160, '--max-read-lines'),
+    trace: bool = typer.Option(True, '--trace/--no-trace', help='Write verifier trace artifacts.'),
+    trace_dir: str | None = typer.Option(None, '--trace-dir', help='Exact trace directory for this run.'),
+    trace_level: str = typer.Option('full', '--trace-level', help='Trace level: minimal, standard, or full.'),
 ):
     from villani_ops.verifier import load_debug_run, deterministic_result, llm_result
     from villani_ops.verifier.render import render, exit_code
+    from villani_ops.verifier.deterministic import build_packet, PROMPT_VERSION
+    from villani_ops.verifier.trace import VerifierTraceWriter, source_artifacts, timeline_rows, validation_windows, failure_classification, transcript
+    workspace_path=Path(workspace)
+    tw=VerifierTraceWriter(workspace_path, Path(debug_dir), Path(trace_dir) if trace_dir else None, trace, trace_level)
+    manifest={'schemaVersion':'villani-ops-verifier-trace-manifest-v1','traceId':None,'createdAt':None,'completedAt':None,'workspace':str(workspace_path),'traceDir':None,'debugDir':debug_dir,'repoDir':repo_dir,'villaniOpsVersion':None,'command':{'argv':sys.argv,'json':json_output,'noLlm':no_llm,'backend':backend,'model':model,'baseUrl':base_url,'traceLevel':trace_level},'verifier':{'mode':'deterministic' if no_llm else 'llm_tool_loop','promptVersion':PROMPT_VERSION},'status':'running'}
     try:
+        tw.start(manifest)
+        tw.write_json('input.json',{'schemaVersion':'villani-ops-verifier-input-v1','debugDir':debug_dir,'repoDir':repo_dir,'workspace':workspace,'backendRequested':backend,'modelRequested':model,'baseUrlRequested':base_url,'maxVerifierToolCalls':max_verifier_tool_calls,'maxToolResultChars':max_tool_result_chars,'maxReadLines':max_read_lines,'verifierTimeoutSeconds':verifier_timeout_seconds,'traceLevel':trace_level})
         run = load_debug_run(debug_dir)
         resolved_repo = None
         candidate = Path(repo_dir) if repo_dir else (Path(run.repoFromMetadata) if run.repoFromMetadata else None)
         if candidate and candidate.exists() and candidate.is_dir():
             resolved_repo = str(candidate)
+        tw.write_json('source_artifacts.json', source_artifacts(Path(debug_dir), run))
+        packet=build_packet(run, resolved_repo)
+        tw.write_json('verifier_packet.json', packet)
+        tw.write_json('requirements.json', {'schemaVersion':'villani-ops-verifier-requirements-v1','objective':run.objective,'requirements':[{'id':r.get('id'),'requirement':r.get('requirement'),'source':'objective' if r.get('id') not in {'final_validation_present','no_blocking_failures'} else 'derived','statusBeforeLlm':r.get('status','unknown'),'evidenceIds':[]} for r in packet.get('requirements',[])]})
+        tw.write_json('evidence_by_category.json', {'schemaVersion':'villani-ops-verifier-evidence-v1', **packet.get('evidence',{})})
+        for row in timeline_rows(run, packet): tw.append_jsonl('timeline.jsonl', row)
+        tw.write_json('validation_windows.json', validation_windows(run, (packet.get('deterministicChecks') or {}).get('finalValidationWindow')))
+        tw.write_json('failure_classification.json', failure_classification(packet))
         result = deterministic_result(run, repo_dir=resolved_repo, mode='deterministic' if no_llm else 'llm_tool_loop', model=model, base_url=base_url)
         if not no_llm:
-            result = llm_result(run, result, workspace=workspace, backend=backend, base_url=base_url, model=model, timeout_seconds=verifier_timeout_seconds, max_tool_calls=max_verifier_tool_calls, max_tool_result_chars=max_tool_result_chars, max_read_lines=max_read_lines)
+            result = llm_result(run, result, workspace=workspace, backend=backend, base_url=base_url, model=model, timeout_seconds=verifier_timeout_seconds, max_tool_calls=max_verifier_tool_calls, max_tool_result_chars=max_tool_result_chars, max_read_lines=max_read_lines, trace=tw)
+        else:
+            tw.write_json('calibration.json', {'schemaVersion':'villani-ops-verifier-calibration-v1','before':{'result':result.get('result'),'verdict':result.get('verdict'),'confidence':result.get('confidence')},'after':{'result':result.get('result'),'verdict':result.get('verdict'),'confidence':result.get('confidence')},'changes':[],'rulesApplied':[]})
+        result['traceDir']=str(tw.trace_dir) if tw.trace_dir else None; result['traceId']=tw.trace_id; result['traceLevel']=trace_level; result['toolCallCount']=len(result.get('toolsUsed') or []); result['llmCallCount']=getattr(tw,'llm_call_count',0)
+        if not trace: result.setdefault('riskFlags',[]).append('Verifier trace was disabled; run cannot be fully audited.')
+        if trace and tw.trace_dir is None: result.setdefault('riskFlags',[]).append('Verifier trace could not be created; run cannot be fully audited.')
+        tw.write_text('verifier_transcript.md', transcript(result, packet, None, tw.trace_dir))
+        tw.finish(result)
         output_path = Path(out) if out else (Path(debug_dir) / 'verification.json' if not json_output else None)
         if output_path:
             output_path.write_text(json.dumps(result, indent=2), encoding='utf-8')
@@ -163,7 +188,14 @@ def verifier(
     except typer.Exit:
         raise
     except Exception as e:
-        result={'schemaVersion':'villani-ops-verifier-result-v3','result':None,'verdict':'error','confidence':0.0,'recommendedAction':'inspect_manually','reason':str(e),'requirementResults':[],'successEvidence':[],'failureEvidence':[],'recoveredFailures':[],'missingEvidence':[],'riskFlags':[],'uncertainty':{'level':'high','reasons':['Verifier infrastructure error.']},'evidenceByCategory':{},'toolsUsed':[],'llmRawVerdict':{},'artifactsUsed':{},'deterministicChecks':{},'debugDir':debug_dir,'repoDir':repo_dir,'createdAt':'','verifier':{'mode':'deterministic' if no_llm else 'llm_tool_loop'}}
+        try: tw.record_error('output', e)
+        except Exception: pass
+        result={'schemaVersion':'villani-ops-verifier-result-v3','result':None,'verdict':'error','confidence':0.0,'recommendedAction':'inspect_manually','reason':str(e),'requirementResults':[],'successEvidence':[],'failureEvidence':[],'recoveredFailures':[],'missingEvidence':[],'riskFlags':[],'uncertainty':{'level':'high','reasons':['Verifier infrastructure error.']},'evidenceByCategory':{},'toolsUsed':[],'llmRawVerdict':{},'artifactsUsed':{},'deterministicChecks':{},'debugDir':debug_dir,'repoDir':repo_dir,'createdAt':'','verifier':{'mode':'deterministic' if no_llm else 'llm_tool_loop','backend':backend,'model':model,'baseUrl':base_url},'traceDir':str(tw.trace_dir) if 'tw' in locals() and tw.trace_dir else None,'traceId':getattr(tw,'trace_id',None) if 'tw' in locals() else None,'traceLevel':trace_level,'toolCallCount':0,'llmCallCount':getattr(tw,'llm_call_count',0) if 'tw' in locals() else 0}
+        try:
+            if 'tw' in locals():
+                tw.write_text('verifier_transcript.md', transcript(result, None, None, tw.trace_dir))
+                tw.finish(result)
+        except Exception: pass
         if json_output:
             typer.echo(json.dumps(result))
         else:
