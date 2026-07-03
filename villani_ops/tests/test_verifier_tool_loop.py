@@ -44,3 +44,43 @@ def test_tool_loop_calls_search_commands(monkeypatch, tmp_path):
     assert res['toolsUsed'][0]['tool']=='search_commands'
     assert res['llmRawVerdict']['verdict']=='success'
     assert res['confidence']==0.9
+
+def test_read_debug_file_blocks_symlink_escape(tmp_path):
+    outside=tmp_path/'outside.txt'; outside.write_text('secret')
+    d=tmp_path/'debug'; d.mkdir(); (d/'session_meta.json').write_text('{"objective":"x"}')
+    (d/'commands.jsonl').write_text('') ; (d/'tool_calls.jsonl').write_text(''); (d/'patches.jsonl').write_text(''); (d/'model_responses.jsonl').write_text('')
+    link=d/'link.txt'
+    try:
+        link.symlink_to(outside)
+    except (OSError, NotImplementedError):
+        pytest.skip('symlink creation unavailable')
+    tools=VerifierTools(load_debug_run(d))
+    with pytest.raises(VerifierToolError): tools.read_debug_file('link.txt')
+
+def test_read_repo_file_blocks_symlink_escape(tmp_path):
+    outside=tmp_path/'outside.txt'; outside.write_text('secret')
+    repo=tmp_path/'repo'; repo.mkdir(); link=repo/'link.txt'
+    try:
+        link.symlink_to(outside)
+    except (OSError, NotImplementedError):
+        pytest.skip('symlink creation unavailable')
+    tools=VerifierTools(load_debug_run(FIX), repo_dir=repo)
+    with pytest.raises(VerifierToolError): tools.read_repo_file('link.txt')
+
+def test_llm_http_failure_is_error(monkeypatch, tmp_path):
+    run=load_debug_run(FIX); det=deterministic_result(run, mode='llm_tool_loop')
+    monkeypatch.setenv('VILLANI_OPS_VERIFIER_MODEL','m')
+    def boom(*a,**k): raise httpx.ConnectError('nope')
+    monkeypatch.setattr(httpx,'post',boom)
+    with pytest.raises(Exception) as ei: llm_result(run,det,workspace=str(tmp_path))
+    assert 'HTTP failure' in str(ei.value)
+
+def test_llm_invalid_json_after_repair_is_error(monkeypatch, tmp_path):
+    run=load_debug_run(FIX); det=deterministic_result(run, mode='llm_tool_loop')
+    s=FileStorage(tmp_path); s.init_workspace(); s.save_backends({'b':Backend(name='b',provider='local',base_url='http://127.0.0.1:1234/v1',model='m',roles=['review'],capability_score=1)})
+    class Resp:
+        def raise_for_status(self): pass
+        def json(self): return {'choices':[{'message':{'content':'not json'}}]}
+    monkeypatch.setattr(httpx,'post',lambda *a,**k: Resp())
+    with pytest.raises(Exception) as ei: llm_result(run,det,workspace=str(tmp_path))
+    assert 'invalid JSON after repair' in str(ei.value)
