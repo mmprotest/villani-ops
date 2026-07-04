@@ -50,19 +50,99 @@ def test_flow_creates_worktrees_verifies_integrates_and_writes_artifacts(tmp_pat
     repo=tmp_path/'repo'; init_repo(repo); ws=tmp_path/'ws'
     runner=FakeRunner(); ver_calls=[]
     def verifier(**kw):
-        ver_calls.append(kw); return {'result':1 if kw['repo_dir'].name=='candidate-002' else 0,'verdict':'success','confidence':.8,'recommendedAction':'accept','traceDir':str(kw['trace_dir'])}
+        ver_calls.append(kw); return {'result':1 if kw['repo_dir'].parent.name=='candidate-002' else 0,'verdict':'success','confidence':.8,'recommendedAction':'accept','traceDir':str(kw['trace_dir'])}
     cfg=VerifierParallelConfig(repo=repo,task='do it',candidates=3,parallelism=2,seed=1,workspace=ws,backend='b',keep_worktrees=True)
     orch=VerifierParallelOrchestrator(cfg, runner=runner, verifier=verifier)
     orch._backend_obj=lambda: Backend(name='b',provider='local',model='m',api_key='x')
     out=orch.run(); od=Path(out['orchestrationDir'])
     assert len(runner.calls)==3 and len(ver_calls)==3
-    assert all(c['repo_dir'].name.startswith('candidate-') for c in ver_calls)
+    assert all(c['repo_dir'].name == 'worktree' and c['repo_dir'].parent.name.startswith('candidate-') for c in ver_calls)
     assert out['winnerCandidateId']=='candidate-002'
     assert (repo/'a.txt').read_text()=='candidate-002'
     for name in ['orchestration.json','candidates.jsonl','candidate-runs.jsonl','verifier-results.jsonl','selection.json','integration.json','transcript.md']:
         assert (od/name).exists()
     assert len((od/'candidates.jsonl').read_text().splitlines())==3
 
+
+
+def test_non_git_source_uses_copied_git_baseline_and_integrates(tmp_path):
+    repo=tmp_path/'plain'; repo.mkdir(); (repo/'a.txt').write_text('original')
+    ws=tmp_path/'ws'; runner=FakeRunner()
+    def verifier(**kw):
+        assert kw['repo_dir'].name=='worktree'
+        assert (kw['repo_dir']/'.git').exists()
+        assert not (repo/'.git').exists()
+        return {'result':1,'verdict':'success','confidence':.9,'recommendedAction':'accept','traceDir':str(kw['trace_dir'])}
+    cfg=VerifierParallelConfig(repo=repo,task='do it',candidates=1,parallelism=1,seed=1,workspace=ws,backend='b',keep_worktrees=True)
+    orch=VerifierParallelOrchestrator(cfg, runner=runner, verifier=verifier)
+    orch._backend_obj=lambda: Backend(name='b',provider='local',model='m',api_key='x')
+    out=orch.run(); od=Path(out['orchestrationDir']); cdir=od/'candidates'/'candidate-001'
+    assert out['status']=='completed'
+    assert (cdir/'worktree'/'.git').exists()
+    assert (cdir/'diff.patch').exists() and 'a.txt' in (cdir/'diff.patch').read_text()
+    assert (cdir/'run').is_dir() and (cdir/'verifier').is_dir()
+    assert not (cdir/'worktrees').exists()
+    assert not (repo/'.git').exists()
+    assert (repo/'a.txt').read_text()=='candidate-001'
+    rec=json.loads((od/'integration.json').read_text())
+    assert rec['status']=='integrated' and rec['winnerCandidateId']=='candidate-001'
+
+
+def test_git_source_uses_copied_git_baseline_and_keeps_source_repo_valid(tmp_path):
+    repo=tmp_path/'repo'; init_repo(repo); ws=tmp_path/'ws'; runner=FakeRunner()
+    def verifier(**kw): return {'result':1,'verdict':'success','confidence':.9,'recommendedAction':'accept','traceDir':str(kw['trace_dir'])}
+    cfg=VerifierParallelConfig(repo=repo,task='do it',candidates=1,parallelism=1,seed=1,workspace=ws,backend='b',keep_worktrees=True)
+    orch=VerifierParallelOrchestrator(cfg, runner=runner, verifier=verifier)
+    orch._backend_obj=lambda: Backend(name='b',provider='local',model='m',api_key='x')
+    out=orch.run(); od=Path(out['orchestrationDir'])
+    assert (od/'candidates'/'candidate-001'/'worktree'/'.git').exists()
+    assert subprocess.run(['git','status','--porcelain'],cwd=repo,text=True,capture_output=True).returncode==0
+    assert (repo/'a.txt').read_text()=='candidate-001'
+
+
+def test_candidate_setup_helper_does_not_mutate_source(tmp_path):
+    from villani_ops.isolation.copy_git import create_git_baselined_copy
+    repo=tmp_path/'plain'; repo.mkdir(); (repo/'file.txt').write_text('x')
+    before=sorted(str(p.relative_to(repo)) for p in repo.rglob('*'))
+    copied=create_git_baselined_copy(repo, tmp_path/'cand')
+    after=sorted(str(p.relative_to(repo)) for p in repo.rglob('*'))
+    assert before==after
+    assert not (repo/'.git').exists()
+    assert (copied.worktree_path/'.git').exists()
+
+
+def test_empty_patch_candidate_is_recorded_and_verified(tmp_path):
+    repo=tmp_path/'plain'; repo.mkdir(); (repo/'a.txt').write_text('original')
+    class NoopRunner:
+        def run_task(self, **kw):
+            dbg=kw['artifacts_dir']/'debug'; dbg.mkdir(parents=True); (dbg/'metadata.json').write_text('{}')
+            return RunnerResult(exit_code=0, stdout='', stderr='', debug_artifact_dir=str(dbg), duration_ms=1)
+    def verifier(**kw): return {'result':1,'verdict':'success','confidence':.9,'recommendedAction':'accept','traceDir':str(kw['trace_dir'])}
+    cfg=VerifierParallelConfig(repo=repo,task='noop',candidates=1,workspace=tmp_path/'ws',backend='b')
+    orch=VerifierParallelOrchestrator(cfg, runner=NoopRunner(), verifier=verifier)
+    orch._backend_obj=lambda: Backend(name='b',provider='local',model='m',api_key='x')
+    out=orch.run(); od=Path(out['orchestrationDir'])
+    row=json.loads((od/'candidates.jsonl').read_text().splitlines()[0])
+    assert row['patchStatus']=='empty' and row['result']==1
+    assert out['status']=='failed'  # empty patch cannot be integrated by safe_apply
+
+
+def test_one_candidate_failure_does_not_kill_successful_candidate(tmp_path):
+    repo=tmp_path/'plain'; repo.mkdir(); (repo/'a.txt').write_text('original')
+    class MixedRunner:
+        def run_task(self, **kw):
+            if kw['context']['attempt_id']=='candidate-001':
+                raise RuntimeError('boom')
+            (kw['repo_path']/'a.txt').write_text('good')
+            dbg=kw['artifacts_dir']/'debug'; dbg.mkdir(parents=True); (dbg/'metadata.json').write_text('{}')
+            return RunnerResult(exit_code=0, stdout='', stderr='', debug_artifact_dir=str(dbg), duration_ms=1)
+    def verifier(**kw): return {'result':1,'verdict':'success','confidence':.9,'recommendedAction':'accept','traceDir':str(kw['trace_dir'])}
+    cfg=VerifierParallelConfig(repo=repo,task='x',candidates=2,parallelism=1,seed=1,workspace=tmp_path/'ws',backend='b')
+    orch=VerifierParallelOrchestrator(cfg, runner=MixedRunner(), verifier=verifier)
+    orch._backend_obj=lambda: Backend(name='b',provider='local',model='m',api_key='x')
+    out=orch.run()
+    assert out['winnerCandidateId']=='candidate-002'
+    assert (repo/'a.txt').read_text()=='good'
 
 def test_failure_no_debug_becomes_verifier_error_and_all_fail_does_not_integrate(tmp_path):
     repo=tmp_path/'repo'; init_repo(repo)
