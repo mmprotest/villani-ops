@@ -4,8 +4,8 @@ from pathlib import Path
 from typing import Any
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import json, secrets, subprocess, sys, time
-from villani_ops.isolation.worktree import GitWorktreeIsolation, capture_worktree
+import json, secrets, subprocess, sys, time, shutil
+from villani_ops.isolation.copy_git import create_git_baselined_copy, capture_candidate_patch
 from villani_ops.runners import runner_for_name
 from villani_ops.storage.files import FileStorage
 from villani_ops.core.task import Task
@@ -23,7 +23,7 @@ class VerifierParallelConfig:
 
 @dataclass
 class CandidateResult:
-    candidate_id:str; worktree_path:Path; run_status:str='pending'; debug_dir:Path|None=None; verifier_result:dict|None=None; verifier_trace_dir:Path|None=None; error:str|None=None; artifacts_dir:Path|None=None; started_at:str|None=None; completed_at:str|None=None; exit_code:int|None=None; stdout_path:Path|None=None; stderr_path:Path|None=None; duration_seconds:float|None=None; changed_files:list[str]|None=None; patch_path:Path|None=None
+    candidate_id:str; worktree_path:Path; run_status:str='pending'; debug_dir:Path|None=None; verifier_result:dict|None=None; verifier_trace_dir:Path|None=None; error:str|None=None; artifacts_dir:Path|None=None; started_at:str|None=None; completed_at:str|None=None; exit_code:int|None=None; stdout_path:Path|None=None; stderr_path:Path|None=None; duration_seconds:float|None=None; changed_files:list[str]|None=None; patch_path:Path|None=None; patch_status:str|None=None
 
 class VerifierParallelOrchestrator:
     def __init__(self, config:VerifierParallelConfig, runner=None, verifier=None, integrator=None):
@@ -40,33 +40,47 @@ class VerifierParallelOrchestrator:
         cdir=odir/'candidates'/cid; rdir=cdir/'run'; rdir.mkdir(parents=True,exist_ok=True); cr=CandidateResult(cid, cdir/'worktree', 'running', artifacts_dir=rdir, started_at=now())
         start=time.time()
         try:
-            wt=GitWorktreeIsolation().create(self.config.repo, odir.name, cid, odir/'candidates'/cid); cr.worktree_path=Path(wt['worktree_path'])
+            copied=create_git_baselined_copy(self.config.repo, cdir)
+            cr.worktree_path=copied.worktree_path; cr.patch_path=copied.patch_path
+        except Exception as e:
+            cr.error=f'candidate isolation setup failed: {e}'; cr.run_status='failed'; cr.patch_status='failed'; (rdir/'stderr.txt').write_text(cr.error,encoding='utf-8'); cr.completed_at=now(); cr.duration_seconds=time.time()-start; return cr
+        try:
             run=self.runner or runner_for_name(self.config.agent or 'villani-code')
             res=run.run_task(repo_path=cr.worktree_path, task=self.config.task, success_criteria=None, backend_name=backend.name, backend_config=backend, timeout_seconds=self.config.candidate_timeout_seconds or backend.timeout_seconds or 1200, context={'attempt_id':cid}, artifacts_dir=rdir)
             (rdir/'stdout.txt').write_text(res.stdout or '',encoding='utf-8'); (rdir/'stderr.txt').write_text(res.stderr or '',encoding='utf-8')
             cr.exit_code=res.exit_code; cr.stdout_path=rdir/'stdout.txt'; cr.stderr_path=rdir/'stderr.txt'; cr.debug_dir=Path(res.debug_artifact_dir) if res.debug_artifact_dir else (Path(res.resolved_trace_dir) if res.resolved_trace_dir else None)
-            cap=capture_worktree(cr.worktree_path,rdir); cr.changed_files=cap.get('changed_files',[]); cr.patch_path=Path(cap['patch_path'])
             cr.run_status='completed' if res.exit_code==0 else 'failed'
         except Exception as e:
-            cr.error=str(e); cr.run_status='failed'; (rdir/'stderr.txt').write_text(str(e),encoding='utf-8')
+            cr.error=f'agent runner failed: {e}'; cr.run_status='failed'; (rdir/'stderr.txt').write_text(cr.error,encoding='utf-8')
+        try:
+            cap=capture_candidate_patch(cr.worktree_path, cr.patch_path or (cdir/'diff.patch'))
+            cr.changed_files=cap.changed_files; cr.patch_path=Path(cap.patch_path) if cap.patch_path else (cdir/'diff.patch')
+            cr.patch_status='captured' if cap.patch_path else ('failed' if cap.failure_reason else 'empty')
+            if cap.failure_reason: cr.error=(cr.error+'; ' if cr.error else '')+f'patch capture failed: {cap.failure_reason}'
+        except Exception as e:
+            cr.patch_status='failed'; cr.error=(cr.error+'; ' if cr.error else '')+f'patch capture failed: {e}'
         cr.completed_at=now(); cr.duration_seconds=time.time()-start
         return cr
     def _run_verifier(self, cr:CandidateResult, odir:Path):
         vdir=odir/'candidates'/cr.candidate_id/'verifier'; vdir.mkdir(parents=True,exist_ok=True); out=vdir/'verifier-result.json'
         if not cr.debug_dir or not Path(cr.debug_dir).exists():
             cr.verifier_result={'result':None,'verdict':'error','confidence':0.0,'recommendedAction':'inspect_manually','reason':'candidate produced no debug artifacts','traceDir':None}; return cr
-        if self.verifier:
-            res=self.verifier(debug_dir=Path(cr.debug_dir), repo_dir=cr.worktree_path, workspace=self.config.workspace, backend=self.config.verifier_backend, out=out, trace_dir=vdir/'trace')
-            if isinstance(res,dict): write_json(out,res)
-        else:
-            cmd=[sys.executable,'-m','villani_ops.cli.main','verifier','--debug-dir',str(cr.debug_dir),'--repo-dir',str(cr.worktree_path),'--workspace',str(self.config.workspace),'--json','--out',str(out),'--verifier-timeout-seconds',str(self.config.verifier_timeout_seconds),'--max-verifier-tool-calls',str(self.config.verifier_max_tool_calls),'--trace-dir',str(vdir/'trace')]
-            if self.config.verifier_backend: cmd += ['--backend', self.config.verifier_backend]
-            p=subprocess.run(cmd,text=True,capture_output=True,timeout=self.config.verifier_timeout_seconds+30); (vdir/'stdout.txt').write_text(p.stdout); (vdir/'stderr.txt').write_text(p.stderr)
-            try: res=json.loads(p.stdout or out.read_text())
-            except Exception: res={'result':None,'verdict':'error','confidence':0.0,'recommendedAction':'inspect_manually','reason':'unparseable verifier output','traceDir':None,'stdoutPath':str(vdir/'stdout.txt'),'stderrPath':str(vdir/'stderr.txt')}
+        try:
+            if self.verifier:
+                res=self.verifier(debug_dir=Path(cr.debug_dir), repo_dir=cr.worktree_path, workspace=self.config.workspace, backend=self.config.verifier_backend, out=out, trace_dir=vdir/'trace')
+                if isinstance(res,dict): write_json(out,res)
+            else:
+                cmd=[sys.executable,'-m','villani_ops.cli.main','verifier','--debug-dir',str(cr.debug_dir),'--repo-dir',str(cr.worktree_path),'--workspace',str(self.config.workspace),'--json','--out',str(out),'--verifier-timeout-seconds',str(self.config.verifier_timeout_seconds),'--max-verifier-tool-calls',str(self.config.verifier_max_tool_calls),'--trace-dir',str(vdir/'trace')]
+                if self.config.verifier_backend: cmd += ['--backend', self.config.verifier_backend]
+                p=subprocess.run(cmd,text=True,capture_output=True,timeout=self.config.verifier_timeout_seconds+30); (vdir/'stdout.txt').write_text(p.stdout); (vdir/'stderr.txt').write_text(p.stderr)
+                try: res=json.loads(p.stdout or out.read_text())
+                except Exception: res={'result':None,'verdict':'error','confidence':0.0,'recommendedAction':'inspect_manually','reason':'unparseable verifier output','traceDir':None,'stdoutPath':str(vdir/'stdout.txt'),'stderrPath':str(vdir/'stderr.txt')}
+        except Exception as e:
+            res={'result':None,'verdict':'error','confidence':0.0,'recommendedAction':'inspect_manually','reason':f'verifier subprocess failed: {e}','traceDir':None}
+            write_json(out,res)
         cr.verifier_result=res if isinstance(res,dict) else {'result':None,'verdict':'error'}; cr.verifier_trace_dir=Path(cr.verifier_result.get('traceDir')) if cr.verifier_result.get('traceDir') else None; return cr
     def _record_candidate(self, cr, p):
-        v=cr.verifier_result or {}; return {'candidateId':cr.candidate_id,'worktreePath':str(cr.worktree_path),'status':'verified' if v else cr.run_status,'agent':self.config.agent,'backend':self.config.backend,'startedAt':cr.started_at,'completedAt':cr.completed_at,'debugDir':str(cr.debug_dir) if cr.debug_dir else None,'verifierResultPath':str(p/'candidates'/cr.candidate_id/'verifier'/'verifier-result.json'),'verifierTraceDir':str(cr.verifier_trace_dir) if cr.verifier_trace_dir else None,'result':v.get('result'),'verdict':v.get('verdict'),'confidence':v.get('confidence'),'recommendedAction':v.get('recommendedAction'),'error':cr.error or (v.get('reason') if v.get('verdict')=='error' else None)}
+        v=cr.verifier_result or {}; return {'candidateId':cr.candidate_id,'worktreePath':str(cr.worktree_path),'status':'verified' if v else cr.run_status,'agent':self.config.agent,'backend':self.config.backend,'startedAt':cr.started_at,'completedAt':cr.completed_at,'debugDir':str(cr.debug_dir) if cr.debug_dir else None,'patchPath':str(cr.patch_path) if cr.patch_path else None,'patchStatus':cr.patch_status,'verifierResultPath':str(p/'candidates'/cr.candidate_id/'verifier'/'verifier-result.json'),'verifierTraceDir':str(cr.verifier_trace_dir) if cr.verifier_trace_dir else None,'result':v.get('result'),'verdict':v.get('verdict'),'confidence':v.get('confidence'),'recommendedAction':v.get('recommendedAction'),'error':cr.error or (v.get('reason') if v.get('verdict')=='error' else None)}
     def _integrate(self, odir, winner):
         rec={'schemaVersion':'villani-ops-verifier-parallel-integration-v1','winnerCandidateId':winner.candidate_id if winner else None,'sourceWorktree':str(winner.worktree_path) if winner else None,'targetRepo':str(self.config.repo),'status':'skipped','changedFiles':[],'error':None}
         if not winner: write_json(odir/'integration.json',rec); return rec
@@ -99,7 +113,7 @@ class VerifierParallelOrchestrator:
         write_json(odir/'orchestration.json',orch); self._transcript(odir,candidates,sel,integ)
         if not cfg.keep_worktrees and integ['status']=='integrated':
             for cr in candidates:
-                subprocess.run(['git','worktree','remove','--force',str(cr.worktree_path)],cwd=cfg.repo,text=True,capture_output=True)
+                if cr.worktree_path and cr.worktree_path.exists(): shutil.rmtree(cr.worktree_path, ignore_errors=True)
         out={'schemaVersion':'villani-ops-verifier-parallel-output-v1','orchestrationId':oid,'status':status,'winnerCandidateId':sel.winnerCandidateId,'winnerResult':sel.winnerResult,'selectionPath':str(odir/'selection.json'),'integrationPath':str(odir/'integration.json'),'orchestrationDir':str(odir),'candidates':sel.allCandidates}
         if cfg.out: write_json(cfg.out,out)
         return out

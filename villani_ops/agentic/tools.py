@@ -462,8 +462,8 @@ def h_select_path(state, inp, ctx):
 def _attempt(aid, scope, subtask_id=None, backend=None, artifacts=None):
     return CandidateAttemptState(attempt_id=aid,backend_name=backend,status='scheduled',scope=scope,subtask_id=subtask_id,artifacts_dir=str(artifacts) if artifacts else None,acceptance_eligible=False)
 def _copy_worktree(src:Path, dst:Path):
-    ignore=shutil.ignore_patterns('.git','.villani-ops','.v','__pycache__')
-    shutil.copytree(src,dst,ignore=ignore,dirs_exist_ok=True)
+    from villani_ops.isolation.copy_git import copy_worktree
+    copy_worktree(src, dst)
 
 
 
