@@ -21,7 +21,7 @@ class EvidenceItem:
     path:str|None=None; toolCallId:str|None=None; deliverableLinked:bool|None=None; deliverableLinks:list[str]=field(default_factory=list); validationStrength:str|None=None; validationWeakness:str|None=None
 @dataclass
 class DeliverableSpec:
-    required_files:list[str]=field(default_factory=list); required_output_files:list[str]=field(default_factory=list); required_edited_files:list[str]=field(default_factory=list); required_services:list[str]=field(default_factory=list); required_endpoints:list[str]=field(default_factory=list); required_commands:list[str]=field(default_factory=list); required_functions:list[str]=field(default_factory=list); required_behavior:list[str]=field(default_factory=list)
+    required_files:list[str]=field(default_factory=list); required_output_files:list[str]=field(default_factory=list); required_edited_files:list[str]=field(default_factory=list); required_services:list[str]=field(default_factory=list); required_endpoints:list[str]=field(default_factory=list); required_binaries:list[str]=field(default_factory=list); required_generated_artifacts:list[str]=field(default_factory=list); required_commands:list[str]=field(default_factory=list); required_functions:list[str]=field(default_factory=list); required_behavior:list[str]=field(default_factory=list); negative_constraints:list[str]=field(default_factory=list); allowed_edit_constraints:list[str]=field(default_factory=list)
 @dataclass
 class RequirementCheck:
     id:str; requirement:str; status:str='unsatisfied'; evidence:list[EvidenceItem]=field(default_factory=list); risks:list[EvidenceItem]=field(default_factory=list)
