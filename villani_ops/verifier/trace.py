@@ -153,6 +153,7 @@ def transcript(result, packet=None, calibration=None, trace_dir=None):
     v=result.get('verifier') or {}; lines=['# Villani Ops Verifier Trace','','## Summary',f"- Result: {result.get('result')}",f"- Verdict: {result.get('verdict')}",f"- Confidence: {result.get('confidence')}",f"- Recommended action: {result.get('recommendedAction')}",f"- Debug dir: {result.get('debugDir')}",f"- Backend: {v.get('backend')}",f"- Model: {v.get('model')}",f"- Trace dir: {trace_dir or result.get('traceDir')}",'','## Objective','',str((packet or {}).get('objective') or ''),'','## Extracted Requirements']
     for r in result.get('requirementResults') or []: lines.append(f"- {r.get('id')}: {r.get('status')} — {r.get('requirement')}")
     lines += ['','## Deliverable Assessment','',json.dumps(result.get('deliverableAssessment') or (packet or {}).get('deliverableAssessment') or {},indent=2,default=str)]
+    lines += ['','## Constraint Assessment','',json.dumps(result.get('constraintAssessment') or (packet or {}).get('constraintAssessment') or {},indent=2,default=str)]
     lines += ['','## Selected Validation Window','',json.dumps((result.get('deterministicChecks') or {}).get('finalValidationWindow'),indent=2,default=str),'','## Top Success Evidence']
     for e in (result.get('successEvidence') or [])[:10]: lines.append(f"- {e.get('text') if isinstance(e,dict) else e}")
     lines += ['','## Failure Classification','','### Active Failures']
