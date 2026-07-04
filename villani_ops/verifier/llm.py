@@ -8,43 +8,70 @@ from .errors import *
 ROLES={'review','selection','classification','policy','coding'}
 SYSTEM='''You are the mandatory binary verifier for Villani Code runs inside Villani Ops.
 
+You are the judge. The deterministic evidence collector is not authoritative.
 You are not a coding agent.
 You are not a repair agent.
 You judge whether the run likely solved the user's objective using Villani Code debug artifacts and optional repo evidence.
 
-You must make a binary prediction when verification completes.
+You must make a binary prediction:
+result 1 means the run likely solved the task.
+result 0 means the run likely did not solve the task.
 
-Return result 1 if the run likely solved the task.
-Return result 0 if the run likely did not solve the task.
-
-Do not return unclear.
-Do not return unknown.
+Do not return unclear or unknown.
 Do not abstain.
 No unclear verdict is allowed.
 
-If evidence is incomplete, noisy, or contradictory, use the evidence you have and make the most conservative prediction.
-False accepts are worse than false rejects.
+First identify the task contract:
+- required outputs
+- required file modifications
+- required behavior
+- required services or installability
+- required performance or quality constraints
+- forbidden changes
+- allowed-edit constraints
+- negative requirements such as "do not", "must not", "only", "no warnings"
 
-You receive an initial evidence packet. The packet may be incomplete, noisy, or wrong. The deterministic evidence extractor is not authoritative.
+Then judge whether the evidence verifies that contract.
+
+Distinguish:
+- evidence that validates the actual deliverable
+- evidence that validates only setup
+- evidence that validates only an exploratory experiment
+- evidence that is an agent claim
+- evidence that is self-validation
+- evidence from independent or downstream validation
+
+Treat deterministic labels such as activeFailures, finalEndToEndValidation, deliverableEvidence, and recoveredFailures as hints, not conclusions. The deterministic labels are hints, not conclusions. The deterministic labels are candidate labels only. They are not authoritative. Decide whether the evidence actually proves or contradicts the task contract.
+
+Use tools when the packet is insufficient, contradictory, or when accepting the run depends on exact evidence.
+False accepts are worse than false rejects, but you must still make a binary prediction.
+If evidence is weak, make the conservative prediction and explain uncertainty.
+
+Accept only when the evidence supports the actual task contract.
+
+Reject when:
+- the final deliverable is not verified
+- the validation tests a local/exploratory substitute instead of the actual deliverable
+- required downstream behavior is not shown
+- required performance/quality constraints are not demonstrated
+- negative constraints or forbidden changes appear violated
+- the evidence is too weak to safely accept
+
+Use tools before accepting when:
+- the task requires generated output files and content is not shown
+- the task restricts allowed edits or forbidden files
+- performance or quality constraints are material
+- installability/service/downstream consumer behavior is material
+- there are earlier failures that may or may not be recovered
+- success depends on diff/file content
 
 You have read-only tools for inspecting debug files, command records, tool calls, transcripts, diffs, and repo files.
-
-Use tools when:
-- a material requirement is uncertain
-- success evidence looks weak
-- failure evidence may have been recovered
-- the final answer makes an unsupported claim
-- the packet contains contradictory evidence
-- the task depends on file contents or diffs
-- you need to confirm whether a command actually passed or failed
-
 Do not use tools aimlessly.
 Do not trust the agent's final answer unless supported by artifacts.
 Earlier failures do not imply failure if later validation shows recovery.
 A zero exit code does not prove success if output contains failure text.
 A non-zero exit code does not prove final failure if a later end-to-end validation resolves the issue.
 Visible validation passing is strong evidence but not proof.
-You must distinguish between evidence that validates the actual deliverable and evidence that only validates an exploratory experiment.
 Strong evidence validates the actual file, output file, service, endpoint, command, binary, function, generated artifact, or behavior required by the objective.
 Weak evidence includes inline scripts that define local implementations, generic PASS strings, dependency installs, setup checks, environment inspections, exploratory benchmarks, package version checks, or agent claims that are not tied to the final deliverable.
 For code tasks, a test is strongest when it imports/runs the final changed file or the project entrypoint after mutation.
@@ -54,9 +81,6 @@ For build/install/instrumentation tasks, successful build/install/runtime checks
 For edit-constrained tasks, output passing is insufficient if the task restricts which files or words may be changed. You must verify the edit constraints before accepting.
 Do not treat generic PASS output as sufficient if it does not exercise the final deliverable.
 Do not treat dependency installation or environment inspection as final validation.
-If deterministic validation counters conflict with deliverable linkage, rely on deliverable-linked evidence.
-Return result 1 only when the evidence supports that the material requirements were satisfied.
-Return result 0 when active blocking evidence remains, material requirements are unsatisfied, or evidence is too weak to safely accept.
 Return only valid JSON.
 '''
 TOOLS=['list_debug_files','read_debug_file','search_debug_file','search_commands','read_command','search_tool_calls','read_tool_call','search_transcript','list_repo_files','read_repo_file','search_repo','read_diff','search_diff']
@@ -131,56 +155,50 @@ def _repair(cfg,bad,timeout, trace=None):
     if trace is not None:
         trace.append_jsonl('llm_messages.jsonl',{'index':getattr(trace,'msg_count',0),'role':'assistant','name':None,'content':content,'createdAt':__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat(),'chars':len(str(content))}); trace.msg_count=getattr(trace,'msg_count',0)+1
     return _parse(content)
-def _adjudication_input(det, verdict, contradictions):
-    cats=det.get('evidenceByCategory',{})
-    return {'originalLlmVerdict':{k:verdict.get(k) for k in ['result','verdict','confidence','reason','recommendedAction','deliverableAssessment','constraintAssessment']},'deterministicContradictions':contradictions,'activeFailures':cats.get('activeFailures',[]),'recoveredFailures':cats.get('recoveredFailures',[]),'deliverableEvidence':cats.get('deliverableEvidence',[]),'finalEndToEndValidation':cats.get('finalEndToEndValidation',[]),'testValidation':cats.get('testValidation',[]),'serviceValidation':cats.get('serviceValidation',[]),'toolObservations':det.get('toolsUsed',[]),'instruction':'Decide whether to keep or change the binary result. False accepts are worse than false rejects.'}
-def run_verifier_adjudication(cfg, adjudication_input, timeout, trace=None):
-    schema='Return JSON: {"type":"adjudication_verdict","result":1,"verdict":"success","confidence":0.84,"recommendedAction":"accept","reason":"...","changedOriginalResult":false,"riskFlags":["..."]}'
-    msgs=[{'role':'system','content':SYSTEM+'\nYou are adjudicating a conflict between an LLM verifier verdict and deterministic evidence. Return only JSON.'},{'role':'user','content':schema+'\nAdjudication input:\n'+json.dumps(adjudication_input,default=str)}]
-    if trace is not None:
-        for m in msgs: trace.append_jsonl('llm_messages.jsonl',{'index':getattr(trace,'msg_count',0),'role':m['role'],'name':None,'content':m['content'],'createdAt':__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat(),'chars':len(str(m['content']))}); trace.msg_count=getattr(trace,'msg_count',0)+1
-    raw=_chat(cfg,msgs,timeout,trace=trace)
-    obj=json.loads(raw)
-    if obj.get('type')!='adjudication_verdict' or obj.get('result') not in (0,1): raise VerifierSchemaError('invalid adjudication schema')
-    obj['verdict']='success' if obj['result']==1 else 'failure'
-    return obj
+def _raw_snapshot(verdict):
+    keys=['result','verdict','confidence','recommendedAction','reason','deliverableAssessment','constraintAssessment','requirementResults','successEvidence','failureEvidence','recoveredFailures','missingEvidence','riskFlags','uncertainty','toolsUsed']
+    return {k:verdict.get(k) for k in keys if k in verdict}
+
+def _make_disagreement(kind, summary, evidence=None):
+    return {'kind':kind,'summary':summary,'evidenceIds':[str((e or {}).get('id') or (e or {}).get('kind') or i) for i,e in enumerate(evidence or [])],'effect':'risk_flag_only'}
+
 def calibrate(det, verdict, trace=None, cfg=None, timeout=30):
-    raw={'result':verdict.get('result'),'verdict':verdict['verdict'],'confidence':float(verdict.get('confidence',0)),'reason':verdict.get('reason','')}; changed=False
-    cats=det.get('evidenceByCategory',{})
+    raw=_raw_snapshot(verdict)
+    cats=det.get('evidenceByCategory',{}) or {}
     validations=cats.get('finalEndToEndValidation',[])+cats.get('testValidation',[])+cats.get('serviceValidation',[])
     strong=[v for v in validations if isinstance(v,dict) and v.get('validationStrength')=='strong']
-    active=cats.get('activeFailures',[])
-    verdict['verdict']='success' if verdict['result']==1 else 'failure'
-    rules=['schema_consistency']
-    contradictions=[]
-    if verdict['result']==1 and active: contradictions.append('LLM success but deterministic active failures remain.')
-    if verdict['result']==0 and (strong or cats.get('finalEndToEndValidation')): contradictions.append('LLM failure but deterministic validation evidence looks strong.')
+    active=cats.get('activeFailures',[]) or []
+    risk_before=list(verdict.get('riskFlags') or [])
+    action_before=verdict.get('recommendedAction')
+    conf_before=float(verdict.get('confidence',0) or 0)
+    rules=['schema_consistency','non_mutating_calibration']
+    disagreements=[]
+    notes=[]
+    if verdict['result']==1 and active:
+        disagreements.append(_make_disagreement('active_failure_disagreement','Deterministic collector found candidate failures, but the LLM judged the run successful.',active))
+        verdict.setdefault('riskFlags',[]).append('Deterministic disagreement: evidence collector found unresolved-looking failures, but the LLM judged them non-blocking.')
+        rules.append('add_deterministic_disagreement_risk')
+    if verdict['result']==0 and (strong or cats.get('finalEndToEndValidation')):
+        disagreements.append(_make_disagreement('validation_signal_disagreement','Deterministic collector found candidate validation signals, but the LLM judged the run unsuccessful.',strong or cats.get('finalEndToEndValidation',[])))
+        verdict.setdefault('riskFlags',[]).append('Deterministic disagreement: evidence collector found validation-looking signals, but the LLM judged them insufficient for the task contract.')
+        rules.append('add_deterministic_disagreement_risk')
     da=det.get('deliverableAssessment') or {}
-    if verdict['result']==1 and da.get('requiredDeliverables') and not (cats.get('deliverableEvidence') or strong): contradictions.append('LLM success but deterministic deliverable evidence is missing.')
-    if verdict['result']==0 and cats.get('deliverableEvidence') and strong: contradictions.append('LLM failure but deliverable evidence and strong validation exist.')
-    adj_in=None; adj=None
-    if contradictions:
-        rules.append('evidence_arbitration_adjudication')
-        adj_in=_adjudication_input(det,verdict,contradictions)
-        if cfg is not None:
-            try:
-                adj=run_verifier_adjudication(cfg,adj_in,timeout,trace=trace)
-                if adj.get('result') != verdict.get('result'):
-                    old=raw.copy()
-                    verdict.update({'result':adj['result'],'verdict':adj['verdict'],'confidence':adj.get('confidence',verdict.get('confidence')),'recommendedAction':adj.get('recommendedAction',verdict.get('recommendedAction')),'reason':adj.get('reason',verdict.get('reason'))})
-                    changed=True; raw=old
-                verdict.setdefault('riskFlags',[]).extend(adj.get('riskFlags') or ['Deterministic disagreement adjudicated.'])
-            except Exception as e:
-                verdict.setdefault('riskFlags',[]).append(f'Adjudication failed; kept original LLM verdict: {e}')
-        else:
-            verdict.setdefault('riskFlags',[]).append('Deterministic disagreement noted; kept original LLM verdict without hard calibration flip.')
-    if verdict['result']==1 and float(verdict.get('confidence',0))>.9:
-        verdict['confidence']=.9; verdict.setdefault('riskFlags',[]).append('Success confidence capped at 0.9.'); rules.append('success_confidence_cap')
+    if verdict['result']==1 and da.get('requiredDeliverables') and not (cats.get('deliverableEvidence') or strong):
+        disagreements.append(_make_disagreement('missing_deterministic_deliverable_label','Deterministic deliverable labels are missing despite an LLM success judgement.',[]))
+        verdict.setdefault('riskFlags',[]).append('Deterministic deliverable evidence labels are missing; LLM success remains authoritative and should be audited if unexpected.')
+    if verdict['result']==0 and cats.get('deliverableEvidence') and strong:
+        disagreements.append(_make_disagreement('deliverable_validation_disagreement','Deterministic deliverable and validation signals exist, but the LLM judged the task contract unmet.',cats.get('deliverableEvidence',[])+strong))
+        verdict.setdefault('riskFlags',[]).append('Deterministic deliverable and validation signals exist, but the LLM judged the task contract unmet.')
+    if verdict['result']==1 and conf_before>.9:
+        verdict['confidence']=.9; verdict.setdefault('riskFlags',[]).append('Success confidence capped at 0.9.'); rules.append('cap_success_confidence')
     verdict.setdefault('uncertainty', {'level':'medium','reasons':[]})
-    cal={'schemaVersion':'villani-ops-verifier-calibration-v1','before':raw,'after':{'result':verdict.get('result'),'verdict':verdict.get('verdict'),'confidence':verdict.get('confidence'),'reason':verdict.get('reason')},'changes':([] if not changed else [{'field':'result/verdict/confidence/reason','from':raw,'to':{'result':verdict.get('result'),'verdict':verdict.get('verdict'),'confidence':verdict.get('confidence'),'reason':verdict.get('reason')},'reason':'Adjudication changed the LLM result based on hard contradictory evidence.'}]),'rulesApplied':rules,'adjudicationInputSummary':adj_in,'adjudicationResult':adj}
+    if disagreements and verdict.get('recommendedAction')=='accept':
+        verdict['recommendedAction']='inspect_manually'; rules.append('conservative_manual_inspection_action')
+    final=finalize_verifier_result(raw, verdict)
+    cal={'schemaVersion':'villani-ops-verifier-calibration-v2','resultMutationAllowed':False,'rawLlmVerdict':raw,'finalResult':{k:final.get(k) for k in ['result','verdict','confidence','recommendedAction','reason']},'resultChanged':False,'confidenceChanged':float(final.get('confidence',0) or 0)!=conf_before,'recommendedActionChanged':final.get('recommendedAction')!=action_before,'riskFlagsAdded':[x for x in final.get('riskFlags',[]) if x not in risk_before],'deterministicDisagreements':disagreements,'contradictions':[d['summary'] for d in disagreements],'uncertaintyNotes':notes,'rulesApplied':rules,'auditAdjudication':{'enabled':False,'note':'Result-changing adjudication is disabled; deterministic disagreements are audit/risk only.'}}
     if trace is not None: trace.write_json('calibration.json',cal)
-    verdict['_calibration']=cal
-    verdict['llmRawVerdict']=raw; return validate_final_result_consistency(verdict)
+    final['_calibration']=cal
+    return final
 def llm_result(run, det, workspace='.villani-ops', backend=None, base_url=None, model=None, timeout_seconds=180, max_tool_calls=12, max_tool_result_chars=12000, max_read_lines=160, trace=None):
     cfg=select_verifier_backend(workspace,backend,base_url,model); tools=VerifierTools(run,det.get('repoDir'),max_tool_result_chars,max_read_lines)
     packet=build_packet(run,det.get('repoDir'))
@@ -222,8 +240,20 @@ def llm_result(run, det, workspace='.villani-ops', backend=None, base_url=None, 
             parsed={'schemaVersion':'villani-ops-verifier-llm-verdict-v1',**{k:obj.get(k) for k in ['result','verdict','confidence','recommendedAction','reason','deliverableAssessment','constraintAssessment','requirementResults','successEvidence','failureEvidence','recoveredFailures','missingEvidence','riskFlags','uncertainty','toolsUsed']}}
             trace.write_json('llm_final_verdict_parsed.json',parsed)
         obj=calibrate(det,obj,trace=trace,cfg=cfg,timeout=max(1,deadline-time.monotonic())); break
-    det.update({'result':obj['result'],'verdict':obj['verdict'],'confidence':obj['confidence'],'recommendedAction':obj['recommendedAction'],'reason':obj['reason'],'deliverableAssessment':obj.get('deliverableAssessment',det.get('deliverableAssessment')),'constraintAssessment':obj.get('constraintAssessment',det.get('constraintAssessment')),'requirementResults':obj.get('requirementResults',det['requirementResults']),'successEvidence':obj.get('successEvidence',det['successEvidence']),'failureEvidence':obj.get('failureEvidence',det['failureEvidence']),'recoveredFailures':obj.get('recoveredFailures',det['recoveredFailures']),'missingEvidence':obj.get('missingEvidence',det['missingEvidence']),'riskFlags':obj.get('riskFlags',det['riskFlags']),'toolsUsed':used+obj.get('toolsUsed',[]),'llmRawVerdict':obj.get('llmRawVerdict',{}),'calibration':obj.get('_calibration',{}),'verifier':{'mode':'llm_tool_loop','backend':cfg['backend'],'model':cfg['model'],'baseUrl':cfg['baseUrl'],'promptVersion':PROMPT_VERSION}})
+    det.update({'result':obj['result'],'verdict':obj['verdict'],'confidence':obj['confidence'],'recommendedAction':obj['recommendedAction'],'reason':obj['reason'],'resultSource':obj.get('resultSource'),'postProcessingChangedResult':obj.get('postProcessingChangedResult'),'deliverableAssessment':obj.get('deliverableAssessment',det.get('deliverableAssessment')),'constraintAssessment':obj.get('constraintAssessment',det.get('constraintAssessment')),'requirementResults':obj.get('requirementResults',det['requirementResults']),'successEvidence':obj.get('successEvidence',det['successEvidence']),'failureEvidence':obj.get('failureEvidence',det['failureEvidence']),'recoveredFailures':obj.get('recoveredFailures',det['recoveredFailures']),'missingEvidence':obj.get('missingEvidence',det['missingEvidence']),'riskFlags':obj.get('riskFlags',det['riskFlags']),'toolsUsed':used+obj.get('toolsUsed',[]),'llmRawVerdict':obj.get('llmRawVerdict',{}),'calibration':obj.get('_calibration',{}),'verifier':{'mode':'llm_tool_loop','backend':cfg['backend'],'model':cfg['model'],'baseUrl':cfg['baseUrl'],'promptVersion':PROMPT_VERSION}})
     return validate_final_result_consistency(det)
+
+def finalize_verifier_result(raw_llm_verdict, processed_verdict, trace_info=None):
+    final=processed_verdict
+    flags=final.setdefault('riskFlags',[])
+    if final.get('result')!=raw_llm_verdict.get('result') or final.get('verdict')!=raw_llm_verdict.get('verdict'):
+        final['result']=raw_llm_verdict.get('result')
+        final['verdict']=raw_llm_verdict.get('verdict')
+        flags.append('Post-processing attempted to change the LLM verifier result. Restored raw LLM result.')
+    final['llmRawVerdict']=raw_llm_verdict
+    final['resultSource']='llm_verifier'
+    final['postProcessingChangedResult']=False
+    return validate_final_result_consistency(final)
 
 def validate_final_result_consistency(result):
     expected={1:'success',0:'failure',None:'error'}.get(result.get('result'))
@@ -232,11 +262,11 @@ def validate_final_result_consistency(result):
         result['verdict']=expected; flags.append('Final consistency fixed result/verdict mismatch.')
     reason=(result.get('reason') or '').lower()
     if result.get('result')==1:
-        if result.get('recommendedAction')=='reject': result['recommendedAction']='accept'; flags.append('Final consistency fixed success recommendedAction.')
+        if result.get('recommendedAction')=='reject': result['recommendedAction']='inspect_manually'; flags.append('Final consistency fixed success recommendedAction.')
         if any(p in reason for p in ['run failed','did not solve','unsatisfied','blocking failure']) and not any(p in reason for p in ['despite','although']):
             result['reason']='The verifier accepted the run based on deliverable-linked evidence; stale contradictory success/failure wording was replaced.'; flags.append('Final consistency replaced stale failure reason under success verdict.')
     elif result.get('result')==0:
-        if result.get('recommendedAction')=='accept': result['recommendedAction']='reject'; flags.append('Final consistency fixed failure recommendedAction.')
+        if result.get('recommendedAction')=='accept': result['recommendedAction']='inspect_manually'; flags.append('Final consistency fixed failure recommendedAction.')
         if any(p in reason for p in ['run succeeded','successfully solved','accepted because']) and not any(p in reason for p in ['not ', 'despite','although']):
             result['reason']='The verifier rejected the run based on unresolved blocking or constraint evidence; stale success wording was replaced.'; flags.append('Final consistency replaced stale success reason under failure verdict.')
     return result
