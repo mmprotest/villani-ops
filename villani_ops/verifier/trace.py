@@ -6,7 +6,7 @@ from typing import Any
 
 LEVELS={"minimal","standard","full"}
 MINIMAL={"manifest.json","verification_result.json","errors.jsonl"}
-STANDARD=MINIMAL|{"input.json","source_artifacts.json","verifier_packet.json","requirements.json","evidence_by_category.json","tool_calls.jsonl","tool_observations.jsonl","llm_messages.jsonl","llm_raw_responses.jsonl","llm_final_verdict_raw.json","llm_final_verdict_parsed.json","calibration.json","verifier_transcript.md"}
+STANDARD=MINIMAL|{"input.json","source_artifacts.json","verifier_packet.json","requirements.json","evidence_by_category.json","tool_calls.jsonl","tool_observations.jsonl","llm_messages.jsonl","llm_raw_responses.jsonl","llm_reasoning_content.jsonl","llm_protocol.jsonl","llm_final_verdict_raw.json","llm_final_verdict_parsed.json","calibration.json","verifier_transcript.md"}
 FULL=STANDARD|{"timeline.jsonl","validation_windows.json","failure_classification.json"}
 SECRET_PATTERNS=[
     (re.compile(r'(?i)(authorization\s*[:=]\s*bearer\s+)[^\s"\']+'), r'\1<redacted>'),
@@ -150,7 +150,7 @@ def validation_windows(run, selected):
     return {'schemaVersion':'villani-ops-verifier-validation-windows-v1','selected':selected,'candidates':rows}
 
 def transcript(result, packet=None, calibration=None, trace_dir=None):
-    v=result.get('verifier') or {}; lines=['# Villani Ops Verifier Trace','','## Summary',f"- Result: {result.get('result')}",f"- Verdict: {result.get('verdict')}",f"- Confidence: {result.get('confidence')}",f"- Recommended action: {result.get('recommendedAction')}",f"- Debug dir: {result.get('debugDir')}",f"- Backend: {v.get('backend')}",f"- Model: {v.get('model')}",f"- Trace dir: {trace_dir or result.get('traceDir')}",'','## Objective','',str((packet or {}).get('objective') or ''),'','## Extracted Requirements']
+    v=result.get('verifier') or {}; lines=['# Villani Ops Verifier Trace','','## Summary',f"- Result: {result.get('result')}",f"- Verdict: {result.get('verdict')}",f"- Confidence: {result.get('confidence')}",f"- Recommended action: {result.get('recommendedAction')}",f"- LLM protocol: {result.get('llmProtocol')}",f"- Debug dir: {result.get('debugDir')}",f"- Backend: {v.get('backend')}",f"- Model: {v.get('model')}",f"- Trace dir: {trace_dir or result.get('traceDir')}",'','## Objective','',str((packet or {}).get('objective') or ''),'','## Extracted Requirements']
     for r in result.get('requirementResults') or []: lines.append(f"- {r.get('id')}: {r.get('status')} — {r.get('requirement')}")
     lines += ['','## Deliverable Assessment','',json.dumps(result.get('deliverableAssessment') or (packet or {}).get('deliverableAssessment') or {},indent=2,default=str)]
     lines += ['','## Constraint Assessment','',json.dumps(result.get('constraintAssessment') or (packet or {}).get('constraintAssessment') or {},indent=2,default=str)]
@@ -160,5 +160,5 @@ def transcript(result, packet=None, calibration=None, trace_dir=None):
     for e in result.get('failureEvidence') or []: lines.append(f"- {e.get('text') if isinstance(e,dict) else e}")
     lines += ['','### Recovered Failures']
     for e in result.get('recoveredFailures') or []: lines.append(f"- {e.get('text') if isinstance(e,dict) else e}")
-    lines += ['','### Post-Validation Risks','','See failure_classification.json.','','## LLM Tool Loop','','See llm_messages.jsonl, tool_calls.jsonl, and tool_observations.jsonl.','','## Raw LLM Verdict','',json.dumps(result.get('llmRawVerdict'),indent=2,default=str),'','## Non-Mutating Calibration','',json.dumps(calibration or result.get('calibration') or {'resultMutationAllowed':False,'rulesApplied':[]},indent=2,default=str),'','## Deterministic Disagreements','',json.dumps((calibration or result.get('calibration') or {}).get('deterministicDisagreements',[]),indent=2,default=str),'','## Audit Adjudication','','Result-changing adjudication is disabled; any adjudication is audit-only.','','## Final Result','',json.dumps(result,indent=2,default=str)]
+    lines += ['','### Post-Validation Risks','','See failure_classification.json.','','## LLM Structured Tool-Call Protocol','',f"Protocol used: {result.get('llmProtocol') or 'unknown'}",'See llm_messages.jsonl, tool_calls.jsonl, and tool_observations.jsonl. Native calls use verifier_read_tool and verifier_final_verdict when supported.','','## Raw LLM Verdict','',json.dumps(result.get('llmRawVerdict'),indent=2,default=str),'','## Non-Mutating Calibration','',json.dumps(calibration or result.get('calibration') or {'resultMutationAllowed':False,'rulesApplied':[]},indent=2,default=str),'','## Deterministic Disagreements','',json.dumps((calibration or result.get('calibration') or {}).get('deterministicDisagreements',[]),indent=2,default=str),'','## Audit Adjudication','','Result-changing adjudication is disabled; any adjudication is audit-only.','','## Final Result','',json.dumps(result,indent=2,default=str)]
     return '\n'.join(lines)+'\n'

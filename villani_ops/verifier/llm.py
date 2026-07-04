@@ -81,9 +81,24 @@ For build/install/instrumentation tasks, successful build/install/runtime checks
 For edit-constrained tasks, output passing is insufficient if the task restricts which files or words may be changed. You must verify the edit constraints before accepting.
 Do not treat generic PASS output as sufficient if it does not exercise the final deliverable.
 Do not treat dependency installation or environment inspection as final validation.
-Return only valid JSON.
+
+You must respond by calling exactly one structured tool:
+- verifier_read_tool when you need more evidence.
+- verifier_final_verdict when you are ready to make the binary judgement.
+
+Do not write JSON in normal assistant text.
+Do not wrap JSON in markdown.
+Do not put the final answer in reasoning text.
+Do not include prose outside tool calls.
+
+If you need evidence, call verifier_read_tool.
+If you are ready to decide, call verifier_final_verdict.
 '''
 TOOLS=['list_debug_files','read_debug_file','search_debug_file','search_commands','read_command','search_tool_calls','read_tool_call','search_transcript','list_repo_files','read_repo_file','search_repo','read_diff','search_diff']
+LLM_TOOLS=[
+    {'type':'function','function':{'name':'verifier_read_tool','description':'Request a read-only verifier tool to inspect debug artifacts, commands, tool calls, transcripts, diffs, or repo files.','parameters':{'type':'object','additionalProperties':False,'required':['tool','args','reason'],'properties':{'tool':{'type':'string','enum':TOOLS},'args':{'type':'object','additionalProperties':True},'reason':{'type':'string'}}}}},
+    {'type':'function','function':{'name':'verifier_final_verdict','description':'Return the final binary verifier judgement.','parameters':{'type':'object','additionalProperties':False,'required':['result','verdict','confidence','recommendedAction','reason','requirementResults','successEvidence','failureEvidence','recoveredFailures','missingEvidence','riskFlags','uncertainty','toolsUsed'],'properties':{'result':{'type':'integer','enum':[0,1]},'verdict':{'type':'string','enum':['success','failure']},'confidence':{'type':'number','minimum':0,'maximum':1},'recommendedAction':{'type':'string','enum':['accept','reject','retry_same_model','retry_higher_model','run_more_tests','inspect_manually']},'reason':{'type':'string'},'requirementResults':{'type':'array','items':{'type':'object','additionalProperties':False,'required':['id','requirement','status','evidence','risks'],'properties':{'id':{'type':'string'},'requirement':{'type':'string'},'status':{'type':'string','enum':['satisfied','unsatisfied']},'evidence':{'type':'array','items':{'type':'string'}},'risks':{'type':'array','items':{'type':'string'}}}}},'successEvidence':{'type':'array','items':{'type':'string'}},'failureEvidence':{'type':'array','items':{'type':'string'}},'recoveredFailures':{'type':'array','items':{'type':'string'}},'missingEvidence':{'type':'array','items':{'type':'string'}},'riskFlags':{'type':'array','items':{'type':'string'}},'uncertainty':{'type':'object','additionalProperties':False,'required':['level','reasons'],'properties':{'level':{'type':'string','enum':['low','medium','high']},'reasons':{'type':'array','items':{'type':'string'}}}},'deliverableAssessment':{'type':'object','additionalProperties':False,'required':['requiredDeliverables','validatedDeliverables','missingDeliverables','weakValidationReasons'],'properties':{'requiredDeliverables':{'type':'array','items':{'type':'string'}},'validatedDeliverables':{'type':'array','items':{'type':'string'}},'missingDeliverables':{'type':'array','items':{'type':'string'}},'weakValidationReasons':{'type':'array','items':{'type':'string'}}}},'constraintAssessment':{'type':'object','additionalProperties':False,'required':['constraints','satisfiedConstraints','violatedConstraints','uncheckedConstraints'],'properties':{'constraints':{'type':'array','items':{'type':'string'}},'satisfiedConstraints':{'type':'array','items':{'type':'string'}},'violatedConstraints':{'type':'array','items':{'type':'string'}},'uncheckedConstraints':{'type':'array','items':{'type':'string'}}}},'toolsUsed':{'type':'array','items':{'type':'object','additionalProperties':False,'required':['tool','reason'],'properties':{'tool':{'type':'string'},'reason':{'type':'string'}}}}}}}}
+]
 
 def _is_local(url):
     h=urlparse(url).hostname or ''; return h in {'127.0.0.1','localhost'}
@@ -111,21 +126,38 @@ def select_verifier_backend(workspace='.villani-ops', backend_name=None, base_ur
     key=b.resolved_api_key() or ('dummy' if _is_local(bu) else None)
     if not key: raise VerifierConfigurationError(f'verifier backend {b.name} has no usable API key')
     return {'name':b.name,'backend':b.name,'baseUrl':bu,'model':mo,'apiKey':key}
-def _chat(cfg,messages,timeout, trace=None):
+def _chat_message(cfg,messages,timeout, trace=None, use_tools=True, force_tool=None):
     started=time.time(); raw=None; status="ok"; http_status=None
     try:
-        r=httpx.post(cfg['baseUrl'].rstrip('/')+'/chat/completions',headers={'Authorization':f"Bearer {cfg['apiKey']}"},json={'model':cfg['model'],'messages':messages,'temperature':0},timeout=timeout)
-        http_status=getattr(r,'status_code',None); r.raise_for_status(); raw=r.json(); return raw['choices'][0]['message'].get('content','')
+        payload={'model':cfg['model'],'messages':messages,'temperature':0}
+        if use_tools:
+            payload.update({'tools':LLM_TOOLS,'tool_choice':force_tool or 'auto'})
+        r=httpx.post(cfg['baseUrl'].rstrip('/')+'/chat/completions',headers={'Authorization':f"Bearer {cfg['apiKey']}"},json=payload,timeout=timeout)
+        http_status=getattr(r,'status_code',None); r.raise_for_status(); raw=r.json(); return raw['choices'][0]['message']
     except Exception:
         status='error'; raise
     finally:
         if trace is not None:
             trace.append_jsonl('llm_raw_responses.jsonl',{'index':getattr(trace,'llm_call_count',0),'createdAt':__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat(),'durationMs':int((time.time()-started)*1000),'provider':'openai-compatible','baseUrl':cfg.get('baseUrl'),'model':cfg.get('model'),'status':status,'httpStatus':http_status,'usage':(raw or {}).get('usage') if isinstance(raw,dict) else None,'raw':raw})
             trace.llm_call_count=getattr(trace,'llm_call_count',0)+1
+def _chat(cfg,messages,timeout, trace=None):
+    return (_chat_message(cfg,messages,timeout,trace=trace,use_tools=False) or {}).get('content','')
+def _json_object_from_mixed(s):
+    if not s: raise VerifierSchemaError('empty response')
+    dec=json.JSONDecoder()
+    for i,ch in enumerate(s):
+        if ch=='{':
+            try: return dec.raw_decode(s[i:])[0]
+            except Exception: pass
+    raise VerifierSchemaError('no JSON object found')
 def _parse(s):
     try: obj=json.loads(s)
-    except Exception as e: raise VerifierSchemaError(str(e))
-    if obj.get('type')=='tool_call': return obj
+    except Exception:
+        obj=_json_object_from_mixed(s)
+    if obj.get('type')=='tool_call':
+        if obj.get('name')=='verifier_read_tool' and isinstance(obj.get('arguments'),dict): return {'type':'tool_call',**obj['arguments']}
+        return obj
+    if obj.get('type')=='final_verdict' and isinstance(obj.get('arguments'),dict): obj={'type':'final_verdict',**obj['arguments']}
     if obj.get('type') is None and ('result' in obj or obj.get('verdict') in {'success','failure'}): obj['type']='final_verdict'
     if obj.get('type')!='final_verdict': raise VerifierSchemaError('invalid final verdict schema')
     if obj.get('result') not in (0,1): raise VerifierSchemaError('final verdict result must be 0 or 1')
@@ -207,40 +239,82 @@ def llm_result(run, det, workspace='.villani-ops', backend=None, base_url=None, 
         trace.msg_count=getattr(trace,'msg_count',0)
         for m in messages:
             trace.append_jsonl('llm_messages.jsonl',{'index':trace.msg_count,'role':m['role'],'name':None,'content':m['content'],'createdAt':__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat(),'chars':len(str(m['content']))}); trace.msg_count+=1
-    used=[]; deadline=time.monotonic()+timeout_seconds; calls=0; content=''
+    used=[]; deadline=time.monotonic()+timeout_seconds; calls=0; content=''; native_supported=True; protocol='native_tool_calls'; protocol_warnings=[]; empty_retried=False; protocol_retried=False
     while True:
         if time.monotonic()>deadline: raise VerifierLlmError('tool loop timeout')
-        try: content=_chat(cfg,messages,max(1,deadline-time.monotonic()),trace=trace)
+        force={'type':'function','function':{'name':'verifier_final_verdict'}} if calls>max_tool_calls else None
+        try:
+            msg=_chat_message(cfg,messages,max(1,deadline-time.monotonic()),trace=trace,use_tools=native_supported,force_tool=force)
         except Exception as e:
+            if native_supported and any(x in str(e).lower() for x in ['tool','tools','tool_choice','function']):
+                native_supported=False; protocol='legacy_json_fallback'; protocol_warnings.append('Backend rejected native tool calls; falling back to legacy JSON protocol.')
+                if trace is not None: trace.append_jsonl('llm_protocol.jsonl',{'protocol':protocol,'warning':protocol_warnings[-1]})
+                continue
             raise VerifierLlmError(f'HTTP failure: {e}')
-        try: obj=_parse(content)
-        except VerifierSchemaError:
-            try: obj=_repair(cfg,content,max(1,deadline-time.monotonic()),trace=trace)
-            except Exception as e: raise VerifierSchemaError(f'invalid JSON after repair: {e}')
+        tc=msg.get('tool_calls') or []
+        content=msg.get('content') or ''
+        if trace is not None:
+            trace.append_jsonl('llm_messages.jsonl',{'index':trace.msg_count,'role':'assistant','name':None,'content':content,'tool_calls':tc or None,'reasoning_content':msg.get('reasoning_content'),'createdAt':__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat(),'chars':len(str(content))}); trace.msg_count+=1
+            if msg.get('reasoning_content'): trace.append_jsonl('llm_reasoning_content.jsonl',{'content':msg.get('reasoning_content'),'chars':len(str(msg.get('reasoning_content')))})
+        if tc:
+            call=tc[0]; fn=(call.get('function') or {}); cname=fn.get('name'); raw_args=fn.get('arguments') or '{}'
+            try: args=json.loads(raw_args) if isinstance(raw_args,str) else (raw_args or {})
+            except Exception as e: raise VerifierSchemaError(f'invalid tool arguments: {e}')
+            if cname=='verifier_read_tool':
+                obj={'type':'tool_call',**args}
+            elif cname=='verifier_final_verdict':
+                obj={'type':'final_verdict',**args}
+                try: obj=_parse(json.dumps(obj))
+                except VerifierSchemaError as e:
+                    if not protocol_retried:
+                        protocol_retried=True; messages.append({'role':'user','content':'Your verifier_final_verdict arguments were invalid: '+str(e)+'. Return exactly one valid structured tool call.'}); continue
+                    raise
+            else:
+                if not protocol_retried:
+                    protocol_retried=True; messages.append({'role':'user','content':'Unknown verifier tool call. Return exactly one valid structured tool call: verifier_read_tool or verifier_final_verdict.'}); continue
+                raise VerifierSchemaError('unknown verifier tool call: '+str(cname))
+        else:
+            if not content.strip():
+                if msg.get('reasoning_content') and not protocol_retried:
+                    protocol_retried=True; messages.append({'role':'user','content':'Return your action using the structured tool call. Do not put the answer in reasoning_content.'}); continue
+                if native_supported and not empty_retried:
+                    empty_retried=True; calls=max_tool_calls+1; messages.append({'role':'user','content':'Empty response received. Return the final judgement using verifier_final_verdict.'}); continue
+                raise VerifierSchemaError('empty verifier response without tool call')
+            try:
+                obj=_parse(content); protocol='legacy_json_fallback'
+                if trace is not None: trace.append_jsonl('llm_protocol.jsonl',{'protocol':'legacy_json_fallback'})
+            except VerifierSchemaError:
+                try: obj=_repair(cfg,content,max(1,deadline-time.monotonic()),trace=trace)
+                except Exception as e: raise VerifierSchemaError(f'invalid JSON after repair: {e}')
         if obj.get('type')=='tool_call':
             if calls>=max_tool_calls:
-                messages.append({'role':'user','content':'Maximum tool calls reached. Return final_verdict JSON using evidence gathered so far.'});
-                max_tool_calls=-1; continue
+                messages.append({'role':'user','content':'Maximum tool calls reached. Return the final judgement using verifier_final_verdict.'});
+                calls=max_tool_calls+1; continue
             name=obj.get('tool'); args=obj.get('args') or {}; idx=calls; calls+=1; used.append({'tool':name,'reason':'LLM requested tool'})
             start=time.time(); status='ok'; err=None
             try: res=tools.dispatch(name,args)
             except Exception as e: res=json.dumps({'error':str(e)}); status='error'; err=str(e)
             if trace is not None:
-                trace.append_jsonl('tool_calls.jsonl',{'index':idx,'tool':name,'args':args,'startedAt':__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat(),'completedAt':__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat(),'durationMs':int((time.time()-start)*1000),'status':status,'resultChars':len(res),'truncated':len(res)>=max_tool_result_chars,'error':err,'reason':'LLM requested tool call.'})
+                trace.append_jsonl('tool_calls.jsonl',{'index':idx,'llmTool':'verifier_read_tool' if native_supported else None,'verifierTool':name,'tool':name,'args':args,'startedAt':__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat(),'completedAt':__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat(),'durationMs':int((time.time()-start)*1000),'status':status,'resultChars':len(res),'truncated':len(res)>=max_tool_result_chars,'error':err,'reason':obj.get('reason') or 'LLM requested tool call.'})
                 trace.append_jsonl('tool_observations.jsonl',{'toolCallIndex':idx,'tool':name,'observation':None,'observationText':res,'chars':len(res),'truncated':len(res)>=max_tool_result_chars})
-            messages.append({'role':'assistant','content':json.dumps(obj)})
-            messages.append({'role':'user','content':'Tool result for '+str(name)+':\n'+res})
+            if native_supported and protocol=='native_tool_calls':
+                tid=f'verifier-call-{idx}'
+                messages.append({'role':'assistant','content':None,'tool_calls':[{'id':tid,'type':'function','function':{'name':'verifier_read_tool','arguments':json.dumps({'tool':name,'args':args,'reason':obj.get('reason') or ''})}}]})
+                messages.append({'role':'tool','tool_call_id':tid,'content':res})
+            else:
+                messages.append({'role':'assistant','content':json.dumps(obj)})
+                messages.append({'role':'user','content':'Tool result for '+str(name)+':\n'+res})
             if trace is not None:
-                for m in messages[-2:]: trace.append_jsonl('llm_messages.jsonl',{'index':trace.msg_count,'role':m['role'],'name':None,'content':m['content'],'createdAt':__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat(),'chars':len(str(m['content']))}); trace.msg_count+=1
+                for m in messages[-2:]: trace.append_jsonl('llm_messages.jsonl',{'index':trace.msg_count,'role':m['role'],'name':None,'content':m.get('content'),'tool_calls':m.get('tool_calls'),'tool_call_id':m.get('tool_call_id'),'createdAt':__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat(),'chars':len(str(m.get('content')))}); trace.msg_count+=1
             continue
         
         if trace is not None:
-            trace.append_jsonl('llm_messages.jsonl',{'index':trace.msg_count,'role':'assistant','name':None,'content':content,'createdAt':__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat(),'chars':len(str(content))}); trace.msg_count+=1
-            trace.write_json('llm_final_verdict_raw.json',{'rawText':content,'parsed':obj})
+            trace.write_json('llm_final_verdict_raw.json',{'protocol':protocol,'rawText':content,'parsed':obj})
             parsed={'schemaVersion':'villani-ops-verifier-llm-verdict-v1',**{k:obj.get(k) for k in ['result','verdict','confidence','recommendedAction','reason','deliverableAssessment','constraintAssessment','requirementResults','successEvidence','failureEvidence','recoveredFailures','missingEvidence','riskFlags','uncertainty','toolsUsed']}}
             trace.write_json('llm_final_verdict_parsed.json',parsed)
+        obj.setdefault('riskFlags',[]); obj['riskFlags']+=protocol_warnings
         obj=calibrate(det,obj,trace=trace,cfg=cfg,timeout=max(1,deadline-time.monotonic())); break
-    det.update({'result':obj['result'],'verdict':obj['verdict'],'confidence':obj['confidence'],'recommendedAction':obj['recommendedAction'],'reason':obj['reason'],'resultSource':obj.get('resultSource'),'postProcessingChangedResult':obj.get('postProcessingChangedResult'),'deliverableAssessment':obj.get('deliverableAssessment',det.get('deliverableAssessment')),'constraintAssessment':obj.get('constraintAssessment',det.get('constraintAssessment')),'requirementResults':obj.get('requirementResults',det['requirementResults']),'successEvidence':obj.get('successEvidence',det['successEvidence']),'failureEvidence':obj.get('failureEvidence',det['failureEvidence']),'recoveredFailures':obj.get('recoveredFailures',det['recoveredFailures']),'missingEvidence':obj.get('missingEvidence',det['missingEvidence']),'riskFlags':obj.get('riskFlags',det['riskFlags']),'toolsUsed':used+obj.get('toolsUsed',[]),'llmRawVerdict':obj.get('llmRawVerdict',{}),'calibration':obj.get('_calibration',{}),'verifier':{'mode':'llm_tool_loop','backend':cfg['backend'],'model':cfg['model'],'baseUrl':cfg['baseUrl'],'promptVersion':PROMPT_VERSION}})
+    det.update({'result':obj['result'],'verdict':obj['verdict'],'confidence':obj['confidence'],'recommendedAction':obj['recommendedAction'],'reason':obj['reason'],'resultSource':obj.get('resultSource'),'postProcessingChangedResult':obj.get('postProcessingChangedResult'),'deliverableAssessment':obj.get('deliverableAssessment',det.get('deliverableAssessment')),'constraintAssessment':obj.get('constraintAssessment',det.get('constraintAssessment')),'requirementResults':obj.get('requirementResults',det['requirementResults']),'successEvidence':obj.get('successEvidence',det['successEvidence']),'failureEvidence':obj.get('failureEvidence',det['failureEvidence']),'recoveredFailures':obj.get('recoveredFailures',det['recoveredFailures']),'missingEvidence':obj.get('missingEvidence',det['missingEvidence']),'riskFlags':obj.get('riskFlags',det['riskFlags']),'toolsUsed':used+obj.get('toolsUsed',[]),'llmRawVerdict':obj.get('llmRawVerdict',{}),'llmProtocol':protocol,'llmProtocolWarnings':protocol_warnings,'calibration':obj.get('_calibration',{}),'verifier':{'mode':'llm_tool_loop','backend':cfg['backend'],'model':cfg['model'],'baseUrl':cfg['baseUrl'],'promptVersion':PROMPT_VERSION}})
     return validate_final_result_consistency(det)
 
 def finalize_verifier_result(raw_llm_verdict, processed_verdict, trace_info=None):
