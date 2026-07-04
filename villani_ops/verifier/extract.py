@@ -5,9 +5,10 @@ VALIDATION=['test','pytest','npm test','pnpm test','yarn test','vitest','jest','
 FAIL_RE=re.compile(r'\b(FAIL|FAILED|error|exception|traceback|not found|refused|timeout|permission denied|connection refused|syntax error|missing file)\b',re.I)
 PASS_RE=re.compile(r'\b(PASS|test[s]? passed|all tests passed|all correctness tests passed|successful|succeeded)\b',re.I)
 URL_RE=re.compile(r'https?://[^\s"\'<>]+')
-KNOWN_EXT={'.py','.r','.R','.stan','.ics','.tex','.txt','.csv','.json','.html','.js','.ts','.md','.yml','.yaml','.sh','.c','.h','.sql','.db','.sqlite','.xml'}
-OUTPUT_EXT={'.json','.txt','.csv','.ics','.html','.xml','.md'}
-PATH_CAND_RE=re.compile(r'(?:https?://[^\s"\'<>]+|(?:\.?\.?/)?[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+|[A-Za-z0-9_.-]+\.(?:py|R|r|stan|ics|tex|txt|csv|json|html|js|ts|md|yml|yaml|sh|c|h|sql|db|sqlite|xml))')
+KNOWN_EXT={'.py','.r','.R','.stan','.ics','.tex','.txt','.csv','.json','.html','.js','.ts','.md','.yml','.yaml','.sh','.c','.h','.sql','.db','.sqlite','.xml','.tar','.gz','.tgz','.zip'}
+OUTPUT_EXT={'.json','.txt','.csv','.ics','.html','.xml','.md','.pdf'}
+INPUT_EXT={'.db','.sqlite','.sql','.tar','.gz','.zip','.tgz'}
+PATH_CAND_RE=re.compile(r'(?:https?://[^\s"\'<>]+|(?:\.?\.?/)?[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+|[A-Za-z0-9_.-]+\.(?:py|R|r|stan|ics|tex|txt|csv|json|html|js|ts|md|yml|yaml|sh|c|h|sql|db|sqlite|xml|tar\.gz|tgz|zip|gz))')
 def is_validation_command(cmd:str|None):
     c=(cmd or '').lower(); return any(v in c for v in VALIDATION)
 def extract_requirements(objective:str|None):
@@ -69,22 +70,45 @@ def _preview_content(t,n=500):
     for k in ['content','text','data']:
         if k in a and a[k] is not None: return _as_text(a[k])[:n]
     return _as_text(t.resultSummary or t.args)[:n]
+def _near(text,p,words,window=90):
+    low=text.lower(); b=_basename(p).lower(); i=low.find(b)
+    if i<0: i=low.find(p.lower())
+    seg=low[max(0,i-window):i+len(b)+window] if i>=0 else low
+    return any(w in seg for w in words)
 def extract_deliverables(objective, run=None):
-    spec=DeliverableSpec(); text=objective or ''
+    spec=DeliverableSpec(); text=objective or ''; low=text.lower()
     for u in URL_RE.findall(text): spec.required_endpoints.append(u.rstrip('.,)'))
     files=_extract_paths_from_obj(text)
+    input_words=['given','provided','input','database','dataset','source archive','tarball','vendor','read from','using the file','using file']
+    output_words=['create','write','generate','save','produce','output','result file','posterior','report','scheduled','answer']
+    edit_words=['modify','edit','fix','implement in','update','change in','change']
     for p in files:
-        ext=_ext(p); low=p.lower()
-        if ext.lower() in OUTPUT_EXT or re.search(r'(must|create|write|generate|output)\s+[^.]{0,80}'+re.escape(_basename(p).lower()), text.lower()): spec.required_output_files.append(p)
-        else: spec.required_edited_files.append(p)
-        spec.required_files.append(p)
-    for pat,dst in [(r'\b(?:must|should)\s+install\s+([A-Za-z0-9_.+-]+)',spec.required_binaries),(r'\b(?:command|run)\s+`?([^`\n]+)`?',spec.required_commands)]:
+        ext=_ext(p).lower()
+        idx=text.lower().find(_basename(p).lower()); before=text.lower()[max(0,idx-45):idx] if idx>=0 else text.lower()
+        local_before=before.split(',')[-1].split('.')[-1]
+        if (any(w in local_before for w in input_words)) or (ext in INPUT_EXT and not any(w in local_before for w in output_words+edit_words)):
+            spec.input_artifacts.append(p)
+        elif ext in {'.py','.r','.R','.js','.ts','.c','.h','.sh'} and _near(text,p,edit_words,35):
+            spec.required_edited_files.append(p); spec.required_files.append(p)
+        elif ext in OUTPUT_EXT or _near(text,p,output_words,30):
+            spec.required_output_files.append(p); spec.required_generated_artifacts.append(p); spec.required_files.append(p)
+        elif _near(text,p,edit_words,35):
+            spec.required_edited_files.append(p); spec.required_files.append(p)
+        else:
+            spec.unknown_paths.append(p); spec.required_edited_files.append(p); spec.required_files.append(p)
+    if re.search(r'\b(performance|faster|runtime|time|timing|median|speed|speedup|optimize|optimized|efficient|threshold)\b',low):
+        spec.required_performance_checks.append('Objective includes runtime/performance requirement')
+    if re.search(r'\b(install|available in path|\bpath\b|pip install|index-url|client|import package|from package import|command should run|binary|executable)\b',low):
+        spec.required_downstream_commands.append('Objective requires downstream installability/consumer behavior')
+    if re.search(r'\b(service|localhost|port|curl|https?://|server)\b',low): spec.required_services.append('service/endpoint behavior')
+    if 'available in path' in low or 'binary' in low or 'executable' in low: spec.required_binaries.append('PATH/executable requirement')
+    for pat,dst in [(r'\b(?:must|should)\s+install\s+([A-Za-z0-9_.+-]+)',spec.required_binaries),(r'\b(?:command|run)\s+`?([^`\n]+)`?',spec.required_entrypoints)]:
         for m in re.findall(pat,text,re.I): dst.append(m.strip())
     for fn in re.findall(r'\bdef\s+([A-Za-z_]\w*)|\bfunction\s+([A-Za-z_]\w*)|`([A-Za-z_]\w*)\(`', text):
         name=next((x for x in fn if x),None)
         if name: spec.required_functions.append(name)
-    for m in re.findall(r'(?i)(do not edit\s+[^.\n]+|must not (?:change|modify|edit)\s+[^.\n]+|do not modify\s+[^.\n]+)',text): spec.negative_constraints.append(m.strip())
-    for m in re.findall(r'(?i)(only edit\s+[^.\n]+|only replace\s+[^.\n]+|using\s+synonyms\.txt|allowed\s+synonyms[^.\n]*)',text): spec.allowed_edit_constraints.append(m.strip())
+    for m in re.findall(r'(?i)(do not edit\s+[^.\n]+|must not (?:change|modify|edit)\s+[^.\n]+|do not modify\s+[^.\n]+|must not\s+[^.\n]+|forbidden\s+[^.\n]+|no warnings|no errors|without warnings|unchanged)',text): spec.negative_constraints.append(m.strip())
+    for m in re.findall(r'(?i)(only edit\s+[^.\n]+|only replace\s+[^.\n]+|allowed\s+[^.\n]+)',text): spec.allowed_edit_constraints.append(m.strip())
     if run:
         for obj in [run.finalSummary,run.summary]:
             if isinstance(obj,dict):

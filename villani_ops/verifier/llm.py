@@ -1,5 +1,5 @@
 from __future__ import annotations
-import json, os, time, httpx
+import json, os, time, re, httpx
 from urllib.parse import urlparse
 from villani_ops.storage.files import FileStorage
 from .deterministic import build_packet, PROMPT_VERSION
@@ -21,12 +21,18 @@ Do not return unclear or unknown.
 Do not abstain.
 No unclear verdict is allowed.
 
-First identify the task contract:
+Before returning result 1, identify the task contract:
 - required outputs
+- required modifications
 - required file modifications
 - required behavior
+- required entrypoints
+- required downstream behavior
+- required services/installability
 - required services or installability
+- required performance/quality constraints
 - required performance or quality constraints
+- required generated artifacts
 - forbidden changes
 - allowed-edit constraints
 - negative requirements such as "do not", "must not", "only", "no warnings"
@@ -50,10 +56,17 @@ If evidence is weak, make the conservative prediction and explain uncertainty.
 Accept only when the evidence supports the actual task contract.
 
 Reject when:
+- validation tests only setup, input artifacts, or exploratory code
+- downstream consumer behavior is required but not shown
+- session-local environment changes are the only installability evidence
+- performance is required but only functional correctness is shown
+- negative constraints or allowed-edit constraints are unchecked or violated
+- generated output file content is not inspected when content matters
 - the final deliverable is not verified
 - the validation tests a local/exploratory substitute instead of the actual deliverable
 - required downstream behavior is not shown
-- required performance/quality constraints are not demonstrated
+- required performance/quality constraints
+- required performance or quality constraints are not demonstrated
 - negative constraints or forbidden changes appear violated
 - the evidence is too weak to safely accept
 
@@ -111,19 +124,74 @@ def select_verifier_backend(workspace='.villani-ops', backend_name=None, base_ur
     key=b.resolved_api_key() or ('dummy' if _is_local(bu) else None)
     if not key: raise VerifierConfigurationError(f'verifier backend {b.name} has no usable API key')
     return {'name':b.name,'backend':b.name,'baseUrl':bu,'model':mo,'apiKey':key}
+def extract_response_text(message: dict) -> str:
+    content=message.get('content') or ''
+    if isinstance(content,list): content=''.join((x.get('text') if isinstance(x,dict) else str(x)) for x in content)
+    content=str(content or '')
+    for k in ['reasoning_content','reasoning','text','output_text']:
+        v=message.get(k)
+        if not content and v: return str(v)
+    return content
+
+def normalize_native_tool_calls(message: dict):
+    out=[]
+    for tc in message.get('tool_calls') or []:
+        fn=(tc or {}).get('function') or {}; name=fn.get('name'); args=fn.get('arguments') or {}
+        if isinstance(args,str):
+            try: args=json.loads(args or '{}')
+            except Exception: args={}
+        if name: out.append({'type':'tool_call','tool':name,'args':args if isinstance(args,dict) else {}})
+    return out
+
+def _balanced_json_candidates(text):
+    text=text or ''; starts=[i for i,ch in enumerate(text) if ch=='{']
+    for st in starts:
+        depth=0; instr=False; esc=False
+        for i in range(st,len(text)):
+            ch=text[i]
+            if instr:
+                if esc: esc=False
+                elif ch=='\\': esc=True
+                elif ch=='"': instr=False
+            else:
+                if ch=='"': instr=True
+                elif ch=='{': depth+=1
+                elif ch=='}':
+                    depth-=1
+                    if depth==0:
+                        yield text[st:i+1]; break
+
+def extract_first_json_object(text: str) -> dict:
+    cleaned=re.sub(r'^```(?:json|text)?\s*|```$','',text.strip(),flags=re.I|re.M)
+    last=None
+    for cand in _balanced_json_candidates(cleaned):
+        try: obj=json.loads(cand)
+        except Exception as e: last=e; continue
+        if isinstance(obj,dict) and (obj.get('type') in {'tool_call','final_verdict'} or (obj.get('type') is None and ('result' in obj or obj.get('verdict') in {'success','failure'}))):
+            return obj
+    raise VerifierSchemaError(str(last or 'no protocol JSON object found'))
+
 def _chat(cfg,messages,timeout, trace=None):
-    started=time.time(); raw=None; status="ok"; http_status=None
+    started=time.time(); raw=None; status="ok"; http_status=None; info={}
     try:
         r=httpx.post(cfg['baseUrl'].rstrip('/')+'/chat/completions',headers={'Authorization':f"Bearer {cfg['apiKey']}"},json={'model':cfg['model'],'messages':messages,'temperature':0},timeout=timeout)
-        http_status=getattr(r,'status_code',None); r.raise_for_status(); raw=r.json(); return raw['choices'][0]['message'].get('content','')
+        http_status=getattr(r,'status_code',None); r.raise_for_status(); raw=r.json(); msg=raw['choices'][0]['message']
+        extracted=extract_response_text(msg); parsed_preview=None; parse_status='native_tool_call' if msg.get('tool_calls') else 'not_parsed'; parse_error=None
+        if extracted:
+            try:
+                parsed_preview=extract_first_json_object(extracted); parse_status='parsed'
+            except Exception as e:
+                parse_status='parse_failed'; parse_error=str(e)
+        info={'content':msg.get('content') or '', 'reasoning_content':msg.get('reasoning_content'), 'nativeToolCalls':msg.get('tool_calls') or [], 'extractedText':extracted, 'extractedJson':parsed_preview, 'parseStatus':parse_status, 'parseError':parse_error, 'toolCalls':normalize_native_tool_calls(msg)}
+        return info
     except Exception:
         status='error'; raise
     finally:
         if trace is not None:
-            trace.append_jsonl('llm_raw_responses.jsonl',{'index':getattr(trace,'llm_call_count',0),'createdAt':__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat(),'durationMs':int((time.time()-started)*1000),'provider':'openai-compatible','baseUrl':cfg.get('baseUrl'),'model':cfg.get('model'),'status':status,'httpStatus':http_status,'usage':(raw or {}).get('usage') if isinstance(raw,dict) else None,'raw':raw})
+            trace.append_jsonl('llm_raw_responses.jsonl',{'index':getattr(trace,'llm_call_count',0),'createdAt':__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat(),'durationMs':int((time.time()-started)*1000),'provider':'openai-compatible','baseUrl':cfg.get('baseUrl'),'model':cfg.get('model'),'status':status,'httpStatus':http_status,'usage':(raw or {}).get('usage') if isinstance(raw,dict) else None,**info})
             trace.llm_call_count=getattr(trace,'llm_call_count',0)+1
 def _parse(s):
-    try: obj=json.loads(s)
+    try: obj=s if isinstance(s,dict) else extract_first_json_object(s)
     except Exception as e: raise VerifierSchemaError(str(e))
     if obj.get('type')=='tool_call': return obj
     if obj.get('type') is None and ('result' in obj or obj.get('verdict') in {'success','failure'}): obj['type']='final_verdict'
@@ -148,13 +216,45 @@ Tool-call schema:
 { "type": "tool_call", "tool": "search_commands", "args": {"query": "PASS", "limit": 10} }
 Return exactly one JSON object."""
 def _repair(cfg,bad,timeout, trace=None):
-    msg=[{'role':'system','content':'Return only valid JSON. No markdown fences.'},{'role':'user','content':'Repair this invalid verifier response to required final_verdict schema. '+_schema_text()+'\nPrevious invalid response:\n'+bad}]
+    if not str(bad or '').strip(): raise VerifierSchemaError('empty response cannot be repaired')
+    msg=[{'role':'system','content':'Return exactly one JSON object only. No markdown fences. No prose.'},{'role':'user','content':'Repair this non-empty malformed verifier response to the required schema. '+_schema_text()+'\nMalformed response:\n'+str(bad)}]
     if trace is not None:
         for m in msg: trace.append_jsonl('llm_messages.jsonl',{'index':getattr(trace,'msg_count',0),'role':m['role'],'name':None,'content':m['content'],'createdAt':__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat(),'chars':len(str(m['content']))}); trace.msg_count=getattr(trace,'msg_count',0)+1
-    content=_chat(cfg,msg,timeout,trace=trace)
+    resp=_chat(cfg,msg,timeout,trace=trace); content=resp.get('extractedText','')
     if trace is not None:
         trace.append_jsonl('llm_messages.jsonl',{'index':getattr(trace,'msg_count',0),'role':'assistant','name':None,'content':content,'createdAt':__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat(),'chars':len(str(content))}); trace.msg_count=getattr(trace,'msg_count',0)+1
     return _parse(content)
+
+
+def _corpus(packet): return json.dumps(packet,default=str).lower()
+def detect_contract_risks(objective: str, packet: dict, deliverable_spec: dict|None=None) -> list[dict]:
+    text=((objective or '')+'\n'+_corpus(packet)); spec_text=json.dumps(deliverable_spec or packet.get('deliverableSpec') or {},default=str).lower(); objective_text=(objective or '').lower(); risks=[]
+    def add(id,kind,reason,req):
+        if not any(r['kind']==kind for r in risks): risks.append({'id':id,'kind':kind,'reason':reason,'requiredInspection':req})
+    if re.search(r'\b(performance|faster|runtime|time|timing|median|speed|speedup|optimize|optimized|efficient|within|threshold|benchmark|golden|reference|seconds|sec/call|elapsed)\b',text): add('risk-performance','performance','Objective/evidence includes runtime/performance requirement.',['search_commands:timing','read_command:benchmark'])
+    if re.search(r'\b(install|available in path|\bpath\b|pip install|index-url|client|import package|from package import|server|service|localhost|port|curl|http|https)\b',text): add('risk-downstream','downstream_consumer','Objective/evidence requires installability/service/downstream consumer behavior.',['search_commands:install/client','read_command:downstream'])
+    if re.search(r'\b(\.ics|\.json|\.csv|\.txt|\.html|\.xml|pdf|report|write|generate|create file|save|produce|output)\b',objective_text+'\n'+spec_text): add('risk-generated-output','generated_output','Objective/evidence mentions generated output artifacts.',['search_tool_calls:filename','read_tool_call:write'])
+    if re.search(r'\b(only edit|do not edit|must not|do not modify|only replace|allowed|forbidden|no warnings|no errors|without warnings|unchanged)\b',text): add('risk-constraints','allowed_edit','Objective includes allowed-edit or negative constraints.',['search_diff','read_diff'])
+    checks=packet.get('deterministicChecks') or {}
+    if checks.get('activeFailureCount') or checks.get('recoveredFailureCount'): add('risk-earlier-failures','earlier_failures_conflict','Evidence contains candidate failures around success evidence.',['search_commands:error/fail','read_command:failure'])
+    return risks
+
+def _tool_texts(tools_used):
+    return ' '.join(json.dumps(t,default=str).lower() for t in tools_used or [])
+def needs_forced_inspection_before_accept(raw_verdict, contract_risks, tools_used, packet):
+    if raw_verdict.get('result')!=1: return None
+    seen=_tool_texts(tools_used); corpus=_corpus(packet)
+    for r in contract_risks:
+        k=r['kind']
+        ok=False; msg=''
+        if k=='performance': ok=bool(re.search(r'timing|performance|median|runtime|speedup|reference|golden|benchmark',seen)) or bool(re.search(r'command\[|exitcode',corpus) and re.search(r'benchmark|median|deployment completed in \d+s|elapsed|seconds|sec/call|speedup|threshold',corpus)); msg='You are about to accept a run with a performance/runtime requirement. Before final_verdict, inspect exact timing or benchmark evidence using tools. Look for baseline/reference/golden comparison, repeated/median timing, threshold, and whether functional correctness alone is insufficient.'
+        elif k in {'downstream_consumer','installability','service_access'}: ok=bool(re.search(r'pip install|index-url|path|which|import|client|service|endpoint|curl|fresh|localhost|port',seen)) or bool(re.search(r'command\[|exitcode',corpus) and re.search(r'git clone|git push|curl .*localhost|pip install|client|fresh',corpus)); msg='You are about to accept a run with installability/service/downstream-consumer requirements. Use tools to inspect exact evidence of a downstream consumer command succeeding. Distinguish server/setup evidence from an actual client/install/import/run command. Distinguish session-local environment exports from persistent/default availability.'
+        elif k=='generated_output': ok=bool(re.search(r'read_tool_call|search_tool_calls|read_repo_file|write|output|artifact|file',seen)); msg='You are about to accept a generated-output task. Use tools to inspect the generated artifact or Write tool content. Confirm the artifact exists and has structure/content relevant to the objective before final_verdict.'
+        elif k in {'allowed_edit','negative_constraint','file_diff'}: ok=bool(re.search(r'search_diff|read_diff|patch|diff|constraint|changed',seen)); msg='You are about to accept a task with negative or allowed-edit constraints. Use tools to inspect diffs, changed files, and any allowed-replacement/constraint source. Output success alone is insufficient if forbidden changes or warnings remain.'
+        elif k=='earlier_failures_conflict': ok=bool(re.search(r'fail|error|read_command|search_commands|recovery|success|pass',seen)); msg='The evidence contains earlier failures and later success claims. Use tools to inspect whether the failures were actually recovered or remain material before accepting.'
+        if not ok: return {'risk':r,'message':msg}
+    return None
+
 def _raw_snapshot(verdict):
     keys=['result','verdict','confidence','recommendedAction','reason','deliverableAssessment','constraintAssessment','requirementResults','successEvidence','failureEvidence','recoveredFailures','missingEvidence','riskFlags','uncertainty','toolsUsed']
     return {k:verdict.get(k) for k in keys if k in verdict}
@@ -202,26 +302,46 @@ def calibrate(det, verdict, trace=None, cfg=None, timeout=30):
 def llm_result(run, det, workspace='.villani-ops', backend=None, base_url=None, model=None, timeout_seconds=180, max_tool_calls=12, max_tool_result_chars=12000, max_read_lines=160, trace=None):
     cfg=select_verifier_backend(workspace,backend,base_url,model); tools=VerifierTools(run,det.get('repoDir'),max_tool_result_chars,max_read_lines)
     packet=build_packet(run,det.get('repoDir'))
+    contract_risks=detect_contract_risks(run.objective,packet,packet.get('deliverableSpec') or {})
+    packet['contractRisks']=contract_risks
+    if trace is not None: trace.write_json('contract_risks.json',contract_risks)
     messages=[{'role':'system','content':SYSTEM},{'role':'user','content':'Objective:\n'+str(run.objective)+'\nAvailable tools: '+', '.join(TOOLS)+'\n'+_schema_text()+'\nEvidence packet:\n'+json.dumps(packet,default=str)}]
     if trace is not None:
         trace.msg_count=getattr(trace,'msg_count',0)
         for m in messages:
             trace.append_jsonl('llm_messages.jsonl',{'index':trace.msg_count,'role':m['role'],'name':None,'content':m['content'],'createdAt':__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat(),'chars':len(str(m['content']))}); trace.msg_count+=1
-    used=[]; deadline=time.monotonic()+timeout_seconds; calls=0; content=''
+    used=[]; forced=[]; deadline=time.monotonic()+timeout_seconds; calls=0; content=''; empty_retry=False
     while True:
         if time.monotonic()>deadline: raise VerifierLlmError('tool loop timeout')
-        try: content=_chat(cfg,messages,max(1,deadline-time.monotonic()),trace=trace)
+        try: resp=_chat(cfg,messages,max(1,deadline-time.monotonic()),trace=trace)
         except Exception as e:
             raise VerifierLlmError(f'HTTP failure: {e}')
-        try: obj=_parse(content)
-        except VerifierSchemaError:
-            try: obj=_repair(cfg,content,max(1,deadline-time.monotonic()),trace=trace)
-            except Exception as e: raise VerifierSchemaError(f'invalid JSON after repair: {e}')
+        native=list(resp.get('toolCalls') or [])
+        content=resp.get('extractedText','') or ''
+        if native:
+            obj=native.pop(0)
+            for extra in reversed(native): messages.append({'role':'assistant','content':json.dumps(extra)})
+        elif not content.strip():
+            if not empty_retry:
+                empty_retry=True
+                msg='Your previous response was empty. Return exactly one JSON object only: either a tool_call or final_verdict matching the schema. No prose.'
+                messages.append({'role':'user','content':msg})
+                if trace is not None:
+                    trace.append_jsonl('errors.jsonl',{'kind':'empty_llm_response','message':'empty response; strict retry issued'})
+                    trace.append_jsonl('llm_messages.jsonl',{'index':trace.msg_count,'role':'user','name':None,'content':msg,'createdAt':__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat(),'chars':len(msg)}); trace.msg_count+=1
+                continue
+            raise VerifierLlmError('empty verifier response after strict retry')
+        else:
+            try: obj=_parse(content)
+            except VerifierSchemaError as pe:
+                if trace is not None: trace.append_jsonl('errors.jsonl',{'kind':'parse_failure','message':str(pe),'contentPreview':content[:1000]})
+                try: obj=_repair(cfg,content,max(1,deadline-time.monotonic()),trace=trace)
+                except Exception as e: raise VerifierSchemaError(f'invalid JSON after repair: {e}')
         if obj.get('type')=='tool_call':
             if calls>=max_tool_calls:
                 messages.append({'role':'user','content':'Maximum tool calls reached. Return final_verdict JSON using evidence gathered so far.'});
                 max_tool_calls=-1; continue
-            name=obj.get('tool'); args=obj.get('args') or {}; idx=calls; calls+=1; used.append({'tool':name,'reason':'LLM requested tool'})
+            name=obj.get('tool'); args=obj.get('args') or {}; idx=calls; calls+=1; used.append({'tool':name,'args':args,'reason':'LLM requested tool'})
             start=time.time(); status='ok'; err=None
             try: res=tools.dispatch(name,args)
             except Exception as e: res=json.dumps({'error':str(e)}); status='error'; err=str(e)
@@ -234,13 +354,27 @@ def llm_result(run, det, workspace='.villani-ops', backend=None, base_url=None, 
                 for m in messages[-2:]: trace.append_jsonl('llm_messages.jsonl',{'index':trace.msg_count,'role':m['role'],'name':None,'content':m['content'],'createdAt':__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat(),'chars':len(str(m['content']))}); trace.msg_count+=1
             continue
         
+        remaining_risks=[r for r in contract_risks if r.get('id') not in {((f.get('risk') or {}).get('id')) for f in forced}]
+        forced_inspection=needs_forced_inspection_before_accept(obj,remaining_risks,used,packet)
+        if forced_inspection and calls<max_tool_calls:
+            forced.append({**forced_inspection,'applied':True,'toolsUsed':used[:]})
+            if trace is not None:
+                trace.append_jsonl('forced_inspections.jsonl',forced[-1])
+            messages.append({'role':'user','content':forced_inspection['message']})
+            if trace is not None:
+                trace.append_jsonl('llm_messages.jsonl',{'index':trace.msg_count,'role':'user','name':None,'content':forced_inspection['message'],'createdAt':__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat(),'chars':len(forced_inspection['message'])}); trace.msg_count+=1
+            continue
+        elif forced_inspection:
+            forced.append({**forced_inspection,'applied':False,'toolLimitReached':True,'toolsUsed':used[:]})
+            obj.setdefault('riskFlags',[]).append('High-risk contract accepted without required inspection because tool limit was reached; LLM result remains authoritative.')
+            if trace is not None: trace.append_jsonl('forced_inspections.jsonl',forced[-1])
         if trace is not None:
             trace.append_jsonl('llm_messages.jsonl',{'index':trace.msg_count,'role':'assistant','name':None,'content':content,'createdAt':__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat(),'chars':len(str(content))}); trace.msg_count+=1
             trace.write_json('llm_final_verdict_raw.json',{'rawText':content,'parsed':obj})
             parsed={'schemaVersion':'villani-ops-verifier-llm-verdict-v1',**{k:obj.get(k) for k in ['result','verdict','confidence','recommendedAction','reason','deliverableAssessment','constraintAssessment','requirementResults','successEvidence','failureEvidence','recoveredFailures','missingEvidence','riskFlags','uncertainty','toolsUsed']}}
             trace.write_json('llm_final_verdict_parsed.json',parsed)
         obj=calibrate(det,obj,trace=trace,cfg=cfg,timeout=max(1,deadline-time.monotonic())); break
-    det.update({'result':obj['result'],'verdict':obj['verdict'],'confidence':obj['confidence'],'recommendedAction':obj['recommendedAction'],'reason':obj['reason'],'resultSource':obj.get('resultSource'),'postProcessingChangedResult':obj.get('postProcessingChangedResult'),'deliverableAssessment':obj.get('deliverableAssessment',det.get('deliverableAssessment')),'constraintAssessment':obj.get('constraintAssessment',det.get('constraintAssessment')),'requirementResults':obj.get('requirementResults',det['requirementResults']),'successEvidence':obj.get('successEvidence',det['successEvidence']),'failureEvidence':obj.get('failureEvidence',det['failureEvidence']),'recoveredFailures':obj.get('recoveredFailures',det['recoveredFailures']),'missingEvidence':obj.get('missingEvidence',det['missingEvidence']),'riskFlags':obj.get('riskFlags',det['riskFlags']),'toolsUsed':used+obj.get('toolsUsed',[]),'llmRawVerdict':obj.get('llmRawVerdict',{}),'calibration':obj.get('_calibration',{}),'verifier':{'mode':'llm_tool_loop','backend':cfg['backend'],'model':cfg['model'],'baseUrl':cfg['baseUrl'],'promptVersion':PROMPT_VERSION}})
+    det.update({'result':obj['result'],'verdict':obj['verdict'],'confidence':obj['confidence'],'recommendedAction':obj['recommendedAction'],'reason':obj['reason'],'resultSource':obj.get('resultSource'),'postProcessingChangedResult':obj.get('postProcessingChangedResult'),'deliverableAssessment':obj.get('deliverableAssessment',det.get('deliverableAssessment')),'constraintAssessment':obj.get('constraintAssessment',det.get('constraintAssessment')),'requirementResults':obj.get('requirementResults',det['requirementResults']),'successEvidence':obj.get('successEvidence',det['successEvidence']),'failureEvidence':obj.get('failureEvidence',det['failureEvidence']),'recoveredFailures':obj.get('recoveredFailures',det['recoveredFailures']),'missingEvidence':obj.get('missingEvidence',det['missingEvidence']),'riskFlags':obj.get('riskFlags',det['riskFlags']),'toolsUsed':used+obj.get('toolsUsed',[]),'contractRisks':contract_risks,'forcedInspections':forced,'llmRawVerdict':obj.get('llmRawVerdict',{}),'calibration':obj.get('_calibration',{}),'verifier':{'mode':'llm_tool_loop','backend':cfg['backend'],'model':cfg['model'],'baseUrl':cfg['baseUrl'],'promptVersion':PROMPT_VERSION}})
     return validate_final_result_consistency(det)
 
 def finalize_verifier_result(raw_llm_verdict, processed_verdict, trace_info=None):

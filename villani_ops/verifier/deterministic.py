@@ -26,8 +26,18 @@ def _deliverable_links(c,spec):
         links.extend([p for p in spec.required_files if _basename(p).lower() not in {'eval.py'}])
     return list(dict.fromkeys(links))
 def annotate_validation(item,c,spec):
-    links=_deliverable_links(c,spec); inline=is_inline_experiment(c); txt=_all(c)
+    links=_deliverable_links(c,spec); inline=is_inline_experiment(c); txt=_all(c); cmd=command_text(c).lower()
     item.deliverableLinked=bool(links); item.deliverableLinks=links
+    item.provenance='command'; item.selfValidation=True
+    vals=[]
+    if links: vals.append('required_output_file' if any(_basename(l)==_basename(x) for l in links for x in spec.required_output_files+spec.required_generated_artifacts) else 'required_edited_file')
+    if spec.required_entrypoints and any(e.lower() in cmd for e in spec.required_entrypoints): vals.append('required_entrypoint')
+    if re.search(r'pip install|index-url|fresh|client|import |from .* import|git clone|git push',cmd+txt): vals.append('downstream_consumer_behavior'); item.downstreamValidation=True
+    if re.search(r'export\s+path=.*&&\s*which|export\s+path=.*;\s*which',cmd): item.sessionLocalOnly=True
+    if re.search(r'benchmark|median|runtime|timing|speedup|seconds|sec/call|elapsed|golden|reference',cmd+txt): vals.append('performance_requirement')
+    if is_setup_or_mutation_command(c): vals.append('setup_only')
+    if re.search(r'\.schema|input|database|dataset',cmd+txt) and not links: vals.append('input_artifact_only')
+    item.validates=list(dict.fromkeys(vals or (['setup_only'] if is_setup_or_mutation_command(c) else ['agent_claim_only'] if not links else [])))
     if links and not inline:
         item.validationStrength='strong'
     elif links and inline and ('import' in txt or any(f'from {_basename(p).split(".")[0].lower()}' in txt for p in links)):
@@ -51,7 +61,7 @@ def is_inspection_command(c):
     cmd=command_text(c).strip().lower()
     first=_cmd0(c)
     exact_prefix=('id ','cat /etc/os-release','cat /etc/ssh/sshd_config','pgrep','ss ','ls','find ','stat ','pwd','whoami','python --version','python3 --version','node --version','npm --version','env')
-    return cmd in {'pwd','whoami','ls','id git'} or (first in {'id','pgrep','ss','ls','stat','whoami','pwd'} or (first=='which' and 'sqlite3' not in cmd)) or any(cmd.startswith(x) for x in exact_prefix)
+    return bool(re.search(r'export\s+path=.*(?:&&|;)\s*which',cmd)) or cmd in {'pwd','whoami','ls','id git'} or (first in {'id','pgrep','ss','ls','stat','whoami','pwd'} or (first=='which' and 'sqlite3' not in cmd)) or any(cmd.startswith(x) for x in exact_prefix)
 
 def is_cleanup_command(c):
     cmd=command_text(c).lower()
