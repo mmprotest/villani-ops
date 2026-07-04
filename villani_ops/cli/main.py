@@ -13,8 +13,8 @@ from villani_ops.agentic.progress import AgenticProgressReporter
 from villani_ops.core.policy import DEFAULT_TIMEOUT_SECONDS
 
 app=typer.Typer(help='Villani Ops: CLI-only multi-agent performance orchestrator for coding tasks.')
-backend_app=typer.Typer(); task_app=typer.Typer(); policy_app=typer.Typer(); runner_app=typer.Typer(); viewer_app=typer.Typer(help='Local run viewer commands')
-app.add_typer(backend_app,name='backend'); app.add_typer(task_app,name='task'); app.add_typer(policy_app,name='policy'); app.add_typer(runner_app,name='runner'); app.add_typer(viewer_app,name='viewer')
+backend_app=typer.Typer(); task_app=typer.Typer(); policy_app=typer.Typer(); runner_app=typer.Typer(); viewer_app=typer.Typer(help='Local run viewer commands'); orchestrate_app=typer.Typer(help='Orchestration modes')
+app.add_typer(backend_app,name='backend'); app.add_typer(task_app,name='task'); app.add_typer(policy_app,name='policy'); app.add_typer(runner_app,name='runner'); app.add_typer(viewer_app,name='viewer'); app.add_typer(orchestrate_app,name='orchestrate')
 console=Console()
 
 
@@ -201,6 +201,53 @@ def verifier(
         else:
             console.print(f'Verifier error: {e}')
         raise typer.Exit(3)
+
+
+@orchestrate_app.command('verifier-parallel')
+def orchestrate_verifier_parallel(
+    repo: str = typer.Option(..., '--repo'),
+    task: str | None = typer.Option(None, '--task'),
+    task_file: str | None = typer.Option(None, '--task-file'),
+    candidates: int = typer.Option(5, '--candidates'),
+    parallelism: int | None = typer.Option(None, '--parallelism'),
+    seed: int | None = typer.Option(None, '--seed'),
+    workspace: str = typer.Option('.villani-ops', '--workspace'),
+    agent: str = typer.Option('villani-code', '--agent'),
+    backend: str | None = typer.Option(None, '--backend'),
+    candidate_timeout_seconds: int | None = typer.Option(None, '--candidate-timeout-seconds'),
+    verifier_backend: str | None = typer.Option(None, '--verifier-backend'),
+    verifier_timeout_seconds: int = typer.Option(180, '--verifier-timeout-seconds'),
+    verifier_max_tool_calls: int = typer.Option(12, '--verifier-max-tool-calls'),
+    on_all_fail: str = typer.Option('fail', '--on-all-fail'),
+    keep_worktrees: bool = typer.Option(False, '--keep-worktrees'),
+    json_output: bool = typer.Option(False, '--json'),
+    out: str | None = typer.Option(None, '--out'),
+):
+    if bool(task) == bool(task_file):
+        raise typer.BadParameter('Require exactly one of --task or --task-file')
+    task_text = task if task is not None else Path(task_file).read_text(encoding='utf-8')
+    if candidates < 1: raise typer.BadParameter('--candidates must be >= 1')
+    if parallelism is not None and parallelism < 1: raise typer.BadParameter('--parallelism must be >= 1')
+    if parallelism is not None and parallelism > candidates: raise typer.BadParameter('--parallelism must not exceed --candidates')
+    if on_all_fail not in {'fail','random','best-confidence'}: raise typer.BadParameter('--on-all-fail must be fail, random, or best-confidence')
+    from villani_ops.orchestrator.verifier_parallel import VerifierParallelConfig, VerifierParallelOrchestrator
+    cfg=VerifierParallelConfig(repo=Path(repo), task=task_text or '', candidates=candidates, parallelism=parallelism, seed=seed, workspace=Path(workspace), agent=agent, backend=backend, verifier_backend=verifier_backend, candidate_timeout_seconds=candidate_timeout_seconds, verifier_timeout_seconds=verifier_timeout_seconds, verifier_max_tool_calls=verifier_max_tool_calls, on_all_fail=on_all_fail, keep_worktrees=keep_worktrees, out=Path(out) if out else None)
+    try:
+        result=VerifierParallelOrchestrator(cfg).run()
+    except Exception as e:
+        if json_output:
+            typer.echo(json.dumps({'schemaVersion':'villani-ops-verifier-parallel-output-v1','status':'failed','error':str(e)}))
+        else:
+            console.print(f'Verifier parallel orchestration failed: {e}')
+        raise typer.Exit(1)
+    if json_output:
+        typer.echo(json.dumps(result))
+    else:
+        console.print(f"Verifier parallel orchestration: {result['status']}")
+        console.print(f"Winner: {result.get('winnerCandidateId') or 'none'}")
+        console.print(f"Artifacts: {result['orchestrationDir']}")
+    if result.get('status')!='completed':
+        raise typer.Exit(1)
 
 @app.command(context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
 def run(ctx: typer.Context, repo: str|None=None, task: str|None=typer.Option(None,'--task'), task_id: str|None=None, success_criteria: str|None=None, mode: str=typer.Option('performance', '--mode', help='Execution mode: performance, cheap, balanced, or quality'), runner: str=typer.Option('villani-code', '--runner'), candidate_attempts: int=typer.Option(3, '--candidate-attempts', min=1, max=8), timeout_seconds: int|None=typer.Option(None, '--timeout-seconds', help=f'Maximum run timeout in seconds (default: {DEFAULT_TIMEOUT_SECONDS}).'), classify: bool=typer.Option(True, '--classify/--no-classify'), non_interactive: bool=False, quiet: bool=typer.Option(False, '--quiet'), verbose: bool=typer.Option(False, '--verbose'), orchestrator: str=typer.Option('adaptive', '--orchestrator', help='Orchestrator architecture: adaptive (default; agentic single-task constrained), agentic (decomposition-capable), or graph (explicit legacy). adaptive: Agentic orchestration constrained to the single-task execution path. The orchestrator investigates, plans, attempts, validates, reviews, observes, and retries within the candidate-attempt budget, but cannot decompose the task.'), ui: bool=typer.Option(False, '--ui', help='Start local run viewer'), no_ui: bool=typer.Option(False, '--no-ui', help='Disable local run viewer'), ui_port: int=typer.Option(8765, '--ui-port'), open_ui: bool=typer.Option(False, '--open-ui'), tournament_budget_policy: str=typer.Option('off', '--tournament-budget-policy', help='Tournament budget policy: off, guarded, or planned'), workspace: str='.villani-ops'):
