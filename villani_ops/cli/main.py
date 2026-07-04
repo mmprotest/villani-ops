@@ -250,10 +250,9 @@ def orchestrate_verifier_parallel(
         raise typer.Exit(1)
 
 @app.command(context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
-def run(ctx: typer.Context, repo: str|None=None, task: str|None=typer.Option(None,'--task'), task_id: str|None=None, success_criteria: str|None=None, mode: str=typer.Option('performance', '--mode', help='Execution mode: performance, cheap, balanced, or quality'), runner: str=typer.Option('villani-code', '--runner'), candidate_attempts: int=typer.Option(3, '--candidate-attempts', min=1, max=8), timeout_seconds: int|None=typer.Option(None, '--timeout-seconds', help=f'Maximum run timeout in seconds (default: {DEFAULT_TIMEOUT_SECONDS}).'), classify: bool=typer.Option(True, '--classify/--no-classify'), non_interactive: bool=False, quiet: bool=typer.Option(False, '--quiet'), verbose: bool=typer.Option(False, '--verbose'), orchestrator: str=typer.Option('adaptive', '--orchestrator', help='Orchestrator architecture: adaptive (default; agentic single-task constrained), agentic (decomposition-capable), or graph (explicit legacy). adaptive: Agentic orchestration constrained to the single-task execution path. The orchestrator investigates, plans, attempts, validates, reviews, observes, and retries within the candidate-attempt budget, but cannot decompose the task.'), ui: bool=typer.Option(False, '--ui', help='Start local run viewer'), no_ui: bool=typer.Option(False, '--no-ui', help='Disable local run viewer'), ui_port: int=typer.Option(8765, '--ui-port'), open_ui: bool=typer.Option(False, '--open-ui'), tournament_budget_policy: str=typer.Option('off', '--tournament-budget-policy', help='Tournament budget policy: off, guarded, or planned'), workspace: str='.villani-ops'):
+def run(ctx: typer.Context, repo: str|None=None, task: str|None=typer.Option(None,'--task'), task_id: str|None=None, success_criteria: str|None=None, mode: str=typer.Option('performance', '--mode', help='Execution mode: performance, cheap, balanced, or quality'), runner: str=typer.Option('villani-code', '--runner'), candidate_attempts: int|None=typer.Option(None, '--candidate-attempts', min=1, max=8), timeout_seconds: int|None=typer.Option(None, '--timeout-seconds', help=f'Maximum run timeout in seconds (default: {DEFAULT_TIMEOUT_SECONDS}).'), classify: bool=typer.Option(True, '--classify/--no-classify'), non_interactive: bool=False, quiet: bool=typer.Option(False, '--quiet'), verbose: bool=typer.Option(False, '--verbose'), orchestrator: str=typer.Option('adaptive', '--orchestrator', help='Orchestrator architecture: adaptive (default; agentic single-task constrained), agentic (decomposition-capable), graph (explicit legacy), or verifier-parallel (parallel candidates with verifier selection).'), task_file: str|None=typer.Option(None,'--task-file'), backend: str|None=typer.Option(None, '--backend', help='Backend name for verifier-parallel runs.'), verifier_backend: str|None=typer.Option(None, '--verifier-backend', help='Verifier backend for verifier-parallel runs.'), ui: bool=typer.Option(False, '--ui', help='Start local run viewer'), no_ui: bool=typer.Option(False, '--no-ui', help='Disable local run viewer'), ui_port: int=typer.Option(8765, '--ui-port'), open_ui: bool=typer.Option(False, '--open-ui'), tournament_budget_policy: str=typer.Option('off', '--tournament-budget-policy', help='Tournament budget policy: off, guarded, or planned'), workspace: str='.villani-ops'):
     forbidden = {
         '--policy': '--policy has been replaced by --mode. Use --mode performance|cheap|balanced|quality. Cost policies moved to villani-ops cost-run.',
-        '--backend': 'Backend assignment is controlled by the execution policy. Configure backends, then use --mode. Performance orchestration always uses the most capable enabled backend in performance mode.',
         '--human-approval': 'Human approval is not supported in the primary orchestration path. Human approval is not supported in performance orchestration.',
     }
     for arg in ctx.args:
@@ -289,23 +288,41 @@ def run(ctx: typer.Context, repo: str|None=None, task: str|None=typer.Option(Non
     if task_id:
         data=json.loads((s.workspace/'tasks'/task_id/'task.json').read_text()); t=Task.model_validate(data); repo=t.repo_path
     else:
-        if not repo or not task: raise typer.BadParameter('Provide --task-id or both --repo and --task')
+        if task_file and task:
+            raise typer.BadParameter('Provide only one of --task or --task-file')
+        if task_file:
+            task = Path(task_file).read_text(encoding='utf-8')
+        if not repo or not task: raise typer.BadParameter('Provide --task-id or both --repo and --task/--task-file')
         t=Task(repo_path=str(Path(repo).resolve()), objective=task, success_criteria=success_criteria)
     if mode not in {'performance','cheap','balanced','quality'}:
         raise typer.BadParameter('Invalid mode. Choose one of: performance, cheap, balanced, quality')
-    if orchestrator not in {'graph','agentic','adaptive'}:
-        raise typer.BadParameter('Invalid orchestrator. Choose one of: adaptive, agentic, graph')
+    if orchestrator not in {'graph','agentic','adaptive','verifier-parallel'}:
+        raise typer.BadParameter('Invalid orchestrator. Choose one of: adaptive, agentic, graph, verifier-parallel')
     if tournament_budget_policy not in {'off','guarded','planned'}:
         raise typer.BadParameter('Invalid tournament budget policy. Choose one of: off, guarded, planned')
-    if runner != 'villani-code':
+    if runner != 'villani-code' and orchestrator != 'verifier-parallel':
         raise typer.BadParameter(f"Runner '{runner}' is registered but not implemented yet." if runner in {"claude-code","pi","aider","codex"} else f"Unsupported runner '{runner}'. Supported runner: villani-code.")
+    if orchestrator == 'verifier-parallel':
+        from villani_ops.orchestrator.verifier_parallel import VerifierParallelConfig, VerifierParallelOrchestrator
+        cfg=VerifierParallelConfig(repo=Path(repo), task=t.objective, candidates=candidate_attempts if candidate_attempts is not None else 5, parallelism=None, seed=None, workspace=Path(workspace), agent=runner, backend=backend, verifier_backend=verifier_backend or backend, candidate_timeout_seconds=timeout_seconds, on_all_fail='fail')
+        try:
+            vp_result=VerifierParallelOrchestrator(cfg).run()
+        except Exception as e:
+            console.print(f'Verifier parallel orchestration failed: {e}')
+            raise typer.Exit(1)
+        console.print(f"Verifier parallel orchestration: {vp_result.get('status')}")
+        console.print(f"Winner: {vp_result.get('winnerCandidateId') or 'none'}")
+        console.print(f"Artifacts: {vp_result.get('orchestrationDir')}")
+        if vp_result.get('status')!='completed':
+            raise typer.Exit(1)
+        return
     if orchestrator in {'agentic','adaptive'}:
         from villani_ops.agentic import OpsRunner, OpsRunRequest
         
         s.init_workspace(); backends=s.load_backends()
-        result=OpsRunner(s, backends=backends, progress_reporter=AgenticProgressReporter(not quiet, verbose=verbose, console=console)).run(OpsRunRequest(repo_path=str(Path(repo).resolve()), task=t.objective, success_criteria=t.success_criteria, mode=mode, runner=runner, candidate_attempts=candidate_attempts, timeout_seconds=timeout_seconds, workspace=workspace, orchestrator=orchestrator, backends=backends, tournament_budget_policy=tournament_budget_policy))
+        result=OpsRunner(s, backends=backends, progress_reporter=AgenticProgressReporter(not quiet, verbose=verbose, console=console)).run(OpsRunRequest(repo_path=str(Path(repo).resolve()), task=t.objective, success_criteria=t.success_criteria, mode=mode, runner=runner, candidate_attempts=candidate_attempts if candidate_attempts is not None else 3, timeout_seconds=timeout_seconds, workspace=workspace, orchestrator=orchestrator, backends=backends, tournament_budget_policy=tournament_budget_policy))
     else:
-        result=VillaniOps(s, progress_reporter=RunProgressReporter(not quiet, verbose=verbose)).run(repo=repo, task=t, candidate_attempts=candidate_attempts, timeout_seconds=timeout_seconds, classify=classify, non_interactive=(non_interactive or not sys.stdin.isatty()), mode=mode, runner=runner)
+        result=VillaniOps(s, progress_reporter=RunProgressReporter(not quiet, verbose=verbose)).run(repo=repo, task=t, candidate_attempts=candidate_attempts if candidate_attempts is not None else 3, timeout_seconds=timeout_seconds, classify=classify, non_interactive=(non_interactive or not sys.stdin.isatty()), mode=mode, runner=runner)
     d=result.decision
     failure_kind = getattr(getattr(result, 'state', None), 'failure_kind', None)
     if failure_kind:
