@@ -208,6 +208,30 @@ def _top_success(cats):
         out.extend(vals)
     return out[:20]
 
+def _candidate_evidence(cats):
+    mapping={
+        'candidateFailures':['activeFailures','recoveredFailures'],
+        'candidateValidationSignals':['finalEndToEndValidation','testValidation','serviceValidation'],
+        'candidateMutations':['repoMutation','fileMutation'],
+        'candidateArtifacts':['deliverableEvidence'],
+        'candidateConstraints':['constraintEvidence'],
+        'candidateRisks':['missingEvidence','riskFlags'],
+        'candidateAgentClaims':['agentClaims'],
+    }
+    out={k:[] for k in mapping}
+    seq=1
+    for bucket, labels in mapping.items():
+        for label in labels:
+            for e in cats.get(label,[]) or []:
+                if isinstance(e,dict):
+                    source=e.get('source') or 'derived'; text=e.get('text') or ''; order=e.get('order',0); strength=e.get('validationStrength') or e.get('confidence') or 'medium'; kind=e.get('kind')
+                else:
+                    source=getattr(e,'source','derived'); text=getattr(e,'text',''); order=getattr(e,'order',0); strength=getattr(e,'validationStrength',None) or getattr(e,'confidence','medium'); kind=getattr(e,'kind',None)
+                provenance='command' if source=='commands' else 'tool_result' if source=='tool_calls' else 'model_claim' if source=='model_responses' else source
+                out[bucket].append({'id':f'ev-{seq:03d}','source':source if source in {'commands','tool_calls','patches','model_responses','derived'} else 'derived','timelineOrder':order,'text':text,'provenance':provenance,'strengthHint':strength if strength in {'strong','medium','weak'} else 'medium','deterministicLabel':label if kind is None else f'{label}:{kind}','notes':['Candidate label only; not authoritative.']})
+                seq+=1
+    return out
+
 def build_packet(run:DebugRun, repo_dir=None):
 
     for ev in build_timeline(run):
@@ -231,7 +255,7 @@ def build_packet(run:DebugRun, repo_dir=None):
     required=list(dict.fromkeys(spec.required_files+spec.required_endpoints))
     assessment={'requiredDeliverables':required,'validatedDeliverables':validated,'missingDeliverables':[x for x in required if _basename(x) not in [_basename(y) for y in validated] and x not in validated],'weakValidationReasons':[getattr(e,'validationWeakness',None) for e in validations2 if getattr(e,'validationWeakness',None)]}
     constraints=list(dict.fromkeys(spec.negative_constraints+spec.allowed_edit_constraints)); violated=[e.text for e in cats.get('constraintEvidence',[]) if e.kind in {'forbidden_file_changed','unexpected_file_changed','allowed_edit_violation'}]; satisfied=[e.text for e in cats.get('constraintEvidence',[]) if e.kind=='allowed_edit_satisfied']; constraint_assessment={'constraints':constraints,'satisfiedConstraints':satisfied,'violatedConstraints':violated,'uncheckedConstraints':([] if not constraints or satisfied or violated else constraints)}
-    return {'schemaVersion':'villani-ops-verifier-packet-v2','objective':run.objective,'run':{'debugDir':run.debugDir,'repoDir':repo_dir,'runId':run.runId,'model':run.model,'provider':run.provider,'status':run.status,'durationMs':run.durationMs},'deliverableSpec':to_jsonable(spec),'deliverableAssessment':assessment,'constraintAssessment':constraint_assessment,'requirements':to_jsonable(reqs),'evidence':to_jsonable(cats),'artifactIndex':{'debugFiles':[],'commandCount':len(run.commands),'toolCallCount':len(run.toolCalls),'patchCount':len(run.patches),'modelResponseCount':len(run.modelResponses)},'deterministicChecks':{'finalValidationWindow':window,'activeFailureCount':len(cats['activeFailures']),'recoveredFailureCount':len(cats['recoveredFailures']),'postValidationRiskCount':post}}
+    return {'schemaVersion':'villani-ops-verifier-packet-v2','objective':run.objective,'run':{'debugDir':run.debugDir,'repoDir':repo_dir,'runId':run.runId,'model':run.model,'provider':run.provider,'status':run.status,'durationMs':run.durationMs},'deliverableSpec':to_jsonable(spec),'deliverableAssessment':assessment,'constraintAssessment':constraint_assessment,'requirements':to_jsonable(reqs),'evidence':to_jsonable(cats),'candidateEvidence':_candidate_evidence(to_jsonable(cats)),'artifactIndex':{'debugFiles':[],'commandCount':len(run.commands),'toolCallCount':len(run.toolCalls),'patchCount':len(run.patches),'modelResponseCount':len(run.modelResponses)},'deterministicChecks':{'finalValidationWindow':window,'activeFailureCount':len(cats['activeFailures']),'recoveredFailureCount':len(cats['recoveredFailures']),'postValidationRiskCount':post}}
 
 def deterministic_result(run:DebugRun, repo_dir=None, mode='deterministic', model=None, base_url=None):
     pkt=build_packet(run,repo_dir); cats=pkt['evidence']; active=cats['activeFailures']; validations=cats['finalEndToEndValidation']+cats['testValidation']+cats['serviceValidation']; status=(run.status or '').lower(); sat=sum(1 for r in pkt['requirements'] if r['status']=='satisfied'); coverage=sat/max(1,len(pkt['requirements']))
