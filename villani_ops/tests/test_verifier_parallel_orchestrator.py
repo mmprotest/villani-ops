@@ -6,8 +6,51 @@ from villani_ops.cli.main import app
 from villani_ops.core.backend import Backend
 from villani_ops.runners.base import RunnerResult
 from villani_ops.orchestrator.selection import select_winner
-from villani_ops.orchestrator.verifier_parallel import VerifierParallelConfig, VerifierParallelOrchestrator
+from villani_ops.orchestrator.verifier_parallel import VerifierParallelConfig, VerifierParallelOrchestrator, resolve_verifier_debug_dir
 
+
+
+
+def _touch(path: Path, ts: float | None = None):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{}')
+    if ts is not None:
+        import os
+        os.utime(path, (ts, ts))
+
+def test_resolve_verifier_debug_dir_direct(tmp_path):
+    debug=tmp_path/'debug'; _touch(debug/'session_meta.json')
+    assert resolve_verifier_debug_dir(debug) == debug
+
+def test_resolve_verifier_debug_dir_nested_timestamp(tmp_path):
+    root=tmp_path/'villani_code_debug'; nested=root/'20260705T004006_753583Z'
+    _touch(nested/'session_meta.json'); _touch(nested/'final_summary.json')
+    assert resolve_verifier_debug_dir(root) == nested
+
+def test_resolve_verifier_debug_dir_prefers_valid_resolved_trace_dir(tmp_path):
+    root=tmp_path/'debug_root'; old=root/'old'; new=root/'new'
+    _touch(old/'session_meta.json', 1); _touch(new/'session_meta.json', 2)
+    assert resolve_verifier_debug_dir(root, old) == old
+
+def test_resolve_verifier_debug_dir_invalid_resolved_trace_falls_back_to_child(tmp_path):
+    root=tmp_path/'debug_root'; invalid=root/'invalid'; valid=root/'valid'
+    invalid.mkdir(parents=True); _touch(valid/'session_meta.json')
+    assert resolve_verifier_debug_dir(root, invalid) == valid
+
+def test_resolve_verifier_debug_dir_chooses_newest_final_summary(tmp_path):
+    root=tmp_path/'debug_root'; old=root/'old'; new=root/'new'
+    _touch(old/'session_meta.json', 1); _touch(old/'final_summary.json', 10)
+    _touch(new/'session_meta.json', 2); _touch(new/'final_summary.json', 20)
+    assert resolve_verifier_debug_dir(root) == new
+
+def test_resolve_verifier_debug_dir_returns_none_without_session_meta(tmp_path):
+    root=tmp_path/'debug_root'; _touch(root/'child'/'final_summary.json')
+    assert resolve_verifier_debug_dir(root) is None
+
+def test_resolve_verifier_debug_dir_only_searches_one_extra_level(tmp_path):
+    root=tmp_path/'debug_root'; deep=root/'a'/'b'/'c'
+    _touch(deep/'session_meta.json')
+    assert resolve_verifier_debug_dir(root) is None
 
 def test_selection_single_success_wins():
     s=select_winner([{'candidateId':'a','result':0},{'candidateId':'b','result':1}],1)
@@ -43,7 +86,7 @@ class FakeRunner:
     def __init__(self): self.calls=[]
     def run_task(self, *, repo_path, task, success_criteria, backend_name, backend_config, timeout_seconds, context, artifacts_dir):
         self.calls.append((repo_path, task, context)); (Path(repo_path)/'a.txt').write_text(context['attempt_id'])
-        dbg=artifacts_dir/'debug'; dbg.mkdir(parents=True); (dbg/'metadata.json').write_text('{}')
+        dbg=artifacts_dir/'debug'; dbg.mkdir(parents=True); (dbg/'session_meta.json').write_text('{}')
         return RunnerResult(exit_code=0, stdout='out', stderr='', debug_artifact_dir=str(dbg), duration_ms=1)
 
 def test_flow_creates_worktrees_verifies_integrates_and_writes_artifacts(tmp_path):
@@ -115,7 +158,7 @@ def test_empty_patch_candidate_is_recorded_and_verified(tmp_path):
     repo=tmp_path/'plain'; repo.mkdir(); (repo/'a.txt').write_text('original')
     class NoopRunner:
         def run_task(self, **kw):
-            dbg=kw['artifacts_dir']/'debug'; dbg.mkdir(parents=True); (dbg/'metadata.json').write_text('{}')
+            dbg=kw['artifacts_dir']/'debug'; dbg.mkdir(parents=True); (dbg/'session_meta.json').write_text('{}')
             return RunnerResult(exit_code=0, stdout='', stderr='', debug_artifact_dir=str(dbg), duration_ms=1)
     def verifier(**kw): return {'result':1,'verdict':'success','confidence':.9,'recommendedAction':'accept','traceDir':str(kw['trace_dir'])}
     cfg=VerifierParallelConfig(repo=repo,task='noop',candidates=1,workspace=tmp_path/'ws',backend='b')
@@ -134,7 +177,7 @@ def test_one_candidate_failure_does_not_kill_successful_candidate(tmp_path):
             if kw['context']['attempt_id']=='candidate-001':
                 raise RuntimeError('boom')
             (kw['repo_path']/'a.txt').write_text('good')
-            dbg=kw['artifacts_dir']/'debug'; dbg.mkdir(parents=True); (dbg/'metadata.json').write_text('{}')
+            dbg=kw['artifacts_dir']/'debug'; dbg.mkdir(parents=True); (dbg/'session_meta.json').write_text('{}')
             return RunnerResult(exit_code=0, stdout='', stderr='', debug_artifact_dir=str(dbg), duration_ms=1)
     def verifier(**kw): return {'result':1,'verdict':'success','confidence':.9,'recommendedAction':'accept','traceDir':str(kw['trace_dir'])}
     cfg=VerifierParallelConfig(repo=repo,task='x',candidates=2,parallelism=1,seed=1,workspace=tmp_path/'ws',backend='b')
@@ -163,3 +206,74 @@ def test_cli_validation_and_json(monkeypatch, tmp_path):
     monkeypatch.setattr(VerifierParallelOrchestrator,'run',fake_run)
     res=r.invoke(app,['orchestrate','verifier-parallel','--repo',str(repo),'--task','x','--json'])
     assert res.exit_code==0 and json.loads(res.stdout)['status']=='completed'
+
+
+def test_verifier_parallel_passes_runner_resolved_nested_trace_dir(tmp_path):
+    repo=tmp_path/'plain'; repo.mkdir(); (repo/'a.txt').write_text('original')
+    seen=[]
+    class NestedRunner:
+        def run_task(self, **kw):
+            (kw['repo_path']/'a.txt').write_text('changed')
+            root=kw['artifacts_dir']/'villani_code_debug'; trace=root/'20260705T004006_753583Z'
+            _touch(trace/'session_meta.json'); _touch(trace/'final_summary.json')
+            return RunnerResult(exit_code=0, stdout='', stderr='', debug_artifact_dir=str(root), resolved_trace_dir=str(trace), duration_ms=1)
+    def verifier(**kw):
+        seen.append(kw['debug_dir'])
+        assert (kw['debug_dir']/'session_meta.json').exists()
+        return {'result':1,'verdict':'success','confidence':.9,'recommendedAction':'accept','traceDir':str(kw['trace_dir'])}
+    cfg=VerifierParallelConfig(repo=repo,task='x',candidates=1,workspace=tmp_path/'ws',backend='b')
+    orch=VerifierParallelOrchestrator(cfg, runner=NestedRunner(), verifier=verifier)
+    orch._backend_obj=lambda: Backend(name='b',provider='local',model='m',api_key='x')
+    out=orch.run(); od=Path(out['orchestrationDir'])
+    assert seen and seen[0].name == '20260705T004006_753583Z'
+    run_row=json.loads((od/'candidate-runs.jsonl').read_text().splitlines()[0])
+    cand_row=json.loads((od/'candidates.jsonl').read_text().splitlines()[0])
+    ver_row=json.loads((od/'verifier-results.jsonl').read_text().splitlines()[0])
+    assert run_row['debugRoot'].endswith('villani_code_debug')
+    assert run_row['debugDir'].endswith('20260705T004006_753583Z')
+    assert cand_row['debugResolutionStatus'] == 'resolved'
+    assert ver_row['debugDir'].endswith('20260705T004006_753583Z')
+    assert 'villani_code_debug' in (od/'transcript.md').read_text()
+
+
+def test_verifier_parallel_finds_nested_trace_without_runner_resolved_trace_dir(tmp_path):
+    repo=tmp_path/'plain'; repo.mkdir(); (repo/'a.txt').write_text('original')
+    seen=[]
+    class NestedRunner:
+        def run_task(self, **kw):
+            (kw['repo_path']/'a.txt').write_text('changed')
+            root=kw['artifacts_dir']/'villani_code_debug'; trace=root/'20260705T004006_753583Z'
+            _touch(trace/'session_meta.json'); _touch(trace/'commands.jsonl')
+            return RunnerResult(exit_code=0, stdout='', stderr='', debug_artifact_dir=str(root), duration_ms=1)
+    def verifier(**kw):
+        seen.append(kw['debug_dir'])
+        return {'result':1,'verdict':'success','confidence':.9,'recommendedAction':'accept','traceDir':str(kw['trace_dir'])}
+    cfg=VerifierParallelConfig(repo=repo,task='x',candidates=1,workspace=tmp_path/'ws',backend='b')
+    orch=VerifierParallelOrchestrator(cfg, runner=NestedRunner(), verifier=verifier)
+    orch._backend_obj=lambda: Backend(name='b',provider='local',model='m',api_key='x')
+    orch.run()
+    assert seen and seen[0].name == '20260705T004006_753583Z'
+
+
+def test_verifier_parallel_invalid_debug_is_candidate_error_and_other_candidate_can_win(tmp_path):
+    repo=tmp_path/'plain'; repo.mkdir(); (repo/'a.txt').write_text('original')
+    class MixedDebugRunner:
+        def run_task(self, **kw):
+            if kw['context']['attempt_id']=='candidate-001':
+                root=kw['artifacts_dir']/'villani_code_debug'; root.mkdir(parents=True)
+                return RunnerResult(exit_code=0, stdout='', stderr='', debug_artifact_dir=str(root), duration_ms=1)
+            (kw['repo_path']/'a.txt').write_text('winner')
+            root=kw['artifacts_dir']/'villani_code_debug'; trace=root/'trace'
+            _touch(trace/'session_meta.json')
+            return RunnerResult(exit_code=0, stdout='', stderr='', debug_artifact_dir=str(root), resolved_trace_dir=str(trace), duration_ms=1)
+    def verifier(**kw):
+        return {'result':1,'verdict':'success','confidence':.9,'recommendedAction':'accept','traceDir':str(kw['trace_dir'])}
+    cfg=VerifierParallelConfig(repo=repo,task='x',candidates=2,parallelism=1,seed=1,workspace=tmp_path/'ws',backend='b')
+    orch=VerifierParallelOrchestrator(cfg, runner=MixedDebugRunner(), verifier=verifier)
+    orch._backend_obj=lambda: Backend(name='b',provider='local',model='m',api_key='x')
+    out=orch.run(); od=Path(out['orchestrationDir'])
+    assert out['winnerCandidateId']=='candidate-002'
+    rows=[json.loads(line) for line in (od/'verifier-results.jsonl').read_text().splitlines()]
+    c1=next(r for r in rows if r['candidateId']=='candidate-001')
+    assert c1['verdict']=='error' and c1['result'] is None
+    assert (repo/'a.txt').read_text()=='winner'
