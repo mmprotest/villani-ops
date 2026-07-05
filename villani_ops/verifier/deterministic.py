@@ -13,6 +13,35 @@ def command_text(c): return c.command or ''
 def command_output_text(c): return ((c.stdout or '')+'\n'+(c.stderr or '')).strip()
 def _all(c): return (command_text(c)+'\n'+command_output_text(c)).lower()
 INLINE_RE=re.compile(r"(python\d*|node|ruby|perl|cat|rscript)\s+-?\s*<<['\"]?(PY|EOF|JS|RB|PL)",re.I)
+CRASH_RE=re.compile(r'\b(segmentation fault|core dumped|sigsegv|abort(?:ed)?|fatal error|uncaught exception|unhandled exception|exit code 139|returncode -11|process crashed)\b',re.I)
+SHELL_MASK_RE=re.compile(r'(&&|\|\||;|\bif\b|\|\s*(?:cat|tee)\b)',re.I)
+DISPLAY_ONLY_RE=re.compile(r'^\s*(?:cat|ls|find|pwd|echo|printf|head|tail|sed|awk|grep|stat|wc)\b',re.I)
+HARNESS_RE=re.compile(r'\b(pytest|unittest|npm\s+test|pnpm\s+test|yarn\s+test|vitest|jest|go\s+test|cargo\s+test|mvn\s+test|gradle\s+test|ctest|bats|tap|prove|tox|nox|ruff|mypy|tsc|typecheck|lint)\b',re.I)
+EXPLICIT_PASS_RE=re.compile(r'\b(pass(?:ed|es)?|success(?:ful)?|succeeded|ok|checks? passed|assertions? passed|verification complete|0\s+fail(?:ed|ures)?|[1-9]\d*\s+(?:tests?|checks?|assertions?)\s+passed)\b',re.I)
+NO_TEST_RE=re.compile(r'\b(0\s+tests?|no tests? ran|collected\s+0\s+items?|0\s+checks?)\b',re.I)
+
+def classify_validation_strength(c, spec=None):
+    cmd=command_text(c).strip(); out=command_output_text(c); txt=(cmd+'\n'+out).lower()
+    reasons=[]
+    if CRASH_RE.search(txt) or (c.exitCode not in (None,0) and is_validation_command(cmd)):
+        return 'failure',['validation command has failure/crash evidence']
+    if not out.strip(): reasons.append('validation command produced empty output')
+    if DISPLAY_ONLY_RE.search(cmd): reasons.append('command only displays or lists content')
+    if SHELL_MASK_RE.search(cmd) and re.search(r'\b(fail|failed|error|exception|traceback)\b', txt, re.I): reasons.append('shell syntax may have masked an inner failure')
+    if NO_TEST_RE.search(txt): reasons.append('test harness reported no executed tests/checks')
+    links=_deliverable_links(c,spec) if spec else []
+    harness=bool(HARNESS_RE.search(cmd) or HARNESS_RE.search(out))
+    explicit=bool(EXPLICIT_PASS_RE.search(out) and not NO_TEST_RE.search(out))
+    exercised=bool(links and (out.strip() or harness or explicit))
+    inline=is_inline_experiment(c)
+    if inline and not links and 'serves correct content' not in txt:
+        return 'weak', reasons or ['inline heredoc does not import or execute required file']
+    if c.exitCode==0 and not reasons and (('serves correct content' in txt) or (harness and explicit) or exercised or (explicit and links)):
+        return 'strong',[]
+    if c.exitCode==0 and explicit and not reasons:
+        return 'medium',['success output is not tied to a required deliverable']
+    return 'weak',reasons or ['no meaningful validation/check evidence was observed']
+
 def is_inline_experiment(c): return bool(INLINE_RE.search(command_text(c) or ''))
 def _deliverable_links(c,spec):
     txt=(command_text(c)+'\n'+command_output_text(c)).lower(); links=[]
@@ -28,20 +57,14 @@ def _deliverable_links(c,spec):
 def annotate_validation(item,c,spec):
     links=_deliverable_links(c,spec); inline=is_inline_experiment(c); txt=_all(c)
     item.deliverableLinked=bool(links); item.deliverableLinks=links
-    if links and not inline:
-        item.validationStrength='strong'
-    elif links and inline and ('import' in txt or any(f'from {_basename(p).split(".")[0].lower()}' in txt for p in links)):
-        item.validationStrength='strong'
-    elif inline:
-        if links and not any(re.search(rf'\bdef\s+{re.escape(fn.lower())}\b', txt) for fn in spec.required_functions):
-            item.validationStrength='strong'; return item
-        item.validationStrength='weak'
-        item.validationWeakness='inline script defines local implementation instead of testing final deliverable' if any(f"def {fn.lower()}" in txt for fn in spec.required_functions) else 'inline heredoc does not import or execute required file'
-    elif re.search(r'\b(pass|all correctness tests passed)\b',txt,re.I) and not links:
-        item.validationStrength='weak'; item.validationWeakness='generic PASS output is not tied to a required deliverable'
-    else:
-        item.validationStrength='medium' if links else 'weak'
-        if not links and (spec.required_files or spec.required_endpoints): item.validationWeakness='validation is not linked to required deliverable'
+    strength,reasons=classify_validation_strength(c,spec)
+    if strength=='failure':
+        item.validationStrength='weak'; item.validationWeakness='; '.join(reasons); return item
+    if inline and strength=='strong' and any(re.search(rf'\bdef\s+{re.escape(fn.lower())}\b', txt) for fn in spec.required_functions):
+        strength='weak'; reasons=['inline script defines local implementation instead of testing final deliverable']
+    item.validationStrength=strength
+    if reasons: item.validationWeakness='; '.join(reasons)
+    elif not links and strength!='strong' and (spec.required_files or spec.required_endpoints): item.validationWeakness='validation is not linked to required deliverable'
     return item
 def _cmd0(c):
     try: return shlex.split(command_text(c) or '')[0].lower()
@@ -84,15 +107,17 @@ def _signal_score(c, spec=None):
     txt=_all(c); cmd=command_text(c).lower(); score=0; signals=[]
     if is_setup_or_mutation_command(c) or is_cleanup_command(c) or (is_inspection_command(c) and not re.search(r'\b(sqlite3|gcno|gcda|gcov|libgcov)\b', cmd+txt)): return 0, []
     links=_deliverable_links(c,spec) if spec else []
-    if c.exitCode==0 and links:
+    strength,reasons=classify_validation_strength(c,spec)
+    if strength=='failure': score-=6; signals.append('validation has failure/crash evidence')
+    if c.exitCode==0 and links and strength=='strong':
         score+=6; signals.append(command_text(c)+' validates deliverable '+', '.join(links[:3]))
     if c.exitCode==0 and re.search(r'\b(posterior_.*\.txt|.*_mean\.txt|\.gcno|\.gcda)\b', txt+cmd): score+=5; signals.append('required generated artifact observed')
     if c.exitCode==0 and any(x in cmd for x in ['nm ','readelf','strings ']) and re.search(r'gcov|libgcov|__gcov', txt): score+=5; signals.append('instrumentation symbols observed')
     if c.exitCode==0 and re.search(r'\bsqlite3\b', cmd) and ('--version' in cmd or ':memory:' in cmd or 'which sqlite3' in cmd): score+=5; signals.append('required binary install/runtime check succeeded')
     if c.exitCode==0 and ('git push' in cmd or 'git clone' in cmd): score+=4; signals.append(command_text(c)+' succeeded')
     if c.exitCode==0 and is_service_validation_command(c): score+=3; signals.append(command_text(c)+' service validation succeeded')
-    if c.exitCode==0 and is_test_validation_command(c) and links: score+=3; signals.append(command_text(c)+' deliverable-linked test succeeded')
-    elif c.exitCode==0 and is_test_validation_command(c): score+=1; signals.append(command_text(c)+' weak generic test signal')
+    if c.exitCode==0 and is_test_validation_command(c) and links and strength=='strong': score+=3; signals.append(command_text(c)+' deliverable-linked test succeeded')
+    elif c.exitCode==0 and is_test_validation_command(c) and strength!='weak': score+=1; signals.append(command_text(c)+' weak generic test signal')
     if re.search(r'\bfail(?:ed)?\b', txt): score-=4; signals.append('FAIL output inside validation window')
     if c.exitCode not in (None,0): score-=3; signals.append(command_text(c)+' non-zero exit inside validation window')
     return score, [x for x in signals if x]
@@ -122,7 +147,7 @@ def detect_final_validation_window(run):
 def is_final_end_to_end_validation_command(c, run_context=None):
     win=(run_context or {}).get('window') if isinstance(run_context,dict) else None
     if win and win.get('startOrder', win.get('startIndex', 0)) <= getattr(c,'_timeline_order',c.index) <= win.get('endOrder', win.get('endIndex', 0)) and not (is_cleanup_command(c) or is_inspection_command(c) or is_setup_or_mutation_command(c)):
-        return _strong_final_signal(c) or (_signal_score(c,(run_context or {}).get('spec'))[0]>=5 if isinstance(run_context,dict) else False) or (_item(c,spec=(run_context or {}).get('spec')).validationStrength=='strong' if isinstance(run_context,dict) and (run_context or {}).get('spec') else False) or is_service_validation_command(c) or is_test_validation_command(c)
+        return _strong_final_signal(c) or (_signal_score(c,(run_context or {}).get('spec'))[0]>=5 if isinstance(run_context,dict) else False) or (_item(c,spec=(run_context or {}).get('spec')).validationStrength=='strong' if isinstance(run_context,dict) and (run_context or {}).get('spec') else False) or (_item(c,spec=(run_context or {}).get('spec')).validationStrength=='strong' if isinstance(run_context,dict) and (run_context or {}).get('spec') and (is_service_validation_command(c) or is_test_validation_command(c)) else False)
     return _strong_final_signal(c) or (_signal_score(c,(run_context or {}).get('spec'))[0]>=5 if isinstance(run_context,dict) else False) or (_item(c,spec=(run_context or {}).get('spec')).validationStrength=='strong' if isinstance(run_context,dict) and (run_context or {}).get('spec') else False)
 
 def _item(c, confidence='medium', spec=None):
@@ -246,7 +271,7 @@ def build_packet(run:DebugRun, repo_dir=None):
         elif getattr(e,'source',None)=='tool_calls' and e.commandId in order_by_tool: e.order=order_by_tool[e.commandId]
     window=detect_final_validation_window(run); active,recovered,post=_classify_failures(run,failures,window)
     cats=_cat(run,success,active,recovered,risks,missing,mutations,window,inspections,deliverables,spec); corpus='\n'.join([e.text for xs in cats.values() for e in xs]).lower()
-    validations2=cats['finalEndToEndValidation']+cats['testValidation']+cats['serviceValidation']
+    validations2=[e for e in cats['finalEndToEndValidation']+cats['testValidation']+cats['serviceValidation'] if getattr(e,'validationStrength',None)=='strong']
     for r in reqs:
         words=[w for w in re_words(r.requirement) if len(w)>3]; hits=sum(1 for w in words[:8] if w in corpus)
         ok=(r.id=='final_validation_present' and bool(validations2)) or (r.id=='no_blocking_failures' and not active) or hits>=max(1,min(3,len(words)//3)) or (bool(validations2) and bool(mutations))
@@ -258,7 +283,7 @@ def build_packet(run:DebugRun, repo_dir=None):
     return {'schemaVersion':'villani-ops-verifier-packet-v2','objective':run.objective,'run':{'debugDir':run.debugDir,'repoDir':repo_dir,'runId':run.runId,'model':run.model,'provider':run.provider,'status':run.status,'durationMs':run.durationMs},'deliverableSpec':to_jsonable(spec),'deliverableAssessment':assessment,'constraintAssessment':constraint_assessment,'requirements':to_jsonable(reqs),'evidence':to_jsonable(cats),'candidateEvidence':_candidate_evidence(to_jsonable(cats)),'artifactIndex':{'debugFiles':[],'commandCount':len(run.commands),'toolCallCount':len(run.toolCalls),'patchCount':len(run.patches),'modelResponseCount':len(run.modelResponses)},'deterministicChecks':{'finalValidationWindow':window,'activeFailureCount':len(cats['activeFailures']),'recoveredFailureCount':len(cats['recoveredFailures']),'postValidationRiskCount':post}}
 
 def deterministic_result(run:DebugRun, repo_dir=None, mode='deterministic', model=None, base_url=None):
-    pkt=build_packet(run,repo_dir); cats=pkt['evidence']; active=cats['activeFailures']; validations=cats['finalEndToEndValidation']+cats['testValidation']+cats['serviceValidation']; status=(run.status or '').lower(); sat=sum(1 for r in pkt['requirements'] if r['status']=='satisfied'); coverage=sat/max(1,len(pkt['requirements']))
+    pkt=build_packet(run,repo_dir); cats=pkt['evidence']; active=cats['activeFailures']; validations=[e for e in cats['finalEndToEndValidation']+cats['testValidation']+cats['serviceValidation'] if isinstance(e,dict) and e.get('validationStrength')=='strong']; status=(run.status or '').lower(); sat=sum(1 for r in pkt['requirements'] if r['status']=='satisfied'); coverage=sat/max(1,len(pkt['requirements']))
     constraint_violations=[e for e in cats.get('constraintEvidence',[]) if isinstance(e,dict) and e.get('kind') in {'forbidden_file_changed','unexpected_file_changed','allowed_edit_violation'}]
     if constraint_violations: verdict='failure'; conf=.9; action='reject'; reason='Allowed-edit or negative constraint was violated.'
     elif status in {'failed','crashed','timed_out','timeout'} and not validations: verdict='failure'; conf=.78; action='retry_same_model'; reason='Run status indicates failure and no later validation evidence was found.'
