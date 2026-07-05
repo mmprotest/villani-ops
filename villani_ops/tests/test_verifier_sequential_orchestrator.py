@@ -105,3 +105,22 @@ def test_bypasses_planner_classifier_and_ground_truth_names_absent(monkeypatch, 
     assert 'reward.txt' not in Path(vs.__file__).read_text()
     assert "/'result.json'" not in Path(vs.__file__).read_text()
     assert "/\"result.json\"" not in Path(vs.__file__).read_text()
+
+
+def test_sequential_early_stop_ignores_later_higher_quality_candidate(tmp_path):
+    repo=tmp_path/'repo'; repo.mkdir(); (repo/'a.txt').write_text('original')
+    runner=FakeRunner()
+    ver_calls=[]
+    def verifier(**kw):
+        cid=kw['repo_dir'].parent.name; ver_calls.append(cid)
+        if cid == 'candidate-001':
+            return {'result':1,'verdict':'success','confidence':0.5,'riskFlags':['risk'],'recommendedAction':'accept','traceDir':str(kw['trace_dir'])}
+        return {'result':1,'verdict':'success','confidence':0.99,'riskFlags':[],'successEvidence':['Behavioral validation test passed'],'recommendedAction':'accept','traceDir':str(kw['trace_dir'])}
+    cfg=VerifierSequentialConfig(repo=repo,task='do it',candidates=2,seed=1,workspace=tmp_path/'ws',backend='b',keep_worktrees=True)
+    orch=VerifierSequentialOrchestrator(cfg, runner=runner, verifier=verifier)
+    orch._backend_obj=lambda: Backend(name='b',provider='local',model='m',api_key='x')
+    out=orch.run()
+    assert out['winnerCandidateId']=='candidate-001'
+    assert runner.calls==['candidate-001']
+    assert ver_calls==['candidate-001']
+    assert out['stoppedEarly'] is True
