@@ -140,9 +140,10 @@ class VerifierParallelOrchestrator:
             write_json(out,res)
         cr.verifier_result=res if isinstance(res,dict) else {'result':None,'verdict':'error'}; cr.verifier_trace_dir=Path(cr.verifier_result.get('traceDir')) if cr.verifier_result.get('traceDir') else None; return cr
     def _record_candidate(self, cr, p):
-        v=cr.verifier_result or {}; return {'candidateId':cr.candidate_id,'worktreePath':str(cr.worktree_path),'status':'verified' if v else cr.run_status,'agent':self.config.agent,'backend':self.config.backend,'startedAt':cr.started_at,'completedAt':cr.completed_at,'debugRoot':str(cr.debug_root) if cr.debug_root else None,'debugDir':str(cr.debug_dir) if cr.debug_dir else None,'resolvedTraceDir':str(cr.resolved_trace_dir) if cr.resolved_trace_dir else None,'debugResolutionStatus':cr.debug_resolution_status,'debugResolutionReason':cr.debug_resolution_reason,'patchPath':str(cr.patch_path) if cr.patch_path else None,'patchStatus':cr.patch_status,'verifierResultPath':str(p/'candidates'/cr.candidate_id/'verifier'/'verifier-result.json'),'verifierTraceDir':str(cr.verifier_trace_dir) if cr.verifier_trace_dir else None,'result':v.get('result'),'verdict':v.get('verdict'),'confidence':v.get('confidence'),'recommendedAction':v.get('recommendedAction'),'error':cr.error or (v.get('reason') if v.get('verdict')=='error' else None)}
+        v=cr.verifier_result or {}; verifier_trace=str(cr.verifier_trace_dir) if cr.verifier_trace_dir else v.get('traceDir')
+        return {'candidateId':cr.candidate_id,'worktreePath':str(cr.worktree_path),'status':'verified' if v else cr.run_status,'agent':self.config.agent,'backend':self.config.backend,'startedAt':cr.started_at,'completedAt':cr.completed_at,'debugRoot':str(cr.debug_root) if cr.debug_root else None,'debugDir':str(cr.debug_dir) if cr.debug_dir else None,'candidateDebugDir':str(cr.debug_dir) if cr.debug_dir else None,'resolvedTraceDir':str(cr.resolved_trace_dir) if cr.resolved_trace_dir else None,'debugResolutionStatus':cr.debug_resolution_status,'debugResolutionReason':cr.debug_resolution_reason,'patchPath':str(cr.patch_path) if cr.patch_path else None,'patchStatus':cr.patch_status,'verifierResultPath':str(p/'candidates'/cr.candidate_id/'verifier'/'verifier-result.json'),'verifierTraceDir':verifier_trace,'traceDir':verifier_trace,'result':v.get('result'),'verdict':v.get('verdict'),'confidence':v.get('confidence'),'recommendedAction':v.get('recommendedAction'),'error':cr.error or (v.get('reason') if v.get('verdict')=='error' else None)}
     def _integrate(self, odir, winner):
-        rec={'schemaVersion':'villani-ops-verifier-parallel-integration-v1','winnerCandidateId':winner.candidate_id if winner else None,'sourceWorktree':str(winner.worktree_path) if winner else None,'targetRepo':str(self.config.repo),'status':'skipped','changedFiles':[],'error':None}
+        rec={'schemaVersion':'villani-ops-verifier-parallel-integration-v1','winnerCandidateId':winner.candidate_id if winner else None,'sourceWorktree':str(winner.worktree_path) if winner else None,'targetRepo':str(self.config.repo),'patchPath':str(winner.patch_path) if winner and winner.patch_path else None,'status':'skipped','changedFiles':[],'error':None}
         if not winner: write_json(odir/'integration.json',rec); return rec
         write_json(odir/'task.json', Task(repo_path=str(self.config.repo), objective=self.config.task).model_dump(mode='json'))
         write_json(odir/'decision.json', {'accepted':True,'winning_patch_path':str(winner.patch_path),'winning_attempt_id':winner.candidate_id})
@@ -151,6 +152,18 @@ class VerifierParallelOrchestrator:
             rec.update({'status':'integrated','changedFiles':winner.changed_files or [],'apply':art})
         except Exception as e: rec.update({'status':'failed','error':str(e)})
         write_json(odir/'integration.json',rec); return rec
+    def _materialization_record(self, odir, source, selection, integ, winner):
+        v=(winner.verifier_result or {}) if winner else {}
+        fallback=bool(selection.get('fallback') or selection.get('fallbackWinner'))
+        status='selected' if winner and (integ.get('status') in {'integrated','skipped'} or fallback or selection.get('winnerResult')==1) else ('no_winner' if not winner else 'integration_failed')
+        rec={'schemaVersion':'villani-ops-materializable-selection-v1','source':source,'orchestrationId':odir.name,'orchestrationDir':str(odir),'winnerCandidateId':winner.candidate_id if winner else None,'winnerResult':selection.get('winnerResult'),'winnerVerdict':v.get('verdict'),'winnerConfidence':v.get('confidence'),'targetRepo':str(self.config.repo),'patchPath':str(winner.patch_path) if winner and winner.patch_path else None,'selectionPath':str(odir/'selection.json'),'integrationPath':str(odir/'integration.json'),'createdAt':now(),'status':status,'fallbackWinner':fallback,'selectionPolicy':selection.get('selectionPolicy'),'materializationPath':str(odir/'materialization.json'),'candidateDebugDir':str(winner.debug_dir) if winner and winner.debug_dir else None,'verifierTraceDir':str(winner.verifier_trace_dir) if winner and winner.verifier_trace_dir else (v.get('traceDir') if v else None)}
+        write_json(odir/'materialization.json', rec)
+        if winner:
+            sel2=dict(selection); sel2.update({'winnerPatchPath':rec['patchPath'],'materializationPath':rec['materializationPath'],'candidateDebugDir':rec['candidateDebugDir'],'verifierTraceDir':rec['verifierTraceDir'],'traceDir':rec['verifierTraceDir']})
+            write_json(odir/'selection.json', sel2)
+            write_json(odir/'task.json', Task(repo_path=str(self.config.repo), objective=self.config.task).model_dump(mode='json'))
+            write_json(odir/'decision.json', {'accepted':True,'winning_patch_path':rec['patchPath'],'winning_attempt_id':winner.candidate_id})
+        return rec
     def run(self):
         cfg=self.config; cfg.repo=Path(cfg.repo).resolve(); cfg.workspace=Path(cfg.workspace).resolve(); cfg.parallelism=cfg.parallelism or cfg.candidates; cfg.seed=cfg.seed if cfg.seed is not None else secrets.randbelow(2**31)
         if cfg.candidates<1 or cfg.parallelism<1 or cfg.parallelism>cfg.candidates: raise ValueError('invalid candidates/parallelism')
@@ -163,18 +176,19 @@ class VerifierParallelOrchestrator:
         candidates=sorted(candidates,key=lambda c:c.candidate_id)
         for cr in candidates:
             append_jsonl(odir/'candidate-runs.jsonl', {'candidateId':cr.candidate_id,'status':cr.run_status,'exitCode':cr.exit_code,'durationSeconds':cr.duration_seconds,'stdoutPath':str(cr.stdout_path) if cr.stdout_path else None,'stderrPath':str(cr.stderr_path) if cr.stderr_path else None,'debugRoot':str(cr.debug_root) if cr.debug_root else None,'debugDir':str(cr.debug_dir) if cr.debug_dir else None,'resolvedTraceDir':str(cr.resolved_trace_dir) if cr.resolved_trace_dir else None})
-            v=cr.verifier_result or {}; append_jsonl(odir/'verifier-results.jsonl', {'candidateId':cr.candidate_id,'result':v.get('result'),'verdict':v.get('verdict'),'confidence':v.get('confidence'),'recommendedAction':v.get('recommendedAction'),'debugDir':str(cr.debug_dir) if cr.debug_dir else None,'traceDir':v.get('traceDir'),'verifierResultPath':str(odir/'candidates'/cr.candidate_id/'verifier'/'verifier-result.json')})
+            v=cr.verifier_result or {}; append_jsonl(odir/'verifier-results.jsonl', {'candidateId':cr.candidate_id,'result':v.get('result'),'verdict':v.get('verdict'),'confidence':v.get('confidence'),'recommendedAction':v.get('recommendedAction'),'debugDir':str(cr.debug_dir) if cr.debug_dir else None,'candidateDebugDir':str(cr.debug_dir) if cr.debug_dir else None,'verifierTraceDir':v.get('traceDir'),'traceDir':v.get('traceDir'),'verifierResultPath':str(odir/'candidates'/cr.candidate_id/'verifier'/'verifier-result.json')})
             append_jsonl(odir/'candidates.jsonl', self._record_candidate(cr,odir))
         sel=select_winner(candidates,cfg.seed,cfg.on_all_fail); write_json(odir/'selection.json',sel.to_dict())
         winner=next((c for c in candidates if c.candidate_id==sel.winnerCandidateId),None); integ=self._integrate(odir,winner)
         status='completed' if integ['status'] in {'integrated','skipped'} and (winner or cfg.on_all_fail=='fail') else 'failed'
         if sel.winnerCandidateId is None and cfg.on_all_fail=='fail': status='failed'
-        orch={'schemaVersion':'villani-ops-verifier-parallel-orchestration-v1','orchestrationId':oid,'mode':'verifier-parallel','createdAt':oid[:16],'completedAt':now(),'status':status,'repo':str(cfg.repo),'workspace':str(cfg.workspace),'taskPreview':cfg.task[:120],'candidates':cfg.candidates,'parallelism':cfg.parallelism,'seed':cfg.seed,'agent':cfg.agent,'backend':cfg.backend,'verifierBackend':cfg.verifier_backend,'onAllFail':cfg.on_all_fail,'winnerCandidateId':sel.winnerCandidateId,'selectionPolicy':POLICY}
+        mat=self._materialization_record(odir, 'verifier-parallel', sel.to_dict(), integ, winner)
+        orch={'schemaVersion':'villani-ops-verifier-parallel-orchestration-v1','orchestrationId':oid,'mode':'verifier-parallel','createdAt':oid[:16],'completedAt':now(),'status':status,'repo':str(cfg.repo),'workspace':str(cfg.workspace),'taskPreview':cfg.task[:120],'candidates':cfg.candidates,'parallelism':cfg.parallelism,'seed':cfg.seed,'agent':cfg.agent,'backend':cfg.backend,'verifierBackend':cfg.verifier_backend,'onAllFail':cfg.on_all_fail,'winnerCandidateId':sel.winnerCandidateId,'selectionPolicy':POLICY,'materializationPath':str(odir/'materialization.json'),'winnerPatchPath':mat.get('patchPath')}
         write_json(odir/'orchestration.json',orch); self._transcript(odir,candidates,sel,integ)
         if not cfg.keep_worktrees and integ['status']=='integrated':
             for cr in candidates:
                 if cr.worktree_path and cr.worktree_path.exists(): shutil.rmtree(cr.worktree_path, ignore_errors=True)
-        out={'schemaVersion':'villani-ops-verifier-parallel-output-v1','orchestrationId':oid,'status':status,'winnerCandidateId':sel.winnerCandidateId,'winnerResult':sel.winnerResult,'selectionPath':str(odir/'selection.json'),'integrationPath':str(odir/'integration.json'),'orchestrationDir':str(odir),'candidates':sel.allCandidates}
+        out={'schemaVersion':'villani-ops-verifier-parallel-output-v1','orchestrationId':oid,'status':status,'winnerCandidateId':sel.winnerCandidateId,'winnerResult':sel.winnerResult,'selectionPath':str(odir/'selection.json'),'integrationPath':str(odir/'integration.json'),'materializationPath':str(odir/'materialization.json'),'winnerPatchPath':mat.get('patchPath'),'candidateDebugDir':mat.get('candidateDebugDir'),'verifierTraceDir':mat.get('verifierTraceDir'),'orchestrationDir':str(odir),'candidates':sel.allCandidates}
         if cfg.out: write_json(cfg.out,out)
         return out
     def _transcript(self, odir,cands,sel,integ):
