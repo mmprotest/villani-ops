@@ -13,33 +13,57 @@ def command_text(c): return c.command or ''
 def command_output_text(c): return ((c.stdout or '')+'\n'+(c.stderr or '')).strip()
 def _all(c): return (command_text(c)+'\n'+command_output_text(c)).lower()
 INLINE_RE=re.compile(r"(python\d*|node|ruby|perl|cat|rscript)\s+-?\s*<<['\"]?(PY|EOF|JS|RB|PL)",re.I)
-CRASH_RE=re.compile(r'\b(segmentation fault|core dumped|sigsegv|abort(?:ed)?|fatal error|uncaught exception|unhandled exception|exit code 139|returncode -11|process crashed)\b',re.I)
+CRASH_RE=re.compile(r'\b(segmentation fault|core dumped|sigsegv|abort(?:ed)?|fatal error|uncaught exception|unhandled exception|exit code 139|returncode -11|process crashed|assertionerror|assertion failed|test failed)\b',re.I)
 SHELL_MASK_RE=re.compile(r'(&&|\|\||;|\bif\b|\|\s*(?:cat|tee)\b)',re.I)
-DISPLAY_ONLY_RE=re.compile(r'^\s*(?:cat|ls|find|pwd|echo|printf|head|tail|sed|awk|grep|stat|wc)\b',re.I)
+DISPLAY_ONLY_RE=re.compile(r'^\s*(?:cat|ls|find|pwd|echo|printf|head|tail|less|more|sed|awk|grep(?!\s+-q)|stat|file|tree|wc|nm|objdump|readelf|strings|ldd|gdb)\b',re.I)
 HARNESS_RE=re.compile(r'\b(pytest|unittest|npm\s+test|pnpm\s+test|yarn\s+test|vitest|jest|go\s+test|cargo\s+test|mvn\s+test|gradle\s+test|ctest|bats|tap|prove|tox|nox|ruff|mypy|tsc|typecheck|lint)\b',re.I)
+CHECK_RE=re.compile(r'\b(assert|raise\s+|from\s+\w+\s+import|import\s+\w+|grep\s+-q|test\s+|\[\s+[^\]]+\s+\]|cmp\s+|diff\s+|sha(?:1|256|512)sum\s+-c|exit\s+1|exit\s+\$?\(?.*!=)\b',re.I)
+EXIT_ONLY_RE=re.compile(r'^\s*(?:exit\s*code|return\s*code|status)\s*:?\s*0\s*$',re.I|re.S)
+DIAGNOSTIC_RE=re.compile(r'\b(gdb|nm|objdump|readelf|strings|ldd|valgrind|asan|ubsan|disassembl|symbol)\b',re.I)
+FAIL_WORD_RE=re.compile(r'(?<!0\s)\bfailed\b|\bfailures?:\s*[1-9]\d*|[1-9]\d*\s+failed\b',re.I)
 EXPLICIT_PASS_RE=re.compile(r'\b(pass(?:ed|es)?|success(?:ful)?|succeeded|ok|checks? passed|assertions? passed|verification complete|0\s+fail(?:ed|ures)?|[1-9]\d*\s+(?:tests?|checks?|assertions?)\s+passed)\b',re.I)
 NO_TEST_RE=re.compile(r'\b(0\s+tests?|no tests? ran|collected\s+0\s+items?|0\s+checks?)\b',re.I)
+MEM_STRONG_RE=re.compile(r'\b(invalid read|invalid write|use[- ]after[- ]free|double free|heap corruption|leak checker failure)\b',re.I)
+MEM_LOST_RE=re.compile(r'\b(definitely|possibly) lost:\s*(?!0\s+bytes)[0-9,]+\s+bytes',re.I)
+VALGRIND_ERR_RE=re.compile(r'ERROR SUMMARY:\s*(?!0\s+errors)[0-9,]+\s+errors',re.I)
+
+def has_strong_failure_text(text):
+    low=text or ''
+    if CRASH_RE.search(low) or MEM_STRONG_RE.search(low) or MEM_LOST_RE.search(low) or VALGRIND_ERR_RE.search(low): return True
+    if FAIL_WORD_RE.search(low) and not re.search(r'\b0\s+failed\b|\b0\s+failures\b', low, re.I): return True
+    return False
 
 def classify_validation_strength(c, spec=None):
-    cmd=command_text(c).strip(); out=command_output_text(c); txt=(cmd+'\n'+out).lower()
-    reasons=[]
-    if CRASH_RE.search(txt) or (c.exitCode not in (None,0) and is_validation_command(cmd)):
+    cmd=command_text(c).strip(); out=command_output_text(c); txt=(cmd+'\n'+out)
+    reasons=[]; out_stripped=out.strip()
+    if has_strong_failure_text(txt) or (c.exitCode not in (None,0) and is_validation_command(cmd)):
         return 'failure',['validation command has failure/crash evidence']
-    if not out.strip(): reasons.append('validation command produced empty output')
-    if DISPLAY_ONLY_RE.search(cmd): reasons.append('command only displays or lists content')
+    if not out_stripped: reasons.append('validation command produced empty output')
+    if EXIT_ONLY_RE.match(out_stripped): reasons.append('validation output only reports a wrapper exit code')
+    if DISPLAY_ONLY_RE.search(cmd): reasons.append('command only displays, lists, or inspects content')
+    if DIAGNOSTIC_RE.search(cmd) and not re.search(r'\b(no errors|no leaks|error summary:\s*0 errors)\b', out, re.I): reasons.append('diagnostic inspection is not behavioral validation')
     if SHELL_MASK_RE.search(cmd) and re.search(r'\b(fail|failed|error|exception|traceback)\b', txt, re.I): reasons.append('shell syntax may have masked an inner failure')
     if NO_TEST_RE.search(txt): reasons.append('test harness reported no executed tests/checks')
     links=_deliverable_links(c,spec) if spec else []
     harness=bool(HARNESS_RE.search(cmd) or HARNESS_RE.search(out))
-    explicit=bool(EXPLICIT_PASS_RE.search(out) and not NO_TEST_RE.search(out))
-    exercised=bool(links and (out.strip() or harness or explicit))
+    meaningful_harness_pass=bool(harness and EXPLICIT_PASS_RE.search(out) and not NO_TEST_RE.search(out) and not EXIT_ONLY_RE.match(out_stripped))
+    validation_pass=bool(is_validation_command(cmd) and links and EXPLICIT_PASS_RE.search(out) and not NO_TEST_RE.search(out) and not EXIT_ONLY_RE.match(out_stripped))
+    explicit_check=bool(CHECK_RE.search(cmd))
+    explicit_pass_after_check=bool(explicit_check and c.exitCode==0 and (EXPLICIT_PASS_RE.search(out) or re.search(r'grep\s+-q|test\s+|\[\s+|cmp\s+|diff\s+',cmd,re.I)))
     inline=is_inline_experiment(c)
-    if inline and not links and 'serves correct content' not in txt:
-        return 'weak', reasons or ['inline heredoc does not import or execute required file']
-    if c.exitCode==0 and not reasons and (('serves correct content' in txt) or (harness and explicit) or exercised or (explicit and links)):
+    transform_display=bool(re.search(r'&&\s*(cat|head|tail|less|more)\b|;\s*echo\s+["\']?exit\s*code',cmd,re.I))
+    if inline and not explicit_check and not meaningful_harness_pass and not validation_pass:
+        return 'weak', reasons or ['inline script prints or experiments without an explicit assertion/check']
+    if transform_display and not explicit_check and not meaningful_harness_pass and not validation_pass:
+        return 'weak', reasons or ['command transforms/runs then displays output without a behavioral check']
+    if c.exitCode==0 and not reasons and (meaningful_harness_pass or validation_pass):
         return 'strong',[]
-    if c.exitCode==0 and explicit and not reasons:
-        return 'medium',['success output is not tied to a required deliverable']
+    if c.exitCode==0 and not reasons and (explicit_pass_after_check or (is_validation_command(cmd) and links and re.search(r'\bwrote\b|created|generated', out, re.I))):
+        return 'strong',[]
+    if c.exitCode==0 and explicit_pass_after_check:
+        return 'medium',reasons
+    if c.exitCode==0 and EXPLICIT_PASS_RE.search(out) and not reasons:
+        return 'medium',['success output is not tied to an explicit check or recognized harness']
     return 'weak',reasons or ['no meaningful validation/check evidence was observed']
 
 def is_inline_experiment(c): return bool(INLINE_RE.search(command_text(c) or ''))
@@ -60,6 +84,8 @@ def annotate_validation(item,c,spec):
     strength,reasons=classify_validation_strength(c,spec)
     if strength=='failure':
         item.validationStrength='weak'; item.validationWeakness='; '.join(reasons); return item
+    if _strong_final_signal(c) and c.exitCode==0:
+        strength='strong'; reasons=[]
     if inline and strength=='strong' and any(re.search(rf'\bdef\s+{re.escape(fn.lower())}\b', txt) for fn in spec.required_functions):
         strength='weak'; reasons=['inline script defines local implementation instead of testing final deliverable']
     item.validationStrength=strength
@@ -118,7 +144,7 @@ def _signal_score(c, spec=None):
     if c.exitCode==0 and is_service_validation_command(c): score+=3; signals.append(command_text(c)+' service validation succeeded')
     if c.exitCode==0 and is_test_validation_command(c) and links and strength=='strong': score+=3; signals.append(command_text(c)+' deliverable-linked test succeeded')
     elif c.exitCode==0 and is_test_validation_command(c) and strength!='weak': score+=1; signals.append(command_text(c)+' weak generic test signal')
-    if re.search(r'\bfail(?:ed)?\b', txt): score-=4; signals.append('FAIL output inside validation window')
+    if has_strong_failure_text(txt): score-=4; signals.append('FAIL output inside validation window')
     if c.exitCode not in (None,0): score-=3; signals.append(command_text(c)+' non-zero exit inside validation window')
     return score, [x for x in signals if x]
 
@@ -155,12 +181,20 @@ def _item(c, confidence='medium', spec=None):
     item=EvidenceItem('command','commands',confidence,f'command[{c.index}] exit={c.exitCode}: {c.command} :: {blob.strip()}',c.toolCallId,timestamp=c.ts,order=c.index)
     return annotate_validation(item,c,spec) if spec else item
 
-def _classify_failures(run, failures, window):
-    active=[]; recovered=[]; post=0; strong_final=window is not None
+def _classify_failures(run, failures, window, mutations=None):
+    active=[]; recovered=[]; post=0; strong_final=window is not None; mutation_orders=[getattr(m,'order',0) for m in (mutations or [])]+[getattr(c,'_timeline_order',c.index) for c in run.commands if is_setup_or_mutation_command(c)]
     win_start=window.get('startOrder', window.get('startIndex')) if window else 10**9; win_end=window.get('endOrder', window.get('endIndex')) if window else -1
     for f in failures:
         if strong_final and f.order < win_start:
-            recovered.append(EvidenceItem('recovered_failure',f.source,f.confidence,'Recovered: '+f.text,f.commandId,f.turnIndex,f.timestamp,f.order))
+            same_cmd_later=False
+            fc=next((x for x in run.commands if getattr(x,'_timeline_order',x.index)==f.order or x.index==f.order),None)
+            if fc is not None:
+                fcmd=(fc.command or '').strip()
+                same_cmd_later=any((c.command or '').strip()==fcmd and getattr(c,'_timeline_order',c.index)>f.order and c.exitCode==0 and command_output_text(c).strip() for c in run.commands)
+            if f.confidence!='high' or any(f.order < mo < win_end for mo in mutation_orders) or same_cmd_later:
+                recovered.append(EvidenceItem('recovered_failure',f.source,f.confidence,'Recovered: '+f.text,f.commandId,f.turnIndex,f.timestamp,f.order))
+            else:
+                active.append(f)
         elif strong_final and f.order > win_end:
             c=next((x for x in run.commands if getattr(x,'_timeline_order',x.index)==f.order or x.index==f.order),None)
             if c and (is_cleanup_command(c) or is_inspection_command(c)):
@@ -269,7 +303,7 @@ def build_packet(run:DebugRun, repo_dir=None):
     for e in failures+success+mutations+inspections+deliverables:
         if getattr(e,'source',None)=='commands': e.order=order_by_cmd.get(next((c.index for c in run.commands if c.toolCallId==e.commandId and e.text.startswith(f'command[{c.index}]')), e.order), e.order)
         elif getattr(e,'source',None)=='tool_calls' and e.commandId in order_by_tool: e.order=order_by_tool[e.commandId]
-    window=detect_final_validation_window(run); active,recovered,post=_classify_failures(run,failures,window)
+    window=detect_final_validation_window(run); active,recovered,post=_classify_failures(run,failures,window,mutations)
     cats=_cat(run,success,active,recovered,risks,missing,mutations,window,inspections,deliverables,spec); corpus='\n'.join([e.text for xs in cats.values() for e in xs]).lower()
     validations2=[e for e in cats['finalEndToEndValidation']+cats['testValidation']+cats['serviceValidation'] if getattr(e,'validationStrength',None)=='strong']
     for r in reqs:
