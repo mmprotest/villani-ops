@@ -100,6 +100,82 @@ LLM_TOOLS=[
     {'type':'function','function':{'name':'verifier_final_verdict','description':'Return the final binary verifier judgement.','parameters':{'type':'object','additionalProperties':False,'required':['result','verdict','confidence','recommendedAction','reason','requirementResults','successEvidence','failureEvidence','recoveredFailures','missingEvidence','riskFlags','uncertainty','toolsUsed'],'properties':{'result':{'type':'integer','enum':[0,1]},'verdict':{'type':'string','enum':['success','failure']},'confidence':{'type':'number','minimum':0,'maximum':1},'recommendedAction':{'type':'string','enum':['accept','reject','retry_same_model','retry_higher_model','run_more_tests','inspect_manually']},'reason':{'type':'string'},'requirementResults':{'type':'array','items':{'type':'object','additionalProperties':False,'required':['id','requirement','status','evidence','risks'],'properties':{'id':{'type':'string'},'requirement':{'type':'string'},'status':{'type':'string','enum':['satisfied','unsatisfied']},'evidence':{'type':'array','items':{'type':'string'}},'risks':{'type':'array','items':{'type':'string'}}}}},'successEvidence':{'type':'array','items':{'type':'string'}},'failureEvidence':{'type':'array','items':{'type':'string'}},'recoveredFailures':{'type':'array','items':{'type':'string'}},'missingEvidence':{'type':'array','items':{'type':'string'}},'riskFlags':{'type':'array','items':{'type':'string'}},'uncertainty':{'type':'object','additionalProperties':False,'required':['level','reasons'],'properties':{'level':{'type':'string','enum':['low','medium','high']},'reasons':{'type':'array','items':{'type':'string'}}}},'deliverableAssessment':{'type':'object','additionalProperties':False,'required':['requiredDeliverables','validatedDeliverables','missingDeliverables','weakValidationReasons'],'properties':{'requiredDeliverables':{'type':'array','items':{'type':'string'}},'validatedDeliverables':{'type':'array','items':{'type':'string'}},'missingDeliverables':{'type':'array','items':{'type':'string'}},'weakValidationReasons':{'type':'array','items':{'type':'string'}}}},'constraintAssessment':{'type':'object','additionalProperties':False,'required':['constraints','satisfiedConstraints','violatedConstraints','uncheckedConstraints'],'properties':{'constraints':{'type':'array','items':{'type':'string'}},'satisfiedConstraints':{'type':'array','items':{'type':'string'}},'violatedConstraints':{'type':'array','items':{'type':'string'}},'uncheckedConstraints':{'type':'array','items':{'type':'string'}}}},'toolsUsed':{'type':'array','items':{'type':'object','additionalProperties':False,'required':['tool','reason'],'properties':{'tool':{'type':'string'},'reason':{'type':'string'}}}}}}}}
 ]
 
+
+def _truncate_text(value, max_text_chars):
+    if not isinstance(value,str): return value
+    if len(value)<=max_text_chars: return value
+    keep=max_text_chars//2
+    return value[:keep]+f"\n...[truncated {len(value)-max_text_chars} chars]...\n"+value[-(max_text_chars-keep):]
+
+def _compact_value(value, max_text_chars):
+    if isinstance(value,dict): return {k:_compact_value(v,max_text_chars) for k,v in value.items()}
+    if isinstance(value,list): return [_compact_value(v,max_text_chars) for v in value]
+    return _truncate_text(value,max_text_chars)
+
+def _cap_list(items, first=0, last=0):
+    items=list(items or [])
+    if len(items)<=first+last or (first==0 and len(items)<=last): return items
+    kept=(items[:first] if first else [])+(items[-last:] if last else [])
+    return kept+[{'truncated_count':len(items)-len(kept)}]
+
+def _dedupe_evidence(items):
+    out=[]; seen=set()
+    for item in items or []:
+        key=json.dumps(item,sort_keys=True,default=str) if not isinstance(item,dict) else (item.get('kind'),item.get('source'),item.get('text'),item.get('path'))
+        if key in seen: continue
+        seen.add(key); out.append(item)
+    return out
+
+def compact_verifier_packet(packet:dict, max_text_chars:int=900)->dict:
+    pkt=_compact_value(packet or {}, max_text_chars)
+    ev=dict(pkt.get('evidence') or {})
+    strong=lambda xs:[x for x in xs or [] if isinstance(x,dict) and x.get('validationStrength')=='strong']
+    final=ev.get('finalEndToEndValidation') or []
+    ev['finalEndToEndValidation']=_cap_list(_dedupe_evidence(strong(final)[:5]+final[-8:]), last=13)
+    for k,n in [('testValidation',8),('serviceValidation',8),('activeFailures',10),('mutationEvidence',10),('fileMutation',10),('repoMutation',10),('deliverableEvidence',10),('constraintEvidence',10)]:
+        if k in ev: ev[k]=_cap_list(_dedupe_evidence(ev.get(k)), last=n)
+    if 'recoveredFailures' in ev: ev['recoveredFailures']=_cap_list(_dedupe_evidence(ev.get('recoveredFailures')), last=5)
+    if 'missingEvidence' in ev: ev['missingEvidence']=_cap_list(_dedupe_evidence(ev.get('missingEvidence')), first=20, last=0)
+    pkt['evidence']=ev
+    ce=pkt.get('candidateEvidence') or {}
+    flat_seen={json.dumps(x,sort_keys=True,default=str) for vals in ev.values() if isinstance(vals,list) for x in vals if isinstance(x,dict)}
+    compact_ce={}
+    for k,vals in ce.items():
+        uniq=[]
+        for v in vals or []:
+            if isinstance(v,dict) and json.dumps(v,sort_keys=True,default=str) in flat_seen: continue
+            uniq.append(v)
+        compact_ce[k]=_cap_list(_dedupe_evidence(uniq), last=5)
+    pkt['candidateEvidence']=compact_ce
+    return pkt
+
+def normalize_read_tool_call(obj, allowed_tools=TOOLS):
+    if not isinstance(obj,dict): return None,'tool call is not an object'
+    out=dict(obj); args=out.get('args')
+    if not isinstance(args,dict): args={}
+    tool=out.get('tool')
+    if (not isinstance(tool,str) or not tool.strip()) and isinstance(out.get('args'),dict) and isinstance(out['args'].get('tool'),str):
+        tool=out['args'].get('tool'); args={k:v for k,v in out['args'].items() if k!='tool'}
+    if not isinstance(tool,str) or not tool.strip(): return None,'tool name is missing or invalid'
+    tool=tool.strip()
+    if tool not in allowed_tools: return None,'tool name is not allowed: '+tool
+    out['tool']=tool; out['args']=args; out.setdefault('reason','LLM requested tool call.')
+    return out,None
+
+def deterministic_fallback_result(det, warning):
+    da=det.get('deliverableAssessment') or {}; cats=det.get('evidenceByCategory') or {}
+    active=cats.get('activeFailures') or []; validations=(cats.get('finalEndToEndValidation') or [])+(cats.get('testValidation') or [])+(cats.get('serviceValidation') or [])
+    strong=[v for v in validations if isinstance(v,dict) and v.get('validationStrength')=='strong']
+    if da.get('missingDeliverables') or active:
+        result=0; verdict='failure'; conf=.78; action='reject'; reason='Deterministic fallback: decisive missing deliverable or active failure evidence remained after LLM/tool-loop failure.'
+    elif strong:
+        result=1; verdict='success'; conf=.72; action='inspect_manually'; reason='Deterministic fallback: strong final validation evidence remained after LLM/tool-loop failure.'
+    else:
+        return None
+    out=dict(det); risks=list(out.get('riskFlags') or []); risks.append(warning)
+    out.update({'result':result,'verdict':verdict,'confidence':conf,'recommendedAction':action,'reason':reason,'riskFlags':risks,'resultSource':'deterministic_fallback','llmProtocolWarnings':list(out.get('llmProtocolWarnings') or [])+[warning]})
+    return validate_final_result_consistency(out)
+
 def _is_local(url):
     h=urlparse(url).hostname or ''; return h in {'127.0.0.1','localhost'}
 def select_verifier_backend(workspace='.villani-ops', backend_name=None, base_url=None, model=None):
@@ -233,7 +309,7 @@ def calibrate(det, verdict, trace=None, cfg=None, timeout=30):
     return final
 def llm_result(run, det, workspace='.villani-ops', backend=None, base_url=None, model=None, timeout_seconds=180, max_tool_calls=12, max_tool_result_chars=12000, max_read_lines=160, trace=None):
     cfg=select_verifier_backend(workspace,backend,base_url,model); tools=VerifierTools(run,det.get('repoDir'),max_tool_result_chars,max_read_lines)
-    packet=build_packet(run,det.get('repoDir'))
+    packet=compact_verifier_packet(build_packet(run,det.get('repoDir')))
     messages=[{'role':'system','content':SYSTEM},{'role':'user','content':'Objective:\n'+str(run.objective)+'\nAvailable tools: '+', '.join(TOOLS)+'\n'+_schema_text()+'\nEvidence packet:\n'+json.dumps(packet,default=str)}]
     if trace is not None:
         trace.msg_count=getattr(trace,'msg_count',0)
@@ -250,6 +326,9 @@ def llm_result(run, det, workspace='.villani-ops', backend=None, base_url=None, 
                 native_supported=False; protocol='legacy_json_fallback'; protocol_warnings.append('Backend rejected native tool calls; falling back to legacy JSON protocol.')
                 if trace is not None: trace.append_jsonl('llm_protocol.jsonl',{'protocol':protocol,'warning':protocol_warnings[-1]})
                 continue
+            if '400' in str(e) or 'bad request' in str(e).lower():
+                fb=deterministic_fallback_result(det,'LLM verifier HTTP/tool-loop failure; returned conservative deterministic fallback: '+str(e))
+                if fb is not None: return fb
             raise VerifierLlmError(f'HTTP failure: {e}')
         tc=msg.get('tool_calls') or []
         content=msg.get('content') or ''
@@ -290,6 +369,15 @@ def llm_result(run, det, workspace='.villani-ops', backend=None, base_url=None, 
             if calls>=max_tool_calls:
                 messages.append({'role':'user','content':'Maximum tool calls reached. Return the final judgement using verifier_final_verdict.'});
                 calls=max_tool_calls+1; continue
+            norm,err=normalize_read_tool_call(obj)
+            if err:
+                protocol_warnings.append('Rejected malformed verifier tool call: '+err)
+                if not protocol_retried:
+                    protocol_retried=True; messages.append({'role':'user','content':'Your verifier_read_tool call was malformed: '+err+'. Return a valid verifier_final_verdict or a verifier_read_tool call with a non-empty allowed tool name.'}); continue
+                fb=deterministic_fallback_result(det,'Malformed LLM tool call could not be normalized: '+err)
+                if fb is not None: return fb
+                raise VerifierSchemaError('invalid verifier tool call: '+err)
+            obj=norm
             name=obj.get('tool'); args=obj.get('args') or {}; idx=calls; calls+=1; used.append({'tool':name,'reason':'LLM requested tool'})
             start=time.time(); status='ok'; err=None
             try: res=tools.dispatch(name,args)

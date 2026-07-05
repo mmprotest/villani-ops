@@ -2,8 +2,8 @@ from __future__ import annotations
 import hashlib,re,json,os
 from .types import *
 VALIDATION=['test','pytest','npm test','pnpm test','yarn test','vitest','jest','go test','cargo test','mvn test','gradle test','tsc','typecheck','build','lint','curl','urllib','requests','wget','git clone','git push','nginx -t','openssl x509','grep','pass','verification','cat ','eval.py','rscript']
-FAIL_RE=re.compile(r'\b(FAIL|FAILED|error|exception|traceback|not found|refused|timeout|permission denied|connection refused|syntax error|missing file)\b',re.I)
-PASS_RE=re.compile(r'\b(PASS|test[s]? passed|all tests passed|all correctness tests passed|successful|succeeded)\b',re.I)
+FAIL_RE=re.compile(r'\b(FAIL|FAILED|error|exception|traceback|not found|refused|timeout|permission denied|connection refused|syntax error|missing file|segmentation fault|core dumped|sigsegv|abort(?:ed)?|fatal error|uncaught exception|unhandled exception|exit code 139|returncode -11|process crashed)\b',re.I)
+PASS_RE=re.compile(r'\b(PASS|test[s]? passed|all tests passed|all correctness tests passed|successful|succeeded|checks? passed|assertions? passed|verification complete)\b',re.I)
 URL_RE=re.compile(r'https?://[^\s"\'<>]+')
 KNOWN_EXT={'.py','.r','.R','.stan','.ics','.tex','.txt','.csv','.json','.html','.js','.ts','.md','.yml','.yaml','.sh','.c','.h','.sql','.db','.sqlite','.xml'}
 OUTPUT_EXT={'.json','.txt','.csv','.ics','.html','.xml','.md'}
@@ -54,12 +54,13 @@ def _tool_args(t):
     return a if isinstance(a,dict) else {}
 def _tool_success(t):
     st=(t.status or '').lower(); return not t.error and st not in {'failed','error','failure','denied','refused'}
-def _extract_paths_from_obj(obj, known=None):
+def _extract_paths_from_obj(obj, known=None, scan_text=True):
     paths=[]
     if isinstance(obj,dict):
-        for k in ['path','file_path','filePath','filename','file','target']:
+        for k in ['path','file_path','filePath','filename','file','target','target_path']:
             if obj.get(k): paths.append(_path_name(str(obj.get(k))))
-    for m in PATH_CAND_RE.findall(_as_text(obj)): paths.append(_path_name(m))
+    if scan_text:
+        for m in PATH_CAND_RE.findall(_as_text(obj)): paths.append(_path_name(m))
     out=[]
     for p in paths:
         if _accept_path(p, known) and p not in out: out.append(p)
@@ -86,13 +87,11 @@ def extract_deliverables(objective, run=None):
     for m in re.findall(r'(?i)(do not edit\s+[^.\n]+|must not (?:change|modify|edit)\s+[^.\n]+|do not modify\s+[^.\n]+)',text): spec.negative_constraints.append(m.strip())
     for m in re.findall(r'(?i)(only edit\s+[^.\n]+|only replace\s+[^.\n]+|using\s+synonyms\.txt|allowed\s+synonyms[^.\n]*)',text): spec.allowed_edit_constraints.append(m.strip())
     if run:
-        for obj in [run.finalSummary,run.summary]:
-            if isinstance(obj,dict):
-                for p in obj.get('changed_files') or obj.get('changedFiles') or []:
-                    if p not in spec.required_files: spec.required_files.append(p)
         for t in run.toolCalls:
-            for p in _extract_paths_from_obj(_tool_args(t), spec.required_files)+_extract_paths_from_obj(t.resultSummary, spec.required_files):
-                if p not in spec.required_files and (any(_basename(p)==_basename(x) for x in spec.required_files) or _tool_name(t) in {'write','edit','patch'}): spec.required_files.append(p)
+            # Required deliverables come from objective text and explicit artifact/path fields,
+            # not from arbitrary tool output, source bodies, diffs, logs, or changed-file summaries.
+            for p in _extract_paths_from_obj(_tool_args(t), spec.required_files, scan_text=False):
+                if p not in spec.required_files and any(_basename(p)==_basename(x) for x in spec.required_files): spec.required_files.append(p)
     for attr in spec.__dataclass_fields__:
         vals=[]; [vals.append(x) for x in getattr(spec,attr) if x and x not in vals]; setattr(spec,attr,vals)
     return spec
@@ -107,7 +106,7 @@ def _ics_ok(preview):
 def tool_call_evidence(run,spec):
     mutations=[]; inspections=[]; deliverables=[]; failures=[]
     for t in run.toolCalls:
-        name=_tool_name(t); ok=_tool_success(t); paths=_extract_paths_from_obj(_tool_args(t),spec.required_files) or _extract_paths_from_obj(t.resultSummary,spec.required_files) or _extract_paths_from_obj(t.raw,spec.required_files)
+        name=_tool_name(t); ok=_tool_success(t); paths=_extract_paths_from_obj(_tool_args(t),spec.required_files,scan_text=False) or _extract_paths_from_obj(t.raw,spec.required_files,scan_text=False)
         order=(t.turnIndex if t.turnIndex is not None else t.index); tid=t.toolCallId
         if not ok:
             failures.append(EvidenceItem('failure_signal','tool_calls','medium',f'tool[{tid}] {t.toolName} failed: {t.error or t.resultSummary}',tid,t.turnIndex,t.startedAt,order,toolCallId=tid)); continue
