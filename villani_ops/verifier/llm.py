@@ -4,6 +4,9 @@ from urllib.parse import urlparse
 from villani_ops.storage.files import FileStorage
 from .deterministic import build_packet, PROMPT_VERSION
 from .tools import VerifierTools
+from .contract import build_task_contract, adjudicate_contract
+from .evidence import build_contract_evidence
+from pathlib import Path
 from .errors import *
 ROLES={'review','selection','classification','policy','coding'}
 SYSTEM='''You are the mandatory binary verifier for Villani Code runs inside Villani Ops.
@@ -169,8 +172,18 @@ def _parse(s):
     obj.setdefault('uncertainty', {'level':'medium','reasons':[]})
     obj.setdefault('deliverableAssessment', {'requiredDeliverables':[],'validatedDeliverables':[],'missingDeliverables':[],'weakValidationReasons':[]})
     obj.setdefault('constraintAssessment', {'constraints':[],'satisfiedConstraints':[],'violatedConstraints':[],'uncheckedConstraints':[]})
-    for r in obj.get('requirementResults') or []:
-        if r.get('status') not in {'satisfied','unsatisfied'}: raise VerifierSchemaError('invalid requirement status')
+    malformed=[]; fixed=[]
+    for i,r in enumerate(obj.get('requirementResults') or []):
+        if not isinstance(r,dict):
+            malformed.append(str(r)); fixed.append({'id':f'malformed-{i}','requirement':str(r),'status':'unsatisfied','evidence':[],'risks':['Malformed LLM requirement output item was not an object.']}); continue
+        r.setdefault('id',f'req-{i}'); r.setdefault('requirement','unknown requirement'); r.setdefault('evidence',[]); r.setdefault('risks',[])
+        if r.get('status') not in {'satisfied','unsatisfied'}:
+            r['status']='unsatisfied'; r.setdefault('risks',[]).append('Missing or invalid requirement status coerced to unsatisfied.')
+            malformed.append(r.get('id'))
+        fixed.append(r)
+    obj['requirementResults']=fixed
+    if malformed:
+        obj['result']=0; obj['verdict']='failure'; obj['recommendedAction']='inspect_manually'; obj.setdefault('riskFlags',[]).append('Malformed LLM requirement output; conservatively failed.'); obj['reason']=((obj.get('reason') or '')+' Malformed LLM requirement output was present.').strip()
     return obj
 def _schema_text():
     return """Final verdict schema (return exactly this shape):
@@ -313,20 +326,34 @@ def llm_result(run, det, workspace='.villani-ops', backend=None, base_url=None, 
             parsed={'schemaVersion':'villani-ops-verifier-llm-verdict-v1',**{k:obj.get(k) for k in ['result','verdict','confidence','recommendedAction','reason','deliverableAssessment','constraintAssessment','requirementResults','successEvidence','failureEvidence','recoveredFailures','missingEvidence','riskFlags','uncertainty','toolsUsed']}}
             trace.write_json('llm_final_verdict_parsed.json',parsed)
         obj.setdefault('riskFlags',[]); obj['riskFlags']+=protocol_warnings
-        obj=calibrate(det,obj,trace=trace,cfg=cfg,timeout=max(1,deadline-time.monotonic())); break
-    det.update({'result':obj['result'],'verdict':obj['verdict'],'confidence':obj['confidence'],'recommendedAction':obj['recommendedAction'],'reason':obj['reason'],'resultSource':obj.get('resultSource'),'postProcessingChangedResult':obj.get('postProcessingChangedResult'),'deliverableAssessment':obj.get('deliverableAssessment',det.get('deliverableAssessment')),'constraintAssessment':obj.get('constraintAssessment',det.get('constraintAssessment')),'requirementResults':obj.get('requirementResults',det['requirementResults']),'successEvidence':obj.get('successEvidence',det['successEvidence']),'failureEvidence':obj.get('failureEvidence',det['failureEvidence']),'recoveredFailures':obj.get('recoveredFailures',det['recoveredFailures']),'missingEvidence':obj.get('missingEvidence',det['missingEvidence']),'riskFlags':obj.get('riskFlags',det['riskFlags']),'toolsUsed':used+obj.get('toolsUsed',[]),'llmRawVerdict':obj.get('llmRawVerdict',{}),'llmProtocol':protocol,'llmProtocolWarnings':protocol_warnings,'calibration':obj.get('_calibration',{}),'verifier':{'mode':'llm_tool_loop','backend':cfg['backend'],'model':cfg['model'],'baseUrl':cfg['baseUrl'],'promptVersion':PROMPT_VERSION}})
+        obj=calibrate(det,obj,trace=trace,cfg=cfg,timeout=max(1,deadline-time.monotonic()))
+        try:
+            root=Path(det.get('repoDir') or run.repoFromMetadata or run.debugDir)
+            contract=build_task_contract(run.objective or '', root, root, run)
+            cev=build_contract_evidence(contract, root, root, run)
+            dec=adjudicate_contract(contract, cev, obj)
+            obj['contract']=dec.contract; obj['evidence']=dec.evidence; obj['blockedRequirements']=dec.blockedRequirements; obj['downgradedFromLlmSuccess']=dec.downgradedFromLlmSuccess
+            if dec.result==0 and obj.get('result')==1:
+                obj.update({'result':0,'verdict':'failure','confidence':dec.confidence,'recommendedAction':dec.recommendedAction,'reason':dec.reason})
+                obj.setdefault('riskFlags',[]).append('Contract adjudication downgraded LLM success due to missing material evidence.')
+                obj=finalize_verifier_result(obj.get('llmRawVerdict',{}), obj)
+        except Exception as e:
+            if obj.get('result')==1:
+                obj.update({'result':0,'verdict':'failure','recommendedAction':'inspect_manually','reason':'Contract adjudication failed conservatively: '+str(e),'downgradedFromLlmSuccess':True})
+        break
+    det.update({'result':obj['result'],'verdict':obj['verdict'],'confidence':obj['confidence'],'recommendedAction':obj['recommendedAction'],'reason':obj['reason'],'resultSource':obj.get('resultSource'),'postProcessingChangedResult':obj.get('postProcessingChangedResult'),'deliverableAssessment':obj.get('deliverableAssessment',det.get('deliverableAssessment')),'constraintAssessment':obj.get('constraintAssessment',det.get('constraintAssessment')),'requirementResults':obj.get('requirementResults',det['requirementResults']),'successEvidence':obj.get('successEvidence',det['successEvidence']),'failureEvidence':obj.get('failureEvidence',det['failureEvidence']),'recoveredFailures':obj.get('recoveredFailures',det['recoveredFailures']),'missingEvidence':obj.get('missingEvidence',det['missingEvidence']),'riskFlags':obj.get('riskFlags',det['riskFlags']),'toolsUsed':used+obj.get('toolsUsed',[]),'llmRawVerdict':obj.get('llmRawVerdict',{}),'llmProtocol':protocol,'llmProtocolWarnings':protocol_warnings,'calibration':obj.get('_calibration',{}),'contract':obj.get('contract'),'evidence':obj.get('evidence'),'blockedRequirements':obj.get('blockedRequirements',[]),'downgradedFromLlmSuccess':obj.get('downgradedFromLlmSuccess',False),'verifier':{'mode':'llm_tool_loop','backend':cfg['backend'],'model':cfg['model'],'baseUrl':cfg['baseUrl'],'promptVersion':PROMPT_VERSION}})
     return validate_final_result_consistency(det)
 
 def finalize_verifier_result(raw_llm_verdict, processed_verdict, trace_info=None):
     final=processed_verdict
     flags=final.setdefault('riskFlags',[])
-    if final.get('result')!=raw_llm_verdict.get('result') or final.get('verdict')!=raw_llm_verdict.get('verdict'):
-        final['result']=raw_llm_verdict.get('result')
-        final['verdict']=raw_llm_verdict.get('verdict')
-        flags.append('Post-processing attempted to change the LLM verifier result. Restored raw LLM result.')
+    changed=final.get('result')!=raw_llm_verdict.get('result') or final.get('verdict')!=raw_llm_verdict.get('verdict')
+    if changed:
+        flags.append('Post-processing changed the raw LLM verifier result under conservative safety/contract rules.')
     final['llmRawVerdict']=raw_llm_verdict
     final['resultSource']='llm_verifier'
-    final['postProcessingChangedResult']=False
+    final['postProcessingChangedResult']=changed
+    final['downgradedFromLlmSuccess']=bool(raw_llm_verdict.get('result')==1 and final.get('result')==0)
     return validate_final_result_consistency(final)
 
 def validate_final_result_consistency(result):

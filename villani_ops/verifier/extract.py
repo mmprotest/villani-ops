@@ -1,7 +1,7 @@
 from __future__ import annotations
 import hashlib,re,json,os
 from .types import *
-VALIDATION=['test','pytest','npm test','pnpm test','yarn test','vitest','jest','go test','cargo test','mvn test','gradle test','tsc','typecheck','build','lint','curl','urllib','requests','wget','git clone','git push','nginx -t','openssl x509','grep','pass','verification','cat ','eval.py','rscript']
+VALIDATION=['test','pytest','npm test','pnpm test','yarn test','vitest','jest','go test','cargo test','mvn test','gradle test','tsc','typecheck','build','lint','curl','urllib','requests','wget','git clone','git push','nginx -t','openssl x509','verification']
 FAIL_RE=re.compile(r'\b(FAIL|FAILED|error|exception|traceback|not found|refused|timeout|permission denied|connection refused|syntax error|missing file)\b',re.I)
 PASS_RE=re.compile(r'\b(PASS|test[s]? passed|all tests passed|all correctness tests passed|successful|succeeded)\b',re.I)
 URL_RE=re.compile(r'https?://[^\s"\'<>]+')

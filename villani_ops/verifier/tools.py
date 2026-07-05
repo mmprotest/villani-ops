@@ -104,7 +104,7 @@ class VerifierTools:
         files=[]
         for p in self.repo.rglob('*'):
             rel=str(p.relative_to(self.repo)); parts=set(Path(rel).parts)
-            if p.is_file() and not(parts&IGNORE) and fnmatch.fnmatch(rel,glob) and not _secret(rel) and not _is_binary(p): files.append(rel)
+            if p.is_file() and not(parts&IGNORE) and (glob in {'**/*','*'} or fnmatch.fnmatch(rel,glob)) and not _secret(rel) and not _is_binary(p): files.append(rel)
             if len(files)>=int(limit): break
         return {'available':True,'files':files}
     def read_repo_file(self,path=None,filename=None,startLine=1,maxLines=None,**args):
@@ -138,3 +138,65 @@ class VerifierTools:
     def dispatch(self,name,args):
         if not hasattr(self,name): raise VerifierToolError('unknown tool')
         res=getattr(self,name)(**(args or {})); return json.dumps(res,default=str)[:self.max_chars]
+
+# Contract-first verifier repository inspection helpers. These helpers are intentionally
+# conservative: arbitrary commands cannot be proven read-only, so destructive-looking
+# commands and shell redirections are blocked before execution.
+import subprocess, difflib, shlex, re
+from dataclasses import dataclass
+
+@dataclass
+class FileComparison:
+    path: str
+    exists_in_original: bool
+    exists_in_final: bool
+    unified_diff: str
+    added_lines: list[str]
+    removed_lines: list[str]
+    newly_created: bool
+    deleted: bool
+
+def _list_repo(root: Path, glob='**/*', limit=1000):
+    root=Path(root)
+    if not root.exists(): return []
+    out=[]
+    for p in root.rglob('*'):
+        rel=str(p.relative_to(root)); parts=set(Path(rel).parts)
+        if p.is_file() and not(parts&IGNORE) and (glob in {'**/*','*'} or fnmatch.fnmatch(rel,glob)) and not _secret(rel) and not _is_binary(p):
+            out.append(rel)
+            if len(out)>=limit: break
+    return sorted(out)
+
+def list_original_repo(original_repo_root, glob='**/*', limit=1000): return _list_repo(Path(original_repo_root), glob, limit)
+def list_final_repo(final_repo_root, glob='**/*', limit=1000): return _list_repo(Path(final_repo_root), glob, limit)
+def read_original_file(original_repo_root, path, max_chars=12000): return _bounded(_safe(Path(original_repo_root), path, True).read_text(errors='replace'), max_chars)
+def read_final_file(final_repo_root, path, max_chars=12000): return _bounded(_safe(Path(final_repo_root), path, True).read_text(errors='replace'), max_chars)
+
+def compare_file(original_repo_root, final_repo_root, path):
+    o=Path(original_repo_root)/path; f=Path(final_repo_root)/path
+    eo=o.exists() and o.is_file(); ef=f.exists() and f.is_file()
+    ot=o.read_text(errors='replace').splitlines() if eo and not _is_binary(o) else []
+    ft=f.read_text(errors='replace').splitlines() if ef and not _is_binary(f) else []
+    diff='\n'.join(difflib.unified_diff(ot, ft, fromfile=f'a/{path}', tofile=f'b/{path}', lineterm=''))
+    added=[ln[1:] for ln in diff.splitlines() if ln.startswith('+') and not ln.startswith('+++')]
+    removed=[ln[1:] for ln in diff.splitlines() if ln.startswith('-') and not ln.startswith('---')]
+    return FileComparison(str(path), eo, ef, diff, added, removed, (not eo and ef), (eo and not ef))
+
+def read_diff(original_repo_root, final_repo_root=None, path=None):
+    # Backwards-compatible module helper: with two repos, compute diffs; VerifierTools.read_diff remains method above.
+    if final_repo_root is None: raise VerifierToolError('final_repo_root is required')
+    files=set(_list_repo(Path(original_repo_root)))|set(_list_repo(Path(final_repo_root)))
+    if path: files={path}
+    return '\n'.join(compare_file(original_repo_root, final_repo_root, p).unified_diff for p in sorted(files) if compare_file(original_repo_root, final_repo_root, p).unified_diff)
+
+_DESTRUCTIVE=re.compile(r'(^|[;&|]\s*)(rm|mv|chmod|chown)\b|git\s+(reset|clean)\b|\b(npm\s+publish|twine\s+upload|curl\s+.*-T|scp\s|rsync\s)|(^|\s)>|>>|\btee\b', re.I)
+def run_readonly_command(command, cwd, clean_env=True, timeout_seconds=20):
+    cmd=str(command or '')
+    if _DESTRUCTIVE.search(cmd):
+        return {'verifierGenerated':True,'blocked':True,'exitCode':None,'stdout':'','stderr':'Blocked destructive or write-capable command; read-only cannot be perfectly guaranteed for arbitrary test commands.','command':cmd}
+    env={'PATH':'/usr/bin:/bin:/usr/local/bin','HOME':'/tmp','LANG':'C.UTF-8','LC_ALL':'C.UTF-8'} if clean_env else os.environ.copy()
+    try:
+        cp=subprocess.run(cmd, cwd=str(cwd), shell=True, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout_seconds)
+        return {'verifierGenerated':True,'blocked':False,'exitCode':cp.returncode,'stdout':_bounded(cp.stdout,6000),'stderr':_bounded(cp.stderr,6000),'command':cmd,'cleanEnv':clean_env}
+    except subprocess.TimeoutExpired as e:
+        return {'verifierGenerated':True,'blocked':False,'exitCode':124,'stdout':_bounded(e.stdout or '',6000),'stderr':'timeout','command':cmd,'cleanEnv':clean_env}

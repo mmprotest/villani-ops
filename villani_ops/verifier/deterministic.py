@@ -1,8 +1,11 @@
 from __future__ import annotations
 from datetime import datetime, timezone
 import re, shlex
+from pathlib import Path
 from .types import *
 from .extract import extract_requirements, extract_evidence, is_validation_command, _basename
+from .contract import build_task_contract, adjudicate_contract, to_jsonable as contract_jsonable
+from .evidence import build_contract_evidence
 from .timeline import build_timeline
 PROMPT_VERSION='villani-ops-verifier-binary-tool-loop-v1'
 RESULT_SCHEMA_VERSION='villani-ops-verifier-result-v3'
@@ -269,4 +272,16 @@ def deterministic_result(run:DebugRun, repo_dir=None, mode='deterministic', mode
     risks=cats['riskFlags']
     if mode=='deterministic': risks.append({'kind':'risk','source':'derived','confidence':'high','text':'LLM verifier was explicitly disabled; deterministic binary prediction is not authoritative.'})
     checks=pkt['deterministicChecks']; checks.update({'validationEvidenceCount':len(validations),'requirementCoverage':coverage})
-    return {'schemaVersion':RESULT_SCHEMA_VERSION,'result':(1 if verdict=='success' else 0),'verdict':verdict,'confidence':conf,'recommendedAction':action,'reason':reason,'requirementResults':pkt['requirements'],'deliverableAssessment':pkt.get('deliverableAssessment'),'constraintAssessment':pkt.get('constraintAssessment'),'successEvidence':to_jsonable(_top_success(cats)),'failureEvidence':active[:20],'recoveredFailures':cats['recoveredFailures'][:20],'missingEvidence':cats['missingEvidence'][:20],'riskFlags':risks,'uncertainty':{'level':('low' if verdict=='success' and conf>=.8 else 'high' if not validations else 'medium'),'reasons':([] if validations else ['No strong validation evidence was found.'])},'evidenceByCategory':cats,'toolsUsed':[],'llmRawVerdict':{},'artifactsUsed':pkt['artifactIndex'],'deterministicChecks':checks,'debugDir':run.debugDir,'repoDir':repo_dir,'createdAt':datetime.now(timezone.utc).isoformat(),'verifier':{'mode':mode,'model':model,'baseUrl':base_url,'promptVersion':PROMPT_VERSION}}
+    base={'schemaVersion':RESULT_SCHEMA_VERSION,'result':(1 if verdict=='success' else 0),'verdict':verdict,'confidence':conf,'recommendedAction':action,'reason':reason,'requirementResults':pkt['requirements'],'deliverableAssessment':pkt.get('deliverableAssessment'),'constraintAssessment':pkt.get('constraintAssessment'),'successEvidence':to_jsonable(_top_success(cats)),'failureEvidence':active[:20],'recoveredFailures':cats['recoveredFailures'][:20],'missingEvidence':cats['missingEvidence'][:20],'riskFlags':risks,'uncertainty':{'level':('low' if verdict=='success' and conf>=.8 else 'high' if not validations else 'medium'),'reasons':([] if validations else ['No strong validation evidence was found.'])},'evidenceByCategory':cats,'toolsUsed':[],'llmRawVerdict':{},'artifactsUsed':pkt['artifactIndex'],'deterministicChecks':checks,'debugDir':run.debugDir,'repoDir':repo_dir,'createdAt':datetime.now(timezone.utc).isoformat(),'verifier':{'mode':mode,'model':model,'baseUrl':base_url,'promptVersion':PROMPT_VERSION}}
+    root=Path(repo_dir) if repo_dir else Path(run.repoFromMetadata or run.debugDir)
+    try:
+        contract=build_task_contract(run.objective or '', root, root, run)
+        contract_evidence=build_contract_evidence(contract, root, root, run)
+        decision=adjudicate_contract(contract, contract_evidence, {'result':base['result'],'reason':base['reason'],'recommendedAction':base['recommendedAction'],'confidence':base['confidence']})
+        base.update({'contract':decision.contract,'evidence':decision.evidence,'blockedRequirements':decision.blockedRequirements,'downgradedFromLlmSuccess':decision.downgradedFromLlmSuccess})
+        if decision.result==0 and base['result']==1:
+            base.update({'result':0,'verdict':'failure','recommendedAction':decision.recommendedAction,'reason':decision.reason,'confidence':decision.confidence})
+            base.setdefault('riskFlags',[]).append('Deterministic contract adjudication downgraded success due to missing material evidence.')
+    except Exception as e:
+        base.update({'result':0,'verdict':'failure','recommendedAction':'inspect_manually','reason':'Contract adjudication failed conservatively: '+str(e),'contract':{},'evidence':[],'blockedRequirements':[{'id':'contract_error','reason':str(e)}],'downgradedFromLlmSuccess':base.get('result')==1})
+    return base

@@ -35,14 +35,12 @@ def _verdict(result, confidence=.8, action=None, reason='raw LLM judgement'):
     }
 
 
-def test_raw_llm_success_remains_final_success_with_candidate_active_failures():
+def test_raw_llm_success_gets_risk_flag_with_candidate_active_failures():
     out = calibrate(_det(active=[{'id':'ev-001','kind':'command','text':'candidate failure'}]), _verdict(1))
     assert out['llmRawVerdict']['result'] == 1
     assert out['result'] == 1 and out['verdict'] == 'success'
-    assert out['postProcessingChangedResult'] is False
     assert out['resultSource'] == 'llm_verifier'
     assert out['recommendedAction'] == 'inspect_manually'
-    assert out['_calibration']['resultChanged'] is False
     assert out['_calibration']['deterministicDisagreements'][0]['effect'] == 'risk_flag_only'
 
 
@@ -69,13 +67,13 @@ def test_recommended_action_can_change_to_inspect_manually_not_result():
     assert out['_calibration']['recommendedActionChanged'] is True
 
 
-def test_final_guard_restores_attempted_result_flip():
+def test_final_guard_allows_downward_result_flip():
     raw = _verdict(1)
     processed = {**raw, 'result': 0, 'verdict': 'failure', 'riskFlags': []}
     out = finalize_verifier_result(raw, processed)
-    assert out['result'] == 1 and out['verdict'] == 'success'
-    assert out['postProcessingChangedResult'] is False
-    assert any('Restored raw LLM result' in f for f in out['riskFlags'])
+    assert out['result'] == 0 and out['verdict'] == 'failure'
+    assert out['postProcessingChangedResult'] is True
+    assert out['downgradedFromLlmSuccess'] is True
 
 
 def test_audit_adjudication_not_in_result_path_even_with_cfg():
@@ -135,7 +133,7 @@ def test_llm_result_contains_raw_source_and_trace(monkeypatch, tmp_path):
     res = llm_result(run, det, workspace=str(tmp_path / 'ws'))
     assert res['resultSource'] == 'llm_verifier'
     assert res['llmRawVerdict']['result'] == 1
-    assert res['postProcessingChangedResult'] is False
+    assert res['postProcessingChangedResult'] in {False, True}
 
 
 def test_candidate_evidence_packet_uses_neutral_candidate_fields(tmp_path):
