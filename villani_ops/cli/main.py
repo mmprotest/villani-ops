@@ -644,4 +644,17 @@ def compare(repo: str=typer.Option(...), tasks: str=typer.Option(...), policies:
     console.print(f'Wrote {out_path}, {csv_path}, {json_path}')
 
 
+@app.command()
+def materialize(
+    workspace: str = typer.Option(..., '--workspace'),
+    repo: str = typer.Option(..., '--repo'),
+    policy: str = typer.Option('accepted', '--policy'),
+):
+    from villani_ops.materialize import materialize_latest
+    result = materialize_latest(Path(workspace), Path(repo), policy=policy)
+    if result.status == 'failed':
+        raise typer.Exit(1)
+    raise typer.Exit(0)
+
+
 if __name__=='__main__': app()
