@@ -13,6 +13,58 @@ from villani_ops.core.backend import Backend
 from villani_ops.git_ops import safe_apply
 from .selection import select_winner, POLICY
 
+
+
+def _is_verifier_debug_dir(path: Path) -> bool:
+    return path.is_dir() and (path / "session_meta.json").exists()
+
+def _safe_mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+def _debug_dir_score(path: Path) -> tuple[int, float, str]:
+    score = 0
+    if (path / "session_meta.json").exists():
+        score += 10
+    if (path / "final_summary.json").exists():
+        score += 5
+    if (path / "commands.jsonl").exists():
+        score += 2
+    if (path / "tool_calls.jsonl").exists():
+        score += 2
+    mtimes = [_safe_mtime(path / name) for name in ("final_summary.json", "session_meta.json", "summary.json") if (path / name).exists()]
+    if not mtimes:
+        mtimes.append(_safe_mtime(path))
+    return (score, max(mtimes), path.name)
+
+def resolve_verifier_debug_dir(debug_root: Path | None, resolved_trace_dir: Path | None = None) -> Path | None:
+    if resolved_trace_dir and _is_verifier_debug_dir(resolved_trace_dir):
+        return resolved_trace_dir
+    candidates: list[Path] = []
+    if debug_root and _is_verifier_debug_dir(debug_root):
+        candidates.append(debug_root)
+    if debug_root and debug_root.exists():
+        children = [child for child in debug_root.iterdir() if child.is_dir()]
+        candidates.extend(child for child in children if _is_verifier_debug_dir(child))
+        for child in children:
+            candidates.extend(grandchild for grandchild in child.iterdir() if grandchild.is_dir() and _is_verifier_debug_dir(grandchild))
+    if not candidates:
+        return None
+    return max(set(candidates), key=_debug_dir_score)
+
+def _debug_resolution(debug_root: Path | None, resolved_trace_dir: Path | None) -> tuple[Path | None, str, str]:
+    resolved = resolve_verifier_debug_dir(debug_root, resolved_trace_dir)
+    if resolved is None:
+        root = debug_root or resolved_trace_dir
+        return None, "missing", f"No verifier-compatible Villani Code debug trace found. Expected session_meta.json under {root} or one of its child trace directories."
+    if resolved_trace_dir and resolved == resolved_trace_dir:
+        return resolved, "resolved", "selected runner resolved_trace_dir containing session_meta.json"
+    if debug_root and resolved == debug_root:
+        return resolved, "resolved", "selected debug root containing session_meta.json"
+    return resolved, "resolved", "selected nested trace directory containing session_meta.json"
+
 def now(): return datetime.now(timezone.utc).isoformat()
 def write_json(p:Path,o): p.parent.mkdir(parents=True,exist_ok=True); p.write_text(json.dumps(o,indent=2,default=str),encoding='utf-8')
 def append_jsonl(p:Path,o): p.parent.mkdir(parents=True,exist_ok=True); p.open('a',encoding='utf-8').write(json.dumps(o,default=str)+'\n')
@@ -23,7 +75,7 @@ class VerifierParallelConfig:
 
 @dataclass
 class CandidateResult:
-    candidate_id:str; worktree_path:Path; run_status:str='pending'; debug_dir:Path|None=None; verifier_result:dict|None=None; verifier_trace_dir:Path|None=None; error:str|None=None; artifacts_dir:Path|None=None; started_at:str|None=None; completed_at:str|None=None; exit_code:int|None=None; stdout_path:Path|None=None; stderr_path:Path|None=None; duration_seconds:float|None=None; changed_files:list[str]|None=None; patch_path:Path|None=None; patch_status:str|None=None
+    candidate_id:str; worktree_path:Path; run_status:str='pending'; debug_root:Path|None=None; debug_dir:Path|None=None; resolved_trace_dir:Path|None=None; debug_resolution_status:str|None=None; debug_resolution_reason:str|None=None; verifier_result:dict|None=None; verifier_trace_dir:Path|None=None; error:str|None=None; artifacts_dir:Path|None=None; started_at:str|None=None; completed_at:str|None=None; exit_code:int|None=None; stdout_path:Path|None=None; stderr_path:Path|None=None; duration_seconds:float|None=None; changed_files:list[str]|None=None; patch_path:Path|None=None; patch_status:str|None=None
 
 class VerifierParallelOrchestrator:
     def __init__(self, config:VerifierParallelConfig, runner=None, verifier=None, integrator=None):
@@ -48,7 +100,10 @@ class VerifierParallelOrchestrator:
             run=self.runner or runner_for_name(self.config.agent or 'villani-code')
             res=run.run_task(repo_path=cr.worktree_path, task=self.config.task, success_criteria=None, backend_name=backend.name, backend_config=backend, timeout_seconds=self.config.candidate_timeout_seconds or backend.timeout_seconds or 1200, context={'attempt_id':cid}, artifacts_dir=rdir)
             (rdir/'stdout.txt').write_text(res.stdout or '',encoding='utf-8'); (rdir/'stderr.txt').write_text(res.stderr or '',encoding='utf-8')
-            cr.exit_code=res.exit_code; cr.stdout_path=rdir/'stdout.txt'; cr.stderr_path=rdir/'stderr.txt'; cr.debug_dir=Path(res.debug_artifact_dir) if res.debug_artifact_dir else (Path(res.resolved_trace_dir) if res.resolved_trace_dir else None)
+            cr.exit_code=res.exit_code; cr.stdout_path=rdir/'stdout.txt'; cr.stderr_path=rdir/'stderr.txt'
+            cr.debug_root=Path(res.debug_artifact_dir) if res.debug_artifact_dir else None
+            cr.resolved_trace_dir=Path(res.resolved_trace_dir) if res.resolved_trace_dir else None
+            cr.debug_dir, cr.debug_resolution_status, cr.debug_resolution_reason = _debug_resolution(cr.debug_root, cr.resolved_trace_dir)
             cr.run_status='completed' if res.exit_code==0 else 'failed'
         except Exception as e:
             cr.error=f'agent runner failed: {e}'; cr.run_status='failed'; (rdir/'stderr.txt').write_text(cr.error,encoding='utf-8')
@@ -63,8 +118,13 @@ class VerifierParallelOrchestrator:
         return cr
     def _run_verifier(self, cr:CandidateResult, odir:Path):
         vdir=odir/'candidates'/cr.candidate_id/'verifier'; vdir.mkdir(parents=True,exist_ok=True); out=vdir/'verifier-result.json'
-        if not cr.debug_dir or not Path(cr.debug_dir).exists():
-            cr.verifier_result={'result':None,'verdict':'error','confidence':0.0,'recommendedAction':'inspect_manually','reason':'candidate produced no debug artifacts','traceDir':None}; return cr
+        if not cr.debug_dir or not _is_verifier_debug_dir(Path(cr.debug_dir)):
+            cr.debug_dir, cr.debug_resolution_status, cr.debug_resolution_reason = _debug_resolution(cr.debug_root, cr.resolved_trace_dir or cr.debug_dir)
+        if not cr.debug_dir or not _is_verifier_debug_dir(Path(cr.debug_dir)):
+            root = cr.debug_root or cr.resolved_trace_dir or cr.debug_dir
+            reason = f'No verifier-compatible Villani Code debug trace found. Expected session_meta.json under {root} or one of its child trace directories.'
+            cr.debug_resolution_status='missing'; cr.debug_resolution_reason=reason
+            cr.verifier_result={'result':None,'verdict':'error','confidence':0.0,'recommendedAction':'inspect_manually','reason':reason,'traceDir':None}; write_json(out, cr.verifier_result); return cr
         try:
             if self.verifier:
                 res=self.verifier(debug_dir=Path(cr.debug_dir), repo_dir=cr.worktree_path, workspace=self.config.workspace, backend=self.config.verifier_backend, out=out, trace_dir=vdir/'trace')
@@ -80,7 +140,7 @@ class VerifierParallelOrchestrator:
             write_json(out,res)
         cr.verifier_result=res if isinstance(res,dict) else {'result':None,'verdict':'error'}; cr.verifier_trace_dir=Path(cr.verifier_result.get('traceDir')) if cr.verifier_result.get('traceDir') else None; return cr
     def _record_candidate(self, cr, p):
-        v=cr.verifier_result or {}; return {'candidateId':cr.candidate_id,'worktreePath':str(cr.worktree_path),'status':'verified' if v else cr.run_status,'agent':self.config.agent,'backend':self.config.backend,'startedAt':cr.started_at,'completedAt':cr.completed_at,'debugDir':str(cr.debug_dir) if cr.debug_dir else None,'patchPath':str(cr.patch_path) if cr.patch_path else None,'patchStatus':cr.patch_status,'verifierResultPath':str(p/'candidates'/cr.candidate_id/'verifier'/'verifier-result.json'),'verifierTraceDir':str(cr.verifier_trace_dir) if cr.verifier_trace_dir else None,'result':v.get('result'),'verdict':v.get('verdict'),'confidence':v.get('confidence'),'recommendedAction':v.get('recommendedAction'),'error':cr.error or (v.get('reason') if v.get('verdict')=='error' else None)}
+        v=cr.verifier_result or {}; return {'candidateId':cr.candidate_id,'worktreePath':str(cr.worktree_path),'status':'verified' if v else cr.run_status,'agent':self.config.agent,'backend':self.config.backend,'startedAt':cr.started_at,'completedAt':cr.completed_at,'debugRoot':str(cr.debug_root) if cr.debug_root else None,'debugDir':str(cr.debug_dir) if cr.debug_dir else None,'resolvedTraceDir':str(cr.resolved_trace_dir) if cr.resolved_trace_dir else None,'debugResolutionStatus':cr.debug_resolution_status,'debugResolutionReason':cr.debug_resolution_reason,'patchPath':str(cr.patch_path) if cr.patch_path else None,'patchStatus':cr.patch_status,'verifierResultPath':str(p/'candidates'/cr.candidate_id/'verifier'/'verifier-result.json'),'verifierTraceDir':str(cr.verifier_trace_dir) if cr.verifier_trace_dir else None,'result':v.get('result'),'verdict':v.get('verdict'),'confidence':v.get('confidence'),'recommendedAction':v.get('recommendedAction'),'error':cr.error or (v.get('reason') if v.get('verdict')=='error' else None)}
     def _integrate(self, odir, winner):
         rec={'schemaVersion':'villani-ops-verifier-parallel-integration-v1','winnerCandidateId':winner.candidate_id if winner else None,'sourceWorktree':str(winner.worktree_path) if winner else None,'targetRepo':str(self.config.repo),'status':'skipped','changedFiles':[],'error':None}
         if not winner: write_json(odir/'integration.json',rec); return rec
@@ -102,8 +162,8 @@ class VerifierParallelOrchestrator:
             for f in as_completed(futs): candidates.append(self._run_verifier(f.result(), odir))
         candidates=sorted(candidates,key=lambda c:c.candidate_id)
         for cr in candidates:
-            append_jsonl(odir/'candidate-runs.jsonl', {'candidateId':cr.candidate_id,'status':cr.run_status,'exitCode':cr.exit_code,'durationSeconds':cr.duration_seconds,'stdoutPath':str(cr.stdout_path) if cr.stdout_path else None,'stderrPath':str(cr.stderr_path) if cr.stderr_path else None,'debugDir':str(cr.debug_dir) if cr.debug_dir else None})
-            v=cr.verifier_result or {}; append_jsonl(odir/'verifier-results.jsonl', {'candidateId':cr.candidate_id,'result':v.get('result'),'verdict':v.get('verdict'),'confidence':v.get('confidence'),'recommendedAction':v.get('recommendedAction'),'traceDir':v.get('traceDir'),'verifierResultPath':str(odir/'candidates'/cr.candidate_id/'verifier'/'verifier-result.json')})
+            append_jsonl(odir/'candidate-runs.jsonl', {'candidateId':cr.candidate_id,'status':cr.run_status,'exitCode':cr.exit_code,'durationSeconds':cr.duration_seconds,'stdoutPath':str(cr.stdout_path) if cr.stdout_path else None,'stderrPath':str(cr.stderr_path) if cr.stderr_path else None,'debugRoot':str(cr.debug_root) if cr.debug_root else None,'debugDir':str(cr.debug_dir) if cr.debug_dir else None,'resolvedTraceDir':str(cr.resolved_trace_dir) if cr.resolved_trace_dir else None})
+            v=cr.verifier_result or {}; append_jsonl(odir/'verifier-results.jsonl', {'candidateId':cr.candidate_id,'result':v.get('result'),'verdict':v.get('verdict'),'confidence':v.get('confidence'),'recommendedAction':v.get('recommendedAction'),'debugDir':str(cr.debug_dir) if cr.debug_dir else None,'traceDir':v.get('traceDir'),'verifierResultPath':str(odir/'candidates'/cr.candidate_id/'verifier'/'verifier-result.json')})
             append_jsonl(odir/'candidates.jsonl', self._record_candidate(cr,odir))
         sel=select_winner(candidates,cfg.seed,cfg.on_all_fail); write_json(odir/'selection.json',sel.to_dict())
         winner=next((c for c in candidates if c.candidate_id==sel.winnerCandidateId),None); integ=self._integrate(odir,winner)
@@ -118,5 +178,5 @@ class VerifierParallelOrchestrator:
         if cfg.out: write_json(cfg.out,out)
         return out
     def _transcript(self, odir,cands,sel,integ):
-        rows='\n'.join(f"| {c.candidate_id} | {c.run_status} | {(c.verifier_result or {}).get('result')} | {(c.verifier_result or {}).get('confidence')} | {(c.verifier_result or {}).get('traceDir')} |" for c in cands)
-        (odir/'transcript.md').write_text(f"# Verifier Parallel Orchestration\n\n## Summary\n- Repo: {self.config.repo}\n- Candidates: {len(cands)}\n- Winner: {sel.winnerCandidateId}\n- Selection policy: {POLICY}\n- Seed: {self.config.seed}\n\n## Task\n\n{self.config.task}\n\n## Candidate Results\n\n| Candidate | Run Status | Verifier Result | Confidence | Trace |\n|---|---|---:|---:|---|\n{rows}\n\n## Selection\n\n{sel.reason}\n\n## Integration\n\n{integ.get('status')} {integ.get('error') or ''}\n",encoding='utf-8')
+        rows='\n'.join(f"| {c.candidate_id} | {c.run_status} | {c.debug_root or ''} | {c.debug_dir or ''} | {(c.verifier_result or {}).get('result')} | {(c.verifier_result or {}).get('confidence')} | {(c.verifier_result or {}).get('traceDir')} |" for c in cands)
+        (odir/'transcript.md').write_text(f"# Verifier Parallel Orchestration\n\n## Summary\n- Repo: {self.config.repo}\n- Candidates: {len(cands)}\n- Winner: {sel.winnerCandidateId}\n- Selection policy: {POLICY}\n- Seed: {self.config.seed}\n\n## Task\n\n{self.config.task}\n\n## Candidate Results\n\n| Candidate | Run Status | Debug Root | Debug Dir | Verifier Result | Confidence | Trace |\n|---|---|---|---|---:|---:|---|\n{rows}\n\n## Selection\n\n{sel.reason}\n\n## Integration\n\n{integ.get('status')} {integ.get('error') or ''}\n",encoding='utf-8')
