@@ -149,6 +149,15 @@ def compact_verifier_packet(packet:dict, max_text_chars:int=900)->dict:
     pkt['candidateEvidence']=compact_ce
     return pkt
 
+
+def compact_tool_result_text(text, max_chars=2200):
+    s=str(text or '')
+    if len(s)<=max_chars: return s
+    keep=max_chars//2
+    return s[:keep]+f"\n...[tool result truncated {len(s)-max_chars} chars]...\n"+s[-(max_chars-keep):]
+
+def _tool_cache_key(name,args):
+    return name+'\0'+json.dumps(args or {},sort_keys=True,default=str)
 def normalize_read_tool_call(obj, allowed_tools=TOOLS):
     if not isinstance(obj,dict): return None,'tool call is not an object'
     out=dict(obj); args=out.get('args')
@@ -164,16 +173,14 @@ def normalize_read_tool_call(obj, allowed_tools=TOOLS):
 
 def deterministic_fallback_result(det, warning):
     da=det.get('deliverableAssessment') or {}; cats=det.get('evidenceByCategory') or {}
-    active=cats.get('activeFailures') or []; validations=(cats.get('finalEndToEndValidation') or [])+(cats.get('testValidation') or [])+(cats.get('serviceValidation') or [])
-    strong=[v for v in validations if isinstance(v,dict) and v.get('validationStrength')=='strong']
+    active=cats.get('activeFailures') or []
     if da.get('missingDeliverables') or active:
         result=0; verdict='failure'; conf=.78; action='reject'; reason='Deterministic fallback: decisive missing deliverable or active failure evidence remained after LLM/tool-loop failure.'
-    elif strong:
-        result=1; verdict='success'; conf=.72; action='inspect_manually'; reason='Deterministic fallback: strong final validation evidence remained after LLM/tool-loop failure.'
     else:
-        return None
+        result=None; verdict='error'; conf=.0; action='inspect_manually'; reason='Deterministic fallback is failure-only; no decisive negative evidence was available after LLM/tool-loop failure.'
     out=dict(det); risks=list(out.get('riskFlags') or []); risks.append(warning)
-    out.update({'result':result,'verdict':verdict,'confidence':conf,'recommendedAction':action,'reason':reason,'riskFlags':risks,'resultSource':'deterministic_fallback','llmProtocolWarnings':list(out.get('llmProtocolWarnings') or [])+[warning]})
+    warnings=list(out.get('llmProtocolWarnings') or [])+[warning,'Deterministic fallback success is disabled; ambiguous positive evidence requires manual inspection.']
+    out.update({'result':result,'verdict':verdict,'confidence':conf,'recommendedAction':action,'reason':reason,'riskFlags':risks,'resultSource':'deterministic_fallback','fallbackReason':'llm_error_after_tool_loop','fallbackPolicy':'failure_only','warnings':warnings,'llmProtocolWarnings':warnings})
     return validate_final_result_consistency(out)
 
 def _is_local(url):
@@ -315,7 +322,7 @@ def llm_result(run, det, workspace='.villani-ops', backend=None, base_url=None, 
         trace.msg_count=getattr(trace,'msg_count',0)
         for m in messages:
             trace.append_jsonl('llm_messages.jsonl',{'index':trace.msg_count,'role':m['role'],'name':None,'content':m['content'],'createdAt':__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat(),'chars':len(str(m['content']))}); trace.msg_count+=1
-    used=[]; deadline=time.monotonic()+timeout_seconds; calls=0; content=''; native_supported=True; protocol='native_tool_calls'; protocol_warnings=[]; empty_retried=False; protocol_retried=False
+    used=[]; deadline=time.monotonic()+timeout_seconds; calls=0; content=''; native_supported=True; protocol='native_tool_calls'; protocol_warnings=[]; empty_retried=False; protocol_retried=False; tool_result_cache={}
     while True:
         if time.monotonic()>deadline: raise VerifierLlmError('tool loop timeout')
         force={'type':'function','function':{'name':'verifier_final_verdict'}} if calls>max_tool_calls else None
@@ -380,8 +387,14 @@ def llm_result(run, det, workspace='.villani-ops', backend=None, base_url=None, 
             obj=norm
             name=obj.get('tool'); args=obj.get('args') or {}; idx=calls; calls+=1; used.append({'tool':name,'reason':'LLM requested tool'})
             start=time.time(); status='ok'; err=None
-            try: res=tools.dispatch(name,args)
-            except Exception as e: res=json.dumps({'error':str(e)}); status='error'; err=str(e)
+            try: raw_res=tools.dispatch(name,args)
+            except Exception as e: raw_res=json.dumps({'error':str(e)}); status='error'; err=str(e)
+            key=_tool_cache_key(name,args)
+            if key in tool_result_cache:
+                res=compact_tool_result_text('Repeated identical tool call; using cached compact summary from earlier result.\n'+tool_result_cache[key], 600)
+            else:
+                res=compact_tool_result_text(raw_res, min(max_tool_result_chars, 2200))
+                tool_result_cache[key]=compact_tool_result_text(res, 500)
             if trace is not None:
                 trace.append_jsonl('tool_calls.jsonl',{'index':idx,'llmTool':'verifier_read_tool' if native_supported else None,'verifierTool':name,'tool':name,'args':args,'startedAt':__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat(),'completedAt':__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat(),'durationMs':int((time.time()-start)*1000),'status':status,'resultChars':len(res),'truncated':len(res)>=max_tool_result_chars,'error':err,'reason':obj.get('reason') or 'LLM requested tool call.'})
                 trace.append_jsonl('tool_observations.jsonl',{'toolCallIndex':idx,'tool':name,'observation':None,'observationText':res,'chars':len(res),'truncated':len(res)>=max_tool_result_chars})

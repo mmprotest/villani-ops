@@ -2,7 +2,7 @@ from __future__ import annotations
 import hashlib,re,json,os
 from .types import *
 VALIDATION=['test','pytest','npm test','pnpm test','yarn test','vitest','jest','go test','cargo test','mvn test','gradle test','tsc','typecheck','build','lint','curl','urllib','requests','wget','git clone','git push','nginx -t','openssl x509','grep','pass','verification','cat ','eval.py','rscript']
-FAIL_RE=re.compile(r'\b(FAIL|FAILED|error|exception|traceback|not found|refused|timeout|permission denied|connection refused|syntax error|missing file|segmentation fault|core dumped|sigsegv|abort(?:ed)?|fatal error|uncaught exception|unhandled exception|exit code 139|returncode -11|process crashed)\b',re.I)
+FAIL_RE=re.compile(r'\b(error|exception|traceback|not found|refused|timeout|permission denied|connection refused|syntax error|missing file|segmentation fault|core dumped|sigsegv|abort(?:ed)?|fatal error|uncaught exception|unhandled exception|exit code 139|returncode -11|process crashed|assertionerror|assertion failed|test failed|invalid read|invalid write|use[- ]after[- ]free|double free|heap corruption|leak checker failure)\b|(?<!0\s)\bfailed\b|\bfailures?:\s*[1-9]\d*|[1-9]\d*\s+failed\b|\b(definitely|possibly) lost:\s*(?!0\s+bytes)[0-9,]+\s+bytes|ERROR SUMMARY:\s*(?!0\s+errors)[0-9,]+\s+errors',re.I)
 PASS_RE=re.compile(r'\b(PASS|test[s]? passed|all tests passed|all correctness tests passed|successful|succeeded|checks? passed|assertions? passed|verification complete)\b',re.I)
 URL_RE=re.compile(r'https?://[^\s"\'<>]+')
 KNOWN_EXT={'.py','.r','.R','.stan','.ics','.tex','.txt','.csv','.json','.html','.js','.ts','.md','.yml','.yaml','.sh','.c','.h','.sql','.db','.sqlite','.xml'}
@@ -57,7 +57,7 @@ def _tool_success(t):
 def _extract_paths_from_obj(obj, known=None, scan_text=True):
     paths=[]
     if isinstance(obj,dict):
-        for k in ['path','file_path','filePath','filename','file','target','target_path']:
+        for k in ['path','file_path','filePath','filename','file','target','target_path','output_path']:
             if obj.get(k): paths.append(_path_name(str(obj.get(k))))
     if scan_text:
         for m in PATH_CAND_RE.findall(_as_text(obj)): paths.append(_path_name(m))
