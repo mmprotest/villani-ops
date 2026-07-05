@@ -277,3 +277,72 @@ def test_verifier_parallel_invalid_debug_is_candidate_error_and_other_candidate_
     c1=next(r for r in rows if r['candidateId']=='candidate-001')
     assert c1['verdict']=='error' and c1['result'] is None
     assert (repo/'a.txt').read_text()=='winner'
+
+
+def test_selection_quality_tiebreak_beats_random_for_result_one():
+    candidates = [
+        {'candidateId':'candidate-001','result':1,'confidence':0.9,'riskFlags':['risk1','risk2'],'missingEvidence':['missing']},
+        {'candidateId':'candidate-002','result':1,'confidence':0.9,'riskFlags':['risk1'],'missingEvidence':[],'successEvidence':['Implementation appears correct from source inspection']},
+        {'candidateId':'candidate-003','result':1,'confidence':0.9,'riskFlags':['risk1'],'missingEvidence':[],'successEvidence':['Behavioral validation test passed','End-to-end runtime cleanup test passed'],'toolsUsed':[{'tool':'read_command','reason':'inspected validation'}]},
+    ]
+    s = select_winner(candidates, seed=7)
+    assert s.winnerCandidateId == 'candidate-003'
+    assert s.qualityTieBreakApplied is True
+    assert s.tieBreak is False
+    assert 'verifier quality tie-break' in s.reason
+
+
+def test_selection_result_one_beats_cleaner_result_zero():
+    s = select_winner([
+        {'candidateId':'candidate-001','result':1,'riskFlags':['risk'],'confidence':0.5},
+        {'candidateId':'candidate-002','result':0,'riskFlags':[],'confidence':0.99},
+    ], seed=1)
+    assert s.winnerCandidateId == 'candidate-001'
+    assert s.winnerResult == 1
+
+
+def test_selection_random_only_after_identical_quality_keys():
+    candidates = [
+        {'candidateId':'candidate-001','result':1,'confidence':0.9,'successEvidence':['test passed']},
+        {'candidateId':'candidate-002','result':1,'confidence':0.9,'successEvidence':['test passed']},
+    ]
+    first = select_winner(candidates, seed=0)
+    assert first.winnerCandidateId == select_winner(candidates, seed=0).winnerCandidateId
+    assert first.winnerCandidateId != select_winner(candidates, seed=1).winnerCandidateId
+    assert first.tieBreak is True
+    assert first.qualityTieBreakApplied is True
+    assert 'tied on verifier result and verifier quality key' in first.reason
+
+
+def test_selection_missing_evidence_beats_more_behavioral_evidence():
+    s = select_winner([
+        {'candidateId':'candidate-001','result':1,'missingEvidence':[],'successEvidence':['source inspection suggests correct']},
+        {'candidateId':'candidate-002','result':1,'missingEvidence':['no final runtime validation'],'successEvidence':['behavioral test passed','integration test passed']},
+    ], seed=5)
+    assert s.winnerCandidateId == 'candidate-001'
+
+
+def test_selection_json_includes_quality_diagnostics(tmp_path):
+    repo=tmp_path/'repo'; init_repo(repo); ws=tmp_path/'ws'
+    runner=FakeRunner()
+    def verifier(**kw):
+        cid=kw['repo_dir'].parent.name
+        return {
+            'result':1,
+            'verdict':'success',
+            'confidence':0.9,
+            'riskFlags':['risk'] if cid == 'candidate-001' else [],
+            'successEvidence':['Behavioral validation test passed'] if cid == 'candidate-002' else ['source inspection suggests correct'],
+            'recommendedAction':'accept',
+            'traceDir':str(kw['trace_dir']),
+        }
+    cfg=VerifierParallelConfig(repo=repo,task='do it',candidates=2,parallelism=1,seed=1,workspace=ws,backend='b',keep_worktrees=True)
+    orch=VerifierParallelOrchestrator(cfg, runner=runner, verifier=verifier)
+    orch._backend_obj=lambda: Backend(name='b',provider='local',model='m',api_key='x')
+    out=orch.run(); od=Path(out['orchestrationDir'])
+    selection=json.loads((od/'selection.json').read_text())
+    assert selection['winnerCandidateId'] == 'candidate-002'
+    assert selection['qualityTieBreakApplied'] is True
+    assert selection['winnerQualityKey']['candidateId'] == 'candidate-002'
+    assert len(selection['candidateQuality']) == 2
+    assert 'verifier quality tie-break' in selection['reason']
