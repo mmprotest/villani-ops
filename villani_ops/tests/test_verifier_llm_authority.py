@@ -55,7 +55,9 @@ def test_raw_llm_failure_remains_final_failure_with_candidate_validation_signals
 
 
 def test_confidence_cap_does_not_change_result():
-    out = calibrate(_det(), _verdict(1, confidence=.98))
+    v = _verdict(1, confidence=.98)
+    v['criticalRequirementCovered'] = True
+    out = calibrate(_det(), v)
     assert out['result'] == 1 and out['verdict'] == 'success'
     assert out['confidence'] == .9
     assert out['postProcessingChangedResult'] is False
@@ -174,3 +176,46 @@ def test_infrastructure_error_schema_still_possible():
     out = {'result': None, 'verdict': 'error', 'recommendedAction': 'inspect_manually', 'riskFlags': []}
     from villani_ops.verifier.llm import validate_final_result_consistency
     assert validate_final_result_consistency(out)['verdict'] == 'error'
+
+
+def test_critical_coverage_accept_remains_accept():
+    v = _verdict(1, confidence=.82, action='accept')
+    v.update({'criticalRequirement':'abnormal path works','directEvidenceForCriticalRequirement':'targeted test exercised abnormal path','criticalRequirementCovered': True})
+    out = calibrate(_det(), v)
+    assert out['result'] == 1
+    assert out['recommendedAction'] == 'accept'
+    assert out['confidence'] == .82
+
+
+def test_critical_coverage_false_downgrades_accept_and_caps_confidence():
+    v = _verdict(1, confidence=.88, action='accept')
+    v.update({'criticalRequirement':'cleanup on cancellation','directEvidenceForCriticalRequirement':'normal path test only','criticalRequirementCovered': False})
+    out = calibrate(_det(), v)
+    assert out['result'] == 1
+    assert out['recommendedAction'] == 'inspect_manually'
+    assert out['confidence'] == .70
+    assert 'success_not_accepted_without_direct_critical_requirement_evidence' in out['warnings']
+
+
+def test_missing_critical_coverage_downgrades_accept_and_caps_confidence():
+    out = calibrate(_det(), _verdict(1, confidence=.86, action='accept'))
+    assert out['result'] == 1
+    assert out['recommendedAction'] == 'inspect_manually'
+    assert out['confidence'] == .70
+
+
+def test_failure_result_not_changed_by_critical_coverage_gate():
+    v = _verdict(0, confidence=.77, action='reject')
+    v.update({'criticalRequirementCovered': False})
+    out = calibrate(_det(), v)
+    assert out['result'] == 0
+    assert out['recommendedAction'] == 'reject'
+    assert out['confidence'] == .77
+
+
+def test_critical_coverage_warning_preserves_existing_warnings():
+    v = _verdict(1, confidence=.8, action='accept')
+    v.update({'warnings':['existing-warning'], 'criticalRequirementCovered': False})
+    out = calibrate(_det(), v)
+    assert 'existing-warning' in out['warnings']
+    assert 'success_not_accepted_without_direct_critical_requirement_evidence' in out['warnings']

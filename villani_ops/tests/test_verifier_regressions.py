@@ -50,7 +50,7 @@ def test_file_output_no_commands_llm_success_not_flipped(monkeypatch, tmp_path):
     s=FileStorage(tmp_path/'ws'); s.init_workspace(); s.save_backends({'b':Backend(name='b',provider='local',base_url='http://127.0.0.1:1234/v1',model='m',roles=['review'],capability_score=1)})
     class Resp:
         def raise_for_status(self): pass
-        def json(self): return {'choices':[{'message':{'content':json.dumps({'type':'final_verdict','result':1,'verdict':'success','confidence':0.95,'recommendedAction':'accept','reason':'Write created the required output file','deliverableAssessment':{'requiredDeliverables':['meeting_scheduled.ics'],'validatedDeliverables':['meeting_scheduled.ics'],'missingDeliverables':[],'weakValidationReasons':[]}})}}]}
+        def json(self): return {'choices':[{'message':{'content':json.dumps({'type':'final_verdict','result':1,'verdict':'success','confidence':0.95,'recommendedAction':'accept','reason':'Write created the required output file','criticalRequirement':'required output file','directEvidenceForCriticalRequirement':'Write created required output file','criticalRequirementCovered':True,'deliverableAssessment':{'requiredDeliverables':['meeting_scheduled.ics'],'validatedDeliverables':['meeting_scheduled.ics'],'missingDeliverables':[],'weakValidationReasons':[]}})}}]}
     monkeypatch.setattr(httpx,'post',lambda *a,**k: Resp())
     res=llm_result(run,det,workspace=str(tmp_path/'ws'))
     assert res['result']==1 and res['verdict']=='success'

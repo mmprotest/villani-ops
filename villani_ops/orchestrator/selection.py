@@ -49,10 +49,16 @@ def _confidence(c):
 
 def _summary(c):
     v=_vr(c)
-    return {'candidateId':_cid(c),'result':v.get('result'),'verdict':v.get('verdict'),'confidence':v.get('confidence'),'recommendedAction':v.get('recommendedAction'),'traceDir':v.get('traceDir') or v.get('trace_dir')}
+    return {'candidateId':_cid(c),'result':v.get('result'),'verdict':v.get('verdict'),'confidence':v.get('confidence'),'recommendedAction':v.get('recommendedAction'),'criticalRequirement':v.get('criticalRequirement'),'directEvidenceForCriticalRequirement':v.get('directEvidenceForCriticalRequirement'),'criticalRequirementCovered':v.get('criticalRequirementCovered'),'traceDir':v.get('traceDir') or v.get('trace_dir')}
 
 def _recommended_action(c):
     return str((_vr(c).get('recommendedAction') or '')).strip().lower()
+
+def _critical_covered(c) -> bool:
+    return _vr(c).get('criticalRequirementCovered') is True
+
+def _strong_accept(c) -> bool:
+    return _recommended_action(c)=='accept' and _critical_covered(c)
 
 def _list_field(v: dict[str, Any], name: str) -> list[Any]:
     value = v.get(name)
@@ -78,7 +84,11 @@ def verifier_quality_details(candidate: Any) -> dict[str, Any]:
     behavioral_count = sum(1 for item in success if _STRONG_SUCCESS_EVIDENCE_RE.search(str(item)))
     tool_count = len(_list_field(v, 'toolsUsed'))
     confidence = _confidence(candidate)
+    critical_covered = 1 if _critical_covered(candidate) else 0
+    strong_accept = 1 if _strong_accept(candidate) else 0
     key = (
+        critical_covered,
+        strong_accept,
         uncertainty_rank,
         -failure_count,
         -missing_count,
@@ -93,6 +103,8 @@ def verifier_quality_details(candidate: Any) -> dict[str, Any]:
         'candidateId': _cid(candidate),
         'result': v.get('result'),
         'confidence': confidence,
+        'criticalRequirementCovered': bool(critical_covered),
+        'strongAccept': bool(strong_accept),
         'uncertaintyLevel': level if level in {'low','medium','high'} else 'medium',
         'failureEvidenceCount': failure_count,
         'missingEvidenceCount': missing_count,
@@ -114,15 +126,17 @@ def _quality_rows(candidates: list[Any]) -> list[dict[str, Any]]:
     for row in rows:
         row['qualityRank']=ranks[row['qualityKey']]
         row['qualityKey']={
-            'uncertaintyRank': row['qualityKey'][0],
-            'negativeFailureEvidenceCount': row['qualityKey'][1],
-            'negativeMissingEvidenceCount': row['qualityKey'][2],
-            'negativeRiskFlagCount': row['qualityKey'][3],
-            'satisfiedRequirementCount': row['qualityKey'][4],
-            'negativeUnsatisfiedRequirementCount': row['qualityKey'][5],
-            'behavioralSuccessEvidenceCount': row['qualityKey'][6],
-            'toolCount': row['qualityKey'][7],
-            'confidence': row['qualityKey'][8],
+            'criticalRequirementCovered': row['qualityKey'][0],
+            'strongAccept': row['qualityKey'][1],
+            'uncertaintyRank': row['qualityKey'][2],
+            'negativeFailureEvidenceCount': row['qualityKey'][3],
+            'negativeMissingEvidenceCount': row['qualityKey'][4],
+            'negativeRiskFlagCount': row['qualityKey'][5],
+            'satisfiedRequirementCount': row['qualityKey'][6],
+            'negativeUnsatisfiedRequirementCount': row['qualityKey'][7],
+            'behavioralSuccessEvidenceCount': row['qualityKey'][8],
+            'toolCount': row['qualityKey'][9],
+            'confidence': row['qualityKey'][10],
         }
     return rows
 
@@ -140,11 +154,11 @@ def select_winner(candidates:list[Any], seed:int, on_all_fail:str='fail')->Selec
     errors=[c for c in candidates if _vr(c).get('result') not in (0,1)]
     fallback=None; quality_applied=False
     if successes:
-        accepted=[c for c in successes if _recommended_action(c)=='accept']
+        accepted=[c for c in successes if _strong_accept(c)]
         bucket=accepted or successes
         win,pool,random_tie=_pick_by_quality(bucket,rng); quality_applied=len(bucket)>1
         if accepted:
-            reason=(f'Selected {_cid(win)} by verifier quality tie-break among candidates with result = 1 and recommendedAction = accept.' if not random_tie else 'Selected randomly among accept-recommended candidates tied on verifier result and verifier quality key.')
+            reason=(f'Selected {_cid(win)} by verifier quality tie-break among candidates with result = 1 and recommendedAction = accept with direct critical-requirement coverage.' if not random_tie else 'Selected randomly among strong accept-recommended candidates tied on verifier result and verifier quality key.')
         else:
             reason=(f'Selected {_cid(win)} by verifier quality tie-break among candidates with result = 1.' if not random_tie else 'Selected randomly among candidates tied on verifier result and verifier quality key.')
     elif on_all_fail=='fail':
@@ -194,6 +208,9 @@ def build_llm_comparison_packet(candidates: list[Any], *, diff_limit: int = 2000
                 'result': v.get('result'),
                 'confidence': v.get('confidence'),
                 'recommendedAction': v.get('recommendedAction'),
+                'criticalRequirement': v.get('criticalRequirement'),
+                'directEvidenceForCriticalRequirement': v.get('directEvidenceForCriticalRequirement'),
+                'criticalRequirementCovered': v.get('criticalRequirementCovered'),
                 'reason': _truncate_text(v.get('reason') or v.get('summary'), evidence_limit),
                 'requirementResults': _truncate_list(v.get('requirementResults'), 5, evidence_limit),
                 'successEvidence': _truncate_list(v.get('successEvidence'), 5, evidence_limit),

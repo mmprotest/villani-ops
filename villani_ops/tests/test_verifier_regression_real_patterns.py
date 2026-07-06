@@ -22,7 +22,7 @@ def fx(tmp_path, objective, commands=None, tools=None, final=None, patches=None)
 def mock_success(monkeypatch):
     class Resp:
         def raise_for_status(self): pass
-        def json(self): return {'choices':[{'message':{'content':json.dumps({'type':'final_verdict','result':1,'verdict':'success','confidence':0.82,'recommendedAction':'accept','reason':'Deliverable-linked evidence validates the task.','deliverableAssessment':{'requiredDeliverables':[],'validatedDeliverables':[],'missingDeliverables':[],'weakValidationReasons':[]},'constraintAssessment':{'constraints':[],'satisfiedConstraints':[],'violatedConstraints':[],'uncheckedConstraints':[]}})}}]}
+        def json(self): return {'choices':[{'message':{'content':json.dumps({'type':'final_verdict','result':1,'verdict':'success','confidence':0.82,'recommendedAction':'accept','reason':'Deliverable-linked evidence validates the task.','criticalRequirement':'deliverable validation','directEvidenceForCriticalRequirement':'deliverable-linked evidence','criticalRequirementCovered':True,'deliverableAssessment':{'requiredDeliverables':[],'validatedDeliverables':[],'missingDeliverables':[],'weakValidationReasons':[]},'constraintAssessment':{'constraints':[],'satisfiedConstraints':[],'violatedConstraints':[],'uncheckedConstraints':[]}})}}]}
     monkeypatch.setattr(httpx,'post',lambda *a,**k: Resp())
 
 def ws(tmp_path):
