@@ -36,7 +36,7 @@ def test_tool_loop_calls_search_commands(monkeypatch, tmp_path):
                 calls.append('first')
                 return {'choices':[{'message':{'content':json.dumps({'type':'tool_call','tool':'search_commands','args':{'query':'PASS','limit':2}})}}]}
             assert 'Tool result for search_commands' in self.payload['messages'][-1]['content']
-            return {'choices':[{'message':{'content':json.dumps({'type':'final_verdict','result':1,'verdict':'success','confidence':0.95,'recommendedAction':'accept','reason':'PASS evidence found','requirementResults':[],'successEvidence':['PASS evidence'],'failureEvidence':[],'recoveredFailures':[],'missingEvidence':[],'riskFlags':[],'toolsUsed':[]})}}]}
+            return {'choices':[{'message':{'content':json.dumps({'type':'final_verdict','result':1,'verdict':'success','confidence':0.95,'recommendedAction':'accept','reason':'PASS evidence found','criticalRequirement':'PASS behavior','directEvidenceForCriticalRequirement':'PASS evidence','criticalRequirementCovered':True,'requirementResults':[],'successEvidence':['PASS evidence'],'failureEvidence':[],'recoveredFailures':[],'missingEvidence':[],'riskFlags':[],'toolsUsed':[]})}}]}
     def fake_post(*args,**kwargs):
         r=Resp(); r.payload=kwargs['json']; return r
     monkeypatch.setattr(httpx,'post',fake_post)
