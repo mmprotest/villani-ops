@@ -11,7 +11,7 @@ from villani_ops.storage.files import FileStorage
 from villani_ops.core.task import Task
 from villani_ops.core.backend import Backend
 from villani_ops.git_ops import safe_apply
-from .selection import select_winner, POLICY
+from .selection import select_winner, POLICY, LLM_COMPARE_POLICY, LLM_COMPARE_FALLBACK_POLICY, select_success_with_llm_comparison
 
 
 
@@ -69,9 +69,21 @@ def now(): return datetime.now(timezone.utc).isoformat()
 def write_json(p:Path,o): p.parent.mkdir(parents=True,exist_ok=True); p.write_text(json.dumps(o,indent=2,default=str),encoding='utf-8')
 def append_jsonl(p:Path,o): p.parent.mkdir(parents=True,exist_ok=True); p.open('a',encoding='utf-8').write(json.dumps(o,default=str)+'\n')
 
+def build_verifier_parallel_candidate_task(task: str, success_criteria: str | None, candidate_id: str) -> str:
+    parts=[
+        f'Verifier-parallel candidate: {candidate_id}',
+        '',
+        'Original task (preserved verbatim):',
+        task,
+    ]
+    if success_criteria:
+        parts += ['', 'Success criteria:', success_criteria]
+    parts += ['', 'Before finishing, run or describe validation that exercises the riskiest requirement in the task, not only the happy path. If the task involves abnormal-path behavior such as interruption, cancellation, cleanup, rollback, timeout, failure handling, concurrency, persistence, recovery, edge cases, or resource management, include validation that targets that behavior. State what was validated and what remains unvalidated.']
+    return '\n'.join(parts)
+
 @dataclass
 class VerifierParallelConfig:
-    repo: Path; task: str; candidates:int=5; parallelism:int|None=None; seed:int|None=None; workspace:Path=Path('.villani-ops'); agent:str='villani-code'; backend:str|None=None; verifier_backend:str|None=None; candidate_timeout_seconds:int|None=None; verifier_timeout_seconds:int=180; verifier_max_tool_calls:int=12; on_all_fail:str='fail'; keep_worktrees:bool=False; out:Path|None=None
+    repo: Path; task: str; success_criteria:str|None=None; candidates:int=5; parallelism:int|None=None; seed:int|None=None; workspace:Path=Path('.villani-ops'); agent:str='villani-code'; backend:str|None=None; verifier_backend:str|None=None; candidate_timeout_seconds:int|None=None; verifier_timeout_seconds:int=180; verifier_max_tool_calls:int=12; on_all_fail:str='fail'; keep_worktrees:bool=False; out:Path|None=None
 
 @dataclass
 class CandidateResult:
@@ -98,7 +110,7 @@ class VerifierParallelOrchestrator:
             cr.error=f'candidate isolation setup failed: {e}'; cr.run_status='failed'; cr.patch_status='failed'; (rdir/'stderr.txt').write_text(cr.error,encoding='utf-8'); cr.completed_at=now(); cr.duration_seconds=time.time()-start; return cr
         try:
             run=self.runner or runner_for_name(self.config.agent or 'villani-code')
-            res=run.run_task(repo_path=cr.worktree_path, task=self.config.task, success_criteria=None, backend_name=backend.name, backend_config=backend, timeout_seconds=self.config.candidate_timeout_seconds or backend.timeout_seconds or 1200, context={'attempt_id':cid}, artifacts_dir=rdir)
+            res=run.run_task(repo_path=cr.worktree_path, task=build_verifier_parallel_candidate_task(self.config.task, self.config.success_criteria, cid), success_criteria=self.config.success_criteria, backend_name=backend.name, backend_config=backend, timeout_seconds=self.config.candidate_timeout_seconds or backend.timeout_seconds or 1200, context={'attempt_id':cid}, artifacts_dir=rdir)
             (rdir/'stdout.txt').write_text(res.stdout or '',encoding='utf-8'); (rdir/'stderr.txt').write_text(res.stderr or '',encoding='utf-8')
             cr.exit_code=res.exit_code; cr.stdout_path=rdir/'stdout.txt'; cr.stderr_path=rdir/'stderr.txt'
             cr.debug_root=Path(res.debug_artifact_dir) if res.debug_artifact_dir else None
@@ -145,7 +157,7 @@ class VerifierParallelOrchestrator:
     def _integrate(self, odir, winner):
         rec={'schemaVersion':'villani-ops-verifier-parallel-integration-v1','winnerCandidateId':winner.candidate_id if winner else None,'sourceWorktree':str(winner.worktree_path) if winner else None,'targetRepo':str(self.config.repo),'patchPath':str(winner.patch_path) if winner and winner.patch_path else None,'status':'skipped','changedFiles':[],'error':None}
         if not winner: write_json(odir/'integration.json',rec); return rec
-        write_json(odir/'task.json', Task(repo_path=str(self.config.repo), objective=self.config.task).model_dump(mode='json'))
+        write_json(odir/'task.json', Task(repo_path=str(self.config.repo), objective=self.config.task, success_criteria=self.config.success_criteria).model_dump(mode='json'))
         write_json(odir/'decision.json', {'accepted':True,'winning_patch_path':str(winner.patch_path),'winning_attempt_id':winner.candidate_id})
         try:
             art=self.integrator(odir,winner) if self.integrator else safe_apply(odir, artifact_name='integration-apply.json')
@@ -161,7 +173,7 @@ class VerifierParallelOrchestrator:
         if winner:
             sel2=dict(selection); sel2.update({'winnerPatchPath':rec['patchPath'],'materializationPath':rec['materializationPath'],'candidateDebugDir':rec['candidateDebugDir'],'verifierTraceDir':rec['verifierTraceDir'],'traceDir':rec['verifierTraceDir']})
             write_json(odir/'selection.json', sel2)
-            write_json(odir/'task.json', Task(repo_path=str(self.config.repo), objective=self.config.task).model_dump(mode='json'))
+            write_json(odir/'task.json', Task(repo_path=str(self.config.repo), objective=self.config.task, success_criteria=self.config.success_criteria).model_dump(mode='json'))
             write_json(odir/'decision.json', {'accepted':True,'winning_patch_path':rec['patchPath'],'winning_attempt_id':winner.candidate_id})
         return rec
     def run(self):
@@ -169,6 +181,10 @@ class VerifierParallelOrchestrator:
         if cfg.candidates<1 or cfg.parallelism<1 or cfg.parallelism>cfg.candidates: raise ValueError('invalid candidates/parallelism')
         oid=datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')+'-'+secrets.token_hex(3); odir=cfg.workspace/'orchestrations'/oid; odir.mkdir(parents=True)
         backend=self._backend_obj(); cfg.backend=cfg.backend or backend.name
+        selector_backend=backend
+        if cfg.verifier_backend and cfg.verifier_backend != backend.name:
+            backs=FileStorage(cfg.workspace).load_backends()
+            selector_backend=backs.get(cfg.verifier_backend) or backend
         candidates=[]
         with ThreadPoolExecutor(max_workers=cfg.parallelism) as ex:
             futs=[ex.submit(self._run_candidate, f'candidate-{i:03d}', odir, backend) for i in range(1,cfg.candidates+1)]
@@ -178,12 +194,27 @@ class VerifierParallelOrchestrator:
             append_jsonl(odir/'candidate-runs.jsonl', {'candidateId':cr.candidate_id,'status':cr.run_status,'exitCode':cr.exit_code,'durationSeconds':cr.duration_seconds,'stdoutPath':str(cr.stdout_path) if cr.stdout_path else None,'stderrPath':str(cr.stderr_path) if cr.stderr_path else None,'debugRoot':str(cr.debug_root) if cr.debug_root else None,'debugDir':str(cr.debug_dir) if cr.debug_dir else None,'resolvedTraceDir':str(cr.resolved_trace_dir) if cr.resolved_trace_dir else None})
             v=cr.verifier_result or {}; append_jsonl(odir/'verifier-results.jsonl', {'candidateId':cr.candidate_id,'result':v.get('result'),'verdict':v.get('verdict'),'confidence':v.get('confidence'),'recommendedAction':v.get('recommendedAction'),'debugDir':str(cr.debug_dir) if cr.debug_dir else None,'candidateDebugDir':str(cr.debug_dir) if cr.debug_dir else None,'verifierTraceDir':v.get('traceDir'),'traceDir':v.get('traceDir'),'verifierResultPath':str(odir/'candidates'/cr.candidate_id/'verifier'/'verifier-result.json')})
             append_jsonl(odir/'candidates.jsonl', self._record_candidate(cr,odir))
-        sel=select_winner(candidates,cfg.seed,cfg.on_all_fail); write_json(odir/'selection.json',sel.to_dict())
+        sel=select_winner(candidates,cfg.seed,cfg.on_all_fail)
+        successes=[c for c in candidates if (c.verifier_result or {}).get('result')==1]
+        if len(successes)>1:
+            meta={'policyName': LLM_COMPARE_POLICY, 'eligibleCandidateIds':[c.candidate_id for c in successes], 'selectedCandidateId':None, 'comparisonReason':None, 'fallbackUsed':False, 'fallbackReason':None}
+            try:
+                cmp=select_success_with_llm_comparison(task=cfg.task, success_criteria=cfg.success_criteria, candidates=successes, model=selector_backend.model, base_url=selector_backend.base_url, provider=selector_backend.provider, api_key=selector_backend.api_key, timeout_s=cfg.verifier_timeout_seconds)
+                if cmp and cmp.get('selectedCandidateId') in meta['eligibleCandidateIds']:
+                    sel.winnerCandidateId=cmp['selectedCandidateId']; sel.winnerResult=1; sel.selectionPolicy=LLM_COMPARE_POLICY; sel.reason=f"Selected {sel.winnerCandidateId} by LLM comparative selection among verifier-success candidates."; sel.candidatePool=meta['eligibleCandidateIds']; sel.tieBreak=True
+                    meta['selectedCandidateId']=cmp['selectedCandidateId']; meta['comparisonReason']=cmp.get('reason')
+                else:
+                    meta['fallbackUsed']=True; meta['fallbackReason']='LLM comparative selector unavailable'; sel.selectionPolicy=LLM_COMPARE_FALLBACK_POLICY
+            except Exception as e:
+                meta['fallbackUsed']=True; meta['fallbackReason']=str(e); sel.selectionPolicy=LLM_COMPARE_FALLBACK_POLICY; sel.reason += f' LLM comparative selection failed; used deterministic quality fallback: {e}'
+            sel.llmComparison=meta; d=sel.to_dict(); write_json(odir/'selection.json',d)
+        else:
+            write_json(odir/'selection.json',sel.to_dict())
         winner=next((c for c in candidates if c.candidate_id==sel.winnerCandidateId),None); integ=self._integrate(odir,winner)
         status='completed' if integ['status'] in {'integrated','skipped'} and (winner or cfg.on_all_fail=='fail') else 'failed'
         if sel.winnerCandidateId is None and cfg.on_all_fail=='fail': status='failed'
         mat=self._materialization_record(odir, 'verifier-parallel', sel.to_dict(), integ, winner)
-        orch={'schemaVersion':'villani-ops-verifier-parallel-orchestration-v1','orchestrationId':oid,'mode':'verifier-parallel','createdAt':oid[:16],'completedAt':now(),'status':status,'repo':str(cfg.repo),'workspace':str(cfg.workspace),'taskPreview':cfg.task[:120],'candidates':cfg.candidates,'parallelism':cfg.parallelism,'seed':cfg.seed,'agent':cfg.agent,'backend':cfg.backend,'verifierBackend':cfg.verifier_backend,'onAllFail':cfg.on_all_fail,'winnerCandidateId':sel.winnerCandidateId,'selectionPolicy':POLICY,'materializationPath':str(odir/'materialization.json'),'winnerPatchPath':mat.get('patchPath')}
+        orch={'schemaVersion':'villani-ops-verifier-parallel-orchestration-v1','orchestrationId':oid,'mode':'verifier-parallel','createdAt':oid[:16],'completedAt':now(),'status':status,'repo':str(cfg.repo),'workspace':str(cfg.workspace),'taskPreview':cfg.task[:120],'candidates':cfg.candidates,'parallelism':cfg.parallelism,'seed':cfg.seed,'agent':cfg.agent,'backend':cfg.backend,'verifierBackend':cfg.verifier_backend,'onAllFail':cfg.on_all_fail,'winnerCandidateId':sel.winnerCandidateId,'selectionPolicy':sel.selectionPolicy,'materializationPath':str(odir/'materialization.json'),'winnerPatchPath':mat.get('patchPath')}
         write_json(odir/'orchestration.json',orch); self._transcript(odir,candidates,sel,integ)
         if not cfg.keep_worktrees and integ['status']=='integrated':
             for cr in candidates:

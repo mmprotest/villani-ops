@@ -1,10 +1,16 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
+from pathlib import Path
+import json
 import random
 import re
+from villani_ops.core.backend import Backend
+from villani_ops.llm.client import LLMClient
 
 POLICY='binary_verifier_quality_tie'
+LLM_COMPARE_POLICY='binary_verifier_llm_compare_tie'
+LLM_COMPARE_FALLBACK_POLICY='binary_verifier_llm_compare_tie_fallback_quality'
 VALID_ON_ALL_FAIL={'fail','random','best-confidence'}
 
 _STRONG_SUCCESS_EVIDENCE_RE = re.compile(
@@ -28,6 +34,7 @@ class SelectionResult:
     qualityTieBreakApplied: bool=False
     winnerQualityKey: dict[str,Any]|None=None
     candidateQuality: list[dict[str,Any]]|None=None
+    llmComparison: dict[str,Any]|None=None
     def to_dict(self): return self.__dict__.copy()
 
 def _vr(c):
@@ -42,7 +49,10 @@ def _confidence(c):
 
 def _summary(c):
     v=_vr(c)
-    return {'candidateId':_cid(c),'result':v.get('result'),'verdict':v.get('verdict'),'confidence':v.get('confidence'),'traceDir':v.get('traceDir') or v.get('trace_dir')}
+    return {'candidateId':_cid(c),'result':v.get('result'),'verdict':v.get('verdict'),'confidence':v.get('confidence'),'recommendedAction':v.get('recommendedAction'),'traceDir':v.get('traceDir') or v.get('trace_dir')}
+
+def _recommended_action(c):
+    return str((_vr(c).get('recommendedAction') or '')).strip().lower()
 
 def _list_field(v: dict[str, Any], name: str) -> list[Any]:
     value = v.get(name)
@@ -130,8 +140,13 @@ def select_winner(candidates:list[Any], seed:int, on_all_fail:str='fail')->Selec
     errors=[c for c in candidates if _vr(c).get('result') not in (0,1)]
     fallback=None; quality_applied=False
     if successes:
-        win,pool,random_tie=_pick_by_quality(successes,rng); quality_applied=len(successes)>1
-        reason=(f'Selected {_cid(win)} by verifier quality tie-break among candidates with result = 1.' if not random_tie else 'Selected randomly among candidates tied on verifier result and verifier quality key.')
+        accepted=[c for c in successes if _recommended_action(c)=='accept']
+        bucket=accepted or successes
+        win,pool,random_tie=_pick_by_quality(bucket,rng); quality_applied=len(bucket)>1
+        if accepted:
+            reason=(f'Selected {_cid(win)} by verifier quality tie-break among candidates with result = 1 and recommendedAction = accept.' if not random_tie else 'Selected randomly among accept-recommended candidates tied on verifier result and verifier quality key.')
+        else:
+            reason=(f'Selected {_cid(win)} by verifier quality tie-break among candidates with result = 1.' if not random_tie else 'Selected randomly among candidates tied on verifier result and verifier quality key.')
     elif on_all_fail=='fail':
         return SelectionResult('villani-ops-verifier-parallel-selection-v1',POLICY,seed,on_all_fail,None,None,False,[],allc,'No candidates had verifier result = 1; on-all-fail=fail skipped integration.',candidateQuality=candidate_quality)
     elif on_all_fail=='random':
@@ -150,3 +165,65 @@ def select_winner(candidates:list[Any], seed:int, on_all_fail:str='fail')->Selec
     v=_vr(win) if win else {}
     winner_quality=next((r for r in candidate_quality if r['candidateId']==_cid(win)), None) if win else None
     return SelectionResult('villani-ops-verifier-parallel-selection-v1',POLICY,seed,on_all_fail,_cid(win) if win else None,v.get('result'),len(pool)>1,pool,allc,reason,fallback,quality_applied,winner_quality,candidate_quality)
+
+
+def _truncate_text(value: Any, limit: int = 1200) -> str:
+    text = str(value or '')
+    return text if len(text) <= limit else text[:limit] + f"\n…[truncated {len(text)-limit} chars]"
+
+def _truncate_list(value: Any, max_items: int = 5, item_limit: int = 500) -> list[Any]:
+    items = value if isinstance(value, list) else []
+    out = [_truncate_text(item, item_limit) for item in items[:max_items]]
+    if len(items) > max_items:
+        out.append(f"…[truncated {len(items)-max_items} items]")
+    return out
+
+def build_llm_comparison_packet(candidates: list[Any], *, diff_limit: int = 2000, evidence_limit: int = 500) -> list[dict[str, Any]]:
+    packets=[]
+    for c in candidates:
+        v=_vr(c)
+        patch_path = getattr(c, 'patch_path', None) or (c.get('patchPath') if isinstance(c, dict) else None)
+        diff=''
+        if patch_path:
+            try: diff=Path(patch_path).read_text(encoding='utf-8', errors='replace')
+            except Exception: diff=''
+        changed = getattr(c, 'changed_files', None) or (c.get('changedFiles') if isinstance(c, dict) else None) or []
+        packets.append({
+            'candidateId': _cid(c),
+            'verifier': {
+                'result': v.get('result'),
+                'confidence': v.get('confidence'),
+                'recommendedAction': v.get('recommendedAction'),
+                'reason': _truncate_text(v.get('reason') or v.get('summary'), evidence_limit),
+                'requirementResults': _truncate_list(v.get('requirementResults'), 5, evidence_limit),
+                'successEvidence': _truncate_list(v.get('successEvidence'), 5, evidence_limit),
+                'failureEvidence': _truncate_list(v.get('failureEvidence'), 5, evidence_limit),
+                'missingEvidence': _truncate_list(v.get('missingEvidence'), 5, evidence_limit),
+                'riskFlags': _truncate_list(v.get('riskFlags'), 5, evidence_limit),
+            },
+            'changedFiles': list(changed)[:30],
+            'diffExcerpt': _truncate_text(diff, diff_limit),
+        })
+    return packets
+
+def select_success_with_llm_comparison(*, task: str, success_criteria: str | None, candidates: list[Any], model: str | None, base_url: str | None, provider: str | None, api_key: str | None, timeout_s: int | None = None) -> dict[str, Any] | None:
+    eligible={_cid(c) for c in candidates}
+    if not eligible or not model or not base_url:
+        return None
+    backend=Backend(name='verifier-parallel-selector', provider=provider or 'openai-compatible', base_url=base_url, model=model, api_key=api_key)
+    packet=build_llm_comparison_packet(candidates)
+    system='You are a strict comparative selector. Return strict JSON only.'
+    user=json.dumps({
+        'instruction': 'Compare candidate patches against the task and success criteria. Prefer direct evidence that the riskiest or most specific requirements are satisfied. Prefer behavioural evidence over source-shape evidence when available. Penalize unresolved failure evidence, missing required outputs, or weak/indirect validation. Choose exactly one eligible candidate id.',
+        'responseSchema': {'selectedCandidateId': 'candidate id from eligible list', 'reason': 'brief reason'},
+        'task': task,
+        'successCriteria': success_criteria,
+        'eligibleCandidateIds': sorted(eligible),
+        'candidates': packet,
+    }, indent=2)[:60000]
+    call=LLMClient().complete_json(backend, system, user, 'VerifierParallelSelection', timeout_seconds=timeout_s, estimate_cost=False)
+    data=call.parsed_json or {}
+    selected=data.get('selectedCandidateId') or data.get('selected_candidate_id')
+    if selected not in eligible:
+        raise ValueError(f'LLM comparative selector returned invalid candidate id: {selected}')
+    return {'selectedCandidateId': selected, 'reason': str(data.get('reason') or data.get('reasoning') or ''), 'packet': packet}

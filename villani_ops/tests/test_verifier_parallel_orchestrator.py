@@ -6,7 +6,7 @@ from villani_ops.cli.main import app
 from villani_ops.core.backend import Backend
 from villani_ops.runners.base import RunnerResult
 from villani_ops.orchestrator.selection import select_winner
-from villani_ops.orchestrator.verifier_parallel import VerifierParallelConfig, VerifierParallelOrchestrator, resolve_verifier_debug_dir
+from villani_ops.orchestrator.verifier_parallel import VerifierParallelConfig, VerifierParallelOrchestrator, resolve_verifier_debug_dir, build_verifier_parallel_candidate_task
 
 
 
@@ -85,26 +85,43 @@ def init_repo(p:Path):
 class FakeRunner:
     def __init__(self): self.calls=[]
     def run_task(self, *, repo_path, task, success_criteria, backend_name, backend_config, timeout_seconds, context, artifacts_dir):
-        self.calls.append((repo_path, task, context)); (Path(repo_path)/'a.txt').write_text(context['attempt_id'])
+        self.calls.append((repo_path, task, success_criteria, context)); (Path(repo_path)/'a.txt').write_text(context['attempt_id'])
         dbg=artifacts_dir/'debug'; dbg.mkdir(parents=True); (dbg/'session_meta.json').write_text('{}')
         return RunnerResult(exit_code=0, stdout='out', stderr='', debug_artifact_dir=str(dbg), duration_ms=1)
+
+
+
+def test_verifier_parallel_config_stores_success_criteria():
+    cfg=VerifierParallelConfig(repo=Path('.'), task='task', success_criteria='must pass')
+    assert cfg.success_criteria == 'must pass'
+
+def test_candidate_prompt_wrapper_preserves_task_and_criteria():
+    task='Line 1\nLine 2 exactly'
+    wrapped=build_verifier_parallel_candidate_task(task, 'criteria text', 'candidate-007')
+    assert task in wrapped
+    assert 'criteria text' in wrapped
+    assert 'riskiest requirement' in wrapped
+    assert 'not only the happy path' in wrapped
 
 def test_flow_creates_worktrees_verifies_integrates_and_writes_artifacts(tmp_path):
     repo=tmp_path/'repo'; init_repo(repo); ws=tmp_path/'ws'
     runner=FakeRunner(); ver_calls=[]
     def verifier(**kw):
         ver_calls.append(kw); return {'result':1 if kw['repo_dir'].parent.name=='candidate-002' else 0,'verdict':'success','confidence':.8,'recommendedAction':'accept','traceDir':str(kw['trace_dir'])}
-    cfg=VerifierParallelConfig(repo=repo,task='do it',candidates=3,parallelism=2,seed=1,workspace=ws,backend='b',keep_worktrees=True)
+    cfg=VerifierParallelConfig(repo=repo,task='do it',success_criteria='done criteria',candidates=3,parallelism=2,seed=1,workspace=ws,backend='b',keep_worktrees=True)
     orch=VerifierParallelOrchestrator(cfg, runner=runner, verifier=verifier)
     orch._backend_obj=lambda: Backend(name='b',provider='local',model='m',api_key='x')
     out=orch.run(); od=Path(out['orchestrationDir'])
     assert len(runner.calls)==3 and len(ver_calls)==3
+    assert all(call[2]=='done criteria' for call in runner.calls)
+    assert all('riskiest requirement' in call[1] for call in runner.calls)
     assert all(c['repo_dir'].name == 'worktree' and c['repo_dir'].parent.name.startswith('candidate-') for c in ver_calls)
     assert out['winnerCandidateId']=='candidate-002'
     assert (repo/'a.txt').read_text()=='candidate-002'
     for name in ['orchestration.json','candidates.jsonl','candidate-runs.jsonl','verifier-results.jsonl','selection.json','integration.json','transcript.md']:
         assert (od/name).exists()
     assert len((od/'candidates.jsonl').read_text().splitlines())==3
+    assert json.loads((od/'task.json').read_text())['success_criteria']=='done criteria'
 
 
 
@@ -346,3 +363,61 @@ def test_selection_json_includes_quality_diagnostics(tmp_path):
     assert selection['winnerQualityKey']['candidateId'] == 'candidate-002'
     assert len(selection['candidateQuality']) == 2
     assert 'verifier quality tie-break' in selection['reason']
+
+def test_llm_comparison_called_for_multiple_successes_and_valid_id_wins(tmp_path, monkeypatch):
+    repo=tmp_path/'repo'; init_repo(repo); ws=tmp_path/'ws'; runner=FakeRunner(); calls=[]
+    def verifier(**kw): return {'result':1,'verdict':'success','confidence':.5,'recommendedAction':'accept','traceDir':str(kw['trace_dir'])}
+    def cmp(**kw):
+        calls.append(kw); return {'selectedCandidateId':'candidate-002','reason':'better evidence'}
+    monkeypatch.setattr('villani_ops.orchestrator.verifier_parallel.select_success_with_llm_comparison', cmp)
+    cfg=VerifierParallelConfig(repo=repo,task='task',success_criteria='criteria',candidates=2,parallelism=1,seed=1,workspace=ws,backend='b',keep_worktrees=True)
+    orch=VerifierParallelOrchestrator(cfg, runner=runner, verifier=verifier); orch._backend_obj=lambda: Backend(name='b',provider='local',model='m',api_key='x',base_url='http://x')
+    out=orch.run(); sel=json.loads((Path(out['orchestrationDir'])/'selection.json').read_text())
+    assert calls and out['winnerCandidateId']=='candidate-002'
+    assert sel['selectionPolicy']=='binary_verifier_llm_compare_tie'
+    assert sel['llmComparison']['comparisonReason']=='better evidence'
+
+
+def test_llm_comparison_invalid_id_falls_back(tmp_path, monkeypatch):
+    repo=tmp_path/'repo'; init_repo(repo); ws=tmp_path/'ws'; runner=FakeRunner()
+    def verifier(**kw):
+        cid=kw['repo_dir'].parent.name
+        return {'result':1,'verdict':'success','confidence':.5,'recommendedAction':'accept','failureEvidence':['x'] if cid=='candidate-002' else [],'traceDir':str(kw['trace_dir'])}
+    monkeypatch.setattr('villani_ops.orchestrator.verifier_parallel.select_success_with_llm_comparison', lambda **kw: {'selectedCandidateId':'bad','reason':'bad'})
+    cfg=VerifierParallelConfig(repo=repo,task='task',candidates=2,parallelism=1,seed=1,workspace=ws,backend='b',keep_worktrees=True)
+    orch=VerifierParallelOrchestrator(cfg, runner=runner, verifier=verifier); orch._backend_obj=lambda: Backend(name='b',provider='local',model='m',api_key='x',base_url='http://x')
+    out=orch.run(); sel=json.loads((Path(out['orchestrationDir'])/'selection.json').read_text())
+    assert out['winnerCandidateId']=='candidate-001'
+    assert sel['selectionPolicy']=='binary_verifier_llm_compare_tie_fallback_quality'
+    assert sel['llmComparison']['fallbackUsed'] is True
+
+
+def test_llm_comparison_exception_falls_back(tmp_path, monkeypatch):
+    repo=tmp_path/'repo'; init_repo(repo); ws=tmp_path/'ws'; runner=FakeRunner()
+    def verifier(**kw): return {'result':1,'verdict':'success','confidence':.5,'recommendedAction':'accept','traceDir':str(kw['trace_dir'])}
+    def boom(**kw): raise RuntimeError('timeout')
+    monkeypatch.setattr('villani_ops.orchestrator.verifier_parallel.select_success_with_llm_comparison', boom)
+    cfg=VerifierParallelConfig(repo=repo,task='task',candidates=2,parallelism=1,seed=1,workspace=ws,backend='b',keep_worktrees=True)
+    orch=VerifierParallelOrchestrator(cfg, runner=runner, verifier=verifier); orch._backend_obj=lambda: Backend(name='b',provider='local',model='m',api_key='x',base_url='http://x')
+    out=orch.run(); sel=json.loads((Path(out['orchestrationDir'])/'selection.json').read_text())
+    assert out['winnerCandidateId'] in {'candidate-001','candidate-002'}
+    assert sel['llmComparison']['fallbackUsed'] is True
+    assert 'timeout' in sel['llmComparison']['fallbackReason']
+
+
+def test_llm_comparison_not_called_for_one_or_zero_successes(tmp_path, monkeypatch):
+    repo=tmp_path/'repo'; init_repo(repo); ws=tmp_path/'ws'; runner=FakeRunner(); calls=[]
+    def verifier(**kw):
+        return {'result':1 if kw['repo_dir'].parent.name=='candidate-001' else 0,'verdict':'success','confidence':.5,'recommendedAction':'accept','traceDir':str(kw['trace_dir'])}
+    monkeypatch.setattr('villani_ops.orchestrator.verifier_parallel.select_success_with_llm_comparison', lambda **kw: calls.append(kw))
+    cfg=VerifierParallelConfig(repo=repo,task='task',candidates=2,parallelism=1,seed=1,workspace=ws,backend='b',keep_worktrees=True)
+    orch=VerifierParallelOrchestrator(cfg, runner=runner, verifier=verifier); orch._backend_obj=lambda: Backend(name='b',provider='local',model='m',api_key='x',base_url='http://x')
+    out=orch.run()
+    assert out['winnerCandidateId']=='candidate-001' and calls==[]
+
+    repo2=tmp_path/'repo2'; init_repo(repo2); ws2=tmp_path/'ws2'; runner2=FakeRunner()
+    def verifier0(**kw): return {'result':0,'verdict':'failure','confidence':.5,'recommendedAction':'reject','traceDir':str(kw['trace_dir'])}
+    cfg2=VerifierParallelConfig(repo=repo2,task='task',candidates=2,parallelism=1,seed=1,workspace=ws2,backend='b',keep_worktrees=True,on_all_fail='fail')
+    orch2=VerifierParallelOrchestrator(cfg2, runner=runner2, verifier=verifier0); orch2._backend_obj=lambda: Backend(name='b',provider='local',model='m',api_key='x',base_url='http://x')
+    out2=orch2.run()
+    assert out2['winnerCandidateId'] is None and calls==[]

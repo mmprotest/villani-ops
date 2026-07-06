@@ -231,7 +231,7 @@ def orchestrate_verifier_parallel(
     if parallelism is not None and parallelism > candidates: raise typer.BadParameter('--parallelism must not exceed --candidates')
     if on_all_fail not in {'fail','random','best-confidence'}: raise typer.BadParameter('--on-all-fail must be fail, random, or best-confidence')
     from villani_ops.orchestrator.verifier_parallel import VerifierParallelConfig, VerifierParallelOrchestrator
-    cfg=VerifierParallelConfig(repo=Path(repo), task=task_text or '', candidates=candidates, parallelism=parallelism, seed=seed, workspace=Path(workspace), agent=agent, backend=backend, verifier_backend=verifier_backend, candidate_timeout_seconds=candidate_timeout_seconds, verifier_timeout_seconds=verifier_timeout_seconds, verifier_max_tool_calls=verifier_max_tool_calls, on_all_fail=on_all_fail, keep_worktrees=keep_worktrees, out=Path(out) if out else None)
+    cfg=VerifierParallelConfig(repo=Path(repo), task=task_text or '', success_criteria=None, candidates=candidates, parallelism=parallelism, seed=seed, workspace=Path(workspace), agent=agent, backend=backend, verifier_backend=verifier_backend, candidate_timeout_seconds=candidate_timeout_seconds, verifier_timeout_seconds=verifier_timeout_seconds, verifier_max_tool_calls=verifier_max_tool_calls, on_all_fail=on_all_fail, keep_worktrees=keep_worktrees, out=Path(out) if out else None)
     try:
         result=VerifierParallelOrchestrator(cfg).run()
     except Exception as e:
@@ -348,7 +348,7 @@ def run(ctx: typer.Context, repo: str|None=None, task: str|None=typer.Option(Non
         raise typer.BadParameter(f"Runner '{runner}' is registered but not implemented yet." if runner in {"claude-code","pi","aider","codex"} else f"Unsupported runner '{runner}'. Supported runner: villani-code.")
     if orchestrator == 'verifier-parallel':
         from villani_ops.orchestrator.verifier_parallel import VerifierParallelConfig, VerifierParallelOrchestrator
-        cfg=VerifierParallelConfig(repo=Path(repo), task=t.objective, candidates=candidate_attempts if candidate_attempts is not None else 5, parallelism=None, seed=None, workspace=Path(workspace), agent=runner, backend=backend, verifier_backend=verifier_backend or backend, candidate_timeout_seconds=timeout_seconds, on_all_fail='fail')
+        cfg=VerifierParallelConfig(repo=Path(repo), task=t.objective, success_criteria=t.success_criteria, candidates=candidate_attempts if candidate_attempts is not None else 5, parallelism=None, seed=None, workspace=Path(workspace), agent=runner, backend=backend, verifier_backend=verifier_backend or backend, candidate_timeout_seconds=timeout_seconds, on_all_fail='fail')
         try:
             vp_result=VerifierParallelOrchestrator(cfg).run()
         except Exception as e:
