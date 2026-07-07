@@ -100,3 +100,24 @@ def test_no_candidate_with_coverage_proven_falls_back_without_fabricating():
     ], seed=1)
     assert s.winnerCandidateId == 'b'
     assert all(not row['criticalRequirementCoverageProven'] for row in s.candidateQuality)
+
+
+def test_same_condition_proven_coverage_outranks_concrete_nonmatching_evidence():
+    s=select_winner([
+        {'candidateId':'nearby','result':1,'confidence':.99,'recommendedAction':'inspect_manually','criticalRequirementCovered':True,'criticalRequirementCoverageProven':False,'criticalRequirementEvidenceRefs':['ev-1'],'criticalRequirementEvidenceMatch':{'ev-1':{'matchesCriticalRequirement':False}}},
+        {'candidateId':'same','result':1,'confidence':.5,'recommendedAction':'inspect_manually','criticalRequirementCovered':True,'criticalRequirementCoverageProven':True,'criticalRequirementEvidenceRefs':['ev-2'],'criticalRequirementEvidenceMatch':{'ev-2':{'matchesCriticalRequirement':True}}},
+    ], seed=1)
+    assert s.winnerCandidateId=='same'
+
+
+def test_accept_without_same_condition_proven_coverage_not_strong():
+    s=select_winner([
+        {'candidateId':'accept_nearby','result':1,'confidence':.99,'recommendedAction':'accept','criticalRequirementCovered':True,'criticalRequirementCoverageProven':False},
+        {'candidateId':'manual_same','result':1,'confidence':.5,'recommendedAction':'inspect_manually','criticalRequirementCovered':True,'criticalRequirementCoverageProven':True},
+    ], seed=1)
+    assert s.winnerCandidateId=='manual_same'
+
+
+def test_llm_comparison_packet_includes_evidence_match():
+    packet=build_llm_comparison_packet([{'candidateId':'c1','result':1,'recommendedAction':'accept','criticalRequirementEvidenceMatch':{'ev-1':{'matchesCriticalRequirement':True,'requirementCondition':'edge'}}}])
+    assert packet[0]['verifier']['criticalRequirementEvidenceMatch']['ev-1']['matchesCriticalRequirement'] is True

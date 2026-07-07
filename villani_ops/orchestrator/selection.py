@@ -49,7 +49,7 @@ def _confidence(c):
 
 def _summary(c):
     v=_vr(c)
-    return {'candidateId':_cid(c),'result':v.get('result'),'verdict':v.get('verdict'),'confidence':v.get('confidence'),'recommendedAction':v.get('recommendedAction'),'criticalRequirement':v.get('criticalRequirement'),'directEvidenceForCriticalRequirement':v.get('directEvidenceForCriticalRequirement'),'criticalRequirementCovered':v.get('criticalRequirementCovered'),'criticalRequirementCoverageProven':v.get('criticalRequirementCoverageProven'),'warnings':v.get('warnings'),'traceDir':v.get('traceDir') or v.get('trace_dir')}
+    return {'candidateId':_cid(c),'result':v.get('result'),'verdict':v.get('verdict'),'confidence':v.get('confidence'),'recommendedAction':v.get('recommendedAction'),'criticalRequirement':v.get('criticalRequirement'),'directEvidenceForCriticalRequirement':v.get('directEvidenceForCriticalRequirement'),'criticalRequirementCovered':v.get('criticalRequirementCovered'),'criticalRequirementCoverageProven':v.get('criticalRequirementCoverageProven'),'criticalRequirementEvidenceMatch':v.get('criticalRequirementEvidenceMatch'),'warnings':v.get('warnings'),'traceDir':v.get('traceDir') or v.get('trace_dir')}
 
 def _recommended_action(c):
     return str((_vr(c).get('recommendedAction') or '')).strip().lower()
@@ -220,6 +220,7 @@ def build_llm_comparison_packet(candidates: list[Any], *, diff_limit: int = 2000
                 'criticalRequirementCovered': v.get('criticalRequirementCovered'),
                 'criticalRequirementEvidenceRefs': _truncate_list(v.get('criticalRequirementEvidenceRefs'), 10, evidence_limit),
                 'criticalRequirementCoverageProven': v.get('criticalRequirementCoverageProven'),
+                'criticalRequirementEvidenceMatch': v.get('criticalRequirementEvidenceMatch') if isinstance(v.get('criticalRequirementEvidenceMatch'), dict) else {},
                 'warnings': _truncate_list(v.get('warnings'), 5, evidence_limit),
                 'reason': _truncate_text(v.get('reason') or v.get('summary'), evidence_limit),
                 'requirementResults': _truncate_list(v.get('requirementResults'), 5, evidence_limit),

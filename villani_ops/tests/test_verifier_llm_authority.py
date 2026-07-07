@@ -180,7 +180,7 @@ def test_infrastructure_error_schema_still_possible():
 
 def test_critical_coverage_accept_remains_accept():
     v = _verdict(1, confidence=.82, action='accept')
-    v.update({'criticalRequirement':'abnormal path works','directEvidenceForCriticalRequirement':'targeted test exercised abnormal path','criticalRequirementCovered': True,'criticalRequirementEvidenceRefs':['ev-pass']})
+    v.update({'criticalRequirement':'abnormal path works','directEvidenceForCriticalRequirement':'targeted test exercised abnormal path','criticalRequirementCovered': True,'criticalRequirementEvidenceRefs':['ev-pass'],'criticalRequirementEvidenceMatch': {'ev-pass': {'matchesCriticalRequirement': True, 'requirementCondition': 'abnormal path works', 'evidenceCondition': 'abnormal path works', 'whySameCondition': 'targeted test exercised abnormal path', 'limitations': []}}})
     out = calibrate(_det(validations=[{'id':'ev-pass','validationStrength':'strong'}]), v)
     assert out['result'] == 1
     assert out['recommendedAction'] == 'accept'
@@ -228,6 +228,7 @@ def _covered_verdict(refs=None, confidence=.82, action='accept'):
         'directEvidenceForCriticalRequirement': 'cited evidence',
         'criticalRequirementCovered': True,
         'criticalRequirementEvidenceRefs': refs or [],
+        'criticalRequirementEvidenceMatch': {r:{'matchesCriticalRequirement':True,'requirementCondition':'critical behavior','evidenceCondition':'critical behavior','whySameCondition':'same condition','limitations':[]} for r in (refs or [])},
     })
     return v
 
@@ -283,3 +284,23 @@ def test_critical_coverage_behavioral_runtime_evidence_accepts():
     out = calibrate(det, _covered_verdict(['runtime']))
     assert out['recommendedAction'] == 'accept'
     assert out['criticalRequirementCoverageProven'] is True
+
+
+def test_proven_coverage_not_downgraded_by_stale_or_diagnostic_disagreement():
+    v=_covered_verdict(['ev-pass'])
+    det=_det(active=[{'id':'old','stale':True,'text':'earlier failure'}], validations=[{'id':'ev-pass','validationStrength':'strong','evidenceKind':'validation','evidenceProvenance':'command_output'}])
+    det['evidenceRegistry']={'ev-pass': {'id':'ev-pass','category':'finalEndToEndValidation','evidenceKind':'validation','evidenceProvenance':'command_output','validationStrength':'strong'}, 'old': {'id':'old','stale':True}}
+    out=calibrate(det, v)
+    assert out['recommendedAction']=='accept'
+    det=_det(active=[{'id':'diag','kind':'diagnostic','diagnosticOnly':True}], validations=[{'id':'ev-pass','validationStrength':'strong','evidenceKind':'validation','evidenceProvenance':'command_output'}])
+    det['evidenceRegistry']={'ev-pass': {'id':'ev-pass','category':'finalEndToEndValidation','evidenceKind':'validation','evidenceProvenance':'command_output','validationStrength':'strong'}, 'diag': {'id':'diag','kind':'diagnostic','diagnosticOnly':True}}
+    out=calibrate(det, v)
+    assert out['recommendedAction']=='accept'
+
+
+def test_proven_coverage_downgraded_by_final_decisive_failure():
+    v=_covered_verdict(['ev-pass'])
+    det=_det(active=[{'id':'fail','validationStrength':'failure','finalStateDecisive':True}], validations=[{'id':'ev-pass','validationStrength':'strong','evidenceKind':'validation','evidenceProvenance':'command_output'}])
+    det['evidenceRegistry']={'ev-pass': {'id':'ev-pass','category':'finalEndToEndValidation','evidenceKind':'validation','evidenceProvenance':'command_output','validationStrength':'strong'}, 'fail': {'id':'fail','validationStrength':'failure','finalStateDecisive':True}}
+    out=calibrate(det, v)
+    assert out['recommendedAction']=='inspect_manually'

@@ -131,7 +131,7 @@ def _det_with(kind='validation', provenance='command_output'):
 
 
 def _verdict(refs, result=1, action='accept', warnings=None):
-    return {'result':result,'verdict':'success' if result==1 else 'failure','confidence':.9,'recommendedAction':action,'reason':'ok','criticalRequirement':'behavior','directEvidenceForCriticalRequirement':'passed','criticalRequirementCovered':True,'criticalRequirementEvidenceRefs':refs,'requirementResults':[],'successEvidence':[],'failureEvidence':[],'recoveredFailures':[],'missingEvidence':[],'riskFlags':[],'toolsUsed':[],'warnings':list(warnings or [])}
+    return {'result':result,'verdict':'success' if result==1 else 'failure','confidence':.9,'recommendedAction':action,'reason':'ok','criticalRequirement':'behavior','directEvidenceForCriticalRequirement':'passed','criticalRequirementCovered':True,'criticalRequirementEvidenceRefs':refs,'criticalRequirementEvidenceMatch':{r:{'matchesCriticalRequirement':True,'requirementCondition':'behavior','evidenceCondition':'behavior','whySameCondition':'same exercised behavior','limitations':[]} for r in refs},'requirementResults':[],'successEvidence':[],'failureEvidence':[],'recoveredFailures':[],'missingEvidence':[],'riskFlags':[],'toolsUsed':[],'warnings':list(warnings or [])}
 
 
 def test_parse_critical_refs_and_harden_requirement_results():
@@ -166,7 +166,7 @@ def test_coverage_gate_accepts_only_concrete_evidence_and_preserves_warnings():
         assert out['recommendedAction'] == 'inspect_manually'
         assert out['criticalRequirementCoverageProven'] is False
         assert 'critical_requirement_evidence_refs_not_concrete' in out['warnings']
-        assert 'accept_downgraded_without_evidence_proven_critical_requirement_coverage' in out['warnings']
+        assert 'accept_downgraded_without_evidence_equivalent_critical_requirement_coverage' in out['warnings']
         assert 'existing' in out['warnings']
 
 
@@ -232,3 +232,53 @@ def test_compact_tool_result_text_truncates_and_repeated_summary_short():
     from villani_ops.verifier.llm import compact_tool_result_text, _tool_cache_key
     assert len(compact_tool_result_text('x'*5000, 1000)) < 1200
     assert _tool_cache_key('read_debug_file', {'path':'a'}) == _tool_cache_key('read_debug_file', {'path':'a'})
+
+
+def test_evidence_equivalence_missing_false_and_material_limitations_downgrade():
+    for match in [{}, {'ev-0001': {'matchesCriticalRequirement': False, 'requirementCondition':'edge','evidenceCondition':'normal','whySameCondition':'','limitations':['weaker nearby']}}, {'ev-0001': {'matchesCriticalRequirement': True, 'requirementCondition':'edge','evidenceCondition':'edge','whySameCondition':'same','limitations':['partial only']}}]:
+        v=_verdict(['ev-0001'])
+        v['criticalRequirementEvidenceMatch']=match
+        out=calibrate(_det_with(), v)
+        assert out['recommendedAction']=='inspect_manually'
+        assert out['criticalRequirementCoverageProven'] is False
+
+
+def test_nearby_condition_concrete_validation_downgrades_but_same_condition_accepts():
+    v=_verdict(['ev-0001'])
+    v['criticalRequirement']='abnormal edge condition'
+    v['criticalRequirementEvidenceMatch']={'ev-0001': {'matchesCriticalRequirement': False, 'requirementCondition':'abnormal edge condition','evidenceCondition':'normal nearby condition','whySameCondition':'','limitations':['tests weaker nearby condition']}}
+    out=calibrate(_det_with(), v)
+    assert out['recommendedAction']=='inspect_manually'
+    v=_verdict(['ev-0001'])
+    v['criticalRequirementEvidenceMatch']={'ev-0001': {'matchesCriticalRequirement': True, 'requirementCondition':'abnormal edge condition','evidenceCondition':'abnormal edge condition','whySameCondition':'validation exercises the same edge condition','limitations':[]}}
+    out=calibrate(_det_with(), v)
+    assert out['recommendedAction']=='accept'
+
+
+def test_parser_hardens_critical_requirement_evidence_match_shapes():
+    obj=_parse('{"type":"final_verdict","result":1,"verdict":"success","recommendedAction":"accept","reason":"ok","criticalRequirementEvidenceMatch":"bad","requirementResults":[]}')
+    assert obj['criticalRequirementEvidenceMatch']=={}
+    assert 'invalid_critical_requirement_evidence_match_shape' in obj['warnings']
+    obj=_parse('{"type":"final_verdict","result":1,"verdict":"success","recommendedAction":"accept","reason":"ok","criticalRequirementEvidenceMatch":{"ev-1":"bad","ev-2":{"matchesCriticalRequirement":"true","requirementCondition":"r","evidenceCondition":"e","whySameCondition":"w","limitations":"partial"}},"requirementResults":[]}')
+    assert 'ev-1' not in obj['criticalRequirementEvidenceMatch']
+    assert obj['criticalRequirementEvidenceMatch']['ev-2']['matchesCriticalRequirement'] is False
+    assert obj['criticalRequirementEvidenceMatch']['ev-2']['limitations']==['partial']
+
+
+def test_packet_compaction_preserves_registry_ids_summaries_and_caps_raw():
+    long='x'*3000
+    packet={'evidence':{'testValidation':[{'id':'ev-0001','text':long,'summary':'edge condition validation','condition':'edge'}]},'evidenceRegistry':{'ev-0001':{'id':'ev-0001','summary':'edge condition validation','condition':'edge','text':long}}}
+    compact=compact_verifier_packet(packet, max_text_chars=80)
+    assert 'ev-0001' in compact['evidenceRegistry']
+    assert compact['evidenceRegistry']['ev-0001']['summary']=='edge condition validation'
+    assert compact['evidenceRegistry']['ev-0001']['condition']=='edge'
+    assert len(compact['evidenceRegistry']['ev-0001']['text']) < 200
+
+
+def test_deterministic_fallback_inconclusive_for_diagnostic_and_tool_loop_only():
+    det={'evidenceByCategory': {'activeFailures':[{'id':'d','kind':'diagnostic','diagnosticOnly':True}]}, 'deliverableAssessment': {}}
+    fb=deterministic_fallback_result(det,'tool loop failed')
+    assert fb['result'] is None
+    assert fb['recommendedAction']=='inspect_manually'
+    fb=deterministic_fallback_result({'evidenceByCategory': {}, 'deliverableAssessment': {}}, 'tool loop failed')
+    assert fb['result'] is None
