@@ -99,7 +99,7 @@ If you are ready to decide, call verifier_final_verdict.
 TOOLS=['list_debug_files','read_debug_file','search_debug_file','search_commands','read_command','search_tool_calls','read_tool_call','search_transcript','list_repo_files','read_repo_file','search_repo','read_diff','search_diff']
 LLM_TOOLS=[
     {'type':'function','function':{'name':'verifier_read_tool','description':'Request a read-only verifier tool to inspect debug artifacts, commands, tool calls, transcripts, diffs, or repo files.','parameters':{'type':'object','additionalProperties':False,'required':['tool','args','reason'],'properties':{'tool':{'type':'string','enum':TOOLS},'args':{'type':'object','additionalProperties':True},'reason':{'type':'string'}}}}},
-    {'type':'function','function':{'name':'verifier_final_verdict','description':'Return the final binary verifier judgement.','parameters':{'type':'object','additionalProperties':False,'required':['result','verdict','confidence','recommendedAction','reason','criticalRequirement','directEvidenceForCriticalRequirement','criticalRequirementCovered','requirementResults','successEvidence','failureEvidence','recoveredFailures','missingEvidence','riskFlags','uncertainty','toolsUsed'],'properties':{'result':{'type':'integer','enum':[0,1]},'verdict':{'type':'string','enum':['success','failure']},'confidence':{'type':'number','minimum':0,'maximum':1},'recommendedAction':{'type':'string','enum':['accept','reject','retry_same_model','retry_higher_model','run_more_tests','inspect_manually']},'reason':{'type':'string'},'criticalRequirement':{'type':'string'},'directEvidenceForCriticalRequirement':{'type':'string'},'criticalRequirementCovered':{'type':'boolean'},'requirementResults':{'type':'array','items':{'type':'object','additionalProperties':False,'required':['id','requirement','status','evidence','risks'],'properties':{'id':{'type':'string'},'requirement':{'type':'string'},'status':{'type':'string','enum':['satisfied','unsatisfied']},'evidence':{'type':'array','items':{'type':'string'}},'risks':{'type':'array','items':{'type':'string'}}}}},'successEvidence':{'type':'array','items':{'type':'string'}},'failureEvidence':{'type':'array','items':{'type':'string'}},'recoveredFailures':{'type':'array','items':{'type':'string'}},'missingEvidence':{'type':'array','items':{'type':'string'}},'riskFlags':{'type':'array','items':{'type':'string'}},'uncertainty':{'type':'object','additionalProperties':False,'required':['level','reasons'],'properties':{'level':{'type':'string','enum':['low','medium','high']},'reasons':{'type':'array','items':{'type':'string'}}}},'deliverableAssessment':{'type':'object','additionalProperties':False,'required':['requiredDeliverables','validatedDeliverables','missingDeliverables','weakValidationReasons'],'properties':{'requiredDeliverables':{'type':'array','items':{'type':'string'}},'validatedDeliverables':{'type':'array','items':{'type':'string'}},'missingDeliverables':{'type':'array','items':{'type':'string'}},'weakValidationReasons':{'type':'array','items':{'type':'string'}}}},'constraintAssessment':{'type':'object','additionalProperties':False,'required':['constraints','satisfiedConstraints','violatedConstraints','uncheckedConstraints'],'properties':{'constraints':{'type':'array','items':{'type':'string'}},'satisfiedConstraints':{'type':'array','items':{'type':'string'}},'violatedConstraints':{'type':'array','items':{'type':'string'}},'uncheckedConstraints':{'type':'array','items':{'type':'string'}}}},'toolsUsed':{'type':'array','items':{'type':'object','additionalProperties':False,'required':['tool','reason'],'properties':{'tool':{'type':'string'},'reason':{'type':'string'}}}}}}}}
+    {'type':'function','function':{'name':'verifier_final_verdict','description':'Return the final binary verifier judgement.','parameters':{'type':'object','additionalProperties':False,'required':['result','verdict','confidence','recommendedAction','reason','criticalRequirement','directEvidenceForCriticalRequirement','criticalRequirementCovered','requirementResults','successEvidence','failureEvidence','recoveredFailures','missingEvidence','riskFlags','uncertainty','toolsUsed'],'properties':{'result':{'type':'integer','enum':[0,1]},'verdict':{'type':'string','enum':['success','failure']},'confidence':{'type':'number','minimum':0,'maximum':1},'recommendedAction':{'type':'string','enum':['accept','reject','retry_same_model','retry_higher_model','run_more_tests','inspect_manually']},'reason':{'type':'string'},'criticalRequirement':{'type':'string'},'directEvidenceForCriticalRequirement':{'type':'string'},'criticalRequirementCovered':{'type':'boolean'},'criticalRequirementEvidenceRefs':{'type':'array','items':{'type':'string'}},'requirementResults':{'type':'array','items':{'type':'object','additionalProperties':False,'required':['id','requirement','status','evidence','risks'],'properties':{'id':{'type':'string'},'requirement':{'type':'string'},'status':{'type':'string','enum':['satisfied','unsatisfied']},'evidence':{'type':'array','items':{'type':'string'}},'risks':{'type':'array','items':{'type':'string'}}}}},'successEvidence':{'type':'array','items':{'type':'string'}},'failureEvidence':{'type':'array','items':{'type':'string'}},'recoveredFailures':{'type':'array','items':{'type':'string'}},'missingEvidence':{'type':'array','items':{'type':'string'}},'riskFlags':{'type':'array','items':{'type':'string'}},'uncertainty':{'type':'object','additionalProperties':False,'required':['level','reasons'],'properties':{'level':{'type':'string','enum':['low','medium','high']},'reasons':{'type':'array','items':{'type':'string'}}}},'deliverableAssessment':{'type':'object','additionalProperties':False,'required':['requiredDeliverables','validatedDeliverables','missingDeliverables','weakValidationReasons'],'properties':{'requiredDeliverables':{'type':'array','items':{'type':'string'}},'validatedDeliverables':{'type':'array','items':{'type':'string'}},'missingDeliverables':{'type':'array','items':{'type':'string'}},'weakValidationReasons':{'type':'array','items':{'type':'string'}}}},'constraintAssessment':{'type':'object','additionalProperties':False,'required':['constraints','satisfiedConstraints','violatedConstraints','uncheckedConstraints'],'properties':{'constraints':{'type':'array','items':{'type':'string'}},'satisfiedConstraints':{'type':'array','items':{'type':'string'}},'violatedConstraints':{'type':'array','items':{'type':'string'}},'uncheckedConstraints':{'type':'array','items':{'type':'string'}}}},'toolsUsed':{'type':'array','items':{'type':'object','additionalProperties':False,'required':['tool','reason'],'properties':{'tool':{'type':'string'},'reason':{'type':'string'}}}}}}}}
 ]
 
 
@@ -252,6 +252,8 @@ def _parse(s):
     obj.setdefault('confidence',0.0)
     obj.setdefault('criticalRequirement','')
     obj.setdefault('directEvidenceForCriticalRequirement','')
+    refs=obj.get('criticalRequirementEvidenceRefs')
+    obj['criticalRequirementEvidenceRefs']=[str(x) for x in refs] if isinstance(refs,list) else []
     obj['criticalRequirementCovered'] = obj.get('criticalRequirementCovered') is True
     for k in ['reason','requirementResults','successEvidence','failureEvidence','recoveredFailures','missingEvidence','riskFlags','toolsUsed']: obj.setdefault(k, [] if k!='reason' else '')
     obj.setdefault('uncertainty', {'level':'medium','reasons':[]})
@@ -262,8 +264,8 @@ def _parse(s):
     return obj
 def _schema_text():
     return """Final verdict schema (return exactly this shape):
-{ "type": "final_verdict", "result": 1, "verdict": "success", "confidence": 0.84, "recommendedAction": "accept", "reason": "short explanation grounded in evidence", "criticalRequirement": "most risk-bearing requirement", "directEvidenceForCriticalRequirement": "strongest direct evidence for that requirement", "criticalRequirementCovered": true, "deliverableAssessment": {"requiredDeliverables":["string"],"validatedDeliverables":["string"],"missingDeliverables":["string"],"weakValidationReasons":["string"]}, "constraintAssessment": {"constraints":["string"],"satisfiedConstraints":["string"],"violatedConstraints":["string"],"uncheckedConstraints":["string"]}, "requirementResults": [{"id":"string","requirement":"string","status":"satisfied | unsatisfied","evidence":["string"],"risks":["string"]}], "successEvidence": ["string"], "failureEvidence": ["string"], "recoveredFailures": ["string"], "missingEvidence": ["string"], "riskFlags": ["string"], "uncertainty": {"level": "low | medium | high", "reasons": ["string"]}, "toolsUsed": [{"tool":"string","reason":"string"}] }
-Rules: result must be 1 or 0. verdict must be success when result is 1. verdict must be failure when result is 0. requirementResults.status must be satisfied or unsatisfied only. Answer: (1) most critical stated requirement, (2) direct evidence covering it, (3) whether the evidence covers it or only a weaker nearby condition, and (4) whether automatic accept is justified. Do not mark criticalRequirementCovered true from imports alone, comments/intent, source plausibility alone for behavioural tasks, normal-path validation for abnormal-path requirements, or candidate validation of only a weaker condition. Do not return unclear. Do not return unknown. Do not return null result. If evidence is incomplete, make the best conservative prediction and explain uncertainty. False accepts are worse than false rejects.
+{ "type": "final_verdict", "result": 1, "verdict": "success", "confidence": 0.84, "recommendedAction": "accept", "reason": "short explanation grounded in evidence", "criticalRequirement": "most risk-bearing requirement", "directEvidenceForCriticalRequirement": "strongest direct evidence for that requirement", "criticalRequirementCovered": true, "criticalRequirementEvidenceRefs": ["evidence-id"], "deliverableAssessment": {"requiredDeliverables":["string"],"validatedDeliverables":["string"],"missingDeliverables":["string"],"weakValidationReasons":["string"]}, "constraintAssessment": {"constraints":["string"],"satisfiedConstraints":["string"],"violatedConstraints":["string"],"uncheckedConstraints":["string"]}, "requirementResults": [{"id":"string","requirement":"string","status":"satisfied | unsatisfied","evidence":["string"],"risks":["string"]}], "successEvidence": ["string"], "failureEvidence": ["string"], "recoveredFailures": ["string"], "missingEvidence": ["string"], "riskFlags": ["string"], "uncertainty": {"level": "low | medium | high", "reasons": ["string"]}, "toolsUsed": [{"tool":"string","reason":"string"}] }
+Rules: result must be 1 or 0. verdict must be success when result is 1. verdict must be failure when result is 0. requirementResults.status must be satisfied or unsatisfied only. Answer: (1) most critical stated requirement, (2) direct evidence covering it, (3) whether the evidence covers it or only a weaker nearby condition, and (4) whether automatic accept is justified, and (5) the evidence ids supporting coverage in criticalRequirementEvidenceRefs. criticalRequirementCovered is not enough by itself for automatic accept; cite concrete evidence. Source inspection alone may support success, but is not enough for automatic accept on behavioural tasks. If direct evidence is absent, set criticalRequirementCovered false or leave evidence refs empty. Do not cite import checks or normal-path checks as coverage for abnormal-path requirements. Do not cite weaker nearby validation as coverage for the critical requirement. Do not mark criticalRequirementCovered true from imports alone, comments/intent, source plausibility alone for behavioural tasks, normal-path validation for abnormal-path requirements, or candidate validation of only a weaker condition. Do not return unclear. Do not return unknown. Do not return null result. If evidence is incomplete, make the best conservative prediction and explain uncertainty. False accepts are worse than false rejects.
 Tool-call schema:
 { "type": "tool_call", "tool": "search_commands", "args": {"query": "PASS", "limit": 10} }
 Return exactly one JSON object."""
@@ -276,8 +278,54 @@ def _repair(cfg,bad,timeout, trace=None):
         trace.append_jsonl('llm_messages.jsonl',{'index':getattr(trace,'msg_count',0),'role':'assistant','name':None,'content':content,'createdAt':__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat(),'chars':len(str(content))}); trace.msg_count=getattr(trace,'msg_count',0)+1
     return _parse(content)
 def _raw_snapshot(verdict):
-    keys=['result','verdict','confidence','recommendedAction','reason','criticalRequirement','directEvidenceForCriticalRequirement','criticalRequirementCovered','deliverableAssessment','constraintAssessment','requirementResults','successEvidence','failureEvidence','recoveredFailures','missingEvidence','riskFlags','uncertainty','toolsUsed']
+    keys=['result','verdict','confidence','recommendedAction','reason','criticalRequirement','directEvidenceForCriticalRequirement','criticalRequirementCovered','criticalRequirementEvidenceRefs','deliverableAssessment','constraintAssessment','requirementResults','successEvidence','failureEvidence','recoveredFailures','missingEvidence','riskFlags','uncertainty','toolsUsed']
     return {k:verdict.get(k) for k in keys if k in verdict}
+
+
+def _iter_evidence_items(det):
+    cats=(det or {}).get('evidenceByCategory',{}) or {}
+    for category, items in cats.items():
+        if isinstance(items,list):
+            for idx,item in enumerate(items):
+                if isinstance(item,dict):
+                    yield category, idx, item
+
+def _evidence_ref_keys(category, idx, item):
+    keys={str(item.get('id') or ''), str(item.get('evidenceId') or ''), str(item.get('ref') or ''), f'{category}:{idx}', f'{category}:{item.get("id")}' if item.get('id') else ''}
+    return {k for k in keys if k}
+
+def _artifact_existence_only(det):
+    da=(det or {}).get('deliverableAssessment') or {}
+    return da.get('artifactExistenceOnly') is True or (det or {}).get('artifactExistenceOnly') is True
+
+def _evidence_proves_critical_coverage(category, item, det):
+    if item.get('criticalRequirementCoverageProven') is True or item.get('coversCriticalRequirement') is True:
+        return True
+    if item.get('criticalRequirementCoverageProven') is False or item.get('coversCriticalRequirement') is False:
+        return False
+    kind=str(item.get('kind') or item.get('type') or '').lower()
+    provenance=str(item.get('provenance') or item.get('source') or '').lower()
+    if category == 'deliverableEvidence':
+        return _artifact_existence_only(det) or item.get('contentCheck') is True or item.get('finalStateCheck') is True
+    if kind in {'source_inspection','comment','intent','import_check','file_existence_check'} or provenance in {'source_inspection','model_reasoning','candidate_claim'}:
+        return False
+    if item.get('normalPathOnly') is True or item.get('weakerNearbyValidation') is True:
+        return False
+    if category in {'finalEndToEndValidation','testValidation','serviceValidation'}:
+        return item.get('validationStrength') != 'weak'
+    if kind in {'runtime_trace','behavioral_trace','assertion','validation_result','final_state_check','content_check'}:
+        return True
+    return False
+
+def prove_critical_requirement_coverage(det, verdict):
+    refs=verdict.get('criticalRequirementEvidenceRefs') or []
+    if verdict.get('criticalRequirementCovered') is not True or not refs:
+        return False
+    wanted={str(r) for r in refs if str(r)}
+    for category, idx, item in _iter_evidence_items(det):
+        if wanted & _evidence_ref_keys(category, idx, item) and _evidence_proves_critical_coverage(category, item, det):
+            return True
+    return False
 
 def _make_disagreement(kind, summary, evidence=None):
     return {'kind':kind,'summary':summary,'evidenceIds':[str((e or {}).get('id') or (e or {}).get('kind') or i) for i,e in enumerate(evidence or [])],'effect':'risk_flag_only'}
@@ -311,6 +359,7 @@ def calibrate(det, verdict, trace=None, cfg=None, timeout=30):
         verdict.setdefault('riskFlags',[]).append('Deterministic deliverable and validation signals exist, but the LLM judged the task contract unmet.')
     if verdict['result']==1 and conf_before>.9:
         verdict['confidence']=.9; verdict.setdefault('riskFlags',[]).append('Success confidence capped at 0.9.'); rules.append('cap_success_confidence')
+    verdict['criticalRequirementCoverageProven']=prove_critical_requirement_coverage(det, verdict)
     verdict.setdefault('uncertainty', {'level':'medium','reasons':[]})
     if disagreements and verdict.get('recommendedAction')=='accept':
         verdict['recommendedAction']='inspect_manually'; rules.append('conservative_manual_inspection_action')
@@ -416,11 +465,11 @@ def llm_result(run, det, workspace='.villani-ops', backend=None, base_url=None, 
         
         if trace is not None:
             trace.write_json('llm_final_verdict_raw.json',{'protocol':protocol,'rawText':content,'parsed':obj})
-            parsed={'schemaVersion':'villani-ops-verifier-llm-verdict-v1',**{k:obj.get(k) for k in ['result','verdict','confidence','recommendedAction','reason','criticalRequirement','directEvidenceForCriticalRequirement','criticalRequirementCovered','deliverableAssessment','constraintAssessment','requirementResults','successEvidence','failureEvidence','recoveredFailures','missingEvidence','riskFlags','uncertainty','toolsUsed']}}
+            parsed={'schemaVersion':'villani-ops-verifier-llm-verdict-v1',**{k:obj.get(k) for k in ['result','verdict','confidence','recommendedAction','reason','criticalRequirement','directEvidenceForCriticalRequirement','criticalRequirementCovered','criticalRequirementEvidenceRefs','deliverableAssessment','constraintAssessment','requirementResults','successEvidence','failureEvidence','recoveredFailures','missingEvidence','riskFlags','uncertainty','toolsUsed']}}
             trace.write_json('llm_final_verdict_parsed.json',parsed)
         obj.setdefault('riskFlags',[]); obj['riskFlags']+=protocol_warnings
         obj=calibrate(det,obj,trace=trace,cfg=cfg,timeout=max(1,deadline-time.monotonic())); break
-    det.update({'result':obj['result'],'verdict':obj['verdict'],'confidence':obj['confidence'],'recommendedAction':obj['recommendedAction'],'reason':obj['reason'],'criticalRequirement':obj.get('criticalRequirement',''),'directEvidenceForCriticalRequirement':obj.get('directEvidenceForCriticalRequirement',''),'criticalRequirementCovered':obj.get('criticalRequirementCovered') is True,'resultSource':obj.get('resultSource'),'postProcessingChangedResult':obj.get('postProcessingChangedResult'),'deliverableAssessment':obj.get('deliverableAssessment',det.get('deliverableAssessment')),'constraintAssessment':obj.get('constraintAssessment',det.get('constraintAssessment')),'requirementResults':obj.get('requirementResults',det['requirementResults']),'successEvidence':obj.get('successEvidence',det['successEvidence']),'failureEvidence':obj.get('failureEvidence',det['failureEvidence']),'recoveredFailures':obj.get('recoveredFailures',det['recoveredFailures']),'missingEvidence':obj.get('missingEvidence',det['missingEvidence']),'riskFlags':obj.get('riskFlags',det['riskFlags']),'toolsUsed':used+obj.get('toolsUsed',[]),'llmRawVerdict':obj.get('llmRawVerdict',{}),'llmProtocol':protocol,'llmProtocolWarnings':protocol_warnings,'calibration':obj.get('_calibration',{}),'verifier':{'mode':'llm_tool_loop','backend':cfg['backend'],'model':cfg['model'],'baseUrl':cfg['baseUrl'],'promptVersion':PROMPT_VERSION}})
+    det.update({'result':obj['result'],'verdict':obj['verdict'],'confidence':obj['confidence'],'recommendedAction':obj['recommendedAction'],'reason':obj['reason'],'criticalRequirement':obj.get('criticalRequirement',''),'directEvidenceForCriticalRequirement':obj.get('directEvidenceForCriticalRequirement',''),'criticalRequirementCovered':obj.get('criticalRequirementCovered') is True,'criticalRequirementEvidenceRefs':obj.get('criticalRequirementEvidenceRefs') or [],'criticalRequirementCoverageProven':obj.get('criticalRequirementCoverageProven') is True,'resultSource':obj.get('resultSource'),'postProcessingChangedResult':obj.get('postProcessingChangedResult'),'deliverableAssessment':obj.get('deliverableAssessment',det.get('deliverableAssessment')),'constraintAssessment':obj.get('constraintAssessment',det.get('constraintAssessment')),'requirementResults':obj.get('requirementResults',det['requirementResults']),'successEvidence':obj.get('successEvidence',det['successEvidence']),'failureEvidence':obj.get('failureEvidence',det['failureEvidence']),'recoveredFailures':obj.get('recoveredFailures',det['recoveredFailures']),'missingEvidence':obj.get('missingEvidence',det['missingEvidence']),'riskFlags':obj.get('riskFlags',det['riskFlags']),'toolsUsed':used+obj.get('toolsUsed',[]),'llmRawVerdict':obj.get('llmRawVerdict',{}),'llmProtocol':protocol,'llmProtocolWarnings':protocol_warnings,'calibration':obj.get('_calibration',{}),'verifier':{'mode':'llm_tool_loop','backend':cfg['backend'],'model':cfg['model'],'baseUrl':cfg['baseUrl'],'promptVersion':PROMPT_VERSION}})
     return validate_final_result_consistency(det)
 
 def finalize_verifier_result(raw_llm_verdict, processed_verdict, trace_info=None):
@@ -449,11 +498,11 @@ def validate_final_result_consistency(result):
         if result.get('recommendedAction')=='accept': result['recommendedAction']='inspect_manually'; flags.append('Final consistency fixed failure recommendedAction.')
         if any(p in reason for p in ['run succeeded','successfully solved','accepted because']) and not any(p in reason for p in ['not ', 'despite','although']):
             result['reason']='The verifier rejected the run based on unresolved blocking or constraint evidence; stale success wording was replaced.'; flags.append('Final consistency replaced stale success reason under failure verdict.')
-    if result.get('result')==1 and result.get('recommendedAction')=='accept' and result.get('criticalRequirementCovered') is not True:
+    if result.get('result')==1 and result.get('recommendedAction')=='accept' and (result.get('criticalRequirementCovered') is not True or result.get('criticalRequirementCoverageProven') is not True):
         result['recommendedAction']='inspect_manually'
         try: result['confidence']=min(float(result.get('confidence',0) or 0), 0.70)
         except Exception: result['confidence']=0.70
-        warning='success_not_accepted_without_direct_critical_requirement_evidence'
+        warning='accept_downgraded_without_evidence_proven_critical_requirement_coverage'
         result.setdefault('warnings',[])
         if warning not in result['warnings']: result['warnings'].append(warning)
         if warning not in flags: flags.append(warning)

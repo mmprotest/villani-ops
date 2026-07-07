@@ -43,7 +43,7 @@ def test_tool_loop_calls_search_commands(monkeypatch, tmp_path):
     res=llm_result(run,det,workspace=str(tmp_path))
     assert res['toolsUsed'][0]['tool']=='search_commands'
     assert res['llmRawVerdict']['verdict']=='success' and res['result']==1
-    assert res['confidence']==0.9
+    assert res['confidence']==0.7
 
 def test_read_debug_file_blocks_symlink_escape(tmp_path):
     outside=tmp_path/'outside.txt'; outside.write_text('secret')

@@ -59,7 +59,7 @@ def test_confidence_cap_does_not_change_result():
     v['criticalRequirementCovered'] = True
     out = calibrate(_det(), v)
     assert out['result'] == 1 and out['verdict'] == 'success'
-    assert out['confidence'] == .9
+    assert out['confidence'] == .70
     assert out['postProcessingChangedResult'] is False
     assert out['_calibration']['confidenceChanged'] is True
 
@@ -180,8 +180,8 @@ def test_infrastructure_error_schema_still_possible():
 
 def test_critical_coverage_accept_remains_accept():
     v = _verdict(1, confidence=.82, action='accept')
-    v.update({'criticalRequirement':'abnormal path works','directEvidenceForCriticalRequirement':'targeted test exercised abnormal path','criticalRequirementCovered': True})
-    out = calibrate(_det(), v)
+    v.update({'criticalRequirement':'abnormal path works','directEvidenceForCriticalRequirement':'targeted test exercised abnormal path','criticalRequirementCovered': True,'criticalRequirementEvidenceRefs':['ev-pass']})
+    out = calibrate(_det(validations=[{'id':'ev-pass','validationStrength':'strong'}]), v)
     assert out['result'] == 1
     assert out['recommendedAction'] == 'accept'
     assert out['confidence'] == .82
@@ -194,7 +194,7 @@ def test_critical_coverage_false_downgrades_accept_and_caps_confidence():
     assert out['result'] == 1
     assert out['recommendedAction'] == 'inspect_manually'
     assert out['confidence'] == .70
-    assert 'success_not_accepted_without_direct_critical_requirement_evidence' in out['warnings']
+    assert 'accept_downgraded_without_evidence_proven_critical_requirement_coverage' in out['warnings']
 
 
 def test_missing_critical_coverage_downgrades_accept_and_caps_confidence():
@@ -218,4 +218,68 @@ def test_critical_coverage_warning_preserves_existing_warnings():
     v.update({'warnings':['existing-warning'], 'criticalRequirementCovered': False})
     out = calibrate(_det(), v)
     assert 'existing-warning' in out['warnings']
-    assert 'success_not_accepted_without_direct_critical_requirement_evidence' in out['warnings']
+    assert 'accept_downgraded_without_evidence_proven_critical_requirement_coverage' in out['warnings']
+
+
+def _covered_verdict(refs=None, confidence=.82, action='accept'):
+    v = _verdict(1, confidence=confidence, action=action)
+    v.update({
+        'criticalRequirement': 'critical behavior',
+        'directEvidenceForCriticalRequirement': 'cited evidence',
+        'criticalRequirementCovered': True,
+        'criticalRequirementEvidenceRefs': refs or [],
+    })
+    return v
+
+
+def test_critical_coverage_proven_accept_stays_accept():
+    det = _det(validations=[{'id': 'ev-pass', 'validationStrength': 'strong'}])
+    out = calibrate(det, _covered_verdict(['ev-pass']))
+    assert out['result'] == 1
+    assert out['recommendedAction'] == 'accept'
+    assert out['criticalRequirementCoverageProven'] is True
+
+
+def test_critical_coverage_declared_without_refs_downgrades_accept():
+    out = calibrate(_det(), _covered_verdict([]))
+    assert out['result'] == 1
+    assert out['recommendedAction'] == 'inspect_manually'
+    assert out['confidence'] == .70
+    assert out['criticalRequirementCoverageProven'] is False
+    assert 'accept_downgraded_without_evidence_proven_critical_requirement_coverage' in out['warnings']
+
+
+def test_critical_coverage_source_inspection_ref_downgrades_accept():
+    det = _det(validations=[{'id': 'src', 'kind': 'source_inspection', 'validationStrength': 'strong'}])
+    out = calibrate(det, _covered_verdict(['src']))
+    assert out['recommendedAction'] == 'inspect_manually'
+    assert out['criticalRequirementCoverageProven'] is False
+
+
+def test_critical_coverage_import_and_file_existence_refs_downgrade_unless_artifact_only():
+    det = _det(validations=[{'id': 'imp', 'kind': 'import_check', 'validationStrength': 'strong'}], deliverables=[{'id': 'exists', 'kind': 'file_existence_check'}])
+    out = calibrate(det, _covered_verdict(['imp', 'exists']))
+    assert out['recommendedAction'] == 'inspect_manually'
+    assert out['criticalRequirementCoverageProven'] is False
+
+    artifact_det = _det(deliverables=[{'id': 'artifact', 'kind': 'file_existence_check'}])
+    artifact_det['deliverableAssessment'] = {'artifactExistenceOnly': True}
+    artifact = calibrate(artifact_det, _covered_verdict(['artifact']))
+    assert artifact['recommendedAction'] == 'accept'
+    assert artifact['criticalRequirementCoverageProven'] is True
+
+
+def test_critical_coverage_normal_path_for_abnormal_requirement_downgrades_accept():
+    det = _det(validations=[{'id': 'normal', 'validationStrength': 'strong', 'normalPathOnly': True}])
+    v = _covered_verdict(['normal'])
+    v['criticalRequirement'] = 'abnormal path behavior'
+    out = calibrate(det, v)
+    assert out['recommendedAction'] == 'inspect_manually'
+    assert out['criticalRequirementCoverageProven'] is False
+
+
+def test_critical_coverage_behavioral_runtime_evidence_accepts():
+    det = _det(validations=[{'id': 'runtime', 'kind': 'runtime_trace', 'validationStrength': 'strong'}])
+    out = calibrate(det, _covered_verdict(['runtime']))
+    assert out['recommendedAction'] == 'accept'
+    assert out['criticalRequirementCoverageProven'] is True
