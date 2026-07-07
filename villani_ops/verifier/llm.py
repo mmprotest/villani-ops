@@ -82,7 +82,7 @@ For edit-constrained tasks, output passing is insufficient if the task restricts
 Do not treat generic PASS output as sufficient if it does not exercise the final deliverable.
 Do not treat dependency installation or environment inspection as final validation.
 
-For the final verdict, explicitly identify the most critical stated or implied requirement, the strongest direct evidence for it, whether that evidence actually covers the requirement rather than a weaker nearby condition, and whether the run should be automatically accepted. For each cited critical evidence ref, fill criticalRequirementEvidenceMatch with: the exact requirement condition, the exact condition the evidence exercises or demonstrates, whether those conditions are materially the same, why they are the same, and remaining limitations. Do not mark evidence as matching merely because it is concrete. Do not mark matching when it tests a weaker nearby condition, only normal path for an abnormal-path requirement, only source plausibility/comments/imports/existence/intent, or model inference without runtime/test/check/artifact evidence. If useful but incomplete, cite it with matchesCriticalRequirement false and explain limitations. If no evidence directly covers the critical requirement, return no matching evidence and do not claim automatic acceptance is justified.
+For the final verdict, explicitly identify the most critical stated or implied requirement, the strongest direct evidence for it, whether that evidence actually covers the requirement rather than a weaker nearby condition, and whether the run should be automatically accepted. For each cited critical evidence ref, fill criticalRequirementEvidenceMatch with: the exact requirement condition, the exact condition the evidence exercises or demonstrates, whether those conditions are materially the same, why they are the same, and remaining limitations as objects with text and material fields. A material limitation means the cited evidence does not fully cover the critical requirement and blocks automatic accept. A non-material audit limitation means the evidence covers the critical requirement, but there is a minor caveat, audit note, or residual uncertainty that does not change whether the same condition was tested or demonstrated. Set material true when the limitation says or implies weaker nearby coverage, normal-path-only coverage for an abnormal-path requirement, no exercise of the critical condition, source-only evidence for a behavioral requirement, diagnostic-only evidence, only imports/existence/comments/intent, candidate-authored evidence that does not match the task condition, evidence before the final relevant mutation, ambiguous final state, or failure to verify the actual required artifact/behavior. Set material false only when the cited evidence covers the same critical condition and the limitation is only an audit caveat that does not change direct exercise or demonstration. Do not mark evidence as matching merely because it is concrete. Do not mark matching when it tests a weaker nearby condition, only normal path for an abnormal-path requirement, only source plausibility/comments/imports/existence/intent, or model inference without runtime/test/check/artifact evidence. If useful but incomplete, cite it with matchesCriticalRequirement false and explain limitations. If no evidence directly covers the critical requirement, return no matching evidence and do not claim automatic acceptance is justified.
 
 You must respond by calling exactly one structured tool:
 - verifier_read_tool when you need more evidence.
@@ -99,7 +99,7 @@ If you are ready to decide, call verifier_final_verdict.
 TOOLS=['list_debug_files','read_debug_file','search_debug_file','search_commands','read_command','search_tool_calls','read_tool_call','search_transcript','list_repo_files','read_repo_file','search_repo','read_diff','search_diff']
 LLM_TOOLS=[
     {'type':'function','function':{'name':'verifier_read_tool','description':'Request a read-only verifier tool to inspect debug artifacts, commands, tool calls, transcripts, diffs, or repo files.','parameters':{'type':'object','additionalProperties':False,'required':['tool','args','reason'],'properties':{'tool':{'type':'string','enum':TOOLS},'args':{'type':'object','additionalProperties':True},'reason':{'type':'string'}}}}},
-    {'type':'function','function':{'name':'verifier_final_verdict','description':'Return the final binary verifier judgement.','parameters':{'type':'object','additionalProperties':False,'required':['result','verdict','confidence','recommendedAction','reason','criticalRequirement','directEvidenceForCriticalRequirement','criticalRequirementCovered','requirementResults','successEvidence','failureEvidence','recoveredFailures','missingEvidence','riskFlags','uncertainty','toolsUsed'],'properties':{'result':{'type':'integer','enum':[0,1]},'verdict':{'type':'string','enum':['success','failure']},'confidence':{'type':'number','minimum':0,'maximum':1},'recommendedAction':{'type':'string','enum':['accept','reject','retry_same_model','retry_higher_model','run_more_tests','inspect_manually']},'reason':{'type':'string'},'criticalRequirement':{'type':'string'},'directEvidenceForCriticalRequirement':{'type':'string'},'criticalRequirementCovered':{'type':'boolean'},'criticalRequirementEvidenceRefs':{'type':'array','items':{'type':'string'}},'criticalRequirementEvidenceMatch':{'type':'object','additionalProperties':{'type':'object','additionalProperties':False,'required':['matchesCriticalRequirement','requirementCondition','evidenceCondition','whySameCondition','limitations'],'properties':{'matchesCriticalRequirement':{'type':'boolean'},'requirementCondition':{'type':'string'},'evidenceCondition':{'type':'string'},'whySameCondition':{'type':'string'},'limitations':{'type':'array','items':{'type':'string'}}}}},'requirementResults':{'type':'array','items':{'type':'object','additionalProperties':False,'required':['id','requirement','status','evidence','risks'],'properties':{'id':{'type':'string'},'requirement':{'type':'string'},'status':{'type':'string','enum':['satisfied','unsatisfied']},'evidence':{'type':'array','items':{'type':'string'}},'risks':{'type':'array','items':{'type':'string'}}}}},'successEvidence':{'type':'array','items':{'type':'string'}},'failureEvidence':{'type':'array','items':{'type':'string'}},'recoveredFailures':{'type':'array','items':{'type':'string'}},'missingEvidence':{'type':'array','items':{'type':'string'}},'riskFlags':{'type':'array','items':{'type':'string'}},'uncertainty':{'type':'object','additionalProperties':False,'required':['level','reasons'],'properties':{'level':{'type':'string','enum':['low','medium','high']},'reasons':{'type':'array','items':{'type':'string'}}}},'deliverableAssessment':{'type':'object','additionalProperties':False,'required':['requiredDeliverables','validatedDeliverables','missingDeliverables','weakValidationReasons'],'properties':{'requiredDeliverables':{'type':'array','items':{'type':'string'}},'validatedDeliverables':{'type':'array','items':{'type':'string'}},'missingDeliverables':{'type':'array','items':{'type':'string'}},'weakValidationReasons':{'type':'array','items':{'type':'string'}}}},'constraintAssessment':{'type':'object','additionalProperties':False,'required':['constraints','satisfiedConstraints','violatedConstraints','uncheckedConstraints'],'properties':{'constraints':{'type':'array','items':{'type':'string'}},'satisfiedConstraints':{'type':'array','items':{'type':'string'}},'violatedConstraints':{'type':'array','items':{'type':'string'}},'uncheckedConstraints':{'type':'array','items':{'type':'string'}}}},'toolsUsed':{'type':'array','items':{'type':'object','additionalProperties':False,'required':['tool','reason'],'properties':{'tool':{'type':'string'},'reason':{'type':'string'}}}}}}}}
+    {'type':'function','function':{'name':'verifier_final_verdict','description':'Return the final binary verifier judgement.','parameters':{'type':'object','additionalProperties':False,'required':['result','verdict','confidence','recommendedAction','reason','criticalRequirement','directEvidenceForCriticalRequirement','criticalRequirementCovered','requirementResults','successEvidence','failureEvidence','recoveredFailures','missingEvidence','riskFlags','uncertainty','toolsUsed'],'properties':{'result':{'type':'integer','enum':[0,1]},'verdict':{'type':'string','enum':['success','failure']},'confidence':{'type':'number','minimum':0,'maximum':1},'recommendedAction':{'type':'string','enum':['accept','reject','retry_same_model','retry_higher_model','run_more_tests','inspect_manually']},'reason':{'type':'string'},'criticalRequirement':{'type':'string'},'directEvidenceForCriticalRequirement':{'type':'string'},'criticalRequirementCovered':{'type':'boolean'},'criticalRequirementEvidenceRefs':{'type':'array','items':{'type':'string'}},'criticalRequirementEvidenceMatch':{'type':'object','additionalProperties':{'type':'object','additionalProperties':False,'required':['matchesCriticalRequirement','requirementCondition','evidenceCondition','whySameCondition','limitations'],'properties':{'matchesCriticalRequirement':{'type':'boolean'},'requirementCondition':{'type':'string'},'evidenceCondition':{'type':'string'},'whySameCondition':{'type':'string'},'limitations':{'type':'array','items':{'type':'object','additionalProperties':False,'required':['text','material'],'properties':{'text':{'type':'string'},'material':{'type':'boolean'}}}}}}},'requirementResults':{'type':'array','items':{'type':'object','additionalProperties':False,'required':['id','requirement','status','evidence','risks'],'properties':{'id':{'type':'string'},'requirement':{'type':'string'},'status':{'type':'string','enum':['satisfied','unsatisfied']},'evidence':{'type':'array','items':{'type':'string'}},'risks':{'type':'array','items':{'type':'string'}}}}},'successEvidence':{'type':'array','items':{'type':'string'}},'failureEvidence':{'type':'array','items':{'type':'string'}},'recoveredFailures':{'type':'array','items':{'type':'string'}},'missingEvidence':{'type':'array','items':{'type':'string'}},'riskFlags':{'type':'array','items':{'type':'string'}},'uncertainty':{'type':'object','additionalProperties':False,'required':['level','reasons'],'properties':{'level':{'type':'string','enum':['low','medium','high']},'reasons':{'type':'array','items':{'type':'string'}}}},'deliverableAssessment':{'type':'object','additionalProperties':False,'required':['requiredDeliverables','validatedDeliverables','missingDeliverables','weakValidationReasons'],'properties':{'requiredDeliverables':{'type':'array','items':{'type':'string'}},'validatedDeliverables':{'type':'array','items':{'type':'string'}},'missingDeliverables':{'type':'array','items':{'type':'string'}},'weakValidationReasons':{'type':'array','items':{'type':'string'}}}},'constraintAssessment':{'type':'object','additionalProperties':False,'required':['constraints','satisfiedConstraints','violatedConstraints','uncheckedConstraints'],'properties':{'constraints':{'type':'array','items':{'type':'string'}},'satisfiedConstraints':{'type':'array','items':{'type':'string'}},'violatedConstraints':{'type':'array','items':{'type':'string'}},'uncheckedConstraints':{'type':'array','items':{'type':'string'}}}},'toolsUsed':{'type':'array','items':{'type':'object','additionalProperties':False,'required':['tool','reason'],'properties':{'tool':{'type':'string'},'reason':{'type':'string'}}}}}}}}
 ]
 
 
@@ -177,7 +177,7 @@ def normalize_read_tool_call(obj, allowed_tools=TOOLS):
     return out,None
 
 
-def _is_final_state_decisive_negative(item):
+def _is_final_state_decisive_negative(item, *, broad_active_failure=False):
     if not isinstance(item,dict): return False
     if item.get('finalStateDecisive') is True or item.get('final') is True: return True
     if item.get('stale') is True or item.get('diagnosticOnly') is True or item.get('recovered') is True: return False
@@ -186,11 +186,14 @@ def _is_final_state_decisive_negative(item):
     provenance=str(item.get('evidenceProvenance') or item.get('provenance') or item.get('source') or '').lower()
     category=str(item.get('category') or item.get('deterministicLabel') or '').lower()
     if kind in {'diagnostic','source_inspection'}: return False
-    return strength=='failure' or 'final' in category or provenance in {'command_output','tool_observation','file_content'}
+    if strength=='failure' and ('final' in category or item.get('explicitFinalCheckFailure') is True): return True
+    if kind in {'missing_deliverable','deliverable_missing'} and ('final' in category or item.get('finalStateDecisive') is True): return True
+    if broad_active_failure and kind in {'failure','failure_signal'} and provenance in {'command_output','tool_observation','file_content'}: return True
+    return False
 
 def deterministic_fallback_result(det, warning):
     da=det.get('deliverableAssessment') or {}; cats=det.get('evidenceByCategory') or {}
-    active=[x for x in (cats.get('activeFailures') or []) if _is_final_state_decisive_negative(x)]
+    active=[x for x in (cats.get('activeFailures') or []) if _is_final_state_decisive_negative(x, broad_active_failure=True)]
     if da.get('missingDeliverables') or active:
         result=0; verdict='failure'; conf=.78; action='reject'; reason='Deterministic fallback: decisive missing deliverable or active failure evidence remained after LLM/tool-loop failure.'
     else:
@@ -283,10 +286,9 @@ def _parse(s):
             if not isinstance(entry,dict):
                 obj['warnings'].append('invalid_critical_requirement_evidence_match_item')
                 continue
-            limitations=entry.get('limitations',[])
-            if limitations is None: limitations=[]
-            elif isinstance(limitations,list): limitations=[str(x) for x in limitations]
-            else: limitations=[str(limitations)]
+            limitations, malformed = _normalize_limitations(entry.get('limitations', []))
+            if malformed:
+                obj['warnings'].append('critical_requirement_match_malformed_limitations')
             cleaned_match[str(ref)]={
                 'matchesCriticalRequirement': entry.get('matchesCriticalRequirement') is True,
                 'requirementCondition': str(entry.get('requirementCondition') or ''),
@@ -313,8 +315,8 @@ def _parse(s):
     return obj
 def _schema_text():
     return """Final verdict schema (return exactly this shape):
-{ "type": "final_verdict", "result": 1, "verdict": "success", "confidence": 0.84, "recommendedAction": "accept", "reason": "short explanation grounded in evidence", "criticalRequirement": "most risk-bearing requirement", "directEvidenceForCriticalRequirement": "strongest direct evidence for that requirement", "criticalRequirementCovered": true, "criticalRequirementEvidenceRefs": ["evidence-id"], "criticalRequirementEvidenceMatch": {"evidence-id": {"matchesCriticalRequirement": true, "requirementCondition": "exact critical condition", "evidenceCondition": "condition exercised by evidence", "whySameCondition": "why this is the same condition", "limitations": []}}, "deliverableAssessment": {"requiredDeliverables":["string"],"validatedDeliverables":["string"],"missingDeliverables":["string"],"weakValidationReasons":["string"]}, "constraintAssessment": {"constraints":["string"],"satisfiedConstraints":["string"],"violatedConstraints":["string"],"uncheckedConstraints":["string"]}, "requirementResults": [{"id":"string","requirement":"string","status":"satisfied | unsatisfied","evidence":["string"],"risks":["string"]}], "successEvidence": ["string"], "failureEvidence": ["string"], "recoveredFailures": ["string"], "missingEvidence": ["string"], "riskFlags": ["string"], "uncertainty": {"level": "low | medium | high", "reasons": ["string"]}, "toolsUsed": [{"tool":"string","reason":"string"}] }
-Rules: result must be 1 or 0. verdict must be success when result is 1. verdict must be failure when result is 0. requirementResults.status must be satisfied or unsatisfied only. criticalRequirementEvidenceRefs must contain only evidence IDs visible in the packet, such as ev-0001; do not invent refs, and return [] when no suitable evidence ID exists. criticalRequirementCovered is not enough by itself for automatic accept; cite concrete evidence IDs and provide criticalRequirementEvidenceMatch for each cited ref. Do not mark evidence as matching the critical requirement merely because it is concrete; do not mark matching for weaker nearby, happy-path-only, source-only, diagnostic-only, or inference-only evidence. Source inspection can support result: success, but cannot by itself prove automatic accept for behavioural tasks. Comments, intent, imports, absence of failures, and validation of only an easier nearby condition are not direct critical-requirement evidence. Do not cite import checks or weaker nearby validation as coverage for the critical requirement. Do not return unclear, unknown, or null result. If evidence is incomplete, make the best conservative prediction and explain uncertainty. False accepts are worse than false rejects.
+{ "type": "final_verdict", "result": 1, "verdict": "success", "confidence": 0.84, "recommendedAction": "accept", "reason": "short explanation grounded in evidence", "criticalRequirement": "most risk-bearing requirement", "directEvidenceForCriticalRequirement": "strongest direct evidence for that requirement", "criticalRequirementCovered": true, "criticalRequirementEvidenceRefs": ["evidence-id"], "criticalRequirementEvidenceMatch": {"evidence-id": {"matchesCriticalRequirement": true, "requirementCondition": "exact critical condition", "evidenceCondition": "condition exercised by evidence", "whySameCondition": "why this is the same condition", "limitations": [{"text":"audit caveat if any","material":false}]}}, "deliverableAssessment": {"requiredDeliverables":["string"],"validatedDeliverables":["string"],"missingDeliverables":["string"],"weakValidationReasons":["string"]}, "constraintAssessment": {"constraints":["string"],"satisfiedConstraints":["string"],"violatedConstraints":["string"],"uncheckedConstraints":["string"]}, "requirementResults": [{"id":"string","requirement":"string","status":"satisfied | unsatisfied","evidence":["string"],"risks":["string"]}], "successEvidence": ["string"], "failureEvidence": ["string"], "recoveredFailures": ["string"], "missingEvidence": ["string"], "riskFlags": ["string"], "uncertainty": {"level": "low | medium | high", "reasons": ["string"]}, "toolsUsed": [{"tool":"string","reason":"string"}] }
+Rules: result must be 1 or 0. verdict must be success when result is 1. verdict must be failure when result is 0. requirementResults.status must be satisfied or unsatisfied only. criticalRequirementEvidenceRefs must contain only evidence IDs visible in the packet, such as ev-0001; do not invent refs, and return [] when no suitable evidence ID exists. criticalRequirementCovered is not enough by itself for automatic accept; cite concrete evidence IDs and provide criticalRequirementEvidenceMatch for each cited ref. Do not mark evidence as matching the critical requirement merely because it is concrete; do not mark matching for weaker nearby, happy-path-only, source-only, diagnostic-only, or inference-only evidence. Source inspection can support result: success, but cannot by itself prove automatic accept for behavioural tasks. Comments, intent, imports, absence of failures, and validation of only an easier nearby condition are not direct critical-requirement evidence. Limitations must be objects with text and material; material limitations block automatic accept, while non-material audit limitations do not. Do not cite import checks or weaker nearby validation as coverage for the critical requirement. Do not return unclear, unknown, or null result. If evidence is incomplete, make the best conservative prediction and explain uncertainty. False accepts are worse than false rejects.
 Tool-call schema:
 { "type": "tool_call", "tool": "search_commands", "args": {"query": "PASS", "limit": 10} }
 Return exactly one JSON object."""
@@ -386,8 +388,33 @@ def _evidence_registry(det):
     return out
 
 def _material_limitations(limitations):
-    # Parser/prompt contract: limitations should be empty when evidence fully matches.
-    return [str(x) for x in (limitations or []) if str(x).strip()]
+    normalized, malformed = _normalize_limitations(limitations)
+    material=[]
+    for item in normalized:
+        if item.get('material') is True and str(item.get('text') or '').strip():
+            material.append(str(item.get('text')))
+    return material, malformed
+
+
+def _normalize_limitations(limitations):
+    if limitations is None:
+        return [], False
+    if not isinstance(limitations, list):
+        return [{'text': str(limitations), 'material': True}], True
+    out=[]; malformed=False
+    for item in limitations:
+        if isinstance(item, str):
+            out.append({'text': item, 'material': True})
+        elif isinstance(item, dict):
+            text=item.get('text')
+            material=item.get('material')
+            if not isinstance(text, str) or not isinstance(material, bool):
+                malformed=True
+            out.append({'text': str(text or item), 'material': material if isinstance(material, bool) else True})
+        else:
+            malformed=True
+            out.append({'text': str(item), 'material': True})
+    return out, malformed
 
 def _warn_once(warnings, warning):
     if warning not in warnings: warnings.append(warning)
@@ -421,16 +448,21 @@ def prove_critical_requirement_coverage(det, verdict):
             continue
         match=match_map.get(ref)
         if not isinstance(match,dict):
+            _warn_once(warnings,'critical_requirement_match_missing')
             _warn_once(warnings,'critical_requirement_evidence_match_missing')
             continue
         req=str(match.get('requirementCondition') or '').strip()
         ev=str(match.get('evidenceCondition') or '').strip()
         why=str(match.get('whySameCondition') or '').strip()
-        limitations=_material_limitations(match.get('limitations'))
+        limitations, malformed_limitations = _material_limitations(match.get('limitations'))
+        if malformed_limitations:
+            _warn_once(warnings,'critical_requirement_match_malformed_limitations')
         if match.get('matchesCriticalRequirement') is not True:
+            _warn_once(warnings,'critical_requirement_match_false')
             _warn_once(warnings,'critical_requirement_evidence_match_not_same_condition')
             continue
-        if limitations:
+        if limitations or malformed_limitations:
+            _warn_once(warnings,'critical_requirement_match_material_limitations')
             _warn_once(warnings,'critical_requirement_evidence_match_has_material_limitations')
             continue
         if not (req and ev and why):
@@ -438,6 +470,7 @@ def prove_critical_requirement_coverage(det, verdict):
             continue
         proven=True
     if saw_non_concrete:
+        _warn_once(warnings,'critical_requirement_match_non_concrete_evidence')
         _warn_once(warnings,'critical_requirement_evidence_refs_not_concrete')
     return proven
 

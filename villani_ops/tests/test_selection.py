@@ -121,3 +121,32 @@ def test_accept_without_same_condition_proven_coverage_not_strong():
 def test_llm_comparison_packet_includes_evidence_match():
     packet=build_llm_comparison_packet([{'candidateId':'c1','result':1,'recommendedAction':'accept','criticalRequirementEvidenceMatch':{'ev-1':{'matchesCriticalRequirement':True,'requirementCondition':'edge'}}}])
     assert packet[0]['verifier']['criticalRequirementEvidenceMatch']['ev-1']['matchesCriticalRequirement'] is True
+
+
+def test_candidate_with_non_material_limitations_and_proven_coverage_outranks_unproven():
+    s=select_winner([
+        {'candidateId':'unproven','result':1,'confidence':.99,'recommendedAction':'inspect_manually','criticalRequirementCoverageProven':False},
+        {'candidateId':'proven_audit','result':1,'confidence':.5,'recommendedAction':'accept','criticalRequirementCoverageProven':True,'criticalRequirementEvidenceMatch':{'ev-1':{'matchesCriticalRequirement':True,'limitations':[{'text':'audit note','material':False}]}}},
+    ], seed=1)
+    assert s.winnerCandidateId=='proven_audit'
+
+
+def test_material_limitations_do_not_count_as_proven_for_selection_strength():
+    s=select_winner([
+        {'candidateId':'material','result':1,'confidence':.99,'recommendedAction':'accept','criticalRequirementCoverageProven':False,'criticalRequirementEvidenceMatch':{'ev-1':{'matchesCriticalRequirement':True,'limitations':[{'text':'weaker nearby','material':True}]}}},
+        {'candidateId':'manual_proven','result':1,'confidence':.5,'recommendedAction':'inspect_manually','criticalRequirementCoverageProven':True},
+    ], seed=1)
+    assert s.winnerCandidateId=='manual_proven'
+
+
+def test_accept_strong_only_when_materiality_processed_coverage_remains_true():
+    s=select_winner([
+        {'candidateId':'accept_material_downgraded','result':1,'confidence':.99,'recommendedAction':'accept','criticalRequirementCoverageProven':False},
+        {'candidateId':'manual_proven','result':1,'confidence':.5,'recommendedAction':'inspect_manually','criticalRequirementCoverageProven':True},
+    ], seed=1)
+    assert s.winnerCandidateId=='manual_proven'
+
+
+def test_llm_comparison_packet_preserves_limitation_materiality():
+    packet=build_llm_comparison_packet([{'candidateId':'c1','result':1,'recommendedAction':'accept','criticalRequirementCoverageProven':True,'criticalRequirementEvidenceMatch':{'ev-1':{'matchesCriticalRequirement':True,'limitations':[{'text':'audit note','material':False}]}}}])
+    assert packet[0]['verifier']['criticalRequirementEvidenceMatch']['ev-1']['limitations'][0]['material'] is False

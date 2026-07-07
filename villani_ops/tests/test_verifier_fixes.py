@@ -262,7 +262,8 @@ def test_parser_hardens_critical_requirement_evidence_match_shapes():
     obj=_parse('{"type":"final_verdict","result":1,"verdict":"success","recommendedAction":"accept","reason":"ok","criticalRequirementEvidenceMatch":{"ev-1":"bad","ev-2":{"matchesCriticalRequirement":"true","requirementCondition":"r","evidenceCondition":"e","whySameCondition":"w","limitations":"partial"}},"requirementResults":[]}')
     assert 'ev-1' not in obj['criticalRequirementEvidenceMatch']
     assert obj['criticalRequirementEvidenceMatch']['ev-2']['matchesCriticalRequirement'] is False
-    assert obj['criticalRequirementEvidenceMatch']['ev-2']['limitations']==['partial']
+    assert obj['criticalRequirementEvidenceMatch']['ev-2']['limitations']==[{'text':'partial','material':True}]
+    assert 'critical_requirement_match_malformed_limitations' in obj['warnings']
 
 
 def test_packet_compaction_preserves_registry_ids_summaries_and_caps_raw():
@@ -282,3 +283,81 @@ def test_deterministic_fallback_inconclusive_for_diagnostic_and_tool_loop_only()
     assert fb['recommendedAction']=='inspect_manually'
     fb=deterministic_fallback_result({'evidenceByCategory': {}, 'deliverableAssessment': {}}, 'tool loop failed')
     assert fb['result'] is None
+
+
+def test_limitation_materiality_parsing_and_coverage_gate():
+    cases=[
+        ({}, True, []),
+        ({'limitations': []}, True, []),
+        ({'limitations': ['legacy caveat']}, False, ['critical_requirement_match_material_limitations']),
+        ({'limitations': [{'text':'blocks same condition','material': True}]}, False, ['critical_requirement_match_material_limitations']),
+        ({'limitations': [{'text':'audit note only','material': False}]}, True, []),
+        ({'limitations': [{'text':'audit note only','material': False},{'text':'weaker condition','material': True}]}, False, ['critical_requirement_match_material_limitations']),
+        ({'limitations': [{'text':'missing material flag'}]}, False, ['critical_requirement_match_malformed_limitations','critical_requirement_match_material_limitations']),
+    ]
+    for extra, expected, warnings in cases:
+        v=_verdict(['ev-0001'])
+        match={'matchesCriticalRequirement': True, 'requirementCondition':'edge', 'evidenceCondition':'edge', 'whySameCondition':'same'}
+        match.update(extra)
+        v['criticalRequirementEvidenceMatch']={'ev-0001': match}
+        out=calibrate(_det_with(), v)
+        assert out['criticalRequirementCoverageProven'] is expected
+        assert out['recommendedAction'] == ('accept' if expected else 'inspect_manually')
+        for warning in warnings:
+            assert warning in out['warnings']
+
+
+def test_coverage_gate_match_false_missing_non_concrete_and_no_failure_flip():
+    v=_verdict(['ev-0001'])
+    v['criticalRequirementEvidenceMatch']['ev-0001']['matchesCriticalRequirement']=False
+    out=calibrate(_det_with(), v)
+    assert out['recommendedAction']=='inspect_manually'
+    assert 'critical_requirement_match_false' in out['warnings']
+
+    v=_verdict(['ev-0001'])
+    v['criticalRequirementEvidenceMatch']={}
+    out=calibrate(_det_with(), v)
+    assert out['recommendedAction']=='inspect_manually'
+    assert 'critical_requirement_match_missing' in out['warnings']
+
+    out=calibrate(_det_with('diagnostic','command_output'), _verdict(['ev-0001']))
+    assert out['recommendedAction']=='inspect_manually'
+    assert 'critical_requirement_match_non_concrete_evidence' in out['warnings']
+
+    out=calibrate(_det_with(), _verdict(['ev-9999']))
+    assert out['result']==1
+    assert out['verdict']=='success'
+    assert out['recommendedAction']=='inspect_manually'
+
+    out=calibrate(_det_with(), _verdict(['ev-9999'], result=0, action='reject'))
+    assert out['result']==0
+    assert out['recommendedAction']=='reject'
+
+
+def test_nearby_material_limitation_blocks_but_audit_limitation_allows():
+    v=_verdict(['ev-0001'])
+    v['criticalRequirement']='edge/abnormal condition'
+    v['criticalRequirementEvidenceMatch']={'ev-0001': {'matchesCriticalRequirement': True, 'requirementCondition':'edge/abnormal condition','evidenceCondition':'weaker nearby normal condition','whySameCondition':'claimed same','limitations':[{'text':'evidence validates weaker nearby condition','material': True}]}}
+    out=calibrate(_det_with(), v)
+    assert out['recommendedAction']=='inspect_manually'
+    assert out['criticalRequirementCoverageProven'] is False
+
+    v=_verdict(['ev-0001'])
+    v['criticalRequirementEvidenceMatch']={'ev-0001': {'matchesCriticalRequirement': True, 'requirementCondition':'edge/abnormal condition','evidenceCondition':'edge/abnormal condition','whySameCondition':'same condition exercised','limitations':[{'text':'minor audit caveat','material': False}]}}
+    out=calibrate(_det_with(), v)
+    assert out['recommendedAction']=='accept'
+    assert out['criticalRequirementCoverageProven'] is True
+
+
+def test_deterministic_disagreement_calibration_with_proven_coverage():
+    base=_verdict(['ev-0001'])
+    assert calibrate({'evidenceByCategory': {'testValidation': [_det_with()['evidenceRegistry']['ev-0001']], 'activeFailures':[{'id':'old','validationStrength':'failure','stale':True}]}, 'evidenceRegistry': _det_with()['evidenceRegistry']}, dict(base))['recommendedAction']=='accept'
+    final_fail={'id':'final','category':'finalEndToEndValidation','validationStrength':'failure','evidenceKind':'validation','evidenceProvenance':'command_output'}
+    assert calibrate({'evidenceByCategory': {'testValidation': [_det_with()['evidenceRegistry']['ev-0001']], 'activeFailures':[final_fail]}, 'evidenceRegistry': _det_with()['evidenceRegistry']}, dict(base))['recommendedAction']=='inspect_manually'
+    for active in [
+        {'id':'diag','kind':'diagnostic','diagnosticOnly':True,'evidenceProvenance':'command_output'},
+        {'id':'src','kind':'source_inspection','evidenceProvenance':'source_diff'},
+        {'id':'absence','kind':'missing_ideal_validation'},
+    ]:
+        out=calibrate({'evidenceByCategory': {'testValidation': [_det_with()['evidenceRegistry']['ev-0001']], 'activeFailures':[active]}, 'evidenceRegistry': _det_with()['evidenceRegistry']}, dict(base))
+        assert out['recommendedAction']=='accept'
