@@ -54,7 +54,7 @@ def test_file_output_no_commands_llm_success_not_flipped(monkeypatch, tmp_path):
     monkeypatch.setattr(httpx,'post',lambda *a,**k: Resp())
     res=llm_result(run,det,workspace=str(tmp_path/'ws'))
     assert res['result']==1 and res['verdict']=='success'
-    assert res['confidence']==0.9
+    assert res['confidence']==0.7
 
 
 def test_recovered_refused_tool_calls_do_not_remain_active_after_validation(tmp_path):

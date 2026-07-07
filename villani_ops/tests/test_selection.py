@@ -67,3 +67,35 @@ def test_comparison_packet_includes_critical_requirement_fields():
     assert verifier['criticalRequirement'] == 'rollback'
     assert verifier['directEvidenceForCriticalRequirement'] == 'rollback test passed'
     assert verifier['criticalRequirementCovered'] is True
+
+
+def test_success_with_coverage_proven_beats_declared_only_when_comparable():
+    s=select_winner([
+        {'candidateId':'declared','result':1,'confidence':.9,'recommendedAction':'inspect_manually','criticalRequirementCovered':True,'criticalRequirementCoverageProven':False},
+        {'candidateId':'proven','result':1,'confidence':.9,'recommendedAction':'inspect_manually','criticalRequirementCovered':True,'criticalRequirementCoverageProven':True},
+    ], seed=1)
+    assert s.winnerCandidateId == 'proven'
+
+
+def test_accept_without_coverage_proven_not_stronger_than_manual_proven():
+    s=select_winner([
+        {'candidateId':'accept_declared','result':1,'confidence':.9,'recommendedAction':'accept','criticalRequirementCovered':True,'criticalRequirementCoverageProven':False},
+        {'candidateId':'manual_proven','result':1,'confidence':.9,'recommendedAction':'inspect_manually','criticalRequirementCovered':True,'criticalRequirementCoverageProven':True},
+    ], seed=1)
+    assert s.winnerCandidateId == 'manual_proven'
+
+
+def test_comparison_packet_includes_coverage_proven_and_warnings():
+    packet=build_llm_comparison_packet([{'candidateId':'c1','result':1,'recommendedAction':'inspect_manually','criticalRequirement':'rollback','directEvidenceForCriticalRequirement':'rollback test passed','criticalRequirementCovered':True,'criticalRequirementCoverageProven':False,'warnings':['accept_downgraded_without_evidence_proven_critical_requirement_coverage']}])
+    verifier=packet[0]['verifier']
+    assert verifier['criticalRequirementCoverageProven'] is False
+    assert 'accept_downgraded_without_evidence_proven_critical_requirement_coverage' in verifier['warnings']
+
+
+def test_no_candidate_with_coverage_proven_falls_back_without_fabricating():
+    s=select_winner([
+        {'candidateId':'a','result':1,'confidence':.8,'recommendedAction':'inspect_manually','criticalRequirementCovered':True,'criticalRequirementCoverageProven':False},
+        {'candidateId':'b','result':1,'confidence':.9,'recommendedAction':'inspect_manually','criticalRequirementCovered':True,'criticalRequirementCoverageProven':False},
+    ], seed=1)
+    assert s.winnerCandidateId == 'b'
+    assert all(not row['criticalRequirementCoverageProven'] for row in s.candidateQuality)

@@ -49,7 +49,7 @@ def _confidence(c):
 
 def _summary(c):
     v=_vr(c)
-    return {'candidateId':_cid(c),'result':v.get('result'),'verdict':v.get('verdict'),'confidence':v.get('confidence'),'recommendedAction':v.get('recommendedAction'),'criticalRequirement':v.get('criticalRequirement'),'directEvidenceForCriticalRequirement':v.get('directEvidenceForCriticalRequirement'),'criticalRequirementCovered':v.get('criticalRequirementCovered'),'traceDir':v.get('traceDir') or v.get('trace_dir')}
+    return {'candidateId':_cid(c),'result':v.get('result'),'verdict':v.get('verdict'),'confidence':v.get('confidence'),'recommendedAction':v.get('recommendedAction'),'criticalRequirement':v.get('criticalRequirement'),'directEvidenceForCriticalRequirement':v.get('directEvidenceForCriticalRequirement'),'criticalRequirementCovered':v.get('criticalRequirementCovered'),'criticalRequirementCoverageProven':v.get('criticalRequirementCoverageProven'),'warnings':v.get('warnings'),'traceDir':v.get('traceDir') or v.get('trace_dir')}
 
 def _recommended_action(c):
     return str((_vr(c).get('recommendedAction') or '')).strip().lower()
@@ -57,8 +57,11 @@ def _recommended_action(c):
 def _critical_covered(c) -> bool:
     return _vr(c).get('criticalRequirementCovered') is True
 
+def _critical_proven(c) -> bool:
+    return _vr(c).get('criticalRequirementCoverageProven') is True
+
 def _strong_accept(c) -> bool:
-    return _recommended_action(c)=='accept' and _critical_covered(c)
+    return _recommended_action(c)=='accept' and _critical_covered(c) and _critical_proven(c)
 
 def _list_field(v: dict[str, Any], name: str) -> list[Any]:
     value = v.get(name)
@@ -85,8 +88,10 @@ def verifier_quality_details(candidate: Any) -> dict[str, Any]:
     tool_count = len(_list_field(v, 'toolsUsed'))
     confidence = _confidence(candidate)
     critical_covered = 1 if _critical_covered(candidate) else 0
+    critical_proven = 1 if _critical_proven(candidate) else 0
     strong_accept = 1 if _strong_accept(candidate) else 0
     key = (
+        critical_proven,
         critical_covered,
         strong_accept,
         uncertainty_rank,
@@ -103,6 +108,7 @@ def verifier_quality_details(candidate: Any) -> dict[str, Any]:
         'candidateId': _cid(candidate),
         'result': v.get('result'),
         'confidence': confidence,
+        'criticalRequirementCoverageProven': bool(critical_proven),
         'criticalRequirementCovered': bool(critical_covered),
         'strongAccept': bool(strong_accept),
         'uncertaintyLevel': level if level in {'low','medium','high'} else 'medium',
@@ -126,17 +132,18 @@ def _quality_rows(candidates: list[Any]) -> list[dict[str, Any]]:
     for row in rows:
         row['qualityRank']=ranks[row['qualityKey']]
         row['qualityKey']={
-            'criticalRequirementCovered': row['qualityKey'][0],
-            'strongAccept': row['qualityKey'][1],
-            'uncertaintyRank': row['qualityKey'][2],
-            'negativeFailureEvidenceCount': row['qualityKey'][3],
-            'negativeMissingEvidenceCount': row['qualityKey'][4],
-            'negativeRiskFlagCount': row['qualityKey'][5],
-            'satisfiedRequirementCount': row['qualityKey'][6],
-            'negativeUnsatisfiedRequirementCount': row['qualityKey'][7],
-            'behavioralSuccessEvidenceCount': row['qualityKey'][8],
-            'toolCount': row['qualityKey'][9],
-            'confidence': row['qualityKey'][10],
+            'criticalRequirementCoverageProven': row['qualityKey'][0],
+            'criticalRequirementCovered': row['qualityKey'][1],
+            'strongAccept': row['qualityKey'][2],
+            'uncertaintyRank': row['qualityKey'][3],
+            'negativeFailureEvidenceCount': row['qualityKey'][4],
+            'negativeMissingEvidenceCount': row['qualityKey'][5],
+            'negativeRiskFlagCount': row['qualityKey'][6],
+            'satisfiedRequirementCount': row['qualityKey'][7],
+            'negativeUnsatisfiedRequirementCount': row['qualityKey'][8],
+            'behavioralSuccessEvidenceCount': row['qualityKey'][9],
+            'toolCount': row['qualityKey'][10],
+            'confidence': row['qualityKey'][11],
         }
     return rows
 
@@ -158,7 +165,7 @@ def select_winner(candidates:list[Any], seed:int, on_all_fail:str='fail')->Selec
         bucket=accepted or successes
         win,pool,random_tie=_pick_by_quality(bucket,rng); quality_applied=len(bucket)>1
         if accepted:
-            reason=(f'Selected {_cid(win)} by verifier quality tie-break among candidates with result = 1 and recommendedAction = accept with direct critical-requirement coverage.' if not random_tie else 'Selected randomly among strong accept-recommended candidates tied on verifier result and verifier quality key.')
+            reason=(f'Selected {_cid(win)} by verifier quality tie-break among candidates with result = 1 and recommendedAction = accept with evidence-proven critical-requirement coverage.' if not random_tie else 'Selected randomly among strong accept-recommended candidates tied on verifier result and verifier quality key.')
         else:
             reason=(f'Selected {_cid(win)} by verifier quality tie-break among candidates with result = 1.' if not random_tie else 'Selected randomly among candidates tied on verifier result and verifier quality key.')
     elif on_all_fail=='fail':
@@ -211,6 +218,8 @@ def build_llm_comparison_packet(candidates: list[Any], *, diff_limit: int = 2000
                 'criticalRequirement': v.get('criticalRequirement'),
                 'directEvidenceForCriticalRequirement': v.get('directEvidenceForCriticalRequirement'),
                 'criticalRequirementCovered': v.get('criticalRequirementCovered'),
+                'criticalRequirementCoverageProven': v.get('criticalRequirementCoverageProven'),
+                'warnings': _truncate_list(v.get('warnings'), 5, evidence_limit),
                 'reason': _truncate_text(v.get('reason') or v.get('summary'), evidence_limit),
                 'requirementResults': _truncate_list(v.get('requirementResults'), 5, evidence_limit),
                 'successEvidence': _truncate_list(v.get('successEvidence'), 5, evidence_limit),
