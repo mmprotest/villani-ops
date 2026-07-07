@@ -2,7 +2,7 @@ import pytest
 from villani_ops.verifier.types import CommandRecord, DebugRun, ToolCallRecord
 from villani_ops.verifier.extract import extract_deliverables
 from villani_ops.verifier.deterministic import _item, classify_validation_strength, build_packet, deterministic_result
-from villani_ops.verifier.llm import compact_verifier_packet, normalize_read_tool_call, deterministic_fallback_result
+from villani_ops.verifier.llm import compact_verifier_packet, normalize_read_tool_call, deterministic_fallback_result, _parse, calibrate, prove_critical_requirement_coverage
 
 
 def cmd(command, stdout='', stderr='', exit=0):
@@ -53,6 +53,20 @@ def test_packet_compaction_caps_strings_and_lists_preserves_decisive_fields():
     assert len(compact['evidence']['activeFailures']) <= 11
     assert len(compact['evidence']['activeFailures'][0]['text']) < 200
     assert any('truncated_count' in x for x in compact['evidence']['activeFailures'])
+
+
+def test_evidence_ids_registry_and_compaction_are_stable():
+    run=DebugRun(debugDir='d', objective='Fix project', status='completed', commands=[cmd('pytest','3 tests passed')])
+    pkt1=build_packet(run); pkt2=build_packet(run)
+    ids=[e['id'] for vals in pkt1['evidence'].values() for e in vals if isinstance(e,dict)]
+    assert ids and ids[0] == 'ev-0001'
+    assert ids == [e['id'] for vals in pkt2['evidence'].values() for e in vals if isinstance(e,dict)]
+    assert pkt1['evidenceRegistry'][ids[0]]['id'] == ids[0]
+    assert {'kind','provenance','category'} <= set(pkt1['evidenceRegistry'][ids[0]])
+    compact=compact_verifier_packet(pkt1, max_text_chars=20)
+    compact_ids=[e['id'] for vals in compact['evidence'].values() for e in vals if isinstance(e,dict) and 'id' in e]
+    assert compact_ids
+    assert all(eid in compact['evidenceRegistry'] for eid in compact_ids)
 
 
 def test_nested_tool_call_is_normalized():
@@ -110,6 +124,61 @@ def test_deterministic_fallback_never_returns_success_for_positive_evidence():
     assert fb['result'] is None
     assert fb['recommendedAction']=='inspect_manually'
     assert fb['fallbackPolicy']=='failure_only'
+
+
+def _det_with(kind='validation', provenance='command_output'):
+    return {'evidenceByCategory': {'testValidation': [{'id':'ev-0001','category':'testValidation','evidenceKind':kind,'evidenceProvenance':provenance,'validationStrength':'strong','text':'passed'}]}, 'evidenceRegistry': {'ev-0001': {'id':'ev-0001','category':'testValidation','evidenceKind':kind,'evidenceProvenance':provenance,'validationStrength':'strong','summary':'passed'}}}
+
+
+def _verdict(refs, result=1, action='accept', warnings=None):
+    return {'result':result,'verdict':'success' if result==1 else 'failure','confidence':.9,'recommendedAction':action,'reason':'ok','criticalRequirement':'behavior','directEvidenceForCriticalRequirement':'passed','criticalRequirementCovered':True,'criticalRequirementEvidenceRefs':refs,'requirementResults':[],'successEvidence':[],'failureEvidence':[],'recoveredFailures':[],'missingEvidence':[],'riskFlags':[],'toolsUsed':[],'warnings':list(warnings or [])}
+
+
+def test_parse_critical_refs_and_harden_requirement_results():
+    obj=_parse('{"type":"final_verdict","result":1,"verdict":"success","confidence":0.8,"recommendedAction":"accept","reason":"ok","criticalRequirementEvidenceRefs":["ev-0001"],"requirementResults":[{"id":"r","requirement":"x","status":"satisfied","evidence":[],"risks":[]},"bad"]}')
+    assert obj['criticalRequirementEvidenceRefs'] == ['ev-0001']
+    assert len(obj['requirementResults']) == 1
+    assert 'invalid_requirement_results_item' in obj['warnings']
+    obj2=_parse('{"type":"final_verdict","result":1,"verdict":"success","recommendedAction":"accept","reason":"ok","requirementResults":"bad"}')
+    assert obj2['requirementResults'] == []
+    assert 'invalid_requirement_results_shape' in obj2['warnings']
+
+
+def test_coverage_refs_invalid_missing_and_mixed_warn():
+    v=_verdict(['ev-9999'])
+    assert prove_critical_requirement_coverage(_det_with(), v) is False
+    assert v['criticalRequirementEvidenceRefs'] == []
+    assert 'critical_requirement_evidence_refs_missing_or_invalid' in v['warnings']
+    v=_verdict(['ev-0001','ev-9999'])
+    assert prove_critical_requirement_coverage(_det_with(), v) is True
+    assert v['criticalRequirementEvidenceRefs'] == ['ev-0001']
+    assert 'critical_requirement_evidence_refs_missing_or_invalid' in v['warnings']
+
+
+def test_coverage_gate_accepts_only_concrete_evidence_and_preserves_warnings():
+    for kind, prov in [('validation','command_output'),('runtime_observation','tool_observation'),('behavioral_check','deterministic_analysis'),('artifact_check','file_content')]:
+        out=calibrate(_det_with(kind, prov), _verdict(['ev-0001'], warnings=['existing']))
+        assert out['recommendedAction'] == 'accept'
+        assert out['criticalRequirementCoverageProven'] is True
+        assert 'existing' in out['warnings']
+    for kind, prov in [('source_inspection','source_diff'),('mutation','source_diff'),('diagnostic','command_output')]:
+        out=calibrate(_det_with(kind, prov), _verdict(['ev-0001'], warnings=['existing']))
+        assert out['recommendedAction'] == 'inspect_manually'
+        assert out['criticalRequirementCoverageProven'] is False
+        assert 'critical_requirement_evidence_refs_not_concrete' in out['warnings']
+        assert 'accept_downgraded_without_evidence_proven_critical_requirement_coverage' in out['warnings']
+        assert 'existing' in out['warnings']
+
+
+def test_coverage_gate_missing_invalid_and_failure_result_behavior():
+    out=calibrate(_det_with(), _verdict([]))
+    assert out['recommendedAction'] == 'inspect_manually'
+    assert 'critical_requirement_evidence_refs_missing_or_invalid' in out['warnings']
+    out=calibrate(_det_with(), _verdict(['ev-9999']))
+    assert out['recommendedAction'] == 'inspect_manually'
+    out=calibrate(_det_with(), _verdict([], result=0, action='reject'))
+    assert out['result'] == 0
+    assert out['recommendedAction'] == 'reject'
 
 
 def test_deterministic_fallback_failure_for_active_crash():

@@ -291,6 +291,49 @@ def _candidate_evidence(cats):
                 seq+=1
     return out
 
+def _evidence_metadata(category, item):
+    src=str((item or {}).get('source') or '')
+    validation_strength=(item or {}).get('validationStrength')
+    kind='unknown'; provenance='unknown'
+    if category in {'finalEndToEndValidation','testValidation','serviceValidation'}:
+        kind='validation' if validation_strength != 'failure' else 'failure'; provenance='command_output'
+    elif category == 'deliverableEvidence':
+        kind='artifact_check'; provenance='file_content' if src in {'tool_calls','derived'} else 'deterministic_analysis'
+    elif category == 'constraintEvidence':
+        kind='artifact_check' if str((item or {}).get('kind') or '').endswith('satisfied') else 'diagnostic'; provenance='deterministic_analysis'
+    elif category in {'repoMutation','fileMutation','setupEvidence'}:
+        kind='mutation'; provenance='source_diff' if category in {'repoMutation','fileMutation'} else 'command_output'
+    elif category in {'inspectionEvidence','cleanupEvidence','riskFlags','recoveredFailures'}:
+        kind='diagnostic'; provenance='tool_observation' if src == 'tool_calls' else 'command_output' if src == 'commands' else 'deterministic_analysis'
+    elif category == 'agentClaims':
+        kind='diagnostic'; provenance='llm_reasoning'
+    elif category == 'activeFailures':
+        kind='failure'; provenance='command_output' if src == 'commands' else 'tool_observation' if src == 'tool_calls' else 'deterministic_analysis'
+    elif category == 'missingEvidence':
+        kind='missing_deliverable'; provenance='deterministic_analysis'
+    return kind, provenance
+
+def assign_evidence_ids(packet:dict):
+    """Attach deterministic citeable IDs and compact metadata to packet evidence."""
+    registry={}
+    seq=1
+    cats=packet.get('evidence') or {}
+    for category in CATS:
+        items=cats.get(category)
+        if not isinstance(items,list): continue
+        for item in items:
+            if not isinstance(item,dict): continue
+            evid=f'ev-{seq:04d}'; seq+=1
+            kind, provenance=_evidence_metadata(category,item)
+            item.setdefault('id', evid)
+            item.setdefault('category', category)
+            item.setdefault('evidenceKind', kind)
+            item.setdefault('evidenceProvenance', provenance)
+            summary=str(item.get('text') or item.get('summary') or '')[:500]
+            registry[item['id']]={'id':item['id'],'category':category,'kind':item.get('evidenceKind'),'provenance':item.get('evidenceProvenance'),'strength':item.get('validationStrength') or item.get('confidence') or item.get('strengthHint'),'summary':summary}
+    packet['evidenceRegistry']=registry
+    return packet, registry
+
 def build_packet(run:DebugRun, repo_dir=None):
 
     for ev in build_timeline(run):
@@ -314,7 +357,8 @@ def build_packet(run:DebugRun, repo_dir=None):
     required=list(dict.fromkeys(spec.required_files+spec.required_endpoints))
     assessment={'requiredDeliverables':required,'validatedDeliverables':validated,'missingDeliverables':[x for x in required if _basename(x) not in [_basename(y) for y in validated] and x not in validated],'weakValidationReasons':[getattr(e,'validationWeakness',None) for e in validations2 if getattr(e,'validationWeakness',None)]}
     constraints=list(dict.fromkeys(spec.negative_constraints+spec.allowed_edit_constraints)); violated=[e.text for e in cats.get('constraintEvidence',[]) if e.kind in {'forbidden_file_changed','unexpected_file_changed','allowed_edit_violation'}]; satisfied=[e.text for e in cats.get('constraintEvidence',[]) if e.kind=='allowed_edit_satisfied']; constraint_assessment={'constraints':constraints,'satisfiedConstraints':satisfied,'violatedConstraints':violated,'uncheckedConstraints':([] if not constraints or satisfied or violated else constraints)}
-    return {'schemaVersion':'villani-ops-verifier-packet-v2','objective':run.objective,'run':{'debugDir':run.debugDir,'repoDir':repo_dir,'runId':run.runId,'model':run.model,'provider':run.provider,'status':run.status,'durationMs':run.durationMs},'deliverableSpec':to_jsonable(spec),'deliverableAssessment':assessment,'constraintAssessment':constraint_assessment,'requirements':to_jsonable(reqs),'evidence':to_jsonable(cats),'candidateEvidence':_candidate_evidence(to_jsonable(cats)),'artifactIndex':{'debugFiles':[],'commandCount':len(run.commands),'toolCallCount':len(run.toolCalls),'patchCount':len(run.patches),'modelResponseCount':len(run.modelResponses)},'deterministicChecks':{'finalValidationWindow':window,'activeFailureCount':len(cats['activeFailures']),'recoveredFailureCount':len(cats['recoveredFailures']),'postValidationRiskCount':post}}
+    packet={'schemaVersion':'villani-ops-verifier-packet-v2','objective':run.objective,'run':{'debugDir':run.debugDir,'repoDir':repo_dir,'runId':run.runId,'model':run.model,'provider':run.provider,'status':run.status,'durationMs':run.durationMs},'deliverableSpec':to_jsonable(spec),'deliverableAssessment':assessment,'constraintAssessment':constraint_assessment,'requirements':to_jsonable(reqs),'evidence':to_jsonable(cats),'candidateEvidence':_candidate_evidence(to_jsonable(cats)),'artifactIndex':{'debugFiles':[],'commandCount':len(run.commands),'toolCallCount':len(run.toolCalls),'patchCount':len(run.patches),'modelResponseCount':len(run.modelResponses)},'deterministicChecks':{'finalValidationWindow':window,'activeFailureCount':len(cats['activeFailures']),'recoveredFailureCount':len(cats['recoveredFailures']),'postValidationRiskCount':post}}
+    return assign_evidence_ids(packet)[0]
 
 def deterministic_result(run:DebugRun, repo_dir=None, mode='deterministic', model=None, base_url=None):
     pkt=build_packet(run,repo_dir); cats=pkt['evidence']; active=cats['activeFailures']; validations=[e for e in cats['finalEndToEndValidation']+cats['testValidation']+cats['serviceValidation'] if isinstance(e,dict) and e.get('validationStrength')=='strong']; status=(run.status or '').lower(); sat=sum(1 for r in pkt['requirements'] if r['status']=='satisfied'); coverage=sat/max(1,len(pkt['requirements']))
@@ -328,4 +372,4 @@ def deterministic_result(run:DebugRun, repo_dir=None, mode='deterministic', mode
     risks=cats['riskFlags']
     if mode=='deterministic': risks.append({'kind':'risk','source':'derived','confidence':'high','text':'LLM verifier was explicitly disabled; deterministic binary prediction is not authoritative.'})
     checks=pkt['deterministicChecks']; checks.update({'validationEvidenceCount':len(validations),'requirementCoverage':coverage})
-    return {'schemaVersion':RESULT_SCHEMA_VERSION,'result':(1 if verdict=='success' else 0),'verdict':verdict,'confidence':conf,'recommendedAction':action,'reason':reason,'requirementResults':pkt['requirements'],'deliverableAssessment':pkt.get('deliverableAssessment'),'constraintAssessment':pkt.get('constraintAssessment'),'successEvidence':to_jsonable(_top_success(cats)),'failureEvidence':active[:20],'recoveredFailures':cats['recoveredFailures'][:20],'missingEvidence':cats['missingEvidence'][:20],'riskFlags':risks,'uncertainty':{'level':('low' if verdict=='success' and conf>=.8 else 'high' if not validations else 'medium'),'reasons':([] if validations else ['No strong validation evidence was found.'])},'evidenceByCategory':cats,'toolsUsed':[],'llmRawVerdict':{},'artifactsUsed':pkt['artifactIndex'],'deterministicChecks':checks,'debugDir':run.debugDir,'repoDir':repo_dir,'createdAt':datetime.now(timezone.utc).isoformat(),'verifier':{'mode':mode,'model':model,'baseUrl':base_url,'promptVersion':PROMPT_VERSION}}
+    return {'schemaVersion':RESULT_SCHEMA_VERSION,'result':(1 if verdict=='success' else 0),'verdict':verdict,'confidence':conf,'recommendedAction':action,'reason':reason,'requirementResults':pkt['requirements'],'deliverableAssessment':pkt.get('deliverableAssessment'),'constraintAssessment':pkt.get('constraintAssessment'),'successEvidence':to_jsonable(_top_success(cats)),'failureEvidence':active[:20],'recoveredFailures':cats['recoveredFailures'][:20],'missingEvidence':cats['missingEvidence'][:20],'riskFlags':risks,'uncertainty':{'level':('low' if verdict=='success' and conf>=.8 else 'high' if not validations else 'medium'),'reasons':([] if validations else ['No strong validation evidence was found.'])},'evidenceByCategory':cats,'evidenceRegistry':pkt.get('evidenceRegistry',{}),'toolsUsed':[],'llmRawVerdict':{},'artifactsUsed':pkt['artifactIndex'],'deterministicChecks':checks,'debugDir':run.debugDir,'repoDir':repo_dir,'createdAt':datetime.now(timezone.utc).isoformat(),'verifier':{'mode':mode,'model':model,'baseUrl':base_url,'promptVersion':PROMPT_VERSION}}

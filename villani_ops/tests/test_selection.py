@@ -6,7 +6,7 @@ from villani_ops.orchestrator.selection import select_winner, build_llm_comparis
 def test_accept_recommended_success_beats_inspect_success():
     s=select_winner([
         {'candidateId':'inspect','result':1,'confidence':1,'recommendedAction':'inspect_manually'},
-        {'candidateId':'accept','result':1,'confidence':0,'recommendedAction':'accept','criticalRequirementCovered':True},
+        {'candidateId':'accept','result':1,'confidence':0,'recommendedAction':'accept','criticalRequirementCovered':True,'criticalRequirementCoverageProven':True},
     ], seed=1)
     assert s.winnerCandidateId == 'accept'
 
@@ -28,13 +28,13 @@ def test_rejected_candidate_does_not_beat_success():
 
 
 def test_accept_tie_is_seed_deterministic():
-    cs=[{'candidateId':f'c{i}','result':1,'recommendedAction':'accept','criticalRequirementCovered':True} for i in range(4)]
+    cs=[{'candidateId':f'c{i}','result':1,'recommendedAction':'accept','criticalRequirementCovered':True,'criticalRequirementCoverageProven':True} for i in range(4)]
     assert select_winner(cs, 99).winnerCandidateId == select_winner(cs, 99).winnerCandidateId
 
 
 def test_comparison_packet_includes_and_truncates(tmp_path):
     patch=tmp_path/'diff.patch'; patch.write_text('diff --git a/x b/x\n' + 'A'*5000)
-    c=SimpleNamespace(candidate_id='candidate-001', patch_path=patch, changed_files=['x'], verifier_result={'result':1,'confidence':.8,'recommendedAction':'accept','reason':'summary','criticalRequirement':'edge case','directEvidenceForCriticalRequirement':'targeted test','criticalRequirementCovered':True,'successEvidence':['B'*1000]})
+    c=SimpleNamespace(candidate_id='candidate-001', patch_path=patch, changed_files=['x'], verifier_result={'result':1,'confidence':.8,'recommendedAction':'accept','reason':'summary','criticalRequirement':'edge case','directEvidenceForCriticalRequirement':'targeted test','criticalRequirementCovered':True,'criticalRequirementEvidenceRefs':['ev-0001'],'criticalRequirementCoverageProven':True,'successEvidence':['B'*1000]})
     packet=build_llm_comparison_packet([c], diff_limit=100, evidence_limit=50)
     row=packet[0]
     assert row['candidateId']=='candidate-001'
@@ -67,6 +67,7 @@ def test_comparison_packet_includes_critical_requirement_fields():
     assert verifier['criticalRequirement'] == 'rollback'
     assert verifier['directEvidenceForCriticalRequirement'] == 'rollback test passed'
     assert verifier['criticalRequirementCovered'] is True
+    assert 'criticalRequirementEvidenceRefs' in verifier
 
 
 def test_success_with_coverage_proven_beats_declared_only_when_comparable():

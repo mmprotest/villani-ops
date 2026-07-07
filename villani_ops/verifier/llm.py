@@ -149,6 +149,10 @@ def compact_verifier_packet(packet:dict, max_text_chars:int=900)->dict:
             uniq.append(v)
         compact_ce[k]=_cap_list(_dedupe_evidence(uniq), last=5)
     pkt['candidateEvidence']=compact_ce
+    reg=packet.get('evidenceRegistry') if isinstance(packet,dict) else None
+    if isinstance(reg,dict):
+        visible={x.get('id') for vals in ev.values() if isinstance(vals,list) for x in vals if isinstance(x,dict) and x.get('id')}
+        pkt['evidenceRegistry']={k:_compact_value(v, max_text_chars) for k,v in reg.items() if k in visible}
     return pkt
 
 
@@ -255,17 +259,28 @@ def _parse(s):
     refs=obj.get('criticalRequirementEvidenceRefs')
     obj['criticalRequirementEvidenceRefs']=[str(x) for x in refs] if isinstance(refs,list) else []
     obj['criticalRequirementCovered'] = obj.get('criticalRequirementCovered') is True
+    obj.setdefault('warnings', [])
+    if not isinstance(obj.get('warnings'), list): obj['warnings']=['invalid_warnings_shape']
     for k in ['reason','requirementResults','successEvidence','failureEvidence','recoveredFailures','missingEvidence','riskFlags','toolsUsed']: obj.setdefault(k, [] if k!='reason' else '')
+    if not isinstance(obj.get('requirementResults'), list):
+        obj['requirementResults']=[]
+        obj['warnings'].append('invalid_requirement_results_shape')
+    cleaned=[]
+    for r in obj.get('requirementResults') or []:
+        if not isinstance(r,dict):
+            obj['warnings'].append('invalid_requirement_results_item')
+            continue
+        if r.get('status') not in {'satisfied','unsatisfied'}: raise VerifierSchemaError('invalid requirement status')
+        cleaned.append(r)
+    obj['requirementResults']=cleaned
     obj.setdefault('uncertainty', {'level':'medium','reasons':[]})
     obj.setdefault('deliverableAssessment', {'requiredDeliverables':[],'validatedDeliverables':[],'missingDeliverables':[],'weakValidationReasons':[]})
     obj.setdefault('constraintAssessment', {'constraints':[],'satisfiedConstraints':[],'violatedConstraints':[],'uncheckedConstraints':[]})
-    for r in obj.get('requirementResults') or []:
-        if r.get('status') not in {'satisfied','unsatisfied'}: raise VerifierSchemaError('invalid requirement status')
     return obj
 def _schema_text():
     return """Final verdict schema (return exactly this shape):
 { "type": "final_verdict", "result": 1, "verdict": "success", "confidence": 0.84, "recommendedAction": "accept", "reason": "short explanation grounded in evidence", "criticalRequirement": "most risk-bearing requirement", "directEvidenceForCriticalRequirement": "strongest direct evidence for that requirement", "criticalRequirementCovered": true, "criticalRequirementEvidenceRefs": ["evidence-id"], "deliverableAssessment": {"requiredDeliverables":["string"],"validatedDeliverables":["string"],"missingDeliverables":["string"],"weakValidationReasons":["string"]}, "constraintAssessment": {"constraints":["string"],"satisfiedConstraints":["string"],"violatedConstraints":["string"],"uncheckedConstraints":["string"]}, "requirementResults": [{"id":"string","requirement":"string","status":"satisfied | unsatisfied","evidence":["string"],"risks":["string"]}], "successEvidence": ["string"], "failureEvidence": ["string"], "recoveredFailures": ["string"], "missingEvidence": ["string"], "riskFlags": ["string"], "uncertainty": {"level": "low | medium | high", "reasons": ["string"]}, "toolsUsed": [{"tool":"string","reason":"string"}] }
-Rules: result must be 1 or 0. verdict must be success when result is 1. verdict must be failure when result is 0. requirementResults.status must be satisfied or unsatisfied only. Answer: (1) most critical stated requirement, (2) direct evidence covering it, (3) whether the evidence covers it or only a weaker nearby condition, and (4) whether automatic accept is justified, and (5) the evidence ids supporting coverage in criticalRequirementEvidenceRefs. criticalRequirementCovered is not enough by itself for automatic accept; cite concrete evidence. Source inspection alone may support success, but is not enough for automatic accept on behavioural tasks. If direct evidence is absent, set criticalRequirementCovered false or leave evidence refs empty. Do not cite import checks or normal-path checks as coverage for abnormal-path requirements. Do not cite weaker nearby validation as coverage for the critical requirement. Do not mark criticalRequirementCovered true from imports alone, comments/intent, source plausibility alone for behavioural tasks, normal-path validation for abnormal-path requirements, or candidate validation of only a weaker condition. Do not return unclear. Do not return unknown. Do not return null result. If evidence is incomplete, make the best conservative prediction and explain uncertainty. False accepts are worse than false rejects.
+Rules: result must be 1 or 0. verdict must be success when result is 1. verdict must be failure when result is 0. requirementResults.status must be satisfied or unsatisfied only. criticalRequirementEvidenceRefs must contain only evidence IDs visible in the packet, such as ev-0001; do not invent refs, and return [] when no suitable evidence ID exists. criticalRequirementCovered is not enough by itself for automatic accept; cite concrete evidence IDs. Source inspection can support result: success, but cannot by itself prove automatic accept for behavioural tasks. Comments, intent, imports, absence of failures, and validation of only an easier nearby condition are not direct critical-requirement evidence. Do not cite import checks or weaker nearby validation as coverage for the critical requirement. Do not return unclear, unknown, or null result. If evidence is incomplete, make the best conservative prediction and explain uncertainty. False accepts are worse than false rejects.
 Tool-call schema:
 { "type": "tool_call", "tool": "search_commands", "args": {"query": "PASS", "limit": 10} }
 Return exactly one JSON object."""
@@ -283,7 +298,7 @@ def _raw_snapshot(verdict):
 
 
 def _iter_evidence_items(det):
-    cats=(det or {}).get('evidenceByCategory',{}) or {}
+    cats=(det or {}).get('evidenceByCategory',{}) or (det or {}).get('evidence',{}) or {}
     for category, items in cats.items():
         if isinstance(items,list):
             for idx,item in enumerate(items):
@@ -291,7 +306,7 @@ def _iter_evidence_items(det):
                     yield category, idx, item
 
 def _evidence_ref_keys(category, idx, item):
-    keys={str(item.get('id') or ''), str(item.get('evidenceId') or ''), str(item.get('ref') or ''), f'{category}:{idx}', f'{category}:{item.get("id")}' if item.get('id') else ''}
+    keys={str(item.get('id') or ''), str(item.get('evidenceId') or ''), str(item.get('ref') or '')}
     return {k for k in keys if k}
 
 def _artifact_existence_only(det):
@@ -303,28 +318,62 @@ def _evidence_proves_critical_coverage(category, item, det):
         return True
     if item.get('criticalRequirementCoverageProven') is False or item.get('coversCriticalRequirement') is False:
         return False
-    kind=str(item.get('kind') or item.get('type') or '').lower()
-    provenance=str(item.get('provenance') or item.get('source') or '').lower()
-    if category == 'deliverableEvidence':
-        return _artifact_existence_only(det) or item.get('contentCheck') is True or item.get('finalStateCheck') is True
-    if kind in {'source_inspection','comment','intent','import_check','file_existence_check'} or provenance in {'source_inspection','model_reasoning','candidate_claim'}:
+    raw_kind=str(item.get('kind') or item.get('type') or '').lower()
+    kind=str(item.get('evidenceKind') or raw_kind).lower()
+    provenance=str(item.get('evidenceProvenance') or item.get('provenance') or item.get('source') or '').lower()
+    if not item.get('evidenceKind'):
+        if str(category) in {'finalEndToEndValidation','testValidation','serviceValidation'} and raw_kind not in {'source_inspection','comment','intent','import_check','file_existence_check'}:
+            kind='runtime_observation' if raw_kind in {'runtime_trace','behavioral_trace'} else 'validation'
+        elif str(category) == 'deliverableEvidence' and (_artifact_existence_only(det) or raw_kind in {'content_check','final_state_check'}):
+            kind='artifact_check'
+    if not item.get('evidenceProvenance') and provenance in {'', 'commands'}:
+        provenance='command_output' if str(category) in {'finalEndToEndValidation','testValidation','serviceValidation'} else provenance
+    if not item.get('evidenceProvenance') and str(category) == 'deliverableEvidence' and kind == 'artifact_check':
+        provenance='file_content'
+    concrete_kinds={'validation','runtime_observation','behavioral_check','artifact_check'}
+    concrete_provenance={'command_output','tool_observation','deterministic_analysis','file_content'}
+    if kind not in concrete_kinds or provenance not in concrete_provenance:
         return False
     if item.get('normalPathOnly') is True or item.get('weakerNearbyValidation') is True:
         return False
-    if category in {'finalEndToEndValidation','testValidation','serviceValidation'}:
-        return item.get('validationStrength') != 'weak'
-    if kind in {'runtime_trace','behavioral_trace','assertion','validation_result','final_state_check','content_check'}:
-        return True
-    return False
+    if kind == 'validation' and item.get('validationStrength') == 'weak':
+        return False
+    return True
+
+def _evidence_registry(det):
+    reg=(det or {}).get('evidenceRegistry')
+    if isinstance(reg,dict): return reg
+    out={}
+    for category, idx, item in _iter_evidence_items(det):
+        item=dict(item)
+        item.setdefault('category', category)
+        for key in _evidence_ref_keys(category,idx,item):
+            out[key]=item
+    return out
 
 def prove_critical_requirement_coverage(det, verdict):
     refs=verdict.get('criticalRequirementEvidenceRefs') or []
+    warnings=verdict.setdefault('warnings',[])
     if verdict.get('criticalRequirementCovered') is not True or not refs:
+        if not refs and 'critical_requirement_evidence_refs_missing_or_invalid' not in warnings:
+            warnings.append('critical_requirement_evidence_refs_missing_or_invalid')
         return False
-    wanted={str(r) for r in refs if str(r)}
-    for category, idx, item in _iter_evidence_items(det):
-        if wanted & _evidence_ref_keys(category, idx, item) and _evidence_proves_critical_coverage(category, item, det):
+    reg=_evidence_registry(det)
+    valid=[]; invalid=[]
+    for ref in [str(r) for r in refs if str(r)]:
+        if ref in reg: valid.append(ref)
+        else: invalid.append(ref)
+    verdict['criticalRequirementEvidenceRefs']=valid
+    if invalid or not valid:
+        if 'critical_requirement_evidence_refs_missing_or_invalid' not in warnings:
+            warnings.append('critical_requirement_evidence_refs_missing_or_invalid')
+    for ref in valid:
+        item=reg.get(ref) or {}
+        category=item.get('category') or item.get('deterministicLabel') or ''
+        if _evidence_proves_critical_coverage(str(category), item, det):
             return True
+    if valid and 'critical_requirement_evidence_refs_not_concrete' not in warnings:
+        warnings.append('critical_requirement_evidence_refs_not_concrete')
     return False
 
 def _make_disagreement(kind, summary, evidence=None):
@@ -469,7 +518,7 @@ def llm_result(run, det, workspace='.villani-ops', backend=None, base_url=None, 
             trace.write_json('llm_final_verdict_parsed.json',parsed)
         obj.setdefault('riskFlags',[]); obj['riskFlags']+=protocol_warnings
         obj=calibrate(det,obj,trace=trace,cfg=cfg,timeout=max(1,deadline-time.monotonic())); break
-    det.update({'result':obj['result'],'verdict':obj['verdict'],'confidence':obj['confidence'],'recommendedAction':obj['recommendedAction'],'reason':obj['reason'],'criticalRequirement':obj.get('criticalRequirement',''),'directEvidenceForCriticalRequirement':obj.get('directEvidenceForCriticalRequirement',''),'criticalRequirementCovered':obj.get('criticalRequirementCovered') is True,'criticalRequirementEvidenceRefs':obj.get('criticalRequirementEvidenceRefs') or [],'criticalRequirementCoverageProven':obj.get('criticalRequirementCoverageProven') is True,'resultSource':obj.get('resultSource'),'postProcessingChangedResult':obj.get('postProcessingChangedResult'),'deliverableAssessment':obj.get('deliverableAssessment',det.get('deliverableAssessment')),'constraintAssessment':obj.get('constraintAssessment',det.get('constraintAssessment')),'requirementResults':obj.get('requirementResults',det['requirementResults']),'successEvidence':obj.get('successEvidence',det['successEvidence']),'failureEvidence':obj.get('failureEvidence',det['failureEvidence']),'recoveredFailures':obj.get('recoveredFailures',det['recoveredFailures']),'missingEvidence':obj.get('missingEvidence',det['missingEvidence']),'riskFlags':obj.get('riskFlags',det['riskFlags']),'toolsUsed':used+obj.get('toolsUsed',[]),'llmRawVerdict':obj.get('llmRawVerdict',{}),'llmProtocol':protocol,'llmProtocolWarnings':protocol_warnings,'calibration':obj.get('_calibration',{}),'verifier':{'mode':'llm_tool_loop','backend':cfg['backend'],'model':cfg['model'],'baseUrl':cfg['baseUrl'],'promptVersion':PROMPT_VERSION}})
+    det.update({'result':obj['result'],'verdict':obj['verdict'],'confidence':obj['confidence'],'recommendedAction':obj['recommendedAction'],'reason':obj['reason'],'criticalRequirement':obj.get('criticalRequirement',''),'directEvidenceForCriticalRequirement':obj.get('directEvidenceForCriticalRequirement',''),'criticalRequirementCovered':obj.get('criticalRequirementCovered') is True,'criticalRequirementEvidenceRefs':obj.get('criticalRequirementEvidenceRefs') or [],'criticalRequirementCoverageProven':obj.get('criticalRequirementCoverageProven') is True,'resultSource':obj.get('resultSource'),'postProcessingChangedResult':obj.get('postProcessingChangedResult'),'deliverableAssessment':obj.get('deliverableAssessment',det.get('deliverableAssessment')),'constraintAssessment':obj.get('constraintAssessment',det.get('constraintAssessment')),'requirementResults':obj.get('requirementResults',det['requirementResults']),'successEvidence':obj.get('successEvidence',det['successEvidence']),'failureEvidence':obj.get('failureEvidence',det['failureEvidence']),'recoveredFailures':obj.get('recoveredFailures',det['recoveredFailures']),'missingEvidence':obj.get('missingEvidence',det['missingEvidence']),'riskFlags':obj.get('riskFlags',det['riskFlags']),'warnings':obj.get('warnings',det.get('warnings',[])),'toolsUsed':used+obj.get('toolsUsed',[]),'llmRawVerdict':obj.get('llmRawVerdict',{}),'llmProtocol':protocol,'llmProtocolWarnings':protocol_warnings,'calibration':obj.get('_calibration',{}),'verifier':{'mode':'llm_tool_loop','backend':cfg['backend'],'model':cfg['model'],'baseUrl':cfg['baseUrl'],'promptVersion':PROMPT_VERSION}})
     return validate_final_result_consistency(det)
 
 def finalize_verifier_result(raw_llm_verdict, processed_verdict, trace_info=None):
