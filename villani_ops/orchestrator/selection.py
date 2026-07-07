@@ -218,6 +218,7 @@ def build_llm_comparison_packet(candidates: list[Any], *, diff_limit: int = 2000
                 'criticalRequirement': v.get('criticalRequirement'),
                 'directEvidenceForCriticalRequirement': v.get('directEvidenceForCriticalRequirement'),
                 'criticalRequirementCovered': v.get('criticalRequirementCovered'),
+                'criticalRequirementEvidenceRefs': _truncate_list(v.get('criticalRequirementEvidenceRefs'), 10, evidence_limit),
                 'criticalRequirementCoverageProven': v.get('criticalRequirementCoverageProven'),
                 'warnings': _truncate_list(v.get('warnings'), 5, evidence_limit),
                 'reason': _truncate_text(v.get('reason') or v.get('summary'), evidence_limit),
