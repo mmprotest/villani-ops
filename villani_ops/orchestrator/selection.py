@@ -138,7 +138,14 @@ def write_candidate_evidence_matrix(path: str | Path, matrix: list[dict[str, Any
 def write_selection_report(path: str | Path, matrix: list[dict[str, Any]], winner_id: str | None) -> Path:
     p = Path(path); p.parent.mkdir(parents=True, exist_ok=True)
     winner = next((r for r in matrix if r['candidate_id'] == winner_id), None)
-    lines = ['# Selection Report', '', '## Winner', f"- Candidate: {winner_id or ''}", f"- Reason: {(winner or {}).get('final_selection_reason','No winner selected.')}", '', '## Candidate Ranking', 'candidate_id | verifier_result | coverage | direct_behavioral | repo_tests | source_inference | risk_flags | status | reason', '--- | --- | ---: | ---: | ---: | ---: | --- | --- | ---']
+    lines = ['# Selection Report', '', '## Winner', f"- Candidate: {winner_id or ''}", f"- Reason: {(winner or {}).get('final_selection_reason','No winner selected.')}"]
+    llm_recommended = next((r for r in matrix if r.get('llm_comparison_recommended')), None)
+    if llm_recommended:
+        note = llm_recommended.get('llm_comparison_advisory_note')
+        if not note:
+            note = 'LLM comparison matched the evidence-ranked winner.' if llm_recommended['candidate_id'] == winner_id else f"LLM comparison recommended {llm_recommended['candidate_id']}, but evidence-ranked selector selected {winner_id} because {(winner or {}).get('final_selection_reason','it had stronger evidence.')}"
+        lines += ['', '## LLM Comparison Advisory', f"- Recommended candidate: {llm_recommended['candidate_id']}", f"- Evidence-ranked winner: {winner_id or ''}", '- Used for final decision: no', f"- Notes: {note}"]
+    lines += ['', '## Candidate Ranking', 'candidate_id | verifier_result | coverage | direct_behavioral | repo_tests | source_inference | risk_flags | status | reason', '--- | --- | ---: | ---: | ---: | ---: | --- | --- | ---']
     for r in sorted(matrix, key=_evidence_rank_key, reverse=True):
         s=r['evidence_score']; lines.append(f"{r['candidate_id']} | {r['verifier_result']} | {s['requirement_coverage']:.2f} | {s['direct_behavioral']:.2f} | {s['repo_tests']:.2f} | {s['source_inference']:.2f} | {'; '.join(r['risk_flags'])} | {r['selection_status']} | {r['final_selection_reason']}")
     lines += ['', '## Why the winner won', (winner or {}).get('final_selection_reason','No winner selected.'), '', '## Why other candidates lost']

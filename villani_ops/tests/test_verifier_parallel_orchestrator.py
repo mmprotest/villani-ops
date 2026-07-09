@@ -363,9 +363,9 @@ def test_selection_json_includes_quality_diagnostics(tmp_path):
     assert selection['qualityTieBreakApplied'] is True
     assert selection['winnerQualityKey']['candidateId'] == 'candidate-002'
     assert len(selection['candidateQuality']) == 2
-    assert 'verifier quality tie-break' in selection['reason']
+    assert 'evidence-ranked selection' in selection['reason']
 
-def test_llm_comparison_called_for_multiple_successes_and_valid_id_wins(tmp_path, monkeypatch):
+def test_llm_comparison_called_for_multiple_successes_and_recorded_advisory(tmp_path, monkeypatch):
     repo=tmp_path/'repo'; init_repo(repo); ws=tmp_path/'ws'; runner=FakeRunner(); calls=[]
     def verifier(**kw): return {'result':1,'verdict':'success','confidence':.5,'recommendedAction':'accept','traceDir':str(kw['trace_dir'])}
     def cmp(**kw):
@@ -374,10 +374,69 @@ def test_llm_comparison_called_for_multiple_successes_and_valid_id_wins(tmp_path
     cfg=VerifierParallelConfig(repo=repo,task='task',success_criteria='criteria',candidates=2,parallelism=1,seed=1,workspace=ws,backend='b',keep_worktrees=True)
     orch=VerifierParallelOrchestrator(cfg, runner=runner, verifier=verifier); orch._backend_obj=lambda: Backend(name='b',provider='local',model='m',api_key='x',base_url='http://x')
     out=orch.run(); sel=json.loads((Path(out['orchestrationDir'])/'selection.json').read_text())
-    assert calls and out['winnerCandidateId']=='candidate-002'
-    assert sel['selectionPolicy']=='binary_verifier_llm_compare_tie'
+    assert calls and out['winnerCandidateId']=='candidate-001'
+    assert sel['selectionPolicy']=='binary_verifier_quality_tie'
+    assert sel['llmComparison']['selectedCandidateId']=='candidate-002'
     assert sel['llmComparison']['comparisonReason']=='better evidence'
+    assert sel['llmComparison']['usedForFinalDecision'] is False
+    assert sel['llmComparison']['disagreedWithEvidenceSelector'] is True
 
+
+
+def test_llm_comparison_cannot_override_evidence_ranked_winner(tmp_path, monkeypatch):
+    repo=tmp_path/'repo'; init_repo(repo); ws=tmp_path/'ws'; runner=FakeRunner(); calls=[]
+    def verifier(**kw):
+        cid=kw['repo_dir'].parent.name
+        if cid == 'candidate-001':
+            return {
+                'result':1,
+                'verdict':'success',
+                'confidence':.9,
+                'recommendedAction':'accept',
+                'requirementResults':[{'requirement':'core behavior','status':'unsatisfied'}],
+                'successEvidence':['source inspection suggests behavior'],
+                'missingEvidence':['missing required behavior validation'],
+                'riskFlags':['resource leak risk'],
+                'traceDir':str(kw['trace_dir']),
+            }
+        return {
+            'result':1,
+            'verdict':'success',
+            'confidence':.8,
+            'recommendedAction':'accept',
+            'criticalRequirementCovered': True,
+            'criticalRequirementCoverageProven': True,
+            'requirementResults':[{'requirement':'core behavior','status':'satisfied'}],
+            'successEvidence':['pytest integration test passed validating core behavior'],
+            'traceDir':str(kw['trace_dir']),
+        }
+    def cmp(**kw):
+        calls.append(kw); return {'selectedCandidateId':'candidate-001','reason':'LLM preferred candidate A'}
+    monkeypatch.setattr('villani_ops.orchestrator.verifier_parallel.select_success_with_llm_comparison', cmp)
+    cfg=VerifierParallelConfig(repo=repo,task='task',success_criteria='core behavior',candidates=2,parallelism=1,seed=1,workspace=ws,backend='b',keep_worktrees=True)
+    orch=VerifierParallelOrchestrator(cfg, runner=runner, verifier=verifier); orch._backend_obj=lambda: Backend(name='b',provider='local',model='m',api_key='x',base_url='http://x')
+    out=orch.run(); od=Path(out['orchestrationDir'])
+    sel=json.loads((od/'selection.json').read_text())
+    matrix=json.loads((od/'candidate_evidence_matrix.json').read_text())
+    report=(od/'selection_report.md').read_text()
+    by_id={row['candidate_id']: row for row in matrix}
+
+    assert calls
+    assert out['winnerCandidateId'] == 'candidate-002'
+    assert sel['winnerCandidateId'] == 'candidate-002'
+    assert sel['llmComparison']['selectedCandidateId'] == 'candidate-001'
+    assert sel['llmComparison']['usedForFinalDecision'] is False
+    assert sel['llmComparison']['disagreedWithEvidenceSelector'] is True
+    assert by_id['candidate-002']['selection_status'] == 'selected'
+    assert by_id['candidate-001']['selection_status'] != 'selected'
+    assert by_id['candidate-001']['llm_comparison_recommended'] is True
+    assert by_id['candidate-001']['llm_disagreement_with_evidence_selector'] is True
+    assert '- Candidate: candidate-002' in report
+    assert '## LLM Comparison Advisory' in report
+    assert '- Recommended candidate: candidate-001' in report
+    assert '- Evidence-ranked winner: candidate-002' in report
+    assert '- Used for final decision: no' in report
+    assert 'LLM comparison recommended candidate-001, but evidence-ranked selector selected candidate-002' in report
 
 def test_llm_comparison_invalid_id_falls_back(tmp_path, monkeypatch):
     repo=tmp_path/'repo'; init_repo(repo); ws=tmp_path/'ws'; runner=FakeRunner()
@@ -389,7 +448,7 @@ def test_llm_comparison_invalid_id_falls_back(tmp_path, monkeypatch):
     orch=VerifierParallelOrchestrator(cfg, runner=runner, verifier=verifier); orch._backend_obj=lambda: Backend(name='b',provider='local',model='m',api_key='x',base_url='http://x')
     out=orch.run(); sel=json.loads((Path(out['orchestrationDir'])/'selection.json').read_text())
     assert out['winnerCandidateId']=='candidate-001'
-    assert sel['selectionPolicy']=='binary_verifier_llm_compare_tie_fallback_quality'
+    assert sel['selectionPolicy']=='binary_verifier_quality_tie'
     assert sel['llmComparison']['fallbackUsed'] is True
 
 
