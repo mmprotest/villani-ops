@@ -153,6 +153,84 @@ def test_test_source_classification_repo_vs_candidate():
     assert _classify_test_source('python -c "print(1)"', []) == 'candidate'
 
 
+def test_abnormal_path_repo_test_counts_as_direct_evidence(tmp_path):
+    import json
+    from villani_ops.orchestrator.selection import build_candidate_evidence_matrix
+    debug = tmp_path/'debug'; debug.mkdir()
+    (debug/'commands.jsonl').write_text(json.dumps({'command':'pytest tests/test_cleanup.py','exitCode':0})+'\n')
+    candidate = SimpleNamespace(
+        candidate_id='candidate-001',
+        debug_dir=debug,
+        changed_files=['src/app.py'],
+        verifier_result={
+            'result': 1,
+            'requirementResults': [{'requirement':'handle cleanup and cancellation on SIGINT', 'status':'satisfied'}],
+        },
+    )
+    row = build_candidate_evidence_matrix([candidate])[0]
+    assert any(e['evidence'] == 'pytest tests/test_cleanup.py' for e in row['direct_behavioral_evidence'])
+    assert not any('no direct evidence for abnormal-path requirement' in flag for flag in row['missing_requirement_flags'])
+    assert not any('cleanup/cancellation evidence is absent' in flag for flag in row['missing_requirement_flags'])
+    assert row['evidence_score']['risk_penalty'] < 6
+
+
+def test_candidate_authored_abnormal_path_test_is_weak_not_absent(tmp_path):
+    import json
+    from villani_ops.orchestrator.selection import build_candidate_evidence_matrix
+    debug = tmp_path/'debug'; debug.mkdir()
+    (debug/'commands.jsonl').write_text(json.dumps({'command':'pytest tests/test_cleanup.py','exitCode':0})+'\n')
+    candidate = SimpleNamespace(
+        candidate_id='candidate-001',
+        debug_dir=debug,
+        changed_files=['tests/test_cleanup.py'],
+        verifier_result={
+            'result': 1,
+            'requirementResults': [{'requirement':'handle cleanup and cancellation on SIGINT', 'status':'satisfied'}],
+        },
+    )
+    row = build_candidate_evidence_matrix([candidate])[0]
+    assert row['tests_run'][0]['source'] == 'candidate'
+    assert any(e['requirement'] == 'candidate test' for e in row['direct_behavioral_evidence'])
+    assert not any('no direct evidence for abnormal-path requirement' in flag for flag in row['missing_requirement_flags'])
+    assert any('abnormal-path evidence is candidate-authored only' in risk for risk in row['risk_flags'])
+
+
+def test_common_repo_test_wrappers_classify_as_repo():
+    from villani_ops.orchestrator.selection import _classify_test_source, _is_test_command
+    commands = [
+        'python -m pytest',
+        'uv run pytest',
+        'uv run python -m pytest',
+        'poetry run pytest',
+        'poetry run python -m pytest',
+        'pipenv run pytest',
+        'npm run test',
+        'pnpm run test',
+        'yarn run test',
+        'bun test',
+        'python -m unittest',
+        './gradlew test',
+        'gradle test',
+        'mvn test',
+        'tox',
+        'nox',
+    ]
+    for command in commands:
+        assert _is_test_command(command), command
+        assert _classify_test_source(command, ['src/app.py']) == 'repo'
+
+
+def test_inline_and_temp_tests_classify_as_candidate():
+    from villani_ops.orchestrator.selection import _classify_test_source
+    commands = [
+        'python -c "import foo; assert foo.bar()"',
+        "python <<'PY'\nprint('test')\nPY",
+        'pytest /tmp/test_candidate.py',
+    ]
+    for command in commands:
+        assert _classify_test_source(command, []) == 'candidate'
+
+
 def test_report_contains_specific_winner_and_loser_evidence(tmp_path):
     from villani_ops.orchestrator.selection import _finalize_evidence_reasons, write_selection_report
     matrix=[

@@ -219,8 +219,10 @@ class VerifierParallelOrchestrator:
             except Exception as e:
                 meta['fallbackUsed']=True; meta['fallbackReason']=str(e); sel.reason += f' LLM comparative selection failed; used deterministic evidence-ranked selector: {e}'
             llm_advisory=meta; sel.llmComparison=meta
-        write_json(odir/'selection.json',sel.to_dict())
         evidence_matrix = _finalize_evidence_reasons(build_candidate_evidence_matrix(candidates, sel.winnerCandidateId), sel.winnerCandidateId)
+        selected_row = next((row for row in evidence_matrix if row.get('selection_status') == 'selected'), None)
+        if selected_row and selected_row.get('final_selection_reason'):
+            sel.reason = selected_row['final_selection_reason']
         if llm_advisory:
             for row in evidence_matrix:
                 recommended = row['candidate_id'] == llm_advisory.get('selectedCandidateId')
@@ -229,6 +231,7 @@ class VerifierParallelOrchestrator:
                 row['llm_disagreement_with_evidence_selector'] = bool(recommended and llm_advisory.get('disagreedWithEvidenceSelector'))
                 if recommended and llm_advisory.get('advisoryNote'):
                     row['llm_comparison_advisory_note'] = llm_advisory['advisoryNote']
+        write_json(odir/'selection.json',sel.to_dict())
         write_candidate_evidence_matrix(odir/'candidate_evidence_matrix.json', evidence_matrix)
         write_selection_report(odir/'selection_report.md', evidence_matrix, sel.winnerCandidateId)
         winner=next((c for c in candidates if c.candidate_id==sel.winnerCandidateId),None); integ=self._integrate(odir,winner)
