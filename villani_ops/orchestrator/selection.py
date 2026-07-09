@@ -14,10 +14,10 @@ LLM_COMPARE_POLICY='binary_verifier_llm_compare_tie'
 LLM_COMPARE_FALLBACK_POLICY='binary_verifier_llm_compare_tie_fallback_quality'
 VALID_ON_ALL_FAIL={'fail','random','best-confidence'}
 
-_CLEANUP_REQUIREMENT_RE = re.compile(r"\b(sigint|interrupt|interruption|cancel|cancellation|cleanup|clean up|shutdown|shut down|resource|rollback)\b", re.IGNORECASE)
+_CLEANUP_REQUIREMENT_RE = re.compile(r"\b(interrupt|interruption|cancel|cancellation|cleanup|clean up|shutdown|shut down|resource|rollback)\b", re.IGNORECASE)
 _ABNORMAL_REQUIREMENT_RE = re.compile(r"\b(cleanup|clean up|cancellation|cancel|interrupt|interruption|rollback|shutdown|shut down|failure handling|timeout|persistence|recovery|edge cases?|resource management|resource)\b", re.IGNORECASE)
-_SEVERE_RISK_RE = re.compile(r"\b(no command log|no repo test|only candidate|pass/fail unknown|critical requirement|no direct evidence|missing cleanup|missing cancellation|broad exception|swallow|fake test|hardcod|ignored failure|unrelated|untested async|resource leak)\b", re.IGNORECASE)
-_TEST_RE = re.compile(r"\b(pytest|unittest|tox|nox|npm|pnpm|yarn|bun|cargo|go|make|gradle|mvn|rspec|jest|vitest|test)\b", re.IGNORECASE)
+_SEVERE_RISK_RE = re.compile(r"\b(no command log|no repo test|only candidate|pass/fail unknown|critical requirement|no direct evidence|missing cleanup|missing cancellation|broad exception|swallow|fake test|hardcod|ignored failure|unrelated|resource leak)\b", re.IGNORECASE)
+_VALIDATION_TERM_RE = re.compile(r"\b(tests?|specs?|checks?|verify|verification|validate|validation|assert|assertion)\b", re.IGNORECASE)
 _BEHAVIOR_RE = re.compile(r"\b(runtime|validation|validated|execution|executed|observed|output|cleanup|cancellation|rollback|persistence|end-to-end|e2e|passed|ran|verified)\b", re.IGNORECASE)
 _SOURCE_RE = re.compile(r"\b(source|inspection|appears|implemented|code added|function modified|import changed|diff|patch|changed file|updated)\b", re.IGNORECASE)
 _COMMAND_KEYS = {'command','cmd','shell'}
@@ -173,71 +173,123 @@ def _normalize_command_tokens(command: str) -> list[str]:
     if not text:
         return []
     try:
-        tokens = shlex.split(text, posix=True)
+        return shlex.split(text, posix=True)
     except ValueError:
-        tokens = text.split()
-    while tokens and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", tokens[0]):
-        tokens = tokens[1:]
-    while len(tokens) >= 2 and tokens[:2] in (['uv', 'run'], ['poetry', 'run'], ['pipenv', 'run']):
-        tokens = tokens[2:]
-    if tokens and tokens[0] == 'npx':
-        tokens = tokens[1:]
-    return tokens
+        return text.split()
 
 
-def _is_test_command(command: str) -> bool:
-    tokens = _normalize_command_tokens(command)
-    if not tokens:
+_METADATA_VALIDATION_FIELDS = {'kind', 'type', 'category', 'name', 'label', 'phase', 'purpose', 'role'}
+_METADATA_SOURCE_FIELDS = {'source', 'origin', 'provenance', 'owner'}
+_REPO_SOURCE_TERMS = {'repo', 'repository', 'existing', 'baseline', 'upstream', 'oracle'}
+_CANDIDATE_SOURCE_TERMS = {'candidate', 'generated', 'new', 'ad_hoc', 'adhoc', 'temporary', 'scratch', 'inline'}
+_GENERIC_TARGET_FLAGS = {'--file', '--path', '--target', '--case', '--suite', '--config'}
+_TEMP_INLINE_RE = re.compile(r"(<<|/tmp/|\b(?:temp|tmp|scratch|generated|ad-hoc|adhoc|one-off|inline)\b)", re.IGNORECASE)
+_INLINE_ARG_RE = re.compile(r"(^|\s)-[A-Za-z]*[ce](\s|=).*(\bassert\b|[;{}()])", re.IGNORECASE | re.DOTALL)
+
+
+def _record_declares_test(record) -> bool:
+    if not isinstance(record, dict):
         return False
-    if re.search(r"(\s-c\s|<<)", str(command or '')):
+    for key, value in record.items():
+        if str(key) in _METADATA_VALIDATION_FIELDS and _VALIDATION_TERM_RE.search(str(value or '')):
+            return True
+    return False
+
+
+def _command_looks_like_validation(command) -> bool:
+    return bool(_VALIDATION_TERM_RE.search(str(command or '')))
+
+
+def _clean_path_token(token: str) -> str:
+    return str(token or '').strip().strip('"\'`.,;:()[]{}<>')
+
+
+def _looks_path_like(token: str) -> bool:
+    t = _clean_path_token(token)
+    return bool(t) and ('/' in t or '\\' in t or t.startswith('.') or t.startswith('..'))
+
+
+def _extract_path_like_tokens(command) -> list[str]:
+    tokens = _normalize_command_tokens(str(command or ''))
+    out=[]
+    for i, token in enumerate(tokens):
+        clean = _clean_path_token(token)
+        if _looks_path_like(clean):
+            out.append(clean)
+        if clean in _GENERIC_TARGET_FLAGS and i + 1 < len(tokens):
+            nxt = _clean_path_token(tokens[i + 1])
+            if _looks_path_like(nxt):
+                out.append(nxt)
+    seen=set(); unique=[]
+    for token in out:
+        norm = token.replace('\\', '/').lstrip('./')
+        if norm and norm not in seen:
+            seen.add(norm); unique.append(token)
+    return unique
+
+
+def _normalize_path_for_overlap(path: str) -> str:
+    return _clean_path_token(path).replace('\\', '/').lstrip('./')
+
+
+def _path_overlaps_changed_files(path_token, changed_files) -> bool:
+    token = _normalize_path_for_overlap(str(path_token or ''))
+    if not token:
+        return False
+    changed = [_normalize_path_for_overlap(str(x)) for x in (changed_files or []) if str(x).strip()]
+    if not changed:
+        return False
+    direct = [c for c in changed if token == c or token.endswith('/' + c) or c.endswith('/' + token)]
+    if direct:
         return True
-    first = tokens[0]
-    if first in {'pytest', 'unittest', 'tox', 'nox', 'jest', 'vitest', 'rspec'}:
-        return True
-    if first in {'python', 'python3'} and len(tokens) >= 3 and tokens[1:3] in (['-m', 'pytest'], ['-m', 'unittest']):
-        return True
-    if first in {'npm', 'pnpm', 'yarn'}:
-        return len(tokens) >= 2 and (tokens[1] == 'test' or (tokens[1] == 'run' and len(tokens) >= 3 and tokens[2].startswith('test')))
-    if first == 'bun':
-        return len(tokens) >= 2 and tokens[1] == 'test'
-    if first in {'cargo', 'go', 'make', 'gradle', './gradlew', 'mvn'}:
-        return len(tokens) >= 2 and tokens[1] == 'test'
-    return bool(_TEST_RE.search(command or ''))
+    basename = token.split('/')[-1]
+    basename_matches = [c for c in changed if c.split('/')[-1] == basename]
+    return len(basename_matches) == 1 and sum(1 for c in changed if c.split('/')[-1] == basename) == 1
 
 
-def _command_targets(command: str) -> list[str]:
-    return re.findall(r"(?:^|\s)([^\s'\"]*(?:tests?/|spec/)[^\s'\"]*\.(?:py|js|ts|tsx|jsx|rb|go|rs|java|kt))", command)
+def _metadata_source(record) -> str | None:
+    if not isinstance(record, dict):
+        return None
+    for key, value in record.items():
+        if str(key) not in _METADATA_SOURCE_FIELDS:
+            continue
+        normalized = str(value or '').strip().lower().replace('-', '_')
+        if normalized in _REPO_SOURCE_TERMS:
+            return 'repo'
+        if normalized in _CANDIDATE_SOURCE_TERMS:
+            return 'candidate'
+    return None
 
 
-def _classify_test_source(command, changed_files) -> str:
-    cmd=str(command or '')
-    changed={str(x).strip() for x in (changed_files or [])}
-    normalized_tokens = _normalize_command_tokens(cmd)
-    normalized = ' '.join(normalized_tokens)
-    if re.search(r"(\s-c\s|<<|/tmp/|tempfile|scratch|ad-?hoc|one-?off)", cmd, re.IGNORECASE):
+def _classify_test_source(command, changed_files, record=None) -> str:
+    meta = _metadata_source(record)
+    if meta:
+        return meta
+    cmd = str(command or '')
+    if _TEMP_INLINE_RE.search(cmd) or _INLINE_ARG_RE.search(cmd):
         return 'candidate'
-    targets=[t.lstrip('./') for t in _command_targets(cmd)]
-    if targets:
-        return 'candidate' if any(t in changed or ('./'+t) in changed for t in targets) else 'repo'
-    broad = {
-        'pytest', 'unittest', 'python -m pytest', 'python3 -m pytest',
-        'python -m unittest', 'python3 -m unittest', 'tox', 'nox',
-        'npm test', 'npm run test', 'pnpm test', 'pnpm run test',
-        'yarn test', 'yarn run test', 'bun test', 'jest', 'vitest',
-        'cargo test', 'go test', 'make test', './gradlew test',
-        'gradle test', 'mvn test', 'rspec',
-    }
-    if normalized in broad or re.fullmatch(r"(npm|pnpm|yarn) run test:[\w:-]+", normalized):
+    paths = _extract_path_like_tokens(cmd)
+    if paths:
+        overlaps = [_path_overlaps_changed_files(path, changed_files) for path in paths]
+        if any(overlaps):
+            return 'candidate'
+        return 'repo' if len(paths) == 1 else 'unknown'
+    if _command_looks_like_validation(cmd) or _record_declares_test(record or {}):
         return 'repo'
     return 'unknown'
+
+
+# Backward-compatible name for callers; internally this means generic validation.
+def _is_test_command(command: str) -> bool:
+    return _command_looks_like_validation(command)
 
 
 def _abnormal_path_keywords() -> tuple[str, ...]:
     return (
         'cleanup', 'clean up', 'shutdown', 'shut down', 'teardown', 'close',
         'closed', 'resource', 'resource leak', 'cancellation', 'cancel',
-        'cancelled', 'canceled', 'sigint', 'signal', 'interrupt',
-        'interruption', 'keyboardinterrupt', 'rollback', 'failure handling',
+        'cancelled', 'canceled', 'signal', 'interrupt',
+        'interruption', 'rollback', 'failure handling',
         'error handling', 'exception', 'timeout', 'recovery', 'persistence',
         'edge case', 'abnormal path',
     )
@@ -299,9 +351,9 @@ def _extract_candidate_tests(candidate, verifier_result, commands, changed_files
         cmd=_record_command(rec)
         if cmd and cmd not in by_cmd: by_cmd[cmd]=rec
     for cmd in commands:
-        if _is_test_command(cmd):
-            rec=by_cmd.get(cmd, {})
-            item={'command': cmd, 'passed': _passed_from_record(rec), 'source': _classify_test_source(cmd, changed_files)}
+        rec=by_cmd.get(cmd, {})
+        if _record_declares_test(rec) or _command_looks_like_validation(cmd):
+            item={'command': cmd, 'passed': _passed_from_record(rec), 'source': _classify_test_source(cmd, changed_files, rec)}
             for key in ('path', 'evidence', 'stdout', 'stderr'):
                 if isinstance(rec, dict) and rec.get(key):
                     item[key] = str(rec.get(key))[:500]
@@ -310,7 +362,7 @@ def _extract_candidate_tests(candidate, verifier_result, commands, changed_files
         for field, passed in (('successEvidence', True), ('failureEvidence', False)):
             for item in _list_field(verifier_result, field):
                 text=str(item)
-                if _is_test_command(text) and text not in seen:
+                if _command_looks_like_validation(text) and text not in seen:
                     tests.append({'command': text[:300], 'passed': passed, 'source': 'unknown'}); seen.add(text)
     return tests
 
