@@ -11,7 +11,7 @@ from villani_ops.storage.files import FileStorage
 from villani_ops.core.task import Task
 from villani_ops.core.backend import Backend
 from villani_ops.git_ops import safe_apply
-from .selection import select_winner, POLICY, LLM_COMPARE_POLICY, LLM_COMPARE_FALLBACK_POLICY, select_success_with_llm_comparison, build_candidate_evidence_matrix, write_candidate_evidence_matrix, write_selection_report, _finalize_evidence_reasons
+from .selection import select_winner, POLICY, LLM_COMPARE_POLICY, select_success_with_llm_comparison, build_candidate_evidence_matrix, write_candidate_evidence_matrix, write_selection_report, _finalize_evidence_reasons, rank_candidates_by_evidence
 
 
 
@@ -196,21 +196,39 @@ class VerifierParallelOrchestrator:
             append_jsonl(odir/'candidates.jsonl', self._record_candidate(cr,odir))
         sel=select_winner(candidates,cfg.seed,cfg.on_all_fail)
         successes=[c for c in candidates if (c.verifier_result or {}).get('result')==1]
+        llm_advisory=None
+        if successes:
+            ranked_successes=rank_candidates_by_evidence(successes)
+            final_winner_id=ranked_successes[0]['candidate_id'] if ranked_successes else None
+            if final_winner_id:
+                sel.winnerCandidateId=final_winner_id; sel.winnerResult=1; sel.selectionPolicy=POLICY
+                sel.reason=ranked_successes[0].get('final_selection_reason') or f"Selected {final_winner_id} by deterministic evidence-ranked selection among verifier-success candidates."
+                sel.candidatePool=[r['candidate_id'] for r in ranked_successes]
+                sel.tieBreak=len(sel.candidatePool)>1
         if len(successes)>1:
-            meta={'policyName': LLM_COMPARE_POLICY, 'eligibleCandidateIds':[c.candidate_id for c in successes], 'selectedCandidateId':None, 'comparisonReason':None, 'fallbackUsed':False, 'fallbackReason':None}
+            meta={'policyName': LLM_COMPARE_POLICY, 'eligibleCandidateIds':[c.candidate_id for c in successes], 'selectedCandidateId':None, 'comparisonReason':None, 'fallbackUsed':False, 'fallbackReason':None, 'usedForFinalDecision':False, 'evidenceRankedWinnerId':sel.winnerCandidateId, 'disagreedWithEvidenceSelector':False, 'advisoryNote':None}
             try:
                 cmp=select_success_with_llm_comparison(task=cfg.task, success_criteria=cfg.success_criteria, candidates=successes, model=selector_backend.model, base_url=selector_backend.base_url, provider=selector_backend.provider, api_key=selector_backend.api_key, timeout_s=cfg.verifier_timeout_seconds)
                 if cmp and cmp.get('selectedCandidateId') in meta['eligibleCandidateIds']:
-                    sel.winnerCandidateId=cmp['selectedCandidateId']; sel.winnerResult=1; sel.selectionPolicy=LLM_COMPARE_POLICY; sel.reason=f"Selected {sel.winnerCandidateId} by LLM comparative selection among verifier-success candidates."; sel.candidatePool=meta['eligibleCandidateIds']; sel.tieBreak=True
                     meta['selectedCandidateId']=cmp['selectedCandidateId']; meta['comparisonReason']=cmp.get('reason')
+                    if meta['selectedCandidateId'] != sel.winnerCandidateId:
+                        meta['disagreedWithEvidenceSelector']=True
+                        meta['advisoryNote']=f"LLM comparison recommended {meta['selectedCandidateId']}, but evidence-ranked selector selected {sel.winnerCandidateId} because {sel.reason}"
                 else:
-                    meta['fallbackUsed']=True; meta['fallbackReason']='LLM comparative selector unavailable'; sel.selectionPolicy=LLM_COMPARE_FALLBACK_POLICY
+                    meta['fallbackUsed']=True; meta['fallbackReason']='LLM comparative selector unavailable'
             except Exception as e:
-                meta['fallbackUsed']=True; meta['fallbackReason']=str(e); sel.selectionPolicy=LLM_COMPARE_FALLBACK_POLICY; sel.reason += f' LLM comparative selection failed; used deterministic quality fallback: {e}'
-            sel.llmComparison=meta; d=sel.to_dict(); write_json(odir/'selection.json',d)
-        else:
-            write_json(odir/'selection.json',sel.to_dict())
+                meta['fallbackUsed']=True; meta['fallbackReason']=str(e); sel.reason += f' LLM comparative selection failed; used deterministic evidence-ranked selector: {e}'
+            llm_advisory=meta; sel.llmComparison=meta
+        write_json(odir/'selection.json',sel.to_dict())
         evidence_matrix = _finalize_evidence_reasons(build_candidate_evidence_matrix(candidates, sel.winnerCandidateId), sel.winnerCandidateId)
+        if llm_advisory:
+            for row in evidence_matrix:
+                recommended = row['candidate_id'] == llm_advisory.get('selectedCandidateId')
+                row['llm_comparison_recommended'] = recommended
+                row['llm_comparison_reason'] = llm_advisory.get('comparisonReason') if recommended else None
+                row['llm_disagreement_with_evidence_selector'] = bool(recommended and llm_advisory.get('disagreedWithEvidenceSelector'))
+                if recommended and llm_advisory.get('advisoryNote'):
+                    row['llm_comparison_advisory_note'] = llm_advisory['advisoryNote']
         write_candidate_evidence_matrix(odir/'candidate_evidence_matrix.json', evidence_matrix)
         write_selection_report(odir/'selection_report.md', evidence_matrix, sel.winnerCandidateId)
         winner=next((c for c in candidates if c.candidate_id==sel.winnerCandidateId),None); integ=self._integrate(odir,winner)
