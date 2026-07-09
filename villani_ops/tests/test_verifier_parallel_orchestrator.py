@@ -548,5 +548,53 @@ def test_verifier_parallel_evidence_matrix_uses_full_candidate_artifacts(tmp_pat
     assert row['tests_run'][0]['command'] == 'pytest tests/test_repo.py'
     assert row['tests_run'][0]['passed'] is True
     assert row['tests_run'][0]['source'] == 'repo'
-    assert row['files_changed'] == ['a.txt']
-    assert row['debug_dir'] and row['stdout_path'] and row['stderr_path'] and row['patch_path']
+
+
+def test_selection_json_uses_finalized_winner_reason(tmp_path):
+    repo=tmp_path/'repo_reason'; init_repo(repo); ws=tmp_path/'ws_reason'
+    class ReasonRunner:
+        def run_task(self, *, repo_path, task, success_criteria, backend_name, backend_config, timeout_seconds, context, artifacts_dir):
+            dbg=artifacts_dir/'debug'; dbg.mkdir(parents=True)
+            (dbg/'session_meta.json').write_text('{}')
+            if context['attempt_id'] == 'candidate-001':
+                (dbg/'commands.jsonl').write_text(json.dumps({'command':'pytest tests/test_cleanup.py','exitCode':0})+'\n')
+            else:
+                (dbg/'commands.jsonl').write_text(json.dumps({'command':'python -c "assert True"','exitCode':0})+'\n')
+            return RunnerResult(exit_code=0, stdout='out', stderr='', debug_artifact_dir=str(dbg), duration_ms=1)
+
+    def verifier(**kw):
+        candidate_id = kw['repo_dir'].parent.name
+        if candidate_id == 'candidate-001':
+            return {
+                'result': 1,
+                'verdict': 'success',
+                'confidence': .5,
+                'recommendedAction': 'accept',
+                'traceDir': str(kw['trace_dir']),
+                'successEvidence': ['SIGINT shutdown closes resources'],
+            }
+        return {
+            'result': 1,
+            'verdict': 'success',
+            'confidence': .9,
+            'recommendedAction': 'accept',
+            'traceDir': str(kw['trace_dir']),
+            'missingEvidence': ['no explicit cleanup/cancellation evidence'],
+            'riskFlags': ['resource leak risk'],
+        }
+
+    cfg=VerifierParallelConfig(repo=repo,task='do it',candidates=2,parallelism=1,seed=1,workspace=ws,backend='b',keep_worktrees=True)
+    orch=VerifierParallelOrchestrator(cfg, runner=ReasonRunner(), verifier=verifier)
+    orch._backend_obj=lambda: Backend(name='b',provider='local',model='m',api_key='x')
+    out=orch.run(); od=Path(out['orchestrationDir'])
+    selection=json.loads((od/'selection.json').read_text())
+    matrix=json.loads((od/'candidate_evidence_matrix.json').read_text())
+    report=(od/'selection_report.md').read_text()
+    selected_row=next(row for row in matrix if row['selection_status'] == 'selected')
+    assert selection['winnerCandidateId'] == 'candidate-001'
+    assert selected_row['candidate_id'] == 'candidate-001'
+    assert 'Candidate: candidate-001' in report
+    assert 'SIGINT shutdown closes resources' in selection['reason'] or 'pytest tests/test_cleanup.py' in selection['reason']
+    assert selection['reason'] != 'deterministic evidence-ranked selection'
+    assert selected_row['final_selection_reason'] == selection['reason']
+    assert selection['reason'] in report

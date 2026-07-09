@@ -5,6 +5,7 @@ from pathlib import Path
 import json
 import random
 import re
+import shlex
 from villani_ops.core.backend import Backend
 from villani_ops.llm.client import LLMClient
 
@@ -16,7 +17,7 @@ VALID_ON_ALL_FAIL={'fail','random','best-confidence'}
 _CLEANUP_REQUIREMENT_RE = re.compile(r"\b(sigint|interrupt|interruption|cancel|cancellation|cleanup|clean up|shutdown|shut down|resource|rollback)\b", re.IGNORECASE)
 _ABNORMAL_REQUIREMENT_RE = re.compile(r"\b(cleanup|clean up|cancellation|cancel|interrupt|interruption|rollback|shutdown|shut down|failure handling|timeout|persistence|recovery|edge cases?|resource management|resource)\b", re.IGNORECASE)
 _SEVERE_RISK_RE = re.compile(r"\b(no command log|no repo test|only candidate|pass/fail unknown|critical requirement|no direct evidence|missing cleanup|missing cancellation|broad exception|swallow|fake test|hardcod|ignored failure|unrelated|untested async|resource leak)\b", re.IGNORECASE)
-_TEST_RE = re.compile(r"\b(pytest|unittest|tox|npm\s+test|pnpm\s+test|yarn\s+test|bun\s+test|cargo\s+test|go\s+test|make\s+test|gradle\s+test|mvn\s+test|rspec|jest|vitest|test)\b", re.IGNORECASE)
+_TEST_RE = re.compile(r"\b(pytest|unittest|tox|nox|npm|pnpm|yarn|bun|cargo|go|make|gradle|mvn|rspec|jest|vitest|test)\b", re.IGNORECASE)
 _BEHAVIOR_RE = re.compile(r"\b(runtime|validation|validated|execution|executed|observed|output|cleanup|cancellation|rollback|persistence|end-to-end|e2e|passed|ran|verified)\b", re.IGNORECASE)
 _SOURCE_RE = re.compile(r"\b(source|inspection|appears|implemented|code added|function modified|import changed|diff|patch|changed file|updated)\b", re.IGNORECASE)
 _COMMAND_KEYS = {'command','cmd','shell'}
@@ -167,7 +168,40 @@ def _extract_candidate_commands(candidate, verifier_result) -> list[str]:
     return out
 
 
+def _normalize_command_tokens(command: str) -> list[str]:
+    text = str(command or '').strip()
+    if not text:
+        return []
+    try:
+        tokens = shlex.split(text, posix=True)
+    except ValueError:
+        tokens = text.split()
+    while tokens and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", tokens[0]):
+        tokens = tokens[1:]
+    while len(tokens) >= 2 and tokens[:2] in (['uv', 'run'], ['poetry', 'run'], ['pipenv', 'run']):
+        tokens = tokens[2:]
+    if tokens and tokens[0] == 'npx':
+        tokens = tokens[1:]
+    return tokens
+
+
 def _is_test_command(command: str) -> bool:
+    tokens = _normalize_command_tokens(command)
+    if not tokens:
+        return False
+    if re.search(r"(\s-c\s|<<)", str(command or '')):
+        return True
+    first = tokens[0]
+    if first in {'pytest', 'unittest', 'tox', 'nox', 'jest', 'vitest', 'rspec'}:
+        return True
+    if first in {'python', 'python3'} and len(tokens) >= 3 and tokens[1:3] in (['-m', 'pytest'], ['-m', 'unittest']):
+        return True
+    if first in {'npm', 'pnpm', 'yarn'}:
+        return len(tokens) >= 2 and (tokens[1] == 'test' or (tokens[1] == 'run' and len(tokens) >= 3 and tokens[2].startswith('test')))
+    if first == 'bun':
+        return len(tokens) >= 2 and tokens[1] == 'test'
+    if first in {'cargo', 'go', 'make', 'gradle', './gradlew', 'mvn'}:
+        return len(tokens) >= 2 and tokens[1] == 'test'
     return bool(_TEST_RE.search(command or ''))
 
 
@@ -178,13 +212,83 @@ def _command_targets(command: str) -> list[str]:
 def _classify_test_source(command, changed_files) -> str:
     cmd=str(command or '')
     changed={str(x).strip() for x in (changed_files or [])}
-    if re.search(r"(\s-c\s|<<|/tmp/|tempfile|scratch)", cmd): return 'candidate'
+    normalized_tokens = _normalize_command_tokens(cmd)
+    normalized = ' '.join(normalized_tokens)
+    if re.search(r"(\s-c\s|<<|/tmp/|tempfile|scratch|ad-?hoc|one-?off)", cmd, re.IGNORECASE):
+        return 'candidate'
     targets=[t.lstrip('./') for t in _command_targets(cmd)]
     if targets:
         return 'candidate' if any(t in changed or ('./'+t) in changed for t in targets) else 'repo'
-    if re.fullmatch(r"\s*(pytest|npm\s+test|pnpm\s+test|yarn\s+test|bun\s+test|cargo\s+test|go\s+test|make\s+test|tox|rspec|jest|vitest)(\s+[-\w=./:]+)*\s*", cmd):
+    broad = {
+        'pytest', 'unittest', 'python -m pytest', 'python3 -m pytest',
+        'python -m unittest', 'python3 -m unittest', 'tox', 'nox',
+        'npm test', 'npm run test', 'pnpm test', 'pnpm run test',
+        'yarn test', 'yarn run test', 'bun test', 'jest', 'vitest',
+        'cargo test', 'go test', 'make test', './gradlew test',
+        'gradle test', 'mvn test', 'rspec',
+    }
+    if normalized in broad or re.fullmatch(r"(npm|pnpm|yarn) run test:[\w:-]+", normalized):
         return 'repo'
     return 'unknown'
+
+
+def _abnormal_path_keywords() -> tuple[str, ...]:
+    return (
+        'cleanup', 'clean up', 'shutdown', 'shut down', 'teardown', 'close',
+        'closed', 'resource', 'resource leak', 'cancellation', 'cancel',
+        'cancelled', 'canceled', 'sigint', 'signal', 'interrupt',
+        'interruption', 'keyboardinterrupt', 'rollback', 'failure handling',
+        'error handling', 'exception', 'timeout', 'recovery', 'persistence',
+        'edge case', 'abnormal path',
+    )
+
+
+def _mentions_abnormal_path(text: str) -> bool:
+    lowered = str(text or '').lower()
+    return any(keyword in lowered for keyword in _abnormal_path_keywords())
+
+
+def _row_direct_evidence_texts(row) -> list[str]:
+    texts = []
+    for evidence in row.get('direct_behavioral_evidence', []):
+        if not isinstance(evidence, dict):
+            continue
+        if evidence.get('requirement') == 'candidate test':
+            continue
+        texts.append(str(evidence.get('evidence') or ''))
+    return texts
+
+
+def _row_test_evidence_texts(row) -> list[str]:
+    texts = []
+    for test in row.get('tests_run', []):
+        if not isinstance(test, dict):
+            continue
+        parts = [test.get('command'), test.get('path'), test.get('evidence'), test.get('stdout'), test.get('stderr')]
+        texts.append(' '.join(str(part) for part in parts if part))
+    return texts
+
+
+def _has_repo_abnormal_path_test_evidence(row) -> bool:
+    for test in row.get('tests_run', []):
+        if test.get('source') == 'repo' and test.get('passed') is True:
+            if _mentions_abnormal_path(' '.join(str(v) for v in test.values())):
+                return True
+    return False
+
+
+def _has_candidate_abnormal_path_test_evidence(row) -> bool:
+    for test in row.get('tests_run', []):
+        if test.get('source') == 'candidate' and test.get('passed') is True:
+            if _mentions_abnormal_path(' '.join(str(v) for v in test.values())):
+                return True
+    return False
+
+
+def _has_direct_abnormal_path_evidence(row) -> bool:
+    if _has_repo_abnormal_path_test_evidence(row):
+        return True
+    return any(_mentions_abnormal_path(text) for text in _row_direct_evidence_texts(row))
 
 
 def _extract_candidate_tests(candidate, verifier_result, commands, changed_files) -> list[dict]:
@@ -198,6 +302,9 @@ def _extract_candidate_tests(candidate, verifier_result, commands, changed_files
         if _is_test_command(cmd):
             rec=by_cmd.get(cmd, {})
             item={'command': cmd, 'passed': _passed_from_record(rec), 'source': _classify_test_source(cmd, changed_files)}
+            for key in ('path', 'evidence', 'stdout', 'stderr'):
+                if isinstance(rec, dict) and rec.get(key):
+                    item[key] = str(rec.get(key))[:500]
             tests.append(item); seen.add(cmd)
     if not tests:
         for field, passed in (('successEvidence', True), ('failureEvidence', False)):
@@ -230,11 +337,6 @@ def build_candidate_evidence_matrix(candidates: list[Any], selected_candidate_id
         commands=_extract_candidate_commands(c, v)
         tests=_extract_candidate_tests(c, v, commands, changed)
         missing_flags=missing + [str(r.get('requirement') or r.get('id') or 'unsatisfied requirement') for r in reqs if r.get('status') == 'unsatisfied']
-        evidence_text=' '.join(map(str, success + _list_field(v,'recoveredFailures') + [v.get('directEvidenceForCriticalRequirement') or '']))
-        for r in reqs:
-            req=str(r.get('requirement') or r.get('id') or '')
-            if r.get('status') == 'satisfied' and _ABNORMAL_REQUIREMENT_RE.search(req) and not _BEHAVIOR_RE.search(evidence_text):
-                missing_flags.append('no direct evidence for abnormal-path requirement: '+req)
         if v.get('criticalRequirementCovered') is False: missing_flags.append('critical requirement was not covered')
         elif v.get('criticalRequirementCovered') is True and v.get('criticalRequirementCoverageProven') is not True: missing_flags.append('critical requirement coverage was not proven by same-condition evidence')
         direct=[]; source=[]
@@ -242,13 +344,30 @@ def build_candidate_evidence_matrix(candidates: list[Any], selected_candidate_id
             if t.get('passed') is True:
                 direct.append(_evidence_item('repo test' if t.get('source')=='repo' else 'candidate test', t['command']))
         for x in success:
-            (direct if _BEHAVIOR_RE.search(str(x)) and not _SOURCE_RE.search(str(x)) else source).append(_evidence_item((reqs[0].get('requirement') if reqs else v.get('criticalRequirement')) or 'task behavior', x))
+            success_text = str(x)
+            target = source
+            if _BEHAVIOR_RE.search(success_text) and (not _SOURCE_RE.search(success_text) or _mentions_abnormal_path(success_text)):
+                target = direct
+            target.append(_evidence_item((reqs[0].get('requirement') if reqs else v.get('criticalRequirement')) or 'task behavior', x))
         if v.get('directEvidenceForCriticalRequirement'):
             direct.append(_evidence_item(v.get('criticalRequirement') or 'critical requirement', v.get('directEvidenceForCriticalRequirement')))
         for r in reqs:
             ev=r.get('evidence') or r.get('directEvidence') or r.get('reason')
             if r.get('status') == 'satisfied' and ev and _BEHAVIOR_RE.search(str(ev)):
                 direct.append(_evidence_item(r.get('requirement') or r.get('id') or 'requirement', ev))
+        evidence_probe = {
+            'tests_run': tests,
+            'direct_behavioral_evidence': direct,
+        }
+        for r in reqs:
+            req=str(r.get('requirement') or r.get('id') or '')
+            if r.get('status') == 'satisfied' and _ABNORMAL_REQUIREMENT_RE.search(req):
+                if _has_direct_abnormal_path_evidence(evidence_probe):
+                    continue
+                if _has_candidate_abnormal_path_test_evidence(evidence_probe):
+                    risks.append('abnormal-path evidence is candidate-authored only')
+                    continue
+                missing_flags.append('no direct evidence for abnormal-path requirement: '+req)
         if changed: source.append(_evidence_item('changed files', ', '.join(changed)))
         if _candidate_patch_path(c): source.append(_evidence_item('patch', str(_candidate_patch_path(c))))
         if not commands: risks.append('no command log evidence')
@@ -297,7 +416,7 @@ def _make_selection_reason(row, winner, all_rows) -> str:
     direct=_snippet(row.get('direct_behavioral_evidence'))
     covered=f"covered {row['evidence_score']['requirement_coverage']:.0f} requirement-coverage points"
     loser=next((r for r in all_rows if r is not row), None)
-    parts=[f"Selected because {row['candidate_id']}"]
+    parts=[f"Selected because {row['candidate_id']} had the strongest evidence-ranked selection record"]
     details=[]
     if direct: details.append(f"had direct behavioral evidence: {direct}")
     if repo: details.append(f"passed repo test evidence from \"{repo}\"")
