@@ -129,118 +129,115 @@ def test_evidence_extraction_reads_debug_commands_jsonl(tmp_path):
     d=tmp_path/'debug'; d.mkdir()
     (d/'session_meta.json').write_text(json.dumps({'tool_input': {'command': 'echo meta'}}))
     rows=[
-        {'command':'pytest tests/test_app.py','exitCode':0},
-        {'tool_input': {'command':'pytest tests/test_fail.py'}, 'exitCode':1},
-        {'command':'python -m build','exitCode':0},
+        {'command':'run-tests checks/existing_case','exitCode':0},
+        {'tool_input': {'command':'verify --case checks/failing_case'}, 'exitCode':1},
+        {'command':'build','exitCode':0},
     ]
     (d/'commands.jsonl').write_text('\n'.join(json.dumps(r) for r in rows))
-    c=SimpleNamespace(candidate_id='candidate-001', debug_dir=d, changed_files=['src/app.py'], verifier_result={'result':1,'toolsUsed':['not-real-tool']})
+    c=SimpleNamespace(candidate_id='candidate-001', debug_dir=d, changed_files=['src/app'], verifier_result={'result':1,'toolsUsed':['not-real-tool']})
     row=build_candidate_evidence_matrix([c])[0]
-    assert 'pytest tests/test_app.py' in row['commands_run']
-    assert 'pytest tests/test_fail.py' in row['commands_run']
-    assert 'python -m build' in row['commands_run']
+    assert 'run-tests checks/existing_case' in row['commands_run']
+    assert 'verify --case checks/failing_case' in row['commands_run']
+    assert 'build' in row['commands_run']
     test_cmds={t['command']: t for t in row['tests_run']}
-    assert test_cmds['pytest tests/test_app.py']['passed'] is True
-    assert test_cmds['pytest tests/test_fail.py']['passed'] is False
-    assert 'python -m build' not in test_cmds
+    assert test_cmds['run-tests checks/existing_case']['passed'] is True
+    assert test_cmds['verify --case checks/failing_case']['passed'] is False
+    assert 'build' not in test_cmds
     assert 'not-real-tool' not in row['commands_run']
 
 
-def test_test_source_classification_repo_vs_candidate():
-    from villani_ops.orchestrator.selection import _classify_test_source
-    assert _classify_test_source('pytest tests/test_app.py', ['src/app.py']) == 'repo'
-    assert _classify_test_source('pytest tests/test_app.py', ['tests/test_app.py']) == 'candidate'
-    assert _classify_test_source('python -c "print(1)"', []) == 'candidate'
-
-
-def test_abnormal_path_repo_test_counts_as_direct_evidence(tmp_path):
-    import json
-    from villani_ops.orchestrator.selection import build_candidate_evidence_matrix
-    debug = tmp_path/'debug'; debug.mkdir()
-    (debug/'commands.jsonl').write_text(json.dumps({'command':'pytest tests/test_cleanup.py','exitCode':0})+'\n')
-    candidate = SimpleNamespace(
-        candidate_id='candidate-001',
-        debug_dir=debug,
-        changed_files=['src/app.py'],
-        verifier_result={
-            'result': 1,
-            'requirementResults': [{'requirement':'handle cleanup and cancellation on SIGINT', 'status':'satisfied'}],
-        },
-    )
-    row = build_candidate_evidence_matrix([candidate])[0]
-    assert any(e['evidence'] == 'pytest tests/test_cleanup.py' for e in row['direct_behavioral_evidence'])
-    assert not any('no direct evidence for abnormal-path requirement' in flag for flag in row['missing_requirement_flags'])
-    assert not any('cleanup/cancellation evidence is absent' in flag for flag in row['missing_requirement_flags'])
-    assert row['evidence_score']['risk_penalty'] < 6
-
-
-def test_candidate_authored_abnormal_path_test_is_weak_not_absent(tmp_path):
-    import json
-    from villani_ops.orchestrator.selection import build_candidate_evidence_matrix
-    debug = tmp_path/'debug'; debug.mkdir()
-    (debug/'commands.jsonl').write_text(json.dumps({'command':'pytest tests/test_cleanup.py','exitCode':0})+'\n')
-    candidate = SimpleNamespace(
-        candidate_id='candidate-001',
-        debug_dir=debug,
-        changed_files=['tests/test_cleanup.py'],
-        verifier_result={
-            'result': 1,
-            'requirementResults': [{'requirement':'handle cleanup and cancellation on SIGINT', 'status':'satisfied'}],
-        },
-    )
-    row = build_candidate_evidence_matrix([candidate])[0]
-    assert row['tests_run'][0]['source'] == 'candidate'
-    assert any(e['requirement'] == 'candidate test' for e in row['direct_behavioral_evidence'])
-    assert not any('no direct evidence for abnormal-path requirement' in flag for flag in row['missing_requirement_flags'])
-    assert any('abnormal-path evidence is candidate-authored only' in risk for risk in row['risk_flags'])
-
-
-def test_common_repo_test_wrappers_classify_as_repo():
-    from villani_ops.orchestrator.selection import _classify_test_source, _is_test_command
-    commands = [
-        'python -m pytest',
-        'uv run pytest',
-        'uv run python -m pytest',
-        'poetry run pytest',
-        'poetry run python -m pytest',
-        'pipenv run pytest',
-        'npm run test',
-        'pnpm run test',
-        'yarn run test',
-        'bun test',
-        'python -m unittest',
-        './gradlew test',
-        'gradle test',
-        'mvn test',
-        'tox',
-        'nox',
+def test_validation_detection_uses_generic_terms_not_toolchains():
+    from villani_ops.orchestrator.selection import _command_looks_like_validation
+    positive = [
+        'run-tests --suite cleanup',
+        'project check',
+        'verify-behavior --case interruption',
+        'validate cleanup',
+        'spec-runner cancellation',
+        'acme-test-runner -q',
     ]
-    for command in commands:
-        assert _is_test_command(command), command
-        assert _classify_test_source(command, ['src/app.py']) == 'repo'
+    negative = ['build', 'install dependencies', 'run app', 'format', 'compile']
+    for command in positive:
+        assert _command_looks_like_validation(command), command
+    for command in negative:
+        assert not _command_looks_like_validation(command), command
 
 
-def test_inline_and_temp_tests_classify_as_candidate():
+def test_structured_record_metadata_can_mark_validation(tmp_path):
+    import json
+    from villani_ops.orchestrator.selection import _record_declares_test, build_candidate_evidence_matrix
+    records = [
+        {'kind': 'test', 'command': 'opaque-runner --foo', 'exitCode': 0},
+        {'category': 'verification', 'command': 'opaque-runner --bar', 'exitCode': 0},
+        {'phase': 'validation', 'command': 'opaque-runner --baz', 'exitCode': 0},
+    ]
+    debug = tmp_path/'debug'; debug.mkdir()
+    (debug/'commands.jsonl').write_text('\n'.join(json.dumps(record) for record in records))
+    row = build_candidate_evidence_matrix([SimpleNamespace(candidate_id='c', debug_dir=debug, changed_files=[], verifier_result={'result': 1})])[0]
+    test_cmds = {item['command'] for item in row['tests_run']}
+    for record in records:
+        assert _record_declares_test(record)
+        assert record['command'] in test_cmds
+
+
+def test_repo_vs_candidate_classification_uses_changed_file_overlap():
+    from villani_ops.orchestrator.selection import _classify_test_source
+    changed_files = ['checks/generated_cleanup_case', 'src/worker']
+    assert _classify_test_source('run-tests checks/existing_cleanup_case', changed_files) == 'repo'
+    assert _classify_test_source('run-tests checks/generated_cleanup_case', changed_files) == 'candidate'
+    assert _classify_test_source('run-tests', changed_files) != 'candidate'
+
+
+def test_inline_temp_and_scratch_validation_is_candidate():
     from villani_ops.orchestrator.selection import _classify_test_source
     commands = [
-        'python -c "import foo; assert foo.bar()"',
-        "python <<'PY'\nprint('test')\nPY",
-        'pytest /tmp/test_candidate.py',
+        'validate --case /tmp/generated_case',
+        'run-tests scratch/generated_case',
+        'verify <<EOF\nassert cleanup\nEOF',
     ]
     for command in commands:
         assert _classify_test_source(command, []) == 'candidate'
 
 
+def test_unknown_when_validation_source_is_ambiguous():
+    from villani_ops.orchestrator.selection import _classify_test_source, _command_looks_like_validation
+    command = 'opaque-runner target'
+    assert not _command_looks_like_validation(command)
+    assert _classify_test_source(command, []) == 'unknown'
+
+
+def test_no_language_or_toolchain_literals_in_selection_classifier():
+    import inspect
+    import villani_ops.orchestrator.selection as selection
+    source = '\n'.join(
+        inspect.getsource(obj).lower()
+        for obj in (
+            selection._record_declares_test,
+            selection._command_looks_like_validation,
+            selection._extract_path_like_tokens,
+            selection._path_overlaps_changed_files,
+            selection._classify_test_source,
+            selection._extract_candidate_tests,
+        )
+    )
+    banned = [
+        'pytest', 'unittest', 'tox', 'nox', 'npm', 'pnpm', 'yarn', 'bun', 'jest',
+        'vitest', 'npx', 'cargo', 'gradle', 'gradlew', 'mvn', 'rspec', 'poetry',
+        'pipenv', 'python', 'python3', 'node', 'ruby', 'java', '.py', '.js', '.ts',
+        '.tsx', '.jsx', '.rb', '.go', '.rs', '.java', '.kt',
+    ]
+    assert not [literal for literal in banned if literal in source]
+
 def test_report_contains_specific_winner_and_loser_evidence(tmp_path):
     from villani_ops.orchestrator.selection import _finalize_evidence_reasons, write_selection_report
     matrix=[
-        {'candidate_id':'winner','verifier_result':'pass','verifier_confidence':.5,'commands_run':['pytest tests/test_cleanup.py'],'tests_run':[{'command':'pytest tests/test_cleanup.py','passed':True,'source':'repo'}],'files_changed':[],'direct_behavioral_evidence':[{'requirement':'cleanup','evidence':'SIGINT shutdown closes resources','strength':'strong'}],'source_level_inference_evidence':[],'missing_requirement_flags':[],'risk_flags':[],'evidence_score':{'direct_behavioral':4,'repo_tests':8,'candidate_tests':0,'source_inference':0,'requirement_coverage':12,'risk_penalty':0,'final':24},'selection_status':'','final_selection_reason':''},
-        {'candidate_id':'loser','verifier_result':'pass','verifier_confidence':.9,'commands_run':[],'tests_run':[],'files_changed':['src/app.py'],'direct_behavioral_evidence':[],'source_level_inference_evidence':[{'requirement':'changed files','evidence':'src/app.py','strength':'medium'}],'missing_requirement_flags':['no explicit cleanup/cancellation evidence'],'risk_flags':['resource leak risk'],'evidence_score':{'direct_behavioral':0,'repo_tests':0,'candidate_tests':0,'source_inference':1,'requirement_coverage':6,'risk_penalty':10,'final':-3},'selection_status':'','final_selection_reason':''},
+        {'candidate_id':'winner','verifier_result':'pass','verifier_confidence':.5,'commands_run':['run-tests checks/cleanup_case'],'tests_run':[{'command':'run-tests checks/cleanup_case','passed':True,'source':'repo'}],'files_changed':[],'direct_behavioral_evidence':[{'requirement':'cleanup','evidence':'interruption shutdown closes resources','strength':'strong'}],'source_level_inference_evidence':[],'missing_requirement_flags':[],'risk_flags':[],'evidence_score':{'direct_behavioral':4,'repo_tests':8,'candidate_tests':0,'source_inference':0,'requirement_coverage':12,'risk_penalty':0,'final':24},'selection_status':'','final_selection_reason':''},
+        {'candidate_id':'loser','verifier_result':'pass','verifier_confidence':.9,'commands_run':[],'tests_run':[],'files_changed':['src/app'],'direct_behavioral_evidence':[],'source_level_inference_evidence':[{'requirement':'changed files','evidence':'src/app','strength':'medium'}],'missing_requirement_flags':['no explicit cleanup/cancellation evidence'],'risk_flags':['resource leak risk'],'evidence_score':{'direct_behavioral':0,'repo_tests':0,'candidate_tests':0,'source_inference':1,'requirement_coverage':6,'risk_penalty':10,'final':-3},'selection_status':'','final_selection_reason':''},
     ]
     matrix=_finalize_evidence_reasons(matrix, 'winner')
     text=write_selection_report(tmp_path/'selection_report.md', matrix, 'winner').read_text()
-    assert 'SIGINT shutdown closes resources' in text
-    assert 'pytest tests/test_cleanup.py' in text
+    assert 'interruption shutdown closes resources' in text
+    assert 'run-tests checks/cleanup_case' in text
     assert 'no explicit cleanup/cancellation evidence' in text
     assert 'resource leak risk' in text
     assert 'winner' in text and 'loser' in text
@@ -257,10 +254,10 @@ def test_evidence_ranking_prefers_repo_test_over_candidate_microtest(tmp_path):
     import json
     from villani_ops.orchestrator.selection import rank_candidates_by_evidence
     da=tmp_path/'a'; db=tmp_path/'b'; da.mkdir(); db.mkdir()
-    (da/'commands.jsonl').write_text(json.dumps({'command':'python -c "assert True"','exitCode':0})+'\n')
-    (db/'commands.jsonl').write_text(json.dumps({'command':'pytest tests/test_cleanup.py','exitCode':0})+'\n')
-    a=SimpleNamespace(candidate_id='A', debug_dir=da, changed_files=['tests/test_new.py'], verifier_result={'result':1,'confidence':.99,'successEvidence':['implemented code added']})
-    b=SimpleNamespace(candidate_id='B', debug_dir=db, changed_files=['src/app.py'], verifier_result={'result':1,'confidence':.1,'successEvidence':['runtime validation observed cleanup behavior']})
+    (da/'commands.jsonl').write_text(json.dumps({'command':'validate --case /tmp/generated_case','exitCode':0})+'\n')
+    (db/'commands.jsonl').write_text(json.dumps({'command':'run-tests checks/cleanup_case','exitCode':0})+'\n')
+    a=SimpleNamespace(candidate_id='A', debug_dir=da, changed_files=['checks/generated_case'], verifier_result={'result':1,'confidence':.99,'successEvidence':['implemented code added']})
+    b=SimpleNamespace(candidate_id='B', debug_dir=db, changed_files=['src/app'], verifier_result={'result':1,'confidence':.1,'successEvidence':['runtime validation observed cleanup behavior']})
     assert rank_candidates_by_evidence([a,b])[0]['candidate_id'] == 'B'
 
 
