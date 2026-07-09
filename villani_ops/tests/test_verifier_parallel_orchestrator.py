@@ -526,3 +526,27 @@ def test_evidence_ranking_prefers_cleanup_coverage_and_writes_reports(tmp_path):
     assert 'candidate-b' in report and 'Selected because' in report and 'candidate-a' in report
     loaded = json.loads(matrix_path.read_text())
     assert {r['candidate_id'] for r in loaded} == {'candidate-a', 'candidate-b'}
+
+
+def test_verifier_parallel_evidence_matrix_uses_full_candidate_artifacts(tmp_path):
+    repo=tmp_path/'repo_full'; init_repo(repo); ws=tmp_path/'ws_full'
+    class CommandRunner:
+        def run_task(self, *, repo_path, task, success_criteria, backend_name, backend_config, timeout_seconds, context, artifacts_dir):
+            (Path(repo_path)/'a.txt').write_text(context['attempt_id'])
+            dbg=artifacts_dir/'debug'; dbg.mkdir(parents=True)
+            (dbg/'session_meta.json').write_text('{}')
+            (dbg/'commands.jsonl').write_text(json.dumps({'command':'pytest tests/test_repo.py','exitCode':0})+'\n')
+            return RunnerResult(exit_code=0, stdout='out', stderr='', debug_artifact_dir=str(dbg), duration_ms=1)
+    def verifier(**kw):
+        return {'result':1,'verdict':'success','confidence':.5,'recommendedAction':'accept','traceDir':str(kw['trace_dir']),'successEvidence':['runtime validation observed']}
+    cfg=VerifierParallelConfig(repo=repo,task='do it',candidates=1,parallelism=1,seed=1,workspace=ws,backend='b',keep_worktrees=True)
+    orch=VerifierParallelOrchestrator(cfg, runner=CommandRunner(), verifier=verifier)
+    orch._backend_obj=lambda: Backend(name='b',provider='local',model='m',api_key='x')
+    out=orch.run(); od=Path(out['orchestrationDir'])
+    row=json.loads((od/'candidate_evidence_matrix.json').read_text())[0]
+    assert row['commands_run'] == ['pytest tests/test_repo.py']
+    assert row['tests_run'][0]['command'] == 'pytest tests/test_repo.py'
+    assert row['tests_run'][0]['passed'] is True
+    assert row['tests_run'][0]['source'] == 'repo'
+    assert row['files_changed'] == ['a.txt']
+    assert row['debug_dir'] and row['stdout_path'] and row['stderr_path'] and row['patch_path']
