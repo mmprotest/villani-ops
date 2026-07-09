@@ -13,6 +13,142 @@ LLM_COMPARE_POLICY='binary_verifier_llm_compare_tie'
 LLM_COMPARE_FALLBACK_POLICY='binary_verifier_llm_compare_tie_fallback_quality'
 VALID_ON_ALL_FAIL={'fail','random','best-confidence'}
 
+_CLEANUP_REQUIREMENT_RE = re.compile(r"\b(sigint|interrupt|interruption|cancel|cancellation|cleanup|clean up|shutdown|shut down|resource|rollback)\b", re.IGNORECASE)
+_SEVERE_RISK_RE = re.compile(r"\b(missing cleanup|missing cancellation|broad exception|swallow|fake test|hardcoded|ignored failure|unrelated|untested async|resource leak)\b", re.IGNORECASE)
+_TEST_RE = re.compile(r"\b(pytest|cargo test|npm test|go test|test|validation|verified|passed|failed)\b", re.IGNORECASE)
+
+
+def _result_label(v: dict[str, Any]) -> str:
+    r = v.get('result')
+    if r == 1 or str(v.get('verdict') or '').lower() == 'success':
+        return 'pass'
+    if r == 0 or str(v.get('verdict') or '').lower() in {'failure', 'failed', 'fail'}:
+        return 'fail'
+    return 'unknown'
+
+
+def _strength(text: Any) -> str:
+    t = str(text or '')
+    if _STRONG_SUCCESS_EVIDENCE_RE.search(t):
+        return 'strong'
+    if t.strip():
+        return 'medium'
+    return 'weak'
+
+
+def _evidence_item(requirement: str, evidence: Any) -> dict[str, str]:
+    return {'requirement': str(requirement or 'unspecified requirement'), 'evidence': str(evidence or ''), 'strength': _strength(evidence)}
+
+
+def _candidate_tests(c: Any, v: dict[str, Any]) -> list[dict[str, Any]]:
+    tests: list[dict[str, Any]] = []
+    for item in _list_field(v, 'successEvidence') + _list_field(v, 'failureEvidence'):
+        text = str(item)
+        if _TEST_RE.search(text):
+            tests.append({'command': text[:300], 'passed': item in _list_field(v, 'successEvidence'), 'source': 'repo'})
+    return tests
+
+
+def build_candidate_evidence_matrix(candidates: list[Any], selected_candidate_id: str | None = None) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for c in candidates:
+        v = _vr(c); cid = str(_cid(c) or '')
+        reqs = [r for r in _list_field(v, 'requirementResults') if isinstance(r, dict)]
+        success = _list_field(v, 'successEvidence')
+        missing = [str(x) for x in _list_field(v, 'missingEvidence')]
+        risks = [str(x) for x in _list_field(v, 'riskFlags')]
+        unsatisfied = [str(r.get('requirement') or r.get('id') or 'unsatisfied requirement') for r in reqs if r.get('status') == 'unsatisfied']
+        missing_flags = missing + unsatisfied
+        cleanup_reqs = [str(r.get('requirement') or r.get('id') or '') for r in reqs if _CLEANUP_REQUIREMENT_RE.search(str(r.get('requirement') or r.get('id') or ''))]
+        evidence_text = ' '.join(map(str, success + _list_field(v, 'recoveredFailures') + [v.get('directEvidenceForCriticalRequirement') or '']))
+        if cleanup_reqs and not _CLEANUP_REQUIREMENT_RE.search(evidence_text):
+            missing_flags.append('missing cleanup/cancellation/interruption/shutdown evidence')
+        if v.get('criticalRequirementCovered') is False:
+            missing_flags.append('critical requirement was not covered')
+        elif v.get('criticalRequirementCovered') is True and v.get('criticalRequirementCoverageProven') is not True:
+            missing_flags.append('critical requirement coverage was not proven by same-condition evidence')
+        direct = [_evidence_item((reqs[0].get('requirement') if reqs else v.get('criticalRequirement')) or 'task behavior', x) for x in success]
+        if v.get('directEvidenceForCriticalRequirement'):
+            direct.append(_evidence_item(v.get('criticalRequirement') or 'critical requirement', v.get('directEvidenceForCriticalRequirement')))
+        source = []
+        changed = getattr(c, 'changed_files', None) or (c.get('changedFiles') if isinstance(c, dict) else None) or []
+        if changed:
+            source.append(_evidence_item('changed files', ', '.join(map(str, changed))))
+        satisfied = sum(1 for r in reqs if r.get('status') == 'satisfied')
+        total = max(1, len(reqs))
+        if not reqs and v.get('criticalRequirementCovered') is True:
+            satisfied = 1
+            total = 1
+        if v.get('criticalRequirementCoverageProven') is True:
+            satisfied = max(satisfied, total)
+        tests = _candidate_tests(c, v)
+        repo_tests = sum(1 for t in tests if t['source'] == 'repo' and t['passed'] is True)
+        candidate_tests = sum(1 for t in tests if t['source'] == 'candidate' and t['passed'] is True)
+        severe = sum(1 for r in risks + missing_flags if _SEVERE_RISK_RE.search(r))
+        risk_penalty = len(risks) * 1.5 + len(missing_flags) * 2 + severe * 5
+        score = {
+            'direct_behavioral': float(sum({'strong': 3, 'medium': 2, 'weak': 1}[e['strength']] for e in direct)),
+            'repo_tests': float(repo_tests * 4),
+            'candidate_tests': float(candidate_tests),
+            'source_inference': float(len(source)),
+            'requirement_coverage': float(10 * satisfied / total),
+            'risk_penalty': float(risk_penalty),
+            'final': 0.0,
+        }
+        score['final'] = score['direct_behavioral'] + score['repo_tests'] + score['candidate_tests'] + score['source_inference'] + score['requirement_coverage'] - score['risk_penalty']
+        row = {'candidate_id': cid, 'verifier_result': _result_label(v), 'verifier_confidence': v.get('confidence'), 'commands_run': [str(x) for x in _list_field(v, 'toolsUsed')], 'tests_run': tests, 'files_changed': [str(x) for x in changed], 'direct_behavioral_evidence': direct, 'source_level_inference_evidence': source, 'missing_requirement_flags': missing_flags, 'risk_flags': risks, 'evidence_score': score, 'selection_status': 'selected' if cid == selected_candidate_id else 'rejected', 'final_selection_reason': ''}
+        rows.append(row)
+    return rows
+
+
+def _evidence_rank_components(row: dict[str, Any]) -> tuple[Any, ...]:
+    s = row['evidence_score']
+    severe = sum(1 for r in row['risk_flags'] + row['missing_requirement_flags'] if _SEVERE_RISK_RE.search(str(r)))
+    return (-severe, -len(row['missing_requirement_flags']), -len(row['risk_flags']), s['direct_behavioral'], s['repo_tests'], s['candidate_tests'], s['source_inference'], s['requirement_coverage'], -s['risk_penalty'], float(row['verifier_confidence'] or 0))
+
+def _evidence_rank_key(row: dict[str, Any]) -> tuple[Any, ...]:
+    return _evidence_rank_components(row) + (-sum(ord(ch) for ch in row['candidate_id']),)
+
+
+def rank_candidates_by_evidence(candidates: list[Any]) -> list[dict[str, Any]]:
+    rows = build_candidate_evidence_matrix(candidates)
+    return sorted(rows, key=_evidence_rank_key, reverse=True)
+
+
+def _finalize_evidence_reasons(rows: list[dict[str, Any]], winner_id: str | None) -> list[dict[str, Any]]:
+    winner = next((r for r in rows if r['candidate_id'] == winner_id), None)
+    for r in rows:
+        if r['candidate_id'] == winner_id:
+            r['selection_status'] = 'selected'
+            r['final_selection_reason'] = f"Selected because it had the strongest evidence-ranked coverage: coverage={r['evidence_score']['requirement_coverage']:.2f}, direct_behavioral={r['evidence_score']['direct_behavioral']:.2f}, risk_penalty={r['evidence_score']['risk_penalty']:.2f}."
+        else:
+            r['selection_status'] = 'rejected'
+            gaps = '; '.join(r['missing_requirement_flags'][:3]) or 'lower evidence-ranked score'
+            if winner:
+                r['final_selection_reason'] = f"Rejected because {gaps}; {winner_id} had stronger requirement coverage or lower risk."
+            else:
+                r['final_selection_reason'] = f"Rejected because {gaps}."
+    return rows
+
+
+def write_candidate_evidence_matrix(path: str | Path, matrix: list[dict[str, Any]]) -> Path:
+    p = Path(path); p.parent.mkdir(parents=True, exist_ok=True); p.write_text(json.dumps(matrix, indent=2, default=str), encoding='utf-8'); return p
+
+
+def write_selection_report(path: str | Path, matrix: list[dict[str, Any]], winner_id: str | None) -> Path:
+    p = Path(path); p.parent.mkdir(parents=True, exist_ok=True)
+    winner = next((r for r in matrix if r['candidate_id'] == winner_id), None)
+    lines = ['# Selection Report', '', '## Winner', f"- Candidate: {winner_id or ''}", f"- Reason: {(winner or {}).get('final_selection_reason','No winner selected.')}", '', '## Candidate Ranking', 'candidate_id | verifier_result | coverage | direct_behavioral | repo_tests | source_inference | risk_flags | status | reason', '--- | --- | ---: | ---: | ---: | ---: | --- | --- | ---']
+    for r in sorted(matrix, key=_evidence_rank_key, reverse=True):
+        s=r['evidence_score']; lines.append(f"{r['candidate_id']} | {r['verifier_result']} | {s['requirement_coverage']:.2f} | {s['direct_behavioral']:.2f} | {s['repo_tests']:.2f} | {s['source_inference']:.2f} | {'; '.join(r['risk_flags'])} | {r['selection_status']} | {r['final_selection_reason']}")
+    lines += ['', '## Why the winner won', (winner or {}).get('final_selection_reason','No winner selected.'), '', '## Why other candidates lost']
+    for r in matrix:
+        if r['candidate_id'] != winner_id:
+            lines += [f"### {r['candidate_id']}", r['final_selection_reason']]
+    gaps=[f"{r['candidate_id']}: {g}" for r in matrix for g in r['missing_requirement_flags']]
+    lines += ['', '## Evidence gaps', *(f"- {g}" for g in (gaps or ['No missing requirement flags recorded.']))]
+    p.write_text('\n'.join(lines)+'\n', encoding='utf-8'); return p
+
 _STRONG_SUCCESS_EVIDENCE_RE = re.compile(
     r"\b(test|tests|passed|validation|validated|verified|behavior|runtime|end-to-end|e2e|integration|executed|ran|imported|output|cleanup|cancellation|install|fresh|downstream|smoke)\b",
     re.IGNORECASE,
@@ -149,9 +285,11 @@ def _quality_rows(candidates: list[Any]) -> list[dict[str, Any]]:
 
 def _pick_by_quality(bucket: list[Any], rng: random.Random) -> tuple[Any|None, list[str], bool]:
     if not bucket: return None, [], False
-    best_key=max(verifier_quality_key(c) for c in bucket)
-    best=[c for c in bucket if verifier_quality_key(c)==best_key]
-    return rng.choice(best), [_cid(c) for c in best], len(best)>1
+    ranked_rows = rank_candidates_by_evidence(bucket)
+    best_id = ranked_rows[0]['candidate_id']
+    best_key = _evidence_rank_components(ranked_rows[0])
+    best = [r['candidate_id'] for r in ranked_rows if _evidence_rank_components(r) == best_key]
+    return next(c for c in bucket if _cid(c) == best_id), best, len(best) > 1
 
 def select_winner(candidates:list[Any], seed:int, on_all_fail:str='fail')->SelectionResult:
     if on_all_fail not in VALID_ON_ALL_FAIL: raise ValueError('invalid on_all_fail')

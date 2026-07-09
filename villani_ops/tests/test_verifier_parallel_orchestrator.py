@@ -118,7 +118,7 @@ def test_flow_creates_worktrees_verifies_integrates_and_writes_artifacts(tmp_pat
     assert all(c['repo_dir'].name == 'worktree' and c['repo_dir'].parent.name.startswith('candidate-') for c in ver_calls)
     assert out['winnerCandidateId']=='candidate-002'
     assert (repo/'a.txt').read_text()=='candidate-002'
-    for name in ['orchestration.json','candidates.jsonl','candidate-runs.jsonl','verifier-results.jsonl','selection.json','integration.json','transcript.md']:
+    for name in ['orchestration.json','candidates.jsonl','candidate-runs.jsonl','verifier-results.jsonl','selection.json','candidate_evidence_matrix.json','selection_report.md','integration.json','transcript.md']:
         assert (od/name).exists()
     assert len((od/'candidates.jsonl').read_text().splitlines())==3
     assert json.loads((od/'task.json').read_text())['success_criteria']=='done criteria'
@@ -318,14 +318,15 @@ def test_selection_result_one_beats_cleaner_result_zero():
     assert s.winnerResult == 1
 
 
-def test_selection_random_only_after_identical_quality_keys():
+def test_selection_uses_stable_candidate_id_after_identical_quality_keys():
     candidates = [
         {'candidateId':'candidate-001','result':1,'confidence':0.9,'successEvidence':['test passed']},
         {'candidateId':'candidate-002','result':1,'confidence':0.9,'successEvidence':['test passed']},
     ]
     first = select_winner(candidates, seed=0)
     assert first.winnerCandidateId == select_winner(candidates, seed=0).winnerCandidateId
-    assert first.winnerCandidateId != select_winner(candidates, seed=1).winnerCandidateId
+    assert first.winnerCandidateId == select_winner(candidates, seed=1).winnerCandidateId
+    assert first.winnerCandidateId == 'candidate-001'
     assert first.tieBreak is True
     assert first.qualityTieBreakApplied is True
     assert 'tied on verifier result and verifier quality key' in first.reason
@@ -421,3 +422,48 @@ def test_llm_comparison_not_called_for_one_or_zero_successes(tmp_path, monkeypat
     orch2=VerifierParallelOrchestrator(cfg2, runner=runner2, verifier=verifier0); orch2._backend_obj=lambda: Backend(name='b',provider='local',model='m',api_key='x',base_url='http://x')
     out2=orch2.run()
     assert out2['winnerCandidateId'] is None and calls==[]
+
+
+def test_evidence_ranking_prefers_cleanup_coverage_and_writes_reports(tmp_path):
+    from villani_ops.orchestrator.selection import build_candidate_evidence_matrix, rank_candidates_by_evidence, _finalize_evidence_reasons, write_candidate_evidence_matrix, write_selection_report
+    candidates = [
+        {
+            'candidateId': 'candidate-a',
+            'result': 1,
+            'confidence': 0.99,
+            'successEvidence': ['implemented async concurrency behavior and smoke test passed'],
+            'requirementResults': [
+                {'requirement': 'support concurrent async work', 'status': 'satisfied'},
+                {'requirement': 'handle interruption and cleanup resources on shutdown', 'status': 'unsatisfied'},
+            ],
+            'missingEvidence': ['no explicit evidence for cleanup, cancellation, interruption, or shutdown'],
+            'riskFlags': [],
+            'changedFiles': ['worker.py'],
+        },
+        {
+            'candidateId': 'candidate-b',
+            'result': 1,
+            'confidence': 0.80,
+            'successEvidence': ['implemented async concurrency behavior and cleanup on cancellation was validated', 'SIGINT shutdown closes resources'],
+            'requirementResults': [
+                {'requirement': 'support concurrent async work', 'status': 'satisfied'},
+                {'requirement': 'handle interruption and cleanup resources on shutdown', 'status': 'satisfied'},
+            ],
+            'missingEvidence': [],
+            'riskFlags': [],
+            'changedFiles': ['worker.py', 'tests/test_worker.py'],
+        },
+    ]
+    ranked = rank_candidates_by_evidence(candidates)
+    assert ranked[0]['candidate_id'] == 'candidate-b'
+    matrix = _finalize_evidence_reasons(build_candidate_evidence_matrix(candidates, 'candidate-b'), 'candidate-b')
+    assert next(r for r in matrix if r['candidate_id'] == 'candidate-b')['selection_status'] == 'selected'
+    row_a = next(r for r in matrix if r['candidate_id'] == 'candidate-a')
+    assert row_a['selection_status'] != 'selected'
+    assert any(any(word in flag for word in ['cleanup', 'cancellation', 'interruption', 'shutdown']) for flag in row_a['missing_requirement_flags'])
+    matrix_path = write_candidate_evidence_matrix(tmp_path/'candidate_evidence_matrix.json', matrix)
+    report_path = write_selection_report(tmp_path/'selection_report.md', matrix, 'candidate-b')
+    report = report_path.read_text()
+    assert 'candidate-b' in report and 'Selected because' in report and 'candidate-a' in report
+    loaded = json.loads(matrix_path.read_text())
+    assert {r['candidate_id'] for r in loaded} == {'candidate-a', 'candidate-b'}

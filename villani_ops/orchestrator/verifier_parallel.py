@@ -11,7 +11,7 @@ from villani_ops.storage.files import FileStorage
 from villani_ops.core.task import Task
 from villani_ops.core.backend import Backend
 from villani_ops.git_ops import safe_apply
-from .selection import select_winner, POLICY, LLM_COMPARE_POLICY, LLM_COMPARE_FALLBACK_POLICY, select_success_with_llm_comparison
+from .selection import select_winner, POLICY, LLM_COMPARE_POLICY, LLM_COMPARE_FALLBACK_POLICY, select_success_with_llm_comparison, build_candidate_evidence_matrix, write_candidate_evidence_matrix, write_selection_report, _finalize_evidence_reasons
 
 
 
@@ -210,6 +210,9 @@ class VerifierParallelOrchestrator:
             sel.llmComparison=meta; d=sel.to_dict(); write_json(odir/'selection.json',d)
         else:
             write_json(odir/'selection.json',sel.to_dict())
+        evidence_matrix = _finalize_evidence_reasons(build_candidate_evidence_matrix(candidates, sel.winnerCandidateId), sel.winnerCandidateId)
+        write_candidate_evidence_matrix(odir/'candidate_evidence_matrix.json', evidence_matrix)
+        write_selection_report(odir/'selection_report.md', evidence_matrix, sel.winnerCandidateId)
         winner=next((c for c in candidates if c.candidate_id==sel.winnerCandidateId),None); integ=self._integrate(odir,winner)
         status='completed' if integ['status'] in {'integrated','skipped'} and (winner or cfg.on_all_fail=='fail') else 'failed'
         if sel.winnerCandidateId is None and cfg.on_all_fail=='fail': status='failed'
